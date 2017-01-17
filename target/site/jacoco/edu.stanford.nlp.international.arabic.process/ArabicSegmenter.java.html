@@ -1,0 +1,647 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ArabicSegmenter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.arabic.process</a> &gt; <span class="el_source">ArabicSegmenter.java</span></div><h1>ArabicSegmenter.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.arabic.process;
+
+
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.io.StringReader;
+import java.io.UnsupportedEncodingException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+
+import edu.stanford.nlp.ie.crf.CRFClassifier;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.SentenceUtils;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.process.TokenizerFactory;
+import edu.stanford.nlp.process.WordSegmenter;
+import edu.stanford.nlp.sequences.DocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.CollectionUtils;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.IntPair;
+import edu.stanford.nlp.util.PropertiesUtils;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * Arabic word segmentation model based on conditional random fields (CRF).
+ * This is a re-implementation (with extensions) of the model described in
+ * (Green and DeNero, 2012).
+ * &lt;p&gt;
+ * This package includes a JFlex-based orthographic normalization package
+ * that runs on the input prior to processing by the CRF-based segmentation
+ * model. The normalization options are configurable, but must be consistent for
+ * both training and test data.
+ *
+ * @author Spence Green
+ */
+<span class="nc bnc" id="L54" title="All 2 branches missed.">public class ArabicSegmenter implements WordSegmenter, ThreadsafeProcessor&lt;String,String&gt; /* Serializable */  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L57">  private static Redwood.RedwoodChannels log = Redwood.channels(ArabicSegmenter.class);</span>
+
+  private static final long serialVersionUID = -4791848633597417788L;
+
+  // SEGMENTER OPTIONS (can be set in the Properties object
+  // passed to the constructor).
+
+  // The input already been tokenized. Do not run the Arabic tokenizer.
+  private static final String optTokenized = &quot;tokenized&quot;;
+
+  // Tokenizer options
+  private static final String optTokenizer = &quot;orthoOptions&quot;;
+
+  // Mark segmented prefixes with this String
+  private static final String optPrefix = &quot;prefixMarker&quot;;
+
+  // Mark segmented suffixes with this String
+  private static final String optSuffix = &quot;suffixMarker&quot;;
+
+  // Number of decoding threads
+  private static final String optThreads = &quot;nthreads&quot;;
+
+  // Write TedEval files
+  private static final String optTedEval = &quot;tedEval&quot;;
+
+  // Use a custom feature factory
+  private static final String optFeatureFactory = &quot;featureFactory&quot;;
+  private static final String defaultFeatureFactory =
+      &quot;edu.stanford.nlp.international.arabic.process.StartAndEndArabicSegmenterFeatureFactory&quot;;
+  private static final String localOnlyFeatureFactory =
+      &quot;edu.stanford.nlp.international.arabic.process.ArabicSegmenterFeatureFactory&quot;;
+
+  // Training and evaluation files have domain labels
+  private static final String optWithDomains = &quot;withDomains&quot;;
+
+  // Training and evaluation text are all in the same domain (default:atb)
+  private static final String optDomain = &quot;domain&quot;;
+
+  // Ignore rewrites (training only, produces a model that then can be used to do
+  // no-rewrite segmentation)
+  private static final String optNoRewrites = &quot;noRewrites&quot;;
+
+  // Use the original feature set which doesn't contain start-and-end &quot;wrapper&quot; features
+  private static final String optLocalFeaturesOnly = &quot;localFeaturesOnly&quot;;
+
+  private transient CRFClassifier&lt;CoreLabel&gt; classifier;
+  private final SeqClassifierFlags flags;
+  private final TokenizerFactory&lt;CoreLabel&gt; tf;
+  private final String prefixMarker;
+  private final String suffixMarker;
+  private final boolean isTokenized;
+  private final String tokenizerOptions;
+  private final String tedEvalPrefix;
+  private final boolean hasDomainLabels;
+  private final String domain;
+  private final boolean noRewrites;
+
+  /**
+   * Make an Arabic Segmenter.
+   *
+   *  @param props Options for how to tokenize. See the main method of {@see ArabicTokenizer} for details
+   */
+<span class="nc" id="L119">  public ArabicSegmenter(Properties props) {</span>
+<span class="nc" id="L120">    isTokenized = props.containsKey(optTokenized);</span>
+<span class="nc" id="L121">    tokenizerOptions = props.getProperty(optTokenizer, null);</span>
+<span class="nc" id="L122">    tedEvalPrefix = props.getProperty(optTedEval, null);</span>
+<span class="nc" id="L123">    hasDomainLabels = props.containsKey(optWithDomains);</span>
+<span class="nc" id="L124">    domain = props.getProperty(optDomain, &quot;atb&quot;);</span>
+<span class="nc" id="L125">    noRewrites = props.containsKey(optNoRewrites);</span>
+<span class="nc" id="L126">    tf = getTokenizerFactory();</span>
+
+<span class="nc" id="L128">    prefixMarker = props.getProperty(optPrefix, &quot;&quot;);</span>
+<span class="nc" id="L129">    suffixMarker = props.getProperty(optSuffix, &quot;&quot;);</span>
+
+<span class="nc bnc" id="L131" title="All 2 branches missed.">    if (props.containsKey(optLocalFeaturesOnly)) {</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">      if (props.containsKey(optFeatureFactory))</span>
+<span class="nc" id="L133">        throw new RuntimeException(&quot;Cannot use custom feature factory with localFeaturesOnly flag--&quot; +</span>
+            &quot;have your custom feature factory extend ArabicSegmenterFeatureFactory instead of &quot; +
+            &quot;StartAndEndArabicSegmenterFeatureFactory and remove the localFeaturesOnly flag.&quot;);
+
+<span class="nc" id="L137">      props.setProperty(optFeatureFactory, localOnlyFeatureFactory);</span>
+    }
+<span class="nc bnc" id="L139" title="All 2 branches missed.">    if (!props.containsKey(optFeatureFactory))</span>
+<span class="nc" id="L140">      props.setProperty(optFeatureFactory, defaultFeatureFactory);</span>
+
+    // Remove all command-line properties that are specific to ArabicSegmenter
+<span class="nc" id="L143">    props.remove(optTokenizer);</span>
+<span class="nc" id="L144">    props.remove(optTokenized);</span>
+<span class="nc" id="L145">    props.remove(optPrefix);</span>
+<span class="nc" id="L146">    props.remove(optSuffix);</span>
+<span class="nc" id="L147">    props.remove(optThreads);</span>
+<span class="nc" id="L148">    props.remove(optTedEval);</span>
+<span class="nc" id="L149">    props.remove(optWithDomains);</span>
+<span class="nc" id="L150">    props.remove(optDomain);</span>
+<span class="nc" id="L151">    props.remove(optNoRewrites);</span>
+<span class="nc" id="L152">    props.remove(optLocalFeaturesOnly);</span>
+
+<span class="nc" id="L154">    flags = new SeqClassifierFlags(props);</span>
+<span class="nc" id="L155">    classifier = new CRFClassifier&lt;&gt;(flags);</span>
+<span class="nc" id="L156">  }</span>
+
+  /**
+   * Copy constructor.
+   *
+   * @param other
+   */
+<span class="nc" id="L163">  public ArabicSegmenter(ArabicSegmenter other) {</span>
+<span class="nc" id="L164">    isTokenized = other.isTokenized;</span>
+<span class="nc" id="L165">    tokenizerOptions = other.tokenizerOptions;</span>
+<span class="nc" id="L166">    prefixMarker = other.prefixMarker;</span>
+<span class="nc" id="L167">    suffixMarker = other.suffixMarker;</span>
+<span class="nc" id="L168">    tedEvalPrefix = other.tedEvalPrefix;</span>
+<span class="nc" id="L169">    hasDomainLabels = other.hasDomainLabels;</span>
+<span class="nc" id="L170">    domain = other.domain;</span>
+<span class="nc" id="L171">    noRewrites = other.noRewrites;</span>
+<span class="nc" id="L172">    flags = other.flags;</span>
+
+    // ArabicTokenizerFactory is *not* threadsafe. Make a new copy.
+<span class="nc" id="L175">    tf = getTokenizerFactory();</span>
+
+    // CRFClassifier is threadsafe, so return a reference.
+<span class="nc" id="L178">    classifier = other.classifier;</span>
+<span class="nc" id="L179">  }</span>
+
+  /**
+   * Creates an ArabicTokenizer. The default tokenizer
+   * is ArabicTokenizer.atbFactory(), which produces the
+   * same orthographic normalization as Green and Manning (2010).
+   *
+   * @return A TokenizerFactory that produces each Arabic token as a CoreLabel
+   */
+  private TokenizerFactory&lt;CoreLabel&gt; getTokenizerFactory() {
+<span class="nc" id="L189">    TokenizerFactory&lt;CoreLabel&gt; tokFactory = null;</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">    if ( ! isTokenized) {</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      if (tokenizerOptions == null) {</span>
+<span class="nc" id="L192">        tokFactory = ArabicTokenizer.atbFactory();</span>
+<span class="nc" id="L193">        String atbVocOptions = &quot;removeProMarker,removeMorphMarker,removeLengthening&quot;;</span>
+<span class="nc" id="L194">        tokFactory.setOptions(atbVocOptions);</span>
+<span class="nc" id="L195">      } else {</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (tokenizerOptions.contains(&quot;removeSegMarker&quot;)) {</span>
+<span class="nc" id="L197">          throw new RuntimeException(&quot;Option 'removeSegMarker' cannot be used with ArabicSegmenter&quot;);</span>
+        }
+<span class="nc" id="L199">        tokFactory = ArabicTokenizer.factory();</span>
+<span class="nc" id="L200">        tokFactory.setOptions(tokenizerOptions);</span>
+      }
+<span class="nc" id="L202">      log.info(&quot;Loaded ArabicTokenizer with options: &quot; + tokenizerOptions);</span>
+    }
+<span class="nc" id="L204">    return tokFactory;</span>
+  }
+
+  @Override
+  public void initializeTraining(double numTrees) {
+<span class="nc" id="L209">    throw new UnsupportedOperationException(&quot;Training is not supported!&quot;);</span>
+  }
+
+  @Override
+  public void train(Collection&lt;Tree&gt; trees) {
+<span class="nc" id="L214">    throw new UnsupportedOperationException(&quot;Training is not supported!&quot;);</span>
+  }
+
+  @Override
+  public void train(Tree tree) {
+<span class="nc" id="L219">    throw new UnsupportedOperationException(&quot;Training is not supported!&quot;);</span>
+  }
+
+  @Override
+  public void train(List&lt;TaggedWord&gt; sentence) {
+<span class="nc" id="L224">    throw new UnsupportedOperationException(&quot;Training is not supported!&quot;);</span>
+  }
+
+  @Override
+  public void finishTraining() {
+<span class="nc" id="L229">    throw new UnsupportedOperationException(&quot;Training is not supported!&quot;);</span>
+  }
+
+  @Override
+  public String process(String nextInput) {
+<span class="nc" id="L234">    return segmentString(nextInput);</span>
+  }
+
+  @Override
+  public ThreadsafeProcessor&lt;String, String&gt; newInstance() {
+<span class="nc" id="L239">    return new ArabicSegmenter(this);</span>
+  }
+
+  @Override
+  public List&lt;HasWord&gt; segment(String line) {
+<span class="nc" id="L244">    String segmentedString = segmentString(line);</span>
+<span class="nc" id="L245">    return SentenceUtils.toWordList(segmentedString.split(&quot;\\s+&quot;));</span>
+  }
+
+  private List&lt;CoreLabel&gt; segmentStringToIOB(String line) {
+    List&lt;CoreLabel&gt; tokenList;
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    if (tf == null) {</span>
+      // Whitespace tokenization.
+<span class="nc" id="L252">      tokenList = IOBUtils.StringToIOB(line);</span>
+    } else {
+<span class="nc" id="L254">      List&lt;CoreLabel&gt; tokens = tf.getTokenizer(new StringReader(line)).tokenize();</span>
+<span class="nc" id="L255">      tokenList = IOBUtils.StringToIOB(tokens, null, false, tf, line);</span>
+    }
+<span class="nc" id="L257">    IOBUtils.labelDomain(tokenList, domain);</span>
+<span class="nc" id="L258">    tokenList = classifier.classify(tokenList);</span>
+<span class="nc" id="L259">    return tokenList;</span>
+  }
+
+  public List&lt;CoreLabel&gt; segmentStringToTokenList(String line) {
+<span class="nc" id="L263">    List&lt;CoreLabel&gt; tokenList = CollectionUtils.makeList();</span>
+<span class="nc" id="L264">    List&lt;CoreLabel&gt; labeledSequence = segmentStringToIOB(line);</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    for (IntPair span : IOBUtils.TokenSpansForIOB(labeledSequence)) {</span>
+<span class="nc" id="L266">      CoreLabel token = new CoreLabel();</span>
+<span class="nc" id="L267">      String text = IOBUtils.IOBToString(labeledSequence, prefixMarker, suffixMarker,</span>
+<span class="nc" id="L268">          span.getSource(), span.getTarget());</span>
+<span class="nc" id="L269">      token.setWord(text);</span>
+<span class="nc" id="L270">      token.setValue(text);</span>
+<span class="nc" id="L271">      token.set(CoreAnnotations.TextAnnotation.class, text);</span>
+<span class="nc" id="L272">      token.set(CoreAnnotations.ArabicSegAnnotation.class, &quot;1&quot;);</span>
+<span class="nc" id="L273">      int start = labeledSequence.get(span.getSource()).beginPosition();</span>
+<span class="nc" id="L274">      int end = labeledSequence.get(span.getTarget() - 1).endPosition();</span>
+<span class="nc" id="L275">      token.setOriginalText(line.substring(start, end));</span>
+<span class="nc" id="L276">      token.set(CoreAnnotations.CharacterOffsetBeginAnnotation.class, start);</span>
+<span class="nc" id="L277">      token.set(CoreAnnotations.CharacterOffsetEndAnnotation.class, end);</span>
+<span class="nc" id="L278">      tokenList.add(token);</span>
+<span class="nc" id="L279">    }</span>
+<span class="nc" id="L280">    return tokenList;</span>
+  }
+
+  public String segmentString(String line) {
+<span class="nc" id="L284">    List&lt;CoreLabel&gt; labeledSequence = segmentStringToIOB(line);</span>
+<span class="nc" id="L285">    String segmentedString = IOBUtils.IOBToString(labeledSequence, prefixMarker, suffixMarker);</span>
+<span class="nc" id="L286">    return segmentedString;</span>
+  }
+
+  /**
+   * Segment all strings from an input.
+   *
+   * @param br -- input stream to segment
+   * @param pwOut -- output stream to write the segmenter text
+   * @return number of input characters segmented
+   */
+  public long segment(BufferedReader br, PrintWriter pwOut) {
+<span class="nc" id="L297">    long nSegmented = 0;</span>
+    try {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      for (String line; (line = br.readLine()) != null;) {</span>
+<span class="nc" id="L300">        nSegmented += line.length(); // Measure this quantity since it is quick to compute</span>
+<span class="nc" id="L301">        String segmentedLine = segmentString(line);</span>
+<span class="nc" id="L302">        pwOut.println(segmentedLine);</span>
+<span class="nc" id="L303">      }</span>
+<span class="nc" id="L304">    } catch (IOException e) {</span>
+<span class="nc" id="L305">      e.printStackTrace();</span>
+<span class="nc" id="L306">    }</span>
+<span class="nc" id="L307">    return nSegmented;</span>
+  }
+
+  /**
+   * Train a segmenter from raw text. Gold segmentation markers are required.
+   */
+  public void train() {
+<span class="nc" id="L314">    boolean hasSegmentationMarkers = true;</span>
+<span class="nc" id="L315">    boolean hasTags = true;</span>
+<span class="nc" id="L316">    DocumentReaderAndWriter&lt;CoreLabel&gt; docReader = new ArabicDocumentReaderAndWriter(hasSegmentationMarkers,</span>
+                                                                                     hasTags,
+                                                                                     hasDomainLabels,
+                                                                                     domain,
+                                                                                     noRewrites,
+                                                                                     tf);
+<span class="nc" id="L322">    ObjectBank&lt;List&lt;CoreLabel&gt;&gt; lines =</span>
+<span class="nc" id="L323">      classifier.makeObjectBankFromFile(flags.trainFile, docReader);</span>
+
+<span class="nc" id="L325">    classifier.train(lines, docReader);</span>
+<span class="nc" id="L326">    log.info(&quot;Finished training.&quot;);</span>
+<span class="nc" id="L327">  }</span>
+
+  /**
+   * Evaluate accuracy when the input is gold segmented text *with* segmentation
+   * markers and morphological analyses. In other words, the evaluation file has the
+   * same format as the training data.
+   *
+   * @param pwOut
+   */
+  private void evaluate(PrintWriter pwOut) {
+<span class="nc" id="L337">    log.info(&quot;Starting evaluation...&quot;);</span>
+<span class="nc" id="L338">    boolean hasSegmentationMarkers = true;</span>
+<span class="nc" id="L339">    boolean hasTags = true;</span>
+<span class="nc" id="L340">    DocumentReaderAndWriter&lt;CoreLabel&gt; docReader = new ArabicDocumentReaderAndWriter(hasSegmentationMarkers,</span>
+                                                                                     hasTags,
+                                                                                     hasDomainLabels,
+                                                                                     domain,
+                                                                                     tf);
+<span class="nc" id="L345">    ObjectBank&lt;List&lt;CoreLabel&gt;&gt; lines =</span>
+<span class="nc" id="L346">      classifier.makeObjectBankFromFile(flags.testFile, docReader);</span>
+
+<span class="nc" id="L348">    PrintWriter tedEvalGoldTree = null, tedEvalParseTree = null;</span>
+<span class="nc" id="L349">    PrintWriter tedEvalGoldSeg = null, tedEvalParseSeg = null;</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">    if (tedEvalPrefix != null) {</span>
+      try {
+<span class="nc" id="L352">        tedEvalGoldTree = new PrintWriter(tedEvalPrefix + &quot;_gold.ftree&quot;);</span>
+<span class="nc" id="L353">        tedEvalGoldSeg = new PrintWriter(tedEvalPrefix + &quot;_gold.segmentation&quot;);</span>
+<span class="nc" id="L354">        tedEvalParseTree = new PrintWriter(tedEvalPrefix + &quot;_parse.ftree&quot;);</span>
+<span class="nc" id="L355">        tedEvalParseSeg = new PrintWriter(tedEvalPrefix + &quot;_parse.segmentation&quot;);</span>
+<span class="nc" id="L356">      } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L357">        System.err.printf(&quot;%s: %s%n&quot;, ArabicSegmenter.class.getName(), e.getMessage());</span>
+<span class="nc" id="L358">      }</span>
+    }
+
+<span class="nc" id="L361">    Counter&lt;String&gt; labelTotal = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L362">    Counter&lt;String&gt; labelCorrect = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L363">    int total = 0;</span>
+<span class="nc" id="L364">    int correct = 0;</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">    for (List&lt;CoreLabel&gt; line : lines) {</span>
+<span class="nc" id="L366">      final String[] inputTokens = tedEvalSanitize(IOBUtils.IOBToString(line).replaceAll(&quot;:&quot;, &quot;#pm#&quot;)).split(&quot; &quot;);</span>
+<span class="nc" id="L367">      final String[] goldTokens = tedEvalSanitize(IOBUtils.IOBToString(line, &quot;:&quot;)).split(&quot; &quot;);</span>
+<span class="nc" id="L368">      line = classifier.classify(line);</span>
+<span class="nc" id="L369">      final String[] parseTokens = tedEvalSanitize(IOBUtils.IOBToString(line, &quot;:&quot;)).split(&quot; &quot;);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">      for (CoreLabel label : line) {</span>
+        // Do not evaluate labeling of whitespace
+<span class="nc" id="L372">        String observation = label.get(CoreAnnotations.CharAnnotation.class);</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if ( ! observation.equals(IOBUtils.getBoundaryCharacter())) {</span>
+<span class="nc" id="L374">          total++;</span>
+<span class="nc" id="L375">          String hypothesis = label.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L376">          String reference = label.get(CoreAnnotations.GoldAnswerAnnotation.class);</span>
+<span class="nc" id="L377">          labelTotal.incrementCount(reference);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">          if (hypothesis.equals(reference)) {</span>
+<span class="nc" id="L379">            correct++;</span>
+<span class="nc" id="L380">            labelCorrect.incrementCount(reference);</span>
+          }
+        }
+<span class="nc" id="L383">      }</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">      if (tedEvalParseSeg != null) {</span>
+<span class="nc" id="L385">        tedEvalGoldTree.printf(&quot;(root&quot;);</span>
+<span class="nc" id="L386">        tedEvalParseTree.printf(&quot;(root&quot;);</span>
+<span class="nc" id="L387">        int safeLength = inputTokens.length;</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (inputTokens.length != goldTokens.length) {</span>
+<span class="nc" id="L389">          log.info(&quot;In generating TEDEval files: Input and gold do not have the same number of tokens&quot;);</span>
+<span class="nc" id="L390">          log.info(&quot;    (ignoring any extras)&quot;);</span>
+<span class="nc" id="L391">          log.info(&quot;  input: &quot; + Arrays.toString(inputTokens));</span>
+<span class="nc" id="L392">          log.info(&quot;  gold: &quot; + Arrays.toString(goldTokens));</span>
+<span class="nc" id="L393">          safeLength = Math.min(inputTokens.length, goldTokens.length);</span>
+        }
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (inputTokens.length != parseTokens.length) {</span>
+<span class="nc" id="L396">          log.info(&quot;In generating TEDEval files: Input and parse do not have the same number of tokens&quot;);</span>
+<span class="nc" id="L397">          log.info(&quot;    (ignoring any extras)&quot;);</span>
+<span class="nc" id="L398">          log.info(&quot;  input: &quot; + Arrays.toString(inputTokens));</span>
+<span class="nc" id="L399">          log.info(&quot;  parse: &quot; + Arrays.toString(parseTokens));</span>
+<span class="nc" id="L400">          safeLength = Math.min(inputTokens.length, parseTokens.length);</span>
+        }
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        for (int i = 0; i &lt; safeLength; i++) {</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">          for (String segment : goldTokens[i].split(&quot;:&quot;))</span>
+<span class="nc" id="L404">            tedEvalGoldTree.printf(&quot; (seg %s)&quot;, segment);</span>
+<span class="nc" id="L405">          tedEvalGoldSeg.printf(&quot;%s\t%s%n&quot;, inputTokens[i], goldTokens[i]);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">          for (String segment : parseTokens[i].split(&quot;:&quot;))</span>
+<span class="nc" id="L407">            tedEvalParseTree.printf(&quot; (seg %s)&quot;, segment);</span>
+<span class="nc" id="L408">          tedEvalParseSeg.printf(&quot;%s\t%s%n&quot;, inputTokens[i], parseTokens[i]);</span>
+        }
+<span class="nc" id="L410">        tedEvalGoldTree.printf(&quot;)%n&quot;);</span>
+<span class="nc" id="L411">        tedEvalGoldSeg.println();</span>
+<span class="nc" id="L412">        tedEvalParseTree.printf(&quot;)%n&quot;);</span>
+<span class="nc" id="L413">        tedEvalParseSeg.println();</span>
+      }
+<span class="nc" id="L415">    }</span>
+
+<span class="nc" id="L417">    double accuracy = ((double) correct) / ((double) total);</span>
+<span class="nc" id="L418">    accuracy *= 100.0;</span>
+
+<span class="nc" id="L420">    pwOut.println(&quot;EVALUATION RESULTS&quot;);</span>
+<span class="nc" id="L421">    pwOut.printf(&quot;#datums:\t%d%n&quot;, total);</span>
+<span class="nc" id="L422">    pwOut.printf(&quot;#correct:\t%d%n&quot;, correct);</span>
+<span class="nc" id="L423">    pwOut.printf(&quot;accuracy:\t%.2f%n&quot;, accuracy);</span>
+<span class="nc" id="L424">    pwOut.println(&quot;==================&quot;);</span>
+
+    // Output the per label accuracies
+<span class="nc" id="L427">    pwOut.println(&quot;PER LABEL ACCURACIES&quot;);</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">    for (String refLabel : labelTotal.keySet()) {</span>
+<span class="nc" id="L429">      double nTotal = labelTotal.getCount(refLabel);</span>
+<span class="nc" id="L430">      double nCorrect = labelCorrect.getCount(refLabel);</span>
+<span class="nc" id="L431">      double acc = (nCorrect / nTotal) * 100.0;</span>
+<span class="nc" id="L432">      pwOut.printf(&quot; %s\t%.2f%n&quot;, refLabel, acc);</span>
+<span class="nc" id="L433">    }</span>
+
+<span class="nc bnc" id="L435" title="All 2 branches missed.">    if (tedEvalParseSeg != null) {</span>
+<span class="nc" id="L436">      tedEvalGoldTree.close();</span>
+<span class="nc" id="L437">      tedEvalGoldSeg.close();</span>
+<span class="nc" id="L438">      tedEvalParseTree.close();</span>
+<span class="nc" id="L439">      tedEvalParseSeg.close();</span>
+    }
+<span class="nc" id="L441">  }</span>
+
+  private static String tedEvalSanitize(String str) {
+<span class="nc" id="L444">    return str.replaceAll(&quot;\\(&quot;, &quot;#lp#&quot;).replaceAll(&quot;\\)&quot;, &quot;#rp#&quot;);</span>
+  }
+
+  /**
+   * Evaluate P/R/F1 when the input is raw text.
+   */
+  private static void evaluateRawText(PrintWriter pwOut) {
+    // TODO(spenceg): Evaluate raw input w.r.t. a reference that might have different numbers
+    // of characters per sentence. Need to implement a monotonic sequence alignment algorithm
+    // to align the two character strings.
+    //    String gold = flags.answerFile;
+    //    String rawFile = flags.testFile;
+<span class="nc" id="L456">    throw new RuntimeException(&quot;Not yet implemented!&quot;);</span>
+  }
+
+  public void serializeSegmenter(String filename) {
+<span class="nc" id="L460">    classifier.serializeClassifier(filename);</span>
+<span class="nc" id="L461">  }</span>
+
+  public void loadSegmenter(String filename, Properties p) {
+    try {
+<span class="nc" id="L465">      classifier = CRFClassifier.getClassifier(filename, p);</span>
+<span class="nc" id="L466">    } catch (ClassCastException | IOException | ClassNotFoundException e) {</span>
+<span class="nc" id="L467">      throw new RuntimeIOException(&quot;Failed to load segmenter &quot; + filename, e);</span>
+<span class="nc" id="L468">    }</span>
+<span class="nc" id="L469">  }</span>
+
+  @Override
+  public void loadSegmenter(String filename) {
+<span class="nc" id="L473">    loadSegmenter(filename, new Properties());</span>
+<span class="nc" id="L474">  }</span>
+
+
+  private static String usage() {
+<span class="nc" id="L478">    String nl = System.lineSeparator();</span>
+<span class="nc" id="L479">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L480">    sb.append(&quot;Usage: java &quot;).append(ArabicSegmenter.class.getName()).append(&quot; OPTS &lt; file_to_segment&quot;).append(nl);</span>
+<span class="nc" id="L481">    sb.append(nl).append(&quot; Options:&quot;).append(nl);</span>
+<span class="nc" id="L482">    sb.append(&quot;  -help                : Print this message.&quot;).append(nl);</span>
+<span class="nc" id="L483">    sb.append(&quot;  -orthoOptions str    : Comma-separated list of orthographic normalization options to pass to ArabicTokenizer.&quot;).append(nl);</span>
+<span class="nc" id="L484">    sb.append(&quot;  -tokenized           : Text is already tokenized. Do not run internal tokenizer.&quot;).append(nl);</span>
+<span class="nc" id="L485">    sb.append(&quot;  -trainFile file      : Gold segmented IOB training file.&quot;).append(nl);</span>
+<span class="nc" id="L486">    sb.append(&quot;  -testFile  file      : Gold segmented IOB evaluation file.&quot;).append(nl);</span>
+<span class="nc" id="L487">    sb.append(&quot;  -textFile  file      : Raw input file to be segmented.&quot;).append(nl);</span>
+<span class="nc" id="L488">    sb.append(&quot;  -loadClassifier file : Load serialized classifier from file.&quot;).append(nl);</span>
+<span class="nc" id="L489">    sb.append(&quot;  -prefixMarker char   : Mark segmented prefixes with specified character.&quot;).append(nl);</span>
+<span class="nc" id="L490">    sb.append(&quot;  -suffixMarker char   : Mark segmented suffixes with specified character.&quot;).append(nl);</span>
+<span class="nc" id="L491">    sb.append(&quot;  -nthreads num        : Number of threads  (default: 1)&quot;).append(nl);</span>
+<span class="nc" id="L492">    sb.append(&quot;  -tedEval prefix      : Output TedEval-compliant gold and parse files.&quot;).append(nl);</span>
+<span class="nc" id="L493">    sb.append(&quot;  -featureFactory cls  : Name of feature factory class  (default: &quot;).append(defaultFeatureFactory);</span>
+<span class="nc" id="L494">    sb.append(&quot;)&quot;).append(nl);</span>
+<span class="nc" id="L495">    sb.append(&quot;  -withDomains         : Train file (if given) and eval file have domain labels.&quot;).append(nl);</span>
+<span class="nc" id="L496">    sb.append(&quot;  -domain dom          : Assume one domain for all data (default: 123)&quot;).append(nl);</span>
+<span class="nc" id="L497">    sb.append(nl).append(&quot; Otherwise, all flags correspond to those present in SeqClassifierFlags.java.&quot;).append(nl);</span>
+<span class="nc" id="L498">    return sb.toString();</span>
+  }
+
+  private static Map&lt;String,Integer&gt; optionArgDefs() {
+<span class="nc" id="L502">    Map&lt;String,Integer&gt; optionArgDefs = Generics.newHashMap();</span>
+<span class="nc" id="L503">    optionArgDefs.put(&quot;help&quot;, 0);</span>
+<span class="nc" id="L504">    optionArgDefs.put(&quot;orthoOptions&quot;, 1);</span>
+<span class="nc" id="L505">    optionArgDefs.put(&quot;tokenized&quot;, 0);</span>
+<span class="nc" id="L506">    optionArgDefs.put(&quot;trainFile&quot;, 1);</span>
+<span class="nc" id="L507">    optionArgDefs.put(&quot;testFile&quot;, 1);</span>
+<span class="nc" id="L508">    optionArgDefs.put(&quot;textFile&quot;, 1);</span>
+<span class="nc" id="L509">    optionArgDefs.put(&quot;loadClassifier&quot;, 1);</span>
+<span class="nc" id="L510">    optionArgDefs.put(&quot;prefixMarker&quot;, 1);</span>
+<span class="nc" id="L511">    optionArgDefs.put(&quot;suffixMarker&quot;, 1);</span>
+<span class="nc" id="L512">    optionArgDefs.put(&quot;nthreads&quot;, 1);</span>
+<span class="nc" id="L513">    optionArgDefs.put(&quot;tedEval&quot;, 1);</span>
+<span class="nc" id="L514">    optionArgDefs.put(&quot;featureFactory&quot;, 1);</span>
+<span class="nc" id="L515">    optionArgDefs.put(&quot;withDomains&quot;, 0);</span>
+<span class="nc" id="L516">    optionArgDefs.put(&quot;domain&quot;, 1);</span>
+<span class="nc" id="L517">    return optionArgDefs;</span>
+  }
+
+  /**
+   *
+   * @param args
+   */
+  public static void main(String[] args) {
+    // Strips off hyphens
+<span class="nc" id="L526">    Properties options = StringUtils.argsToProperties(args, optionArgDefs());</span>
+<span class="nc bnc" id="L527" title="All 4 branches missed.">    if (options.containsKey(&quot;help&quot;) || args.length == 0) {</span>
+<span class="nc" id="L528">      log.info(usage());</span>
+<span class="nc" id="L529">      System.exit(-1);</span>
+    }
+
+<span class="nc" id="L532">    int nThreads = PropertiesUtils.getInt(options, &quot;nthreads&quot;, 1);</span>
+<span class="nc" id="L533">    ArabicSegmenter segmenter = getSegmenter(options);</span>
+
+    // Decode either an evaluation file or raw text
+    try {
+      PrintWriter pwOut;
+<span class="nc bnc" id="L538" title="All 2 branches missed.">      if (segmenter.flags.outputEncoding != null) {</span>
+<span class="nc" id="L539">        OutputStreamWriter out = new OutputStreamWriter(System.out, segmenter.flags.outputEncoding);</span>
+<span class="nc" id="L540">        pwOut = new PrintWriter(out, true);</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">      } else if (segmenter.flags.inputEncoding != null) {</span>
+<span class="nc" id="L542">        OutputStreamWriter out = new OutputStreamWriter(System.out, segmenter.flags.inputEncoding);</span>
+<span class="nc" id="L543">        pwOut = new PrintWriter(out, true);</span>
+<span class="nc" id="L544">      } else {</span>
+<span class="nc" id="L545">        pwOut = new PrintWriter(System.out, true);</span>
+      }
+<span class="nc bnc" id="L547" title="All 2 branches missed.">      if (segmenter.flags.testFile != null) {</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        if (segmenter.flags.answerFile == null) {</span>
+<span class="nc" id="L549">          segmenter.evaluate(pwOut);</span>
+        } else {
+<span class="nc" id="L551">          segmenter.evaluateRawText(pwOut);</span>
+        }
+
+      } else {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        BufferedReader br = (segmenter.flags.textFile == null) ?</span>
+<span class="nc" id="L556">            IOUtils.readerFromStdin() :</span>
+<span class="nc" id="L557">                IOUtils.readerFromString(segmenter.flags.textFile, segmenter.flags.inputEncoding);</span>
+
+<span class="nc" id="L559">        double charsPerSec = decode(segmenter, br, pwOut, nThreads);</span>
+<span class="nc" id="L560">        IOUtils.closeIgnoringExceptions(br);</span>
+<span class="nc" id="L561">        System.err.printf(&quot;Done! Processed input text at %.2f input characters/second%n&quot;, charsPerSec);</span>
+      }
+
+<span class="nc" id="L564">    } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L565">      e.printStackTrace();</span>
+<span class="nc" id="L566">    } catch (IOException e) {</span>
+<span class="nc" id="L567">      System.err.printf(&quot;%s: Could not open %s%n&quot;, ArabicSegmenter.class.getName(), segmenter.flags.textFile);</span>
+<span class="nc" id="L568">    }</span>
+<span class="nc" id="L569">  }</span>
+
+  /**
+   * Segment input and write to output stream.
+   *
+   * @param segmenter
+   * @param br
+   * @param pwOut
+   * @param nThreads
+   * @return input characters processed per second
+   */
+  private static double decode(ArabicSegmenter segmenter, BufferedReader br,
+                               PrintWriter pwOut, int nThreads) {
+<span class="nc bnc" id="L582" title="All 4 branches missed.">    assert nThreads &gt; 0;</span>
+<span class="nc" id="L583">    long nChars = 0;</span>
+<span class="nc" id="L584">    final long startTime = System.nanoTime();</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">    if (nThreads &gt; 1) {</span>
+<span class="nc" id="L586">      MulticoreWrapper&lt;String,String&gt; wrapper = new MulticoreWrapper&lt;&gt;(nThreads, segmenter);</span>
+      try {
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        for (String line; (line = br.readLine()) != null;) {</span>
+<span class="nc" id="L589">          nChars += line.length();</span>
+<span class="nc" id="L590">          wrapper.put(line);</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">          while (wrapper.peek()) {</span>
+<span class="nc" id="L592">            pwOut.println(wrapper.poll());</span>
+          }
+        }
+
+<span class="nc" id="L596">        wrapper.join();</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">        while (wrapper.peek()) {</span>
+<span class="nc" id="L598">          pwOut.println(wrapper.poll());</span>
+        }
+
+<span class="nc" id="L601">      } catch (IOException e) {</span>
+<span class="nc" id="L602">        e.printStackTrace();</span>
+<span class="nc" id="L603">      }</span>
+
+<span class="nc" id="L605">    } else {</span>
+<span class="nc" id="L606">      nChars = segmenter.segment(br, pwOut);</span>
+    }
+<span class="nc" id="L608">    long duration = System.nanoTime() - startTime;</span>
+<span class="nc" id="L609">    double charsPerSec = (double) nChars / (duration / 1000000000.0);</span>
+<span class="nc" id="L610">    return charsPerSec;</span>
+  }
+
+  /**
+   * Train a new segmenter or load an trained model from file.  First
+   * checks to see if there is a &quot;model&quot; or &quot;loadClassifier&quot; flag to
+   * load from, and if not tries to run training using the given
+   * options.
+   *
+   * @param options
+   * @return the trained or loaded model
+   */
+  public static ArabicSegmenter getSegmenter(Properties options) {
+<span class="nc" id="L623">    ArabicSegmenter segmenter = new ArabicSegmenter(options);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">    if (segmenter.flags.inputEncoding == null) {</span>
+<span class="nc" id="L625">      segmenter.flags.inputEncoding = System.getProperty(&quot;file.encoding&quot;);</span>
+    }
+
+    // Load or train the classifier
+<span class="nc bnc" id="L629" title="All 2 branches missed.">    if (segmenter.flags.loadClassifier != null) {</span>
+<span class="nc" id="L630">      segmenter.loadSegmenter(segmenter.flags.loadClassifier, options);</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">    } else if (segmenter.flags.trainFile != null){</span>
+<span class="nc" id="L632">      segmenter.train();</span>
+
+<span class="nc bnc" id="L634" title="All 2 branches missed.">      if(segmenter.flags.serializeTo != null) {</span>
+<span class="nc" id="L635">        segmenter.serializeSegmenter(segmenter.flags.serializeTo);</span>
+<span class="nc" id="L636">        log.info(&quot;Serialized segmenter to: &quot; + segmenter.flags.serializeTo);</span>
+      }
+    } else {
+<span class="nc" id="L639">      log.info(&quot;No training file or trained model specified!&quot;);</span>
+<span class="nc" id="L640">      log.info(usage());</span>
+<span class="nc" id="L641">      System.exit(-1);</span>
+    }
+<span class="nc" id="L643">    return segmenter;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

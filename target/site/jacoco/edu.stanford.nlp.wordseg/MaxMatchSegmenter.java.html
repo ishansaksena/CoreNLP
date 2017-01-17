@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MaxMatchSegmenter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.wordseg</a> &gt; <span class="el_source">MaxMatchSegmenter.java</span></div><h1>MaxMatchSegmenter.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.wordseg;
+
+import edu.stanford.nlp.fsm.DFSA;
+import edu.stanford.nlp.fsm.DFSAState;
+import edu.stanford.nlp.fsm.DFSATransition;
+import edu.stanford.nlp.io.EncodingPrintWriter;
+import edu.stanford.nlp.ling.*;
+import edu.stanford.nlp.ling.SentenceUtils;
+import edu.stanford.nlp.process.WordSegmenter;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.util.*;
+import java.io.*;
+import java.util.regex.Pattern;
+
+
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * Lexicon-based segmenter. Uses dynamic programming to find a word
+ * segmentation that satisfies the following two preferences:
+ * (1) minimize the number of out-of-vocabulary (OOV) words;
+ * (2) if there are multiple segmentations with the same number
+ * of OOV words, then select the one that minimizes the number
+ * of segments. Note that {@link edu.stanford.nlp.parser.lexparser.MaxMatchSegmenter}
+ * contains a greedy version of this algorithm.
+ *
+ * Note that the output segmentation may need to postprocessing for the segmentation
+ * of non-Chinese characters (e.g., punctuation, foreign names).
+ *
+ * @author Michel Galley
+ */
+<span class="nc bnc" id="L36" title="All 2 branches missed.">public class MaxMatchSegmenter implements WordSegmenter {</span>
+
+  private static final boolean DEBUG = false;
+
+<span class="nc" id="L40">  private static Redwood.RedwoodChannels logger = Redwood.channels(MaxMatchSegmenter.class);</span>
+
+<span class="nc" id="L42">  private final Set&lt;String&gt; words = Generics.newHashSet();</span>
+<span class="nc" id="L43">  private int len = -1;</span>
+<span class="nc" id="L44">  private int edgesNb = 0;</span>
+  private static final int maxLength = 10;
+  private List&lt;DFSAState&lt;Word, Integer&gt;&gt; states;
+<span class="nc" id="L47">  private DFSA&lt;Word, Integer&gt; lattice = null;</span>
+<span class="nc" id="L48">  public enum MatchHeuristic { MINWORDS, MAXWORDS, MAXLEN }</span>
+
+<span class="nc" id="L50">  private static final Pattern chineseStartChars = Pattern.compile(&quot;^[\u4E00-\u9FFF]&quot;);</span>
+<span class="nc" id="L51">  private static final Pattern chineseEndChars = Pattern.compile(&quot;[\u4E00-\u9FFF]$&quot;);</span>
+<span class="nc" id="L52">  private static final Pattern chineseChars = Pattern.compile(&quot;[\u4E00-\u9FFF]&quot;);</span>
+
+<span class="nc" id="L54">  private static final Pattern excludeChars = Pattern.compile(&quot;[0-9\uff10-\uff19&quot; +</span>
+        &quot;\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4E5D\u5341&quot; +
+        &quot;\u96F6\u3007\u767E\u5343\u4E07\u4ebf\u5169\u25cb\u25ef\u3021-\u3029\u3038-\u303A&quot; +
+        &quot;-#$%&amp;'*+/@_\uff0d\uff03\uff04\uff05\uff06\uff07\uff0a\uff0b\uff0f\uff20\uff3f]&quot;);
+
+  @Override
+<span class="nc" id="L60">  public void initializeTraining(double numTrees) {}</span>
+
+  @Override
+  public void train(Collection&lt;Tree&gt; trees) {
+<span class="nc bnc" id="L64" title="All 2 branches missed.">    for (Tree tree : trees) {</span>
+<span class="nc" id="L65">      train(tree);</span>
+<span class="nc" id="L66">    }</span>
+<span class="nc" id="L67">  }</span>
+
+  @Override
+  public void train(Tree tree) {
+<span class="nc" id="L71">    train(tree.taggedYield());</span>
+<span class="nc" id="L72">  }</span>
+
+  @Override
+  public void train(List&lt;TaggedWord&gt; sentence) {
+<span class="nc bnc" id="L76" title="All 2 branches missed.">    for (TaggedWord word : sentence) {</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">      if (word.word().length() &lt;= maxLength) {</span>
+<span class="nc" id="L78">        addStringToLexicon(word.word());</span>
+      }
+<span class="nc" id="L80">    }</span>
+<span class="nc" id="L81">  }</span>
+
+  @Override
+<span class="nc" id="L84">  public void finishTraining() {}</span>
+
+  @Override
+  public void loadSegmenter(String filename) {
+<span class="nc" id="L88">    addLexicon(filename);</span>
+<span class="nc" id="L89">  }</span>
+
+  public List&lt;HasWord&gt; segment(String s) {
+<span class="nc" id="L92">    buildSegmentationLattice(s);</span>
+<span class="nc" id="L93">    ArrayList&lt;Word&gt; sent = maxMatchSegmentation();</span>
+<span class="nc" id="L94">    printlnErr(&quot;raw output: &quot;+ SentenceUtils.listToString(sent));</span>
+<span class="nc" id="L95">    ArrayList&lt;Word&gt; postProcessedSent = postProcessSentence(sent);</span>
+<span class="nc" id="L96">    printlnErr(&quot;processed output: &quot;+ SentenceUtils.listToString(postProcessedSent));</span>
+<span class="nc" id="L97">    ChineseStringUtils.CTPPostProcessor postProcessor = new ChineseStringUtils.CTPPostProcessor();</span>
+<span class="nc" id="L98">    String postSentString = postProcessor.postProcessingAnswer(postProcessedSent.toString(), false);</span>
+<span class="nc" id="L99">    printlnErr(&quot;Sighan2005 output: &quot;+postSentString);</span>
+<span class="nc" id="L100">    String[] postSentArray = postSentString.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L101">    ArrayList&lt;Word&gt; postSent = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">    for(String w : postSentArray) {</span>
+<span class="nc" id="L103">      postSent.add(new Word(w));</span>
+    }
+<span class="nc" id="L105">    return new ArrayList&lt;&gt;(postSent);</span>
+  }
+
+  /**
+   * Add a word to the lexicon, unless it contains some non-Chinese character.
+   */
+  private void addStringToLexicon(String str) {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">    if(str.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L113">      logger.warn(&quot;WARNING: blank line in lexicon&quot;);</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">    } else if(str.contains(&quot; &quot;)) {</span>
+<span class="nc" id="L115">      logger.warn(&quot;WARNING: word with space in lexicon&quot;);</span>
+    } else {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">      if(excludeChar(str)) {</span>
+<span class="nc" id="L118">        printlnErr(&quot;skipping word: &quot;+str);</span>
+<span class="nc" id="L119">        return;</span>
+      }
+      // printlnErr(&quot;adding word: &quot;+str);
+<span class="nc" id="L122">      words.add(str);</span>
+    }
+<span class="nc" id="L124">  }</span>
+
+  /**
+   * Read lexicon from a one-column text file.
+   */
+  private void addLexicon(String filename) {
+    try {
+<span class="nc" id="L131">      BufferedReader lexiconReader = new BufferedReader(new InputStreamReader(new FileInputStream(filename), &quot;UTF-8&quot;));</span>
+      String lexiconLine;
+<span class="nc bnc" id="L133" title="All 2 branches missed.">      while ((lexiconLine = lexiconReader.readLine()) != null) {</span>
+<span class="nc" id="L134">        addStringToLexicon(lexiconLine);</span>
+      }
+<span class="nc" id="L136">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L137">      logger.error(&quot;Lexicon not found: &quot;+ filename);</span>
+<span class="nc" id="L138">      System.exit(-1);</span>
+<span class="nc" id="L139">    } catch (IOException e) {</span>
+<span class="nc" id="L140">      logger.error(&quot;IO error while reading: &quot;+ filename, e);</span>
+<span class="nc" id="L141">      throw new RuntimeException(e);</span>
+<span class="nc" id="L142">    }</span>
+<span class="nc" id="L143">  }</span>
+
+  /**
+   * Builds a lattice of all possible segmentations using only words
+   * present in the lexicon. This function must be run prior to
+   * running maxMatchSegmentation.
+   */
+  private void buildSegmentationLattice(String s) {
+<span class="nc" id="L151">    edgesNb = 0;</span>
+<span class="nc" id="L152">    len = s.length();</span>
+    // Initialize word lattice:
+<span class="nc" id="L154">    states = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L155">    lattice = new DFSA&lt;&gt;(&quot;wordLattice&quot;);</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">    for (int i=0; i&lt;=s.length(); ++i)</span>
+<span class="nc" id="L157">      states.add(new DFSAState&lt;&gt;(i, lattice));</span>
+    // Set start and accepting state:
+<span class="nc" id="L159">    lattice.setInitialState(states.get(0));</span>
+<span class="nc" id="L160">    states.get(len).setAccepting(true);</span>
+    // Find all instances of lexicon words in input string:
+<span class="nc bnc" id="L162" title="All 2 branches missed.">    for (int start=0; start&lt;len; ++start) {</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">      for (int end=len; end&gt;start; --end) {</span>
+<span class="nc" id="L164">        String str = s.substring(start, end);</span>
+<span class="nc bnc" id="L165" title="All 4 branches missed.">        assert(str.length() &gt; 0);</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        boolean isOneChar = (start+1 == end);</span>
+<span class="nc" id="L167">        boolean isInDict = words.contains(str);</span>
+<span class="nc bnc" id="L168" title="All 4 branches missed.">        if (isInDict || isOneChar) {</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">          double cost = isInDict ? 1 : 100;</span>
+<span class="nc" id="L170">          DFSATransition&lt;Word, Integer&gt; trans =</span>
+<span class="nc" id="L171">                  new DFSATransition&lt;&gt;(null, states.get(start), states.get(end), new Word(str), null, cost);</span>
+          //logger.info(&quot;start=&quot;+start+&quot; end=&quot;+end+&quot; word=&quot;+str);
+<span class="nc" id="L173">          states.get(start).addTransition(trans);</span>
+<span class="nc" id="L174">          ++edgesNb;</span>
+        }
+      }
+    }
+<span class="nc" id="L178">  }</span>
+
+  /**
+   *  Returns the lexicon-based segmentation that minimizes the number of words.
+   * @return Segmented sentence.
+   */
+  public ArrayList&lt;Word&gt; maxMatchSegmentation() {
+<span class="nc" id="L185">    return segmentWords(MatchHeuristic.MINWORDS);</span>
+  }
+
+  /**
+   * Returns the lexicon-based segmentation following heuristic h.
+   * Note that buildSegmentationLattice must be run first.
+   * Two heuristics are currently available -- MINWORDS and MAXWORDS --
+   * to respectively minimize and maximize the number of segment
+   * (where each segment is a lexicon word, if possible).
+   *
+   * @param h Heuristic to use for segmentation.
+   * @return Segmented sentence.
+   * @throws UnsupportedOperationException
+   * @see #buildSegmentationLattice
+   */
+  public ArrayList&lt;Word&gt; segmentWords(MatchHeuristic h) throws UnsupportedOperationException {
+<span class="nc bnc" id="L201" title="All 4 branches missed.">    if(lattice==null || len &lt; 0)</span>
+<span class="nc" id="L202">      throw new UnsupportedOperationException(&quot;segmentWords must be run first&quot;);</span>
+<span class="nc" id="L203">    List&lt;Word&gt; segmentedWords = new ArrayList&lt;&gt;();</span>
+    // Init dynamic programming:
+<span class="nc" id="L205">    double[] costs = new double[len+1];</span>
+<span class="nc" id="L206">    List&lt;DFSATransition&lt;Word, Integer&gt;&gt; bptrs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">    for (int i = 0; i &lt; len + 1; ++i) {</span>
+<span class="nc" id="L208">      bptrs.add(null);</span>
+    }
+<span class="nc" id="L210">    costs[0]=0.0;</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">    for (int i=1; i&lt;=len; ++i)</span>
+<span class="nc" id="L212">       costs[i] = Double.MAX_VALUE;</span>
+    // DP:
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    for (int start=0; start&lt;len; ++start) {</span>
+<span class="nc" id="L215">      DFSAState&lt;Word, Integer&gt; fromState = states.get(start);</span>
+<span class="nc" id="L216">      Collection&lt;DFSATransition&lt;Word, Integer&gt;&gt; trs = fromState.transitions();</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">      for (DFSATransition&lt;Word, Integer&gt; tr : trs) {</span>
+<span class="nc" id="L218">        DFSAState&lt;Word, Integer&gt; toState = tr.getTarget();</span>
+<span class="nc" id="L219">        double lcost = tr.score();</span>
+<span class="nc" id="L220">        int end = toState.stateID();</span>
+        //logger.debug(&quot;start=&quot;+start+&quot; end=&quot;+end+&quot; word=&quot;+tr.getInput());
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (h == MatchHeuristic.MINWORDS) {</span>
+          // Minimize number of words:
+<span class="nc bnc" id="L224" title="All 2 branches missed.">          if (costs[start]+1 &lt; costs[end]) {</span>
+<span class="nc" id="L225">            costs[end] = costs[start]+lcost;</span>
+<span class="nc" id="L226">            bptrs.set(end, tr);</span>
+            //logger.debug(&quot;start=&quot;+start+&quot; end=&quot;+end+&quot; word=&quot;+tr.getInput());
+          }
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        } else if (h == MatchHeuristic.MAXWORDS) {</span>
+          // Maximze number of words:
+<span class="nc bnc" id="L231" title="All 2 branches missed.">          if (costs[start]+1 &lt; costs[end]) {</span>
+<span class="nc" id="L232">            costs[end] = costs[start]-lcost;</span>
+<span class="nc" id="L233">            bptrs.set(end, tr);</span>
+          }
+        } else {
+<span class="nc" id="L236">          throw new UnsupportedOperationException(&quot;unimplemented heuristic&quot;);</span>
+        }
+<span class="nc" id="L238">      }</span>
+    }
+    // Extract min-cost path:
+<span class="nc" id="L241">    int i=len;</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">    while (i&gt;0) {</span>
+<span class="nc" id="L243">      DFSATransition&lt;Word, Integer&gt; tr = bptrs.get(i);</span>
+<span class="nc" id="L244">      DFSAState&lt;Word, Integer&gt; fromState = tr.getSource();</span>
+<span class="nc" id="L245">      Word word = tr.getInput();</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">      if (!word.word().equals(&quot; &quot;))</span>
+<span class="nc" id="L247">        segmentedWords.add(0, word);</span>
+<span class="nc" id="L248">      i = fromState.stateID();</span>
+<span class="nc" id="L249">    }</span>
+    if(DEBUG) {
+      // Print lattice density ([1,+inf[) : if equal to 1, it means
+      // there is only one segmentation using words of the lexicon.
+      double density = edgesNb*1.0/segmentedWords.size();
+      logger.debug(&quot;latticeDensity: &quot;+density+&quot; cost: &quot;+costs[len]);
+    }
+<span class="nc" id="L256">    return new ArrayList&lt;&gt;(segmentedWords);</span>
+  }
+
+  /**
+   * Returns a lexicon-based segmentation. At each position x in the input string,
+   * it attempts to find largest value y, so that [x,y] is part of the lexicon.
+   * Then, it tried to match more input from position y+1. This greedy algorithm
+   * (taken from edu.stanford.nlp.lexparser.MaxMatchSegmenter) has no theoretical
+   * guarantee, and it would be wise to use segmentWords instead.
+   *
+   * @param s Input (unsegmented) string.
+   * @return Segmented sentence.
+   */
+  public ArrayList&lt;Word&gt; greedilySegmentWords(String s) {
+<span class="nc" id="L270">    List&lt;Word&gt; segmentedWords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L271">    int length = s.length();</span>
+<span class="nc" id="L272">    int start = 0;</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    while (start &lt; length) {</span>
+<span class="nc" id="L274">      int end = Math.min(length, start + maxLength);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">      while (end &gt; start + 1) {</span>
+<span class="nc" id="L276">        String nextWord = s.substring(start, end);</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        if (words.contains(nextWord)) {</span>
+<span class="nc" id="L278">          segmentedWords.add(new Word(nextWord));</span>
+<span class="nc" id="L279">          break;</span>
+        }
+<span class="nc" id="L281">        end--;</span>
+<span class="nc" id="L282">      }</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">      if (end == start + 1) {</span>
+        // character does not start any word in our dictionary
+<span class="nc" id="L285">        segmentedWords.add(new Word(new String(new char[] {s.charAt(start)} )));</span>
+<span class="nc" id="L286">        start++;</span>
+      } else {
+<span class="nc" id="L288">        start = end;</span>
+      }
+<span class="nc" id="L290">    }</span>
+<span class="nc" id="L291">    return new ArrayList&lt;&gt;(segmentedWords);</span>
+  }
+
+  public static void main(String[] args) {
+<span class="nc" id="L295">    Properties props = StringUtils.argsToProperties(args);</span>
+    // logger.debug(props.toString());
+<span class="nc" id="L297">    SeqClassifierFlags flags = new SeqClassifierFlags(props);</span>
+<span class="nc" id="L298">    MaxMatchSegmenter seg = new MaxMatchSegmenter();</span>
+<span class="nc" id="L299">    String lexiconFile = props.getProperty(&quot;lexicon&quot;);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    if(lexiconFile != null) {</span>
+<span class="nc" id="L301">      seg.addLexicon(lexiconFile);</span>
+    } else {
+<span class="nc" id="L303">      logger.error(&quot;Error: no lexicon file!&quot;);</span>
+<span class="nc" id="L304">      System.exit(1);</span>
+    }
+
+<span class="nc" id="L307">    Sighan2005DocumentReaderAndWriter sighanRW = new Sighan2005DocumentReaderAndWriter();</span>
+<span class="nc" id="L308">    sighanRW.init(flags);</span>
+
+<span class="nc" id="L310">    BufferedReader br = new BufferedReader(new InputStreamReader(System.in));</span>
+<span class="nc" id="L311">    PrintWriter stdoutW = new PrintWriter(System.out);</span>
+<span class="nc" id="L312">    int lineNb = 0;</span>
+    for ( ; ; ) {
+<span class="nc" id="L314">      ++lineNb;</span>
+<span class="nc" id="L315">      logger.info(&quot;line: &quot;+lineNb);</span>
+      try {
+<span class="nc" id="L317">        String line = br.readLine();</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">        if(line == null)</span>
+<span class="nc" id="L319">          break;</span>
+<span class="nc" id="L320">        String outputLine = null;</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if(props.getProperty(&quot;greedy&quot;) != null) {</span>
+<span class="nc" id="L322">          ArrayList&lt;Word&gt; sentence = seg.greedilySegmentWords(line);</span>
+<span class="nc" id="L323">          outputLine = SentenceUtils.listToString(sentence);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        } else if(props.getProperty(&quot;maxwords&quot;) != null) {</span>
+<span class="nc" id="L325">          seg.buildSegmentationLattice(line);</span>
+<span class="nc" id="L326">          outputLine = SentenceUtils.listToString(seg.segmentWords(MatchHeuristic.MAXWORDS));</span>
+        } else {
+<span class="nc" id="L328">          seg.buildSegmentationLattice(line);</span>
+<span class="nc" id="L329">          outputLine = SentenceUtils.listToString(seg.maxMatchSegmentation());</span>
+        }
+<span class="nc" id="L331">        StringReader strR = new StringReader(outputLine);</span>
+<span class="nc" id="L332">        Iterator&lt;List&lt;CoreLabel&gt;&gt; itr = sighanRW.getIterator(strR);</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        while(itr.hasNext()) {</span>
+<span class="nc" id="L334">          sighanRW.printAnswers(itr.next(), stdoutW);</span>
+        }
+        // System.out.println(outputLine);
+      }
+<span class="nc" id="L338">      catch (IOException e) {</span>
+<span class="nc" id="L339">        break;</span>
+<span class="nc" id="L340">      }</span>
+    }
+<span class="nc" id="L342">    stdoutW.flush();</span>
+<span class="nc" id="L343">  }</span>
+
+  private static void printlnErr(String s) {
+<span class="nc" id="L346">    EncodingPrintWriter.err.println(s, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L347">  }</span>
+
+  private static ArrayList&lt;Word&gt; postProcessSentence(ArrayList&lt;Word&gt; sent) {
+<span class="nc" id="L350">    ArrayList&lt;Word&gt; newSent = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    for(Word word : sent) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">      if(newSent.size() &gt; 0) {</span>
+<span class="nc" id="L353">        String prevWord = newSent.get(newSent.size()-1).toString();</span>
+<span class="nc" id="L354">        String curWord = word.toString();</span>
+<span class="nc" id="L355">        String prevChar = prevWord.substring(prevWord.length()-1);</span>
+<span class="nc" id="L356">        String curChar = curWord.substring(0,1);</span>
+<span class="nc bnc" id="L357" title="All 4 branches missed.">        if(!isChinese(prevChar) &amp;&amp; !isChinese(curChar)) {</span>
+<span class="nc" id="L358">          Word mergedWord = new Word(prevWord+curWord);</span>
+<span class="nc" id="L359">          newSent.set(newSent.size()-1, mergedWord);</span>
+          //printlnErr(&quot;merged: &quot;+mergedWord);
+          //printlnErr(&quot;merged: &quot;+mergedWord+&quot; from: &quot;+prevWord+&quot; and: &quot;+curWord);
+<span class="nc" id="L362">          continue;</span>
+        }
+      }
+<span class="nc" id="L365">      newSent.add(word);</span>
+<span class="nc" id="L366">    }</span>
+<span class="nc" id="L367">    return new ArrayList&lt;&gt;(newSent);</span>
+  }
+
+<span class="nc" id="L370">  private static boolean startsWithChinese(String str) { return chineseStartChars.matcher(str).matches(); }</span>
+<span class="nc" id="L371">  private static boolean endsWithChinese(String str) { return chineseEndChars.matcher(str).matches(); }</span>
+<span class="nc" id="L372">  private static boolean isChinese(String str) { return chineseChars.matcher(str).matches(); }</span>
+<span class="nc" id="L373">  private static boolean excludeChar(String str) { return excludeChars.matcher(str).matches(); }</span>
+
+  private static final long serialVersionUID   = 8263734344886904724L;
+
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

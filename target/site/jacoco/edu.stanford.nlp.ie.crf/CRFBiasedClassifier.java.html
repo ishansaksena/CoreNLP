@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CRFBiasedClassifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.crf</a> &gt; <span class="el_source">CRFBiasedClassifier.java</span></div><h1>CRFBiasedClassifier.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.crf; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.optimization.GoldenSectionLineSearch;
+import edu.stanford.nlp.optimization.LineSearcher;
+import edu.stanford.nlp.sequences.Clique;
+import edu.stanford.nlp.sequences.DocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.FeatureFactory;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.util.CoreMap;
+import java.util.function.Function;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.PaddedList;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.util.*;
+
+/**
+ * CRFBiasedClassifier is used to adjust the precision-recall tradeoff
+ * of any CRF model implemented using CRFClassifier. This adjustment is
+ * performed after CRF training.  The method is described in (Minkov,
+ * Wang, Tomasic, and Cohen, 2006): &quot;NER Systems that Suit User's
+ * Preferences: Adjusting the Recall-Precision Trade-off for Entity
+ * Extraction&quot;.  CRFBiasedClassifier can import any model serialized
+ * with {@link CRFClassifier} and supports most command-line parameters
+ * available in {@link CRFClassifier}.  In addition to this,
+ * CRFBiasedClassifier also interprets the parameter -classBias, as in:
+ * &lt;p&gt;&lt;code&gt;
+ * java -server -mx500m edu.stanford.nlp.ie.crf.CRFBiasedClassifier -loadClassifier model.gz -testFile test.txt -classBias A:0.5,B:1.5
+ * &lt;/code&gt;
+ * &lt;p&gt;
+ * The command above sets a bias of 0.5 towards class A and a bias of
+ * 1.5 towards class B. These biases (which internally are treated as
+ * feature weights in the log-linear model underpinning the CRF
+ * classifier) can take any real value. As the weight of A tends to plus
+ * infinity, the classifier will only predict A labels, and as it tends
+ * towards minus infinity, it will never predict A labels.
+ *
+ * @author Michel Galley
+ * @author Sonal Gupta (made the class generic)
+ */
+
+public class CRFBiasedClassifier&lt;IN extends CoreMap&gt; extends CRFClassifier&lt;IN&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L48">  private static Redwood.RedwoodChannels log = Redwood.channels(CRFBiasedClassifier.class);</span>
+
+  private static final String BIAS = &quot;@@@DECODING_CLASS_BIAS@@@&quot;;
+<span class="nc" id="L51">  private boolean testTime = false;</span>
+
+
+  public CRFBiasedClassifier(Properties props) {
+<span class="nc" id="L55">    super(props);</span>
+<span class="nc" id="L56">  }</span>
+
+<span class="nc" id="L58">  public CRFBiasedClassifier(SeqClassifierFlags flags) {super(flags); }</span>
+
+  @Override
+  public CRFDatum&lt;List&lt;String&gt;, CRFLabel&gt; makeDatum(List&lt;IN&gt; info, int loc, List&lt;FeatureFactory&lt;IN&gt;&gt; featureFactories) {
+
+<span class="nc" id="L63">    pad.set(CoreAnnotations.AnswerAnnotation.class, flags.backgroundSymbol);</span>
+<span class="nc" id="L64">    PaddedList&lt;IN&gt; pInfo = new PaddedList&lt;&gt;(info, pad);</span>
+
+<span class="nc" id="L66">    List&lt;List&lt;String&gt;&gt; features = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L67">    Collection&lt;Clique&gt; done = Generics.newHashSet();</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">    for (int i = 0; i &lt; windowSize; i++) {</span>
+<span class="nc" id="L69">      List&lt;String&gt; featuresC = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L70">      List&lt;Clique&gt; windowCliques = FeatureFactory.getCliques(i, 0);</span>
+<span class="nc" id="L71">      windowCliques.removeAll(done);</span>
+<span class="nc" id="L72">      done.addAll(windowCliques);</span>
+<span class="nc bnc" id="L73" title="All 2 branches missed.">      for (Clique c : windowCliques) {</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        for (FeatureFactory&lt;IN&gt; featureFactory : featureFactories) {</span>
+<span class="nc" id="L75">          featuresC.addAll(featureFactory.getCliqueFeatures(pInfo, loc, c));</span>
+<span class="nc" id="L76">        }</span>
+<span class="nc bnc" id="L77" title="All 4 branches missed.">        if(testTime &amp;&amp; i==0)</span>
+          // this feature is only present at test time and only appears
+          // in cliques of size 1 (i.e., cliques with window=0)
+<span class="nc" id="L80">          featuresC.add(BIAS);</span>
+<span class="nc" id="L81">      }</span>
+<span class="nc" id="L82">      features.add(featuresC);</span>
+    }
+
+<span class="nc" id="L85">    int[] labels = new int[windowSize];</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">    for (int i = 0; i &lt; windowSize; i++) {</span>
+<span class="nc" id="L87">      String answer = pInfo.get(loc + i - windowSize + 1).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L88">      labels[i] = classIndex.indexOf(answer);</span>
+    }
+
+<span class="nc" id="L91">    return new CRFDatum&lt;&gt;(features, new CRFLabel(labels), null);</span>
+  }
+
+  void addBiasFeature() {
+<span class="nc bnc" id="L95" title="All 2 branches missed.">    if(!featureIndex.contains(BIAS)) {</span>
+<span class="nc" id="L96">      featureIndex.add(BIAS);</span>
+<span class="nc" id="L97">      double[][] newWeights = new double[weights.length+1][];</span>
+<span class="nc" id="L98">      System.arraycopy (weights,0,newWeights,0,weights.length);</span>
+<span class="nc" id="L99">      newWeights[weights.length] = new double[classIndex.size()];</span>
+<span class="nc" id="L100">      weights = newWeights;</span>
+    }
+<span class="nc" id="L102">  }</span>
+
+  public void setBiasWeight(String cname, double weight) {
+<span class="nc" id="L105">    int ci = classIndex.indexOf(cname);</span>
+<span class="nc" id="L106">    setBiasWeight(ci, weight);</span>
+<span class="nc" id="L107">  }</span>
+
+  public void setBiasWeight(int cindex, double weight) {
+<span class="nc" id="L110">    addBiasFeature();</span>
+<span class="nc" id="L111">    int fi = featureIndex.indexOf(BIAS);</span>
+<span class="nc" id="L112">    weights[fi][cindex] = weight;</span>
+<span class="nc" id="L113">  }</span>
+
+  @Override
+  public List&lt;IN&gt; classify(List&lt;IN&gt; document) {
+<span class="nc" id="L117">    testTime = true;</span>
+<span class="nc" id="L118">    List&lt;IN&gt; l = super.classify(document);</span>
+<span class="nc" id="L119">    testTime = false;</span>
+<span class="nc" id="L120">    return l;</span>
+  }
+
+  class CRFBiasedClassifierOptimizer implements Function&lt;Double,Double&gt;  {
+    CRFBiasedClassifier&lt;IN&gt; crf;
+    Function&lt;Double, Double&gt; evalFunction;
+
+<span class="nc" id="L127">    CRFBiasedClassifierOptimizer(CRFBiasedClassifier&lt;IN&gt; c, Function&lt;Double, Double&gt; e) {</span>
+<span class="nc" id="L128">      crf = c;</span>
+<span class="nc" id="L129">      evalFunction = e;</span>
+<span class="nc" id="L130">    }</span>
+
+    @Override
+    public Double apply(Double w) {
+<span class="nc" id="L134">      crf.setBiasWeight(0,w);</span>
+<span class="nc" id="L135">      return evalFunction.apply(w);</span>
+    }
+  }
+
+  /**
+   * Adjust the bias parameter to optimize some objective function.
+   * Note that this function only tunes the bias parameter of one class
+   * (class of index 0), and is thus only useful for binary classification
+   * problems.
+   */
+  public void adjustBias(List&lt;List&lt;IN&gt;&gt; develData, Function&lt;Double,Double&gt; evalFunction, double low, double high) {
+<span class="nc" id="L146">    LineSearcher ls = new GoldenSectionLineSearch(true,1e-2,low,high);</span>
+<span class="nc" id="L147">    CRFBiasedClassifierOptimizer optimizer = new CRFBiasedClassifierOptimizer(this, evalFunction);</span>
+<span class="nc" id="L148">    double optVal = ls.minimize(optimizer);</span>
+<span class="nc" id="L149">    int bi = featureIndex.indexOf(BIAS);</span>
+<span class="nc" id="L150">    log.info(&quot;Class bias of &quot;+weights[bi][0]+&quot; reaches optimal value &quot;+optVal);</span>
+<span class="nc" id="L151">  }</span>
+
+  /** The main method, which is essentially the same as in CRFClassifier. See the class documentation. */
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L155">    log.info(&quot;CRFBiasedClassifier invoked at &quot; + new Date()</span>
+            + &quot; with arguments:&quot;);
+<span class="nc bnc" id="L157" title="All 2 branches missed.">    for (String arg : args) {</span>
+<span class="nc" id="L158">      log.info(&quot; &quot; + arg);</span>
+    }
+<span class="nc" id="L160">    log.info();</span>
+
+<span class="nc" id="L162">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L163">    CRFBiasedClassifier&lt;CoreLabel&gt; crf = new CRFBiasedClassifier&lt;&gt;(props);</span>
+<span class="nc" id="L164">    String testFile = crf.flags.testFile;</span>
+<span class="nc" id="L165">    String loadPath = crf.flags.loadClassifier;</span>
+
+<span class="nc bnc" id="L167" title="All 2 branches missed.">    if (loadPath != null) {</span>
+<span class="nc" id="L168">      crf.loadClassifierNoExceptions(loadPath, props);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    } else if (crf.flags.loadJarClassifier != null) {</span>
+<span class="nc" id="L170">      crf.loadJarClassifier(crf.flags.loadJarClassifier, props);</span>
+    } else {
+<span class="nc" id="L172">      crf.loadDefaultClassifier();</span>
+    }
+<span class="nc bnc" id="L174" title="All 2 branches missed.">    if(crf.flags.classBias != null) {</span>
+<span class="nc" id="L175">      StringTokenizer biases = new java.util.StringTokenizer(crf.flags.classBias,&quot;,&quot;);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">      while (biases.hasMoreTokens()) {</span>
+<span class="nc" id="L177">        StringTokenizer bias = new java.util.StringTokenizer(biases.nextToken(),&quot;:&quot;);</span>
+<span class="nc" id="L178">        String cname = bias.nextToken();</span>
+<span class="nc" id="L179">        double w = Double.parseDouble(bias.nextToken());</span>
+<span class="nc" id="L180">        crf.setBiasWeight(cname,w);</span>
+<span class="nc" id="L181">        log.info(&quot;Setting bias for class &quot;+cname+&quot; to &quot;+w);</span>
+<span class="nc" id="L182">      }</span>
+    }
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">    if (testFile != null) {</span>
+<span class="nc" id="L186">      DocumentReaderAndWriter&lt;CoreLabel&gt; readerAndWriter = crf.makeReaderAndWriter();</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      if (crf.flags.printFirstOrderProbs) {</span>
+<span class="nc" id="L188">        crf.printFirstOrderProbs(testFile, readerAndWriter);</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">      } else if (crf.flags.printProbs) {</span>
+<span class="nc" id="L190">        crf.printProbs(testFile, readerAndWriter);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      } else if (crf.flags.useKBest) {</span>
+<span class="nc" id="L192">        int k = crf.flags.kBest;</span>
+<span class="nc" id="L193">        crf.classifyAndWriteAnswersKBest(testFile, k, readerAndWriter);</span>
+<span class="nc" id="L194">      } else {</span>
+<span class="nc" id="L195">        crf.classifyAndWriteAnswers(testFile, readerAndWriter, true);</span>
+      }
+    }
+<span class="nc" id="L198">  } // end main</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

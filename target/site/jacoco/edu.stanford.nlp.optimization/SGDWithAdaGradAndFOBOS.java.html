@@ -1,0 +1,608 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SGDWithAdaGradAndFOBOS.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">SGDWithAdaGradAndFOBOS.java</span></div><h1>SGDWithAdaGradAndFOBOS.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.Timing;
+
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.*;
+
+/**
+ * Stochastic Gradient Descent With AdaGrad and FOBOS in batch mode.
+ * Optionally, user can also turn on AdaDelta via option &quot;useAdaDelta&quot;
+ * Similar to SGDMinimizer, regularization is done in the minimizer, not in the objective function.
+ * This version is not efficient for online setting. For online variant, consider implementing SparseAdaGradMinimizer.java
+ *
+ * @author Mengqiu Wang
+ */
+public class SGDWithAdaGradAndFOBOS&lt;T extends DiffFunction&gt; implements Minimizer&lt;T&gt;, HasEvaluators  {
+
+  /** A logger for this class */
+<span class="nc" id="L22">  private static Redwood.RedwoodChannels log = Redwood.channels(SGDWithAdaGradAndFOBOS.class);</span>
+
+  protected double[] x;
+  protected double initRate;  // Initial stochastic iteration count
+  protected double lambda;
+  // when alpha = 1, sg-lasso is just lasso; when alpha = 0, sg-lasso is g-lasso
+<span class="nc" id="L28">  protected double alpha = 1.0;</span>
+<span class="nc" id="L29">  protected boolean quiet = false;</span>
+  private static final int DEFAULT_NUM_PASSES = 50;
+  protected final int numPasses; //-1;
+<span class="nc" id="L32">  protected int bSize = 1;  // NOTE: If bSize does not divide evenly into total number of samples,</span>
+                            // some samples may get accounted for twice in one pass
+  private static final int DEFAULT_TUNING_SAMPLES = Integer.MAX_VALUE;
+  private static final int DEFAULT_BATCH_SIZE = 1000;
+<span class="nc" id="L36">  private double eps = 1e-3;</span>
+<span class="nc" id="L37">  private double TOL = 1e-4;</span>
+
+  // fields for approximating Hessian to feed to QN
+<span class="nc" id="L40">  public List&lt;double[]&gt; yList = null;</span>
+<span class="nc" id="L41">  public List&lt;double[]&gt; sList = null;</span>
+  public double[] diag;
+<span class="nc" id="L43">  private int hessSampleSize = -1;</span>
+<span class="nc" id="L44">  private double[] s,y = null;</span>
+
+<span class="nc" id="L46">  protected Random gen = new Random(1);</span>
+<span class="nc" id="L47">  protected long maxTime = Long.MAX_VALUE;</span>
+
+<span class="nc" id="L49">  private int evaluateIters = 0;    // Evaluate every x iterations (0 = no evaluation)</span>
+  private Evaluator[] evaluators;  // separate set of evaluators to check how optimization is going
+<span class="nc" id="L51">  private Prior prior = Prior.LASSO;</span>
+
+<span class="nc" id="L53">  private boolean useEvalImprovement = false;</span>
+<span class="nc" id="L54">  private boolean useAvgImprovement = false;</span>
+<span class="nc" id="L55">  private boolean suppressTestPrompt = false;</span>
+<span class="nc" id="L56">  private int terminateOnEvalImprovementNumOfEpoch = 1;</span>
+<span class="nc" id="L57">  private double bestEvalSoFar = Double.NEGATIVE_INFINITY;</span>
+  private double[] xBest;
+<span class="nc" id="L59">  private int noImproveItrCount = 0;</span>
+
+<span class="nc" id="L61">  private boolean useAdaDelta = false;</span>
+<span class="nc" id="L62">  private boolean useAdaDiff = false;</span>
+<span class="nc" id="L63">  private double rho = 0.95;</span>
+  private double[] sumGradSquare;
+  private double[] prevGrad, prevDeltaX;
+  private double[] sumDeltaXSquare;
+
+  public void setHessSampleSize(int hessSize) {
+<span class="nc" id="L69">    this.hessSampleSize = hessSize;</span>
+    // (TODO) should initialize relevant data structure as well
+<span class="nc" id="L71">  }</span>
+
+  public void terminateOnEvalImprovement(boolean toTerminate) {
+<span class="nc" id="L74">    useEvalImprovement = toTerminate;</span>
+<span class="nc" id="L75">  }</span>
+
+  public void terminateOnAvgImprovement(boolean toTerminate, double tolerance) {
+<span class="nc" id="L78">    useAvgImprovement = toTerminate;</span>
+<span class="nc" id="L79">    TOL = tolerance;</span>
+<span class="nc" id="L80">  }</span>
+
+  public void suppressTestPrompt(boolean suppressTestPrompt) {
+<span class="nc" id="L83">    this.suppressTestPrompt = suppressTestPrompt;</span>
+<span class="nc" id="L84">  }</span>
+
+  public void setTerminateOnEvalImprovementNumOfEpoch(int terminateOnEvalImprovementNumOfEpoch) {
+<span class="nc" id="L87">    this.terminateOnEvalImprovementNumOfEpoch = terminateOnEvalImprovementNumOfEpoch;</span>
+<span class="nc" id="L88">  }</span>
+
+  public boolean toContinue(double[] x, double currEval) {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">    if (currEval &gt;= bestEvalSoFar) {</span>
+<span class="nc" id="L92">      bestEvalSoFar = currEval;</span>
+<span class="nc" id="L93">      noImproveItrCount = 0;</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">      if (xBest == null)</span>
+<span class="nc" id="L95">        xBest = Arrays.copyOf(x, x.length);</span>
+      else
+<span class="nc" id="L97">        System.arraycopy( x, 0, xBest, 0, x.length );</span>
+<span class="nc" id="L98">      return true;</span>
+    } else {
+<span class="nc" id="L100">      noImproveItrCount += 1;</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">      return noImproveItrCount &lt;= terminateOnEvalImprovementNumOfEpoch;</span>
+    }
+  }
+
+<span class="nc" id="L105">  public enum Prior {</span>
+<span class="nc" id="L106">    LASSO, RIDGE, GAUSSIAN, aeLASSO, gLASSO, sgLASSO, NONE</span>
+  }
+
+  private static Prior getPrior(String priorType) {
+<span class="nc bnc" id="L110" title="All 30 branches missed.">    switch (priorType) {</span>
+      case &quot;none&quot;:
+<span class="nc" id="L112">        return Prior.NONE;</span>
+      case &quot;lasso&quot;:
+<span class="nc" id="L114">        return Prior.LASSO;</span>
+      case &quot;ridge&quot;:
+<span class="nc" id="L116">        return Prior.RIDGE;</span>
+      case &quot;gaussian&quot;:
+<span class="nc" id="L118">        return Prior.GAUSSIAN;</span>
+      case &quot;ae-lasso&quot;:
+<span class="nc" id="L120">        return Prior.aeLASSO;</span>
+      case &quot;g-lasso&quot;:
+<span class="nc" id="L122">        return Prior.gLASSO;</span>
+      case &quot;sg-lasso&quot;:
+<span class="nc" id="L124">        return Prior.sgLASSO;</span>
+      default:
+<span class="nc" id="L126">        throw new IllegalArgumentException(&quot;prior type &quot; + priorType + &quot; not recognized; supported priors &quot; +</span>
+            &quot;are: lasso, ridge, gaussian, ae-lasso, g-lasso, and sg-lasso&quot;);
+    }
+  }
+
+  public SGDWithAdaGradAndFOBOS(double initRate, double lambda, int numPasses) {
+<span class="nc" id="L132">    this(initRate, lambda, numPasses, -1);</span>
+<span class="nc" id="L133">  }</span>
+
+  public SGDWithAdaGradAndFOBOS(double initRate, double lambda, int numPasses, int batchSize) {
+<span class="nc" id="L136">    this(initRate, lambda, numPasses, batchSize, &quot;lasso&quot;, 1.0, false, false, 1e-3, 0.95);</span>
+<span class="nc" id="L137">  }</span>
+
+
+  public SGDWithAdaGradAndFOBOS(double initRate, double lambda, int numPasses, 
+      int batchSize, String priorType, double alpha, boolean useAdaDelta, boolean useAdaDiff, double adaGradEps, double adaDeltaRho)
+<span class="nc" id="L142">  {</span>
+<span class="nc" id="L143">    this.initRate = initRate;</span>
+<span class="nc" id="L144">    this.prior = getPrior(priorType);</span>
+<span class="nc" id="L145">    this.bSize = batchSize;</span>
+<span class="nc" id="L146">    this.lambda = lambda;</span>
+<span class="nc" id="L147">    this.eps = adaGradEps;</span>
+<span class="nc" id="L148">    this.rho = adaDeltaRho;</span>
+<span class="nc" id="L149">    this.useAdaDelta = useAdaDelta;</span>
+<span class="nc" id="L150">    this.useAdaDiff = useAdaDiff;</span>
+<span class="nc" id="L151">    this.alpha = alpha;</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">    if (numPasses &gt;= 0) {</span>
+<span class="nc" id="L153">      this.numPasses = numPasses;</span>
+    } else {
+<span class="nc" id="L155">      this.numPasses = DEFAULT_NUM_PASSES;</span>
+<span class="nc" id="L156">      sayln(&quot;  SGDWithAdaGradAndFOBOS: numPasses=&quot; + numPasses + &quot;, defaulting to &quot; + this.numPasses);</span>
+    }
+<span class="nc" id="L158">  }</span>
+
+  public void shutUp() {
+<span class="nc" id="L161">    this.quiet = true;</span>
+<span class="nc" id="L162">  }</span>
+
+<span class="nc" id="L164">  private static final NumberFormat nf = new DecimalFormat(&quot;0.000E0&quot;);</span>
+
+  protected String getName() {
+<span class="nc" id="L167">    return &quot;SGDWithAdaGradAndFOBOS&quot; + bSize + &quot;_lambda&quot; + nf.format(lambda) + &quot;_alpha&quot; + nf.format(alpha);</span>
+  }
+
+  @Override
+  public void setEvaluators(int iters, Evaluator[] evaluators)
+  {
+<span class="nc" id="L173">    this.evaluateIters = iters;</span>
+<span class="nc" id="L174">    this.evaluators = evaluators;</span>
+<span class="nc" id="L175">  }</span>
+
+  // really this is the the L2 norm....
+  private static double getNorm(double[] w)
+  {
+<span class="nc" id="L180">    double norm = 0;</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">    for (double aW : w) {</span>
+<span class="nc" id="L182">      norm += aW * aW;</span>
+    }
+<span class="nc" id="L184">    return Math.sqrt(norm);</span>
+  }
+
+  private double doEvaluation(double[] x) {
+    // Evaluate solution
+<span class="nc bnc" id="L189" title="All 2 branches missed.">    if (evaluators == null) return Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L190">    double score = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">    for (Evaluator eval:evaluators) {</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">      if (!suppressTestPrompt)</span>
+<span class="nc" id="L193">        sayln(&quot;  Evaluating: &quot; + eval.toString());</span>
+<span class="nc" id="L194">      double aScore = eval.evaluate(x);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">      if (aScore != Double.NEGATIVE_INFINITY)</span>
+<span class="nc" id="L196">        score = aScore;</span>
+    }
+<span class="nc" id="L198">    return score;</span>
+  }
+
+  private static double pospart(double number) {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">    return number &gt; 0.0 ? number : 0.0;</span>
+  }
+
+  /*
+  private void approxHessian(double[] newX) {
+    for(int i = 0; i &lt; x.length; i++){
+      double thisGain = fixedGain*gainSchedule(k,5*numBatches)/(diag[i]);
+      newX[i] = x[i] - thisGain*grad[i];
+    }
+
+    //Get a new pair...
+    say(&quot; A &quot;);
+    if (hessSampleSize &gt; 0 &amp;&amp; sList.size() == hessSampleSize || sList.size() == hessSampleSize) {
+      s = sList.remove(0);
+      y = yList.remove(0);
+    } else {
+      s = new double[x.length];
+      y = new double[x.length];
+    }
+
+    s = prevDeltaX;
+
+    s = ArrayMath.pairwiseSubtract(newX, x);
+    dfunction.recalculatePrevBatch = true;
+    System.arraycopy(dfunction.derivativeAt(newX,bSize),0,y,0,grad.length);
+
+    ArrayMath.pairwiseSubtractInPlace(y,newGrad);  // newY = newY-newGrad
+    double[] comp = new double[x.length];
+
+    sList.add(s);
+    yList.add(y);
+    ScaledSGDMinimizer.updateDiagBFGS(diag,s,y);
+  }
+  */
+
+  private double computeLearningRate(int index, double grad) {
+    // double eps2 = 1e-12;
+<span class="nc" id="L239">    double currentRate = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L240">    double prevG = prevGrad[index];</span>
+<span class="nc" id="L241">    double gradDiff = grad-prevG;</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">    if (useAdaDelta) {</span>
+<span class="nc" id="L243">      double deltaXt = prevDeltaX[index];</span>
+<span class="nc" id="L244">      sumDeltaXSquare[index] = sumDeltaXSquare[index] * rho + (1-rho) * deltaXt * deltaXt;</span>
+
+<span class="nc bnc" id="L246" title="All 2 branches missed.">      if (useAdaDiff) {</span>
+<span class="nc" id="L247">        sumGradSquare[index] = sumGradSquare[index] * rho + (1-rho) * (gradDiff) * (gradDiff);</span>
+      } else {
+<span class="nc" id="L249">        sumGradSquare[index] = sumGradSquare[index] * rho + (1-rho) * grad * grad;</span>
+      }
+
+      // double nominator = initRate;
+      // if (sumDeltaXSquare[index] &gt; 0) {
+      //   nominator = Math.sqrt(sumDeltaXSquare[index]+eps);
+      // }
+      // currentRate = nominator / Math.sqrt(sumGradSquare[index]+eps);
+<span class="nc" id="L257">      currentRate = Math.sqrt(sumDeltaXSquare[index]+eps) / Math.sqrt(sumGradSquare[index]+eps);</span>
+
+      // double deltaXt = currentRate * grad;
+      // sumDeltaXSquare[index] = sumDeltaXSquare[index] * rho + (1-rho) * deltaXt * deltaXt;
+<span class="nc" id="L261">    } else {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">      if (useAdaDiff) {</span>
+<span class="nc" id="L263">        sumGradSquare[index] += gradDiff * gradDiff;</span>
+      } else {
+<span class="nc" id="L265">        sumGradSquare[index] += grad * grad;</span>
+      }
+      // apply AdaGrad
+<span class="nc" id="L268">      currentRate = initRate / Math.sqrt(sumGradSquare[index]+eps);</span>
+    }
+    // prevDeltaX[index] = grad * currentRate;
+<span class="nc" id="L271">    return currentRate;</span>
+  }
+
+  private void updateX(double[] x, int index, double realUpdate) {
+<span class="nc" id="L275">    prevDeltaX[index] = realUpdate - x[index];</span>
+<span class="nc" id="L276">    x[index] = realUpdate;</span>
+<span class="nc" id="L277">  }</span>
+
+  @Override
+  public double[] minimize(DiffFunction function, double functionTolerance, double[] initial) {
+<span class="nc" id="L281">    return minimize(function, functionTolerance, initial, -1);</span>
+  }
+
+  @Override
+  public double[] minimize(DiffFunction f, double functionTolerance, double[] initial, int maxIterations) {
+<span class="nc" id="L286">    int totalSamples = 0;</span>
+<span class="nc" id="L287">    sayln(&quot;Using lambda=&quot; + lambda);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    if (f instanceof AbstractStochasticCachingDiffUpdateFunction) {</span>
+<span class="nc" id="L289">      AbstractStochasticCachingDiffUpdateFunction func  = (AbstractStochasticCachingDiffUpdateFunction) f;</span>
+<span class="nc" id="L290">      func.sampleMethod = AbstractStochasticCachingDiffFunction.SamplingMethod.Shuffled;</span>
+<span class="nc" id="L291">      totalSamples = func.dataDimension();</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">      if (bSize &gt; totalSamples) {</span>
+<span class="nc" id="L293">        log.info(&quot;WARNING: Total number of samples=&quot; + totalSamples +</span>
+                &quot; is smaller than requested batch size=&quot; + bSize + &quot;!!!&quot;);
+<span class="nc" id="L295">        bSize = totalSamples;</span>
+<span class="nc" id="L296">        sayln(&quot;Using batch size=&quot; + bSize);</span>
+      }
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      if (bSize &lt;= 0) {</span>
+<span class="nc" id="L299">        log.info(&quot;WARNING: Requested batch size=&quot; + bSize + &quot; &lt;= 0 !!!&quot;);</span>
+<span class="nc" id="L300">        bSize = totalSamples;</span>
+<span class="nc" id="L301">        sayln(&quot;Using batch size=&quot; + bSize);</span>
+      }
+    }
+
+<span class="nc" id="L305">    x = new double[initial.length];</span>
+<span class="nc" id="L306">    double[] testUpdateCache = null, currentRateCache = null, bCache = null;</span>
+<span class="nc" id="L307">    sumGradSquare = new double[initial.length];</span>
+<span class="nc" id="L308">    prevGrad = new double[initial.length];</span>
+<span class="nc" id="L309">    prevDeltaX = new double[initial.length];</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">    if (useAdaDelta) {</span>
+<span class="nc" id="L311">      sumDeltaXSquare = new double[initial.length];</span>
+<span class="nc bnc" id="L312" title="All 4 branches missed.">      if (prior != Prior.NONE &amp;&amp; prior != Prior.GAUSSIAN) {</span>
+<span class="nc" id="L313">        throw new UnsupportedOperationException(&quot;useAdaDelta is currently only supported for Prior.NONE or Prior.GAUSSIAN&quot;); </span>
+      }
+    }
+
+<span class="nc" id="L317">    int[][] featureGrouping = null;</span>
+<span class="nc bnc" id="L318" title="All 4 branches missed.">    if (prior != Prior.LASSO &amp;&amp; prior != Prior.NONE) {</span>
+<span class="nc" id="L319">      testUpdateCache = new double[initial.length];</span>
+<span class="nc" id="L320">      currentRateCache = new double[initial.length];</span>
+    }
+<span class="nc bnc" id="L322" title="All 6 branches missed.">    if (prior != Prior.LASSO &amp;&amp; prior != Prior.RIDGE &amp;&amp; prior != Prior.GAUSSIAN) {</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">      if (!(f instanceof HasFeatureGrouping)) {</span>
+<span class="nc" id="L324">        throw new UnsupportedOperationException(&quot;prior is specified to be ae-lasso or g-lasso, but function does not support feature grouping&quot;);</span>
+      }
+<span class="nc" id="L326">      featureGrouping = ((HasFeatureGrouping)f).getFeatureGrouping();</span>
+    }
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    if (prior == Prior.sgLASSO) {</span>
+<span class="nc" id="L329">      bCache = new double[initial.length];</span>
+    }
+
+<span class="nc" id="L332">    System.arraycopy(initial, 0, x, 0, x.length);</span>
+
+<span class="nc" id="L334">    int numBatches =  1;</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">    if (f instanceof AbstractStochasticCachingDiffUpdateFunction) {</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">      if (totalSamples &gt; 0)</span>
+<span class="nc" id="L337">        numBatches = totalSamples / bSize;</span>
+    }
+
+<span class="nc bnc" id="L340" title="All 4 branches missed.">    boolean have_max = (maxIterations &gt; 0 || numPasses &gt; 0);</span>
+
+<span class="nc bnc" id="L342" title="All 2 branches missed.">    if (!have_max){</span>
+<span class="nc" id="L343">      throw new UnsupportedOperationException(&quot;No maximum number of iterations has been specified.&quot;);</span>
+    } else{
+<span class="nc" id="L345">      maxIterations = Math.max(maxIterations, numPasses*numBatches);</span>
+    }
+
+<span class="nc" id="L348">    sayln(&quot;       Batch size of: &quot; + bSize);</span>
+<span class="nc" id="L349">    sayln(&quot;       Data dimension of: &quot; + totalSamples );</span>
+<span class="nc" id="L350">    sayln(&quot;       Batches per pass through data:  &quot; + numBatches );</span>
+<span class="nc" id="L351">    sayln(&quot;       Number of passes is = &quot; + numPasses);</span>
+<span class="nc" id="L352">    sayln(&quot;       Max iterations is = &quot; + maxIterations);</span>
+
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //            Loop
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+<span class="nc" id="L360">    Timing total = new Timing();</span>
+<span class="nc" id="L361">    Timing current = new Timing();</span>
+<span class="nc" id="L362">    total.start();</span>
+<span class="nc" id="L363">    current.start();</span>
+<span class="nc" id="L364">    int iters = 0;</span>
+<span class="nc" id="L365">    double gValue = 0;</span>
+<span class="nc" id="L366">    double wValue = 0;</span>
+<span class="nc" id="L367">    double currentRate = 0, testUpdate = 0, realUpdate = 0;</span>
+
+<span class="nc" id="L369">    List&lt;Double&gt; values = null; </span>
+<span class="nc" id="L370">    double oldObjVal = 0;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    for (int pass = 0; pass &lt; numPasses; pass++)  {</span>
+<span class="nc bnc" id="L372" title="All 6 branches missed.">      boolean doEval = (pass &gt; 0 &amp;&amp; evaluateIters &gt; 0 &amp;&amp; pass % evaluateIters == 0);</span>
+<span class="nc" id="L373">      double evalScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      if (doEval) {</span>
+<span class="nc" id="L375">        evalScore = doEvaluation(x);</span>
+<span class="nc bnc" id="L376" title="All 4 branches missed.">        if (useEvalImprovement &amp;&amp; !toContinue(x, evalScore))</span>
+<span class="nc" id="L377">          break;</span>
+      }
+      // TODO: currently objVal is only updated for GAUSSIAN prior
+      // when other priors are used, objVal only reflects the un-regularized obj value
+<span class="nc" id="L381">      double objVal = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L382">      double objDelta = Double.NEGATIVE_INFINITY;</span>
+
+<span class="nc" id="L384">      say(&quot;Iter: &quot; + iters + &quot; pass &quot; + pass + &quot; batch 1 ... &quot;);</span>
+<span class="nc" id="L385">      int numOfNonZero = 0, numOfNonZeroGroup = 0;</span>
+<span class="nc" id="L386">      String gSizeStr = &quot;&quot;;</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">      for (int batch = 0; batch &lt; numBatches; batch++) {</span>
+<span class="nc" id="L388">        iters++;</span>
+
+        //Get the next gradients
+        // log.info(&quot;getting gradients&quot;);
+<span class="nc" id="L392">        double[] gradients = null;</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (f instanceof AbstractStochasticCachingDiffUpdateFunction) {</span>
+<span class="nc" id="L394">          AbstractStochasticCachingDiffUpdateFunction func = (AbstractStochasticCachingDiffUpdateFunction) f;</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">          if (bSize == totalSamples) {</span>
+<span class="nc" id="L396">            objVal = func.valueAt(x);</span>
+<span class="nc" id="L397">            gradients = func.getDerivative();</span>
+<span class="nc" id="L398">            objDelta = objVal-oldObjVal;</span>
+<span class="nc" id="L399">            oldObjVal = objVal;</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            if (values == null)</span>
+<span class="nc" id="L401">              values = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L402">            values.add(objVal);</span>
+          } else {
+<span class="nc" id="L404">            func.calculateStochasticGradient(x, bSize);</span>
+<span class="nc" id="L405">            gradients = func.getDerivative();</span>
+          }
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        } else if (f instanceof AbstractCachingDiffFunction) {</span>
+<span class="nc" id="L408">          AbstractCachingDiffFunction func = (AbstractCachingDiffFunction) f;</span>
+<span class="nc" id="L409">          gradients = func.derivativeAt(x);</span>
+        }
+
+        // log.info(&quot;applying regularization&quot;);
+<span class="nc bnc" id="L413" title="All 4 branches missed.">        if (prior == Prior.NONE || prior == Prior.GAUSSIAN) { // Gaussian prior is also handled in objective</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">          for (int index = 0; index &lt; x.length; index++) {</span>
+<span class="nc" id="L415">            gValue = gradients[index];</span>
+<span class="nc" id="L416">            currentRate = computeLearningRate(index, gValue);</span>
+            // arrive at x(t+1/2)
+<span class="nc" id="L418">            wValue = x[index];</span>
+<span class="nc" id="L419">            testUpdate = wValue - (currentRate * gValue);</span>
+<span class="nc" id="L420">            realUpdate = testUpdate;</span>
+<span class="nc" id="L421">            updateX(x, index, realUpdate);</span>
+            // x[index] = testUpdate;
+          }
+<span class="nc bnc" id="L424" title="All 4 branches missed.">        } else if (prior == Prior.LASSO || prior == Prior.RIDGE) {</span>
+<span class="nc" id="L425">          double testUpdateSquaredSum = 0;</span>
+<span class="nc" id="L426">          Set&lt;Integer&gt; paramRange = null;</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">          if (f instanceof HasRegularizerParamRange) {</span>
+<span class="nc" id="L428">            paramRange = ((HasRegularizerParamRange)f).getRegularizerParamRange(x);</span>
+          } else {
+<span class="nc" id="L430">            paramRange = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            for (int i = 0; i &lt; x.length; i++)</span>
+<span class="nc" id="L432">              paramRange.add(i);</span>
+          }
+
+<span class="nc bnc" id="L435" title="All 2 branches missed.">          for (int index : paramRange) {</span>
+<span class="nc" id="L436">            gValue = gradients[index];</span>
+<span class="nc" id="L437">            currentRate = computeLearningRate(index, gValue);</span>
+            // arrive at x(t+1/2)
+<span class="nc" id="L439">            wValue = x[index];</span>
+<span class="nc" id="L440">            testUpdate = wValue - (currentRate * gValue);</span>
+<span class="nc" id="L441">            double currentLambda = currentRate * lambda;</span>
+            // apply FOBOS
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            if (prior == Prior.LASSO) {</span>
+<span class="nc" id="L444">              realUpdate = Math.signum(testUpdate) * pospart(Math.abs(testUpdate) - currentLambda);</span>
+<span class="nc" id="L445">              updateX(x, index, realUpdate);</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">              if (realUpdate != 0)</span>
+<span class="nc" id="L447">                numOfNonZero++;</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            } else if (prior == Prior.RIDGE) {</span>
+<span class="nc" id="L449">              testUpdateSquaredSum += testUpdate*testUpdate;</span>
+<span class="nc" id="L450">              testUpdateCache[index] = testUpdate;</span>
+<span class="nc" id="L451">              currentRateCache[index] = currentRate;</span>
+            // } else if (prior == Prior.GAUSSIAN) { // GAUSSIAN prior is assumed to be handled in the objective directly
+            //   realUpdate = testUpdate / (1 + currentLambda);
+            //   updateX(x, index, realUpdate);
+            //   // update objVal
+            //   objVal += currentLambda * wValue * wValue;
+            }
+<span class="nc" id="L458">          }</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">          if (prior == Prior.RIDGE) {</span>
+<span class="nc" id="L460">            double testUpdateNorm = Math.sqrt(testUpdateSquaredSum);</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            for (int index = 0 ; index &lt; testUpdateCache.length; index++) {</span>
+<span class="nc" id="L462">              realUpdate = testUpdateCache[index] * pospart( 1 - currentRateCache[index] * lambda / testUpdateNorm );</span>
+<span class="nc" id="L463">              updateX(x, index, realUpdate);</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">              if (realUpdate != 0)</span>
+<span class="nc" id="L465">                numOfNonZero++;</span>
+            }
+          }
+<span class="nc" id="L468">        } else {</span>
+          // log.info(&quot;featureGroup.length: &quot; + featureGrouping.length);
+<span class="nc bnc" id="L470" title="All 2 branches missed.">          for (int[] gFeatureIndices : featureGrouping) {</span>
+            // if (gIndex % 100 == 0) log.info(gIndex+&quot; &quot;);
+<span class="nc" id="L472">            double testUpdateSquaredSum = 0;</span>
+<span class="nc" id="L473">            double testUpdateAbsSum = 0;</span>
+<span class="nc" id="L474">            double M = gFeatureIndices.length;</span>
+<span class="nc" id="L475">            double dm = Math.log(M);</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">            for (int index : gFeatureIndices) {</span>
+<span class="nc" id="L477">              gValue = gradients[index];</span>
+<span class="nc" id="L478">              currentRate = computeLearningRate(index, gValue);</span>
+              // arrive at x(t+1/2)
+<span class="nc" id="L480">              wValue = x[index];</span>
+<span class="nc" id="L481">              testUpdate = wValue - (currentRate * gValue);</span>
+<span class="nc" id="L482">              testUpdateSquaredSum += testUpdate * testUpdate;</span>
+<span class="nc" id="L483">              testUpdateAbsSum += Math.abs(testUpdate);</span>
+<span class="nc" id="L484">              testUpdateCache[index] = testUpdate;</span>
+<span class="nc" id="L485">              currentRateCache[index] = currentRate;</span>
+            }
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            if (prior == Prior.gLASSO) {</span>
+<span class="nc" id="L488">              double testUpdateNorm = Math.sqrt(testUpdateSquaredSum);</span>
+<span class="nc" id="L489">              boolean groupHasNonZero = false;</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">              for (int index : gFeatureIndices) {</span>
+<span class="nc" id="L491">                realUpdate = testUpdateCache[index] * pospart(1 - currentRateCache[index] * lambda * dm / testUpdateNorm);</span>
+<span class="nc" id="L492">                updateX(x, index, realUpdate);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">                if (realUpdate != 0) {</span>
+<span class="nc" id="L494">                  numOfNonZero++;</span>
+<span class="nc" id="L495">                  groupHasNonZero = true;</span>
+                }
+              }
+<span class="nc bnc" id="L498" title="All 2 branches missed.">              if (groupHasNonZero)</span>
+<span class="nc" id="L499">                numOfNonZeroGroup++;</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">            } else if (prior == Prior.aeLASSO) {</span>
+<span class="nc" id="L501">              int nonZeroCount = 0;</span>
+<span class="nc" id="L502">              boolean groupHasNonZero = false;</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">              for (int index : gFeatureIndices) {</span>
+<span class="nc" id="L504">                double tau = currentRateCache[index] * lambda / (1 + currentRateCache[index] * lambda * M) * testUpdateAbsSum;</span>
+<span class="nc" id="L505">                realUpdate = Math.signum(testUpdateCache[index]) * pospart(Math.abs(testUpdateCache[index]) - tau);</span>
+<span class="nc" id="L506">                updateX(x, index, realUpdate);</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                if (realUpdate != 0) {</span>
+<span class="nc" id="L508">                  numOfNonZero++;</span>
+<span class="nc" id="L509">                  nonZeroCount++;</span>
+<span class="nc" id="L510">                  groupHasNonZero = true;</span>
+                }
+              }
+<span class="nc bnc" id="L513" title="All 2 branches missed.">              if (groupHasNonZero)</span>
+<span class="nc" id="L514">                numOfNonZeroGroup++;</span>
+              // gSizeStr += nonZeroCount+&quot;,&quot;;
+<span class="nc bnc" id="L516" title="All 2 branches missed.">            } else if (prior == Prior.sgLASSO) {</span>
+<span class="nc" id="L517">              double bSquaredSum = 0, b = 0;</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">              for (int index : gFeatureIndices) {</span>
+<span class="nc" id="L519">                b = Math.signum(testUpdateCache[index]) * pospart(Math.abs(testUpdateCache[index]) -</span>
+                        currentRateCache[index] * alpha * lambda);
+<span class="nc" id="L521">                bCache[index] = b;</span>
+<span class="nc" id="L522">                bSquaredSum += b * b;</span>
+              }
+<span class="nc" id="L524">              double bNorm = Math.sqrt(bSquaredSum);</span>
+<span class="nc" id="L525">              int nonZeroCount = 0;</span>
+<span class="nc" id="L526">              boolean groupHasNonZero = false;</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">              for (int index : gFeatureIndices) {</span>
+<span class="nc" id="L528">                realUpdate = bCache[index] * pospart(1 - currentRateCache[index] * (1.0 - alpha) * lambda * dm / bNorm);</span>
+<span class="nc" id="L529">                updateX(x, index, realUpdate);</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                if (realUpdate != 0) {</span>
+<span class="nc" id="L531">                  numOfNonZero++;</span>
+<span class="nc" id="L532">                  nonZeroCount++;</span>
+<span class="nc" id="L533">                  groupHasNonZero = true;</span>
+                }
+              }
+<span class="nc bnc" id="L536" title="All 2 branches missed.">              if (groupHasNonZero) {</span>
+<span class="nc" id="L537">                numOfNonZeroGroup++;</span>
+                // gSizeStr += nonZeroCount+&quot;,&quot;;
+              }
+            }
+          }
+          // log.info();
+        }
+
+        // update gradient and lastX
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        for (int index = 0; index &lt; x.length; index++) {</span>
+<span class="nc" id="L547">          prevGrad[index] = gradients[index];</span>
+        }
+
+        // if (hessSampleSize &gt; 0) {
+        //   approxHessian();
+        // }
+      }
+
+      try {
+<span class="nc" id="L556">        ArrayMath.assertFinite(x,&quot;x&quot;);</span>
+<span class="nc" id="L557">      } catch (ArrayMath.InvalidElementException e) {</span>
+<span class="nc" id="L558">        log.info(e.toString());</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">        for(int i=0;i&lt;x.length;i++){ x[i]=Double.NaN; }</span>
+<span class="nc" id="L560">        break;</span>
+<span class="nc" id="L561">      }</span>
+<span class="nc bnc" id="L562" title="All 8 branches missed.">      sayln(String.valueOf(numBatches)+&quot;, n0-fCount:&quot; + numOfNonZero + ((prior != Prior.LASSO &amp;&amp; prior != Prior.RIDGE)? &quot;, n0-gCount:&quot;+numOfNonZeroGroup : &quot;&quot;) + ((evalScore != Double.NEGATIVE_INFINITY) ? &quot;, evalScore:&quot;+evalScore : &quot;&quot;) + (objVal != Double.NEGATIVE_INFINITY ? &quot;, obj_val:&quot; + nf.format(objVal) + &quot;, obj_delta:&quot; + objDelta : &quot;&quot;) );</span>
+
+<span class="nc bnc" id="L564" title="All 6 branches missed.">      if (values != null &amp;&amp; useAvgImprovement &amp;&amp; iters &gt; 5) {</span>
+<span class="nc" id="L565">        int size = values.size();</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        double previousVal = (size &gt;= 10 ? values.get(size - 10) : values.get(0));</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">        double averageImprovement = (previousVal - objVal) / (size &gt;= 10 ? 10 : size);</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">        if (Math.abs(averageImprovement / objVal) &lt; TOL) {</span>
+<span class="nc" id="L569">          sayln(&quot;Online Optmization completed, due to average improvement: | newest_val - previous_val | / |newestVal| &lt; TOL &quot;);</span>
+<span class="nc" id="L570">          break;</span>
+        }
+      }
+
+<span class="nc bnc" id="L574" title="All 2 branches missed.">      if (iters &gt;= maxIterations) {</span>
+<span class="nc" id="L575">        sayln(&quot;Online Optimization complete.  Stopped after max iterations&quot;);</span>
+<span class="nc" id="L576">        break;</span>
+      }
+
+<span class="nc bnc" id="L579" title="All 2 branches missed.">      if (total.report() &gt;= maxTime){</span>
+<span class="nc" id="L580">        sayln(&quot;Online Optimization complete.  Stopped after max time&quot;);</span>
+<span class="nc" id="L581">        break;</span>
+      }
+    }
+<span class="nc bnc" id="L584" title="All 2 branches missed.">    if (evaluateIters &gt; 0) {</span>
+      // do final evaluation
+<span class="nc bnc" id="L586" title="All 2 branches missed.">      double evalScore = (useEvalImprovement ? doEvaluation(xBest) : doEvaluation(x));</span>
+<span class="nc" id="L587">      sayln(&quot;final evalScore is: &quot; + evalScore);</span>
+    }
+
+<span class="nc" id="L590">    sayln(&quot;Completed in: &quot; + Timing.toSecondsString(total.report()) + &quot; s&quot;);</span>
+
+<span class="nc bnc" id="L592" title="All 2 branches missed.">    return (useEvalImprovement ? xBest : x);</span>
+  }
+
+  protected void sayln(String s) {
+<span class="nc bnc" id="L596" title="All 2 branches missed.">    if (!quiet) {</span>
+<span class="nc" id="L597">      log.info(s);</span>
+    }
+<span class="nc" id="L599">  }</span>
+
+  protected void say(String s) {
+<span class="nc bnc" id="L602" title="All 2 branches missed.">    if (!quiet) {</span>
+<span class="nc" id="L603">      log.info(s);</span>
+    }
+<span class="nc" id="L605">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

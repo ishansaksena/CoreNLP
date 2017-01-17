@@ -1,0 +1,749 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KBPStatisticalExtractor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">KBPStatisticalExtractor.java</span></div><h1>KBPStatisticalExtractor.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie;
+
+
+import edu.stanford.nlp.classify.*;
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.optimization.*;
+import edu.stanford.nlp.pipeline.DefaultPaths;
+import edu.stanford.nlp.simple.Sentence;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.util.logging.RedwoodConfiguration;
+
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+/**
+ * A relation extractor to work with Victor's new KBP data.
+ */
+@SuppressWarnings(&quot;FieldCanBeLocal&quot;)
+public class KBPStatisticalExtractor implements KBPRelationExtractor, Serializable {
+  private static final long serialVersionUID = 1L;
+
+  @ArgumentParser.Option(name=&quot;train&quot;, gloss=&quot;The dataset to train on&quot;)
+<span class="nc" id="L37">  public static File TRAIN_FILE = new File(&quot;train.conll&quot;);</span>
+
+  @ArgumentParser.Option(name=&quot;test&quot;, gloss=&quot;The dataset to test on&quot;)
+<span class="nc" id="L40">  public static File TEST_FILE = new File(&quot;test.conll&quot;);</span>
+
+  @ArgumentParser.Option(name=&quot;model&quot;, gloss=&quot;The dataset to test on&quot;)
+<span class="nc" id="L43">  public static String MODEL_FILE = DefaultPaths.DEFAULT_KBP_CLASSIFIER;</span>
+
+  @ArgumentParser.Option(name=&quot;predictions&quot;, gloss=&quot;Dump model predictions to this file&quot;)
+<span class="nc" id="L46">  public static Optional&lt;String&gt; PREDICTIONS = Optional.empty();</span>
+
+<span class="nc" id="L48">  private enum MinimizerType{ QN, SGD, HYBRID, L1 }</span>
+  @ArgumentParser.Option(name=&quot;minimizer&quot;, gloss=&quot;The minimizer to use for training the classifier&quot;)
+<span class="nc" id="L50">  private static MinimizerType minimizer = MinimizerType.L1;</span>
+
+  @ArgumentParser.Option(name=&quot;feature_threshold&quot;, gloss=&quot;The minimum number of times to see a feature to count it&quot;)
+<span class="nc" id="L53">  private static int FEATURE_THRESHOLD = 0;</span>
+
+  @ArgumentParser.Option(name=&quot;sigma&quot;, gloss=&quot;The regularizer for the classifier&quot;)
+<span class="nc" id="L56">  private static double SIGMA = 1.0;</span>
+
+
+<span class="nc" id="L59">  private static final Redwood.RedwoodChannels log = Redwood.channels(KBPStatisticalExtractor.class);</span>
+
+
+  /**
+   * A list of triggers for top employees.
+   */
+<span class="nc" id="L65">  private static final Set&lt;String&gt; TOP_EMPLOYEE_TRIGGERS = Collections.unmodifiableSet(new HashSet&lt;String&gt;(){{</span>
+<span class="nc" id="L66">    add(&quot;executive&quot;);</span>
+<span class="nc" id="L67">    add(&quot;chairman&quot;);</span>
+<span class="nc" id="L68">    add(&quot;president&quot;);</span>
+<span class="nc" id="L69">    add(&quot;chief&quot;);</span>
+<span class="nc" id="L70">    add(&quot;head&quot;);</span>
+<span class="nc" id="L71">    add(&quot;general&quot;);</span>
+<span class="nc" id="L72">    add(&quot;ceo&quot;);</span>
+<span class="nc" id="L73">    add(&quot;officer&quot;);</span>
+<span class="nc" id="L74">    add(&quot;founder&quot;);</span>
+<span class="nc" id="L75">    add(&quot;found&quot;);</span>
+<span class="nc" id="L76">    add(&quot;leader&quot;);</span>
+<span class="nc" id="L77">    add(&quot;vice&quot;);</span>
+<span class="nc" id="L78">    add(&quot;king&quot;);</span>
+<span class="nc" id="L79">    add(&quot;prince&quot;);</span>
+<span class="nc" id="L80">    add(&quot;manager&quot;);</span>
+<span class="nc" id="L81">    add(&quot;host&quot;);</span>
+<span class="nc" id="L82">    add(&quot;minister&quot;);</span>
+<span class="nc" id="L83">    add(&quot;adviser&quot;);</span>
+<span class="nc" id="L84">    add(&quot;boss&quot;);</span>
+<span class="nc" id="L85">    add(&quot;chair&quot;);</span>
+<span class="nc" id="L86">    add(&quot;ambassador&quot;);</span>
+<span class="nc" id="L87">    add(&quot;shareholder&quot;);</span>
+<span class="nc" id="L88">    add(&quot;star&quot;);</span>
+<span class="nc" id="L89">    add(&quot;governor&quot;);</span>
+<span class="nc" id="L90">    add(&quot;investor&quot;);</span>
+<span class="nc" id="L91">    add(&quot;representative&quot;);</span>
+<span class="nc" id="L92">    add(&quot;dean&quot;);</span>
+<span class="nc" id="L93">    add(&quot;commissioner&quot;);</span>
+<span class="nc" id="L94">    add(&quot;deputy&quot;);</span>
+<span class="nc" id="L95">    add(&quot;commander&quot;);</span>
+<span class="nc" id="L96">    add(&quot;scientist&quot;);</span>
+<span class="nc" id="L97">    add(&quot;midfielder&quot;);</span>
+<span class="nc" id="L98">    add(&quot;speaker&quot;);</span>
+<span class="nc" id="L99">    add(&quot;researcher&quot;);</span>
+<span class="nc" id="L100">    add(&quot;editor&quot;);</span>
+<span class="nc" id="L101">    add(&quot;chancellor&quot;);</span>
+<span class="nc" id="L102">    add(&quot;fellow&quot;);</span>
+<span class="nc" id="L103">    add(&quot;leadership&quot;);</span>
+<span class="nc" id="L104">    add(&quot;diplomat&quot;);</span>
+<span class="nc" id="L105">    add(&quot;attorney&quot;);</span>
+<span class="nc" id="L106">    add(&quot;associate&quot;);</span>
+<span class="nc" id="L107">    add(&quot;striker&quot;);</span>
+<span class="nc" id="L108">    add(&quot;pilot&quot;);</span>
+<span class="nc" id="L109">    add(&quot;captain&quot;);</span>
+<span class="nc" id="L110">    add(&quot;banker&quot;);</span>
+<span class="nc" id="L111">    add(&quot;mayer&quot;);</span>
+<span class="nc" id="L112">    add(&quot;premier&quot;);</span>
+<span class="nc" id="L113">    add(&quot;producer&quot;);</span>
+<span class="nc" id="L114">    add(&quot;architect&quot;);</span>
+<span class="nc" id="L115">    add(&quot;designer&quot;);</span>
+<span class="nc" id="L116">    add(&quot;major&quot;);</span>
+<span class="nc" id="L117">    add(&quot;advisor&quot;);</span>
+<span class="nc" id="L118">    add(&quot;presidency&quot;);</span>
+<span class="nc" id="L119">    add(&quot;senator&quot;);</span>
+<span class="nc" id="L120">    add(&quot;specialist&quot;);</span>
+<span class="nc" id="L121">    add(&quot;faculty&quot;);</span>
+<span class="nc" id="L122">    add(&quot;monitor&quot;);</span>
+<span class="nc" id="L123">    add(&quot;chairwoman&quot;);</span>
+<span class="nc" id="L124">    add(&quot;mayor&quot;);</span>
+<span class="nc" id="L125">    add(&quot;columnist&quot;);</span>
+<span class="nc" id="L126">    add(&quot;mediator&quot;);</span>
+<span class="nc" id="L127">    add(&quot;prosecutor&quot;);</span>
+<span class="nc" id="L128">    add(&quot;entrepreneur&quot;);</span>
+<span class="nc" id="L129">    add(&quot;creator&quot;);</span>
+<span class="nc" id="L130">    add(&quot;superstar&quot;);</span>
+<span class="nc" id="L131">    add(&quot;commentator&quot;);</span>
+<span class="nc" id="L132">    add(&quot;principal&quot;);</span>
+<span class="nc" id="L133">    add(&quot;operative&quot;);</span>
+<span class="nc" id="L134">    add(&quot;businessman&quot;);</span>
+<span class="nc" id="L135">    add(&quot;peacekeeper&quot;);</span>
+<span class="nc" id="L136">    add(&quot;investigator&quot;);</span>
+<span class="nc" id="L137">    add(&quot;coordinator&quot;);</span>
+<span class="nc" id="L138">    add(&quot;knight&quot;);</span>
+<span class="nc" id="L139">    add(&quot;lawmaker&quot;);</span>
+<span class="nc" id="L140">    add(&quot;justice&quot;);</span>
+<span class="nc" id="L141">    add(&quot;publisher&quot;);</span>
+<span class="nc" id="L142">    add(&quot;playmaker&quot;);</span>
+<span class="nc" id="L143">    add(&quot;moderator&quot;);</span>
+<span class="nc" id="L144">    add(&quot;negotiator&quot;);</span>
+<span class="nc" id="L145">  }});</span>
+
+
+  /**
+   * &lt;p&gt;
+   *   Often, features fall naturally into &lt;i&gt;feature templates&lt;/i&gt; and their associated value.
+   *   For example, unigram features have a feature template of unigram, and a feature value of the word
+   *   in question.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   This method is a convenience convention for defining these feature template / value pairs.
+   *   The advantage of using the method is that it allows for easily finding the feature template for a
+   *   given feature value; thus, you can do feature selection post-hoc on the String features by splitting
+   *   out certain feature templates.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   Note that spaces in the feature value are also replaced with a special character, mostly out of
+   *   paranoia.
+   * &lt;/p&gt;
+   *
+   * @param features The feature counter we are updating.
+   * @param featureTemplate The feature template to add a value to.
+   * @param featureValue The value of the feature template. This is joined with the template, so it
+   *                     need only be unique within the template.
+   */
+  private static void indicator(Counter&lt;String&gt; features, String featureTemplate, String featureValue) {
+<span class="nc" id="L173">    features.incrementCount(featureTemplate + &quot;ℵ&quot; + featureValue.replace(' ', 'ˑ'));</span>
+<span class="nc" id="L174">  }</span>
+
+  /**
+   * Get information from the span between the two mentions.
+   * Canonically, get the words in this span.
+   * For instance, for &quot;Obama was born in Hawaii&quot;, this would return a list
+   * &quot;was born in&quot; if the selector is &lt;code&gt;CoreLabel::token&lt;/code&gt;;
+   * or &quot;be bear in&quot; if the selector is &lt;code&gt;CoreLabel::lemma&lt;/code&gt;.
+   *
+   * @param input The featurizer input.
+   * @param selector The field to compute for each element in the span. A good default is &lt;code&gt;&lt;/code&gt;CoreLabel::word&lt;/code&gt; or &lt;code&gt;&lt;/code&gt;CoreLabel::token&lt;/code&gt;
+   * @param &lt;E&gt; The type of element returned by the selector.
+   *
+   * @return A list of elements between the two mentions.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private  static &lt;E&gt; List&lt;E&gt; spanBetweenMentions(KBPInput input, Function&lt;CoreLabel, E&gt; selector) {
+<span class="nc" id="L191">    List&lt;CoreLabel&gt; sentence = input.sentence.asCoreLabels(Sentence::lemmas, Sentence::nerTags);</span>
+<span class="nc" id="L192">    Span subjSpan = input.subjectSpan;</span>
+<span class="nc" id="L193">    Span objSpan = input.objectSpan;</span>
+
+    // Corner cases
+<span class="nc bnc" id="L196" title="All 2 branches missed.">    if (Span.overlaps(subjSpan, objSpan)) {</span>
+<span class="nc" id="L197">      return Collections.EMPTY_LIST;</span>
+    }
+
+    // Get the range between the subject and object
+<span class="nc" id="L201">    int begin = subjSpan.end();</span>
+<span class="nc" id="L202">    int end = objSpan.start();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    if (begin &gt; end) {</span>
+<span class="nc" id="L204">      begin = objSpan.end();</span>
+<span class="nc" id="L205">      end = subjSpan.start();</span>
+    }
+<span class="nc bnc" id="L207" title="All 2 branches missed.">    if (begin &gt; end) {</span>
+<span class="nc" id="L208">      throw new IllegalArgumentException(&quot;Gabor sucks at logic and he should feel bad about it: &quot; + subjSpan + &quot; and &quot; + objSpan);</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">    } else if (begin == end) {</span>
+<span class="nc" id="L210">      return Collections.EMPTY_LIST;</span>
+    }
+
+    // Compute the return value
+<span class="nc" id="L214">    List&lt;E&gt; rtn = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">    for (int i = begin; i &lt; end; ++i) {</span>
+<span class="nc" id="L216">      rtn.add(selector.apply(sentence.get(i)));</span>
+    }
+<span class="nc" id="L218">    return rtn;</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   *   Span features often only make sense if the subject and object are positioned at the correct ends of the span.
+   *   For example, &quot;x is the son of y&quot; and &quot;y is the son of x&quot; have the same span feature, but mean different things
+   *   depending on where x and y are.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   This is a simple helper to position a dummy subject and object token appropriately.
+   * &lt;/p&gt;
+   *
+   * @param input The featurizer input.
+   * @param feature The span feature to augment.
+   *
+   * @return The augmented feature.
+   */
+  private static String withMentionsPositioned(KBPInput input, String feature) {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (input.subjectSpan.isBefore(input.objectSpan)) {</span>
+<span class="nc" id="L239">      return &quot;+__SUBJ__ &quot; + feature + &quot; __OBJ__&quot;;</span>
+    } else {
+<span class="nc" id="L241">      return &quot;__OBJ__ &quot; + feature + &quot; __SUBJ__&quot;;</span>
+    }
+  }
+
+  @SuppressWarnings(&quot;UnusedParameters&quot;)
+  private static void denseFeatures(KBPInput input, Sentence sentence, ClassicCounter&lt;String&gt; feats) {
+<span class="nc" id="L247">    boolean subjBeforeObj = input.subjectSpan.isBefore(input.objectSpan);</span>
+
+    // Type signature
+<span class="nc" id="L250">    indicator(feats, &quot;type_signature&quot;, input.subjectType + &quot;,&quot; + input.objectType);</span>
+
+    // Relative position
+<span class="nc bnc" id="L253" title="All 2 branches missed.">    indicator(feats, &quot;subj_before_obj&quot;, subjBeforeObj ? &quot;y&quot; : &quot;n&quot;);</span>
+<span class="nc" id="L254">  }</span>
+
+  @SuppressWarnings(&quot;UnusedParameters&quot;)
+  private static void surfaceFeatures(KBPInput input, Sentence simpleSentence, ClassicCounter&lt;String&gt; feats) {
+<span class="nc" id="L258">    List&lt;String&gt; lemmaSpan = spanBetweenMentions(input, CoreLabel::lemma);</span>
+<span class="nc" id="L259">    List&lt;String&gt; nerSpan = spanBetweenMentions(input, CoreLabel::ner);</span>
+<span class="nc" id="L260">    List&lt;String&gt; posSpan = spanBetweenMentions(input, CoreLabel::tag);</span>
+
+    // Unigram features of the sentence
+<span class="nc" id="L263">    List&lt;CoreLabel&gt; tokens = input.sentence.asCoreLabels(Sentence::lemmas, Sentence::nerTags);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    for (CoreLabel token : tokens) {</span>
+<span class="nc" id="L265">      indicator(feats, &quot;sentence_unigram&quot;, token.lemma());</span>
+<span class="nc" id="L266">    }</span>
+
+    // Full lemma span ( -0.3 F1 )
+//    if (lemmaSpan.size() &lt;= 5) {
+//      indicator(feats, &quot;full_lemma_span&quot;, withMentionsPositioned(input, StringUtils.join(lemmaSpan, &quot; &quot;)));
+//    }
+
+    // Lemma n-grams
+<span class="nc" id="L274">    String lastLemma = &quot;_^_&quot;;</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">    for (String lemma : lemmaSpan) {</span>
+<span class="nc" id="L276">      indicator(feats, &quot;lemma_bigram&quot;, withMentionsPositioned(input, lastLemma + &quot; &quot; + lemma));</span>
+<span class="nc" id="L277">      indicator(feats, &quot;lemma_unigram&quot;, withMentionsPositioned(input, lemma));</span>
+<span class="nc" id="L278">      lastLemma = lemma;</span>
+<span class="nc" id="L279">    }</span>
+<span class="nc" id="L280">    indicator(feats, &quot;lemma_bigram&quot;, withMentionsPositioned(input, lastLemma + &quot; _$_&quot;));</span>
+
+    // NER + lemma bi-grams
+<span class="nc bnc" id="L283" title="All 2 branches missed.">    for (int i = 0; i &lt; lemmaSpan.size() - 1; ++i) {</span>
+<span class="nc bnc" id="L284" title="All 6 branches missed.">      if (!&quot;O&quot;.equals(nerSpan.get(i)) &amp;&amp; &quot;O&quot;.equals(nerSpan.get(i + 1)) &amp;&amp; &quot;IN&quot;.equals(posSpan.get(i + 1))) {</span>
+<span class="nc" id="L285">        indicator(feats, &quot;ner/lemma_bigram&quot;, withMentionsPositioned(input, nerSpan.get(i) + &quot; &quot; + lemmaSpan.get(i + 1)));</span>
+      }
+<span class="nc bnc" id="L287" title="All 6 branches missed.">      if (!&quot;O&quot;.equals(nerSpan.get(i + 1)) &amp;&amp; &quot;O&quot;.equals(nerSpan.get(i)) &amp;&amp; &quot;IN&quot;.equals(posSpan.get(i))) {</span>
+<span class="nc" id="L288">        indicator(feats, &quot;ner/lemma_bigram&quot;, withMentionsPositioned(input, lemmaSpan.get(i) + &quot; &quot; + nerSpan.get(i + 1)));</span>
+      }
+    }
+
+    // Distance between mentions
+<span class="nc" id="L293">    String distanceBucket = &quot;&gt;10&quot;;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">    if (lemmaSpan.size() == 0) {</span>
+<span class="nc" id="L295">      distanceBucket = &quot;0&quot;;</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">    } else if (lemmaSpan.size() &lt;= 3) {</span>
+<span class="nc" id="L297">      distanceBucket = &quot;&lt;=3&quot;;</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">    } else if (lemmaSpan.size() &lt;= 5) {</span>
+<span class="nc" id="L299">      distanceBucket = &quot;&lt;=5&quot;;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    } else if (lemmaSpan.size() &lt;= 10) {</span>
+<span class="nc" id="L301">      distanceBucket = &quot;&lt;=10&quot;;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">    } else if (lemmaSpan.size() &lt;= 15) {</span>
+<span class="nc" id="L303">      distanceBucket = &quot;&lt;=15&quot;;</span>
+    }
+<span class="nc" id="L305">    indicator(feats, &quot;distance_between_entities_bucket&quot;, distanceBucket);</span>
+
+    // Punctuation features
+<span class="nc" id="L308">    int numCommasInSpan = 0;</span>
+<span class="nc" id="L309">    int numQuotesInSpan = 0;</span>
+<span class="nc" id="L310">    int parenParity = 0;</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    for (String lemma : lemmaSpan) {</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">      if (lemma.equals(&quot;,&quot;)) { numCommasInSpan += 1; }</span>
+<span class="nc bnc" id="L313" title="All 6 branches missed.">      if (lemma.equals(&quot;\&quot;&quot;) || lemma.equals(&quot;``&quot;) || lemma.equals(&quot;''&quot;)) {</span>
+<span class="nc" id="L314">        numQuotesInSpan += 1;</span>
+      }
+<span class="nc bnc" id="L316" title="All 4 branches missed.">      if (lemma.equals(&quot;(&quot;) || lemma.equals(&quot;-LRB-&quot;)) { parenParity += 1; }</span>
+<span class="nc bnc" id="L317" title="All 4 branches missed.">      if (lemma.equals(&quot;)&quot;) || lemma.equals(&quot;-RRB-&quot;)) { parenParity -= 1; }</span>
+<span class="nc" id="L318">    }</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    indicator(feats, &quot;comma_parity&quot;, numCommasInSpan % 2 == 0 ? &quot;even&quot; : &quot;odd&quot;);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    indicator(feats, &quot;quote_parity&quot;, numQuotesInSpan % 2 == 0 ? &quot;even&quot; : &quot;odd&quot;);</span>
+<span class="nc" id="L321">    indicator(feats, &quot;paren_parity&quot;, &quot;&quot; + parenParity);</span>
+
+    // Is broken by entity
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    Set&lt;String&gt; intercedingNERTags = nerSpan.stream().filter(ner -&gt; !ner.equals(&quot;O&quot;)).collect(Collectors.toSet());</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    if (!intercedingNERTags.isEmpty()) {</span>
+<span class="nc" id="L326">      indicator(feats, &quot;has_interceding_ner&quot;, &quot;t&quot;);</span>
+    }
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    for (String ner : intercedingNERTags) {</span>
+<span class="nc" id="L329">      indicator(feats, &quot;interceding_ner&quot;, ner);</span>
+<span class="nc" id="L330">    }</span>
+
+    // Left and right context
+<span class="nc" id="L333">    List&lt;CoreLabel&gt; sentence = input.sentence.asCoreLabels(Sentence::nerTags);</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">    if (input.subjectSpan.start() == 0) {</span>
+<span class="nc" id="L335">      indicator(feats, &quot;subj_left&quot;, &quot;^&quot;);</span>
+    } else {
+<span class="nc" id="L337">      indicator(feats, &quot;subj_left&quot;, sentence.get(input.subjectSpan.start() - 1).lemma());</span>
+    }
+<span class="nc bnc" id="L339" title="All 2 branches missed.">    if (input.subjectSpan.end() == sentence.size()) {</span>
+<span class="nc" id="L340">      indicator(feats, &quot;subj_right&quot;, &quot;$&quot;);</span>
+    } else {
+<span class="nc" id="L342">      indicator(feats, &quot;subj_right&quot;, sentence.get(input.subjectSpan.end()).lemma());</span>
+    }
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    if (input.objectSpan.start() == 0) {</span>
+<span class="nc" id="L345">      indicator(feats, &quot;obj_left&quot;, &quot;^&quot;);</span>
+    } else {
+<span class="nc" id="L347">      indicator(feats, &quot;obj_left&quot;, sentence.get(input.objectSpan.start() - 1).lemma());</span>
+    }
+<span class="nc bnc" id="L349" title="All 2 branches missed.">    if (input.objectSpan.end() == sentence.size()) {</span>
+<span class="nc" id="L350">      indicator(feats, &quot;obj_right&quot;, &quot;$&quot;);</span>
+    } else {
+<span class="nc" id="L352">      indicator(feats, &quot;obj_right&quot;, sentence.get(input.objectSpan.end()).lemma());</span>
+    }
+
+    // Skip-word patterns
+<span class="nc bnc" id="L356" title="All 4 branches missed.">    if (lemmaSpan.size() == 1 &amp;&amp; input.subjectSpan.isBefore(input.objectSpan)) {</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">      String left = input.subjectSpan.start() == 0 ? &quot;^&quot; : sentence.get(input.subjectSpan.start() - 1).lemma();</span>
+<span class="nc" id="L358">      indicator(feats, &quot;X&lt;subj&gt;Y&lt;obj&gt;&quot;, left + &quot;_&quot; + lemmaSpan.get(0));</span>
+    }
+<span class="nc" id="L360">  }</span>
+
+
+  private static void dependencyFeatures(KBPInput input, Sentence sentence, ClassicCounter&lt;String&gt; feats) {
+<span class="nc" id="L364">    int subjectHead = sentence.algorithms().headOfSpan(input.subjectSpan);</span>
+<span class="nc" id="L365">    int objectHead = sentence.algorithms().headOfSpan(input.objectSpan);</span>
+
+//    indicator(feats, &quot;subject_head&quot;, sentence.lemma(subjectHead));
+//    indicator(feats, &quot;object_head&quot;, sentence.lemma(objectHead));
+<span class="nc bnc" id="L369" title="All 2 branches missed.">    if (input.objectType.isRegexNERType) {</span>
+<span class="nc" id="L370">      indicator(feats, &quot;object_head&quot;, sentence.lemma(objectHead));</span>
+    }
+
+    // Get the dependency path
+<span class="nc" id="L374">    List&lt;String&gt; depparsePath = sentence.algorithms().dependencyPathBetween(subjectHead, objectHead, Sentence::lemmas);</span>
+
+    // Chop out appos edges
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    if (depparsePath.size() &gt; 3) {</span>
+<span class="nc" id="L378">      List&lt;Integer&gt; apposChunks = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">      for (int i = 1; i &lt; depparsePath.size() - 1; ++i) {</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (&quot;-appos-&gt;&quot;.equals(depparsePath.get(i))) {</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">          if (i != 1) {</span>
+<span class="nc" id="L382">            apposChunks.add(i - 1);</span>
+          }
+<span class="nc" id="L384">          apposChunks.add(i);</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        } else if (&quot;&lt;-appos-&quot;.equals(depparsePath.get(i))) {</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">          if (i &lt; depparsePath.size() - 1) {</span>
+<span class="nc" id="L387">            apposChunks.add(i + 1);</span>
+          }
+<span class="nc" id="L389">          apposChunks.add(i);</span>
+        }
+      }
+<span class="nc" id="L392">      Collections.sort(apposChunks);</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">      for (int i = apposChunks.size() - 1; i &gt;= 0; --i) {</span>
+<span class="nc" id="L394">        depparsePath.remove(i);</span>
+      }
+    }
+
+    // Dependency path distance buckets
+<span class="nc" id="L399">    String distanceBucket = &quot;&gt;10&quot;;</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">    if (depparsePath.size() == 3) {</span>
+<span class="nc" id="L401">      distanceBucket = &quot;&lt;=3&quot;;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">    } else if (depparsePath.size() &lt;= 5) {</span>
+<span class="nc" id="L403">      distanceBucket = &quot;&lt;=5&quot;;</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">    } else if (depparsePath.size() &lt;= 7) {</span>
+<span class="nc" id="L405">      distanceBucket = &quot;&lt;=7&quot;;</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">    } else if (depparsePath.size() &lt;= 9) {</span>
+<span class="nc" id="L407">      distanceBucket = &quot;&lt;=9&quot;;</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">    } else if (depparsePath.size() &lt;= 13) {</span>
+<span class="nc" id="L409">      distanceBucket = &quot;&lt;=13&quot;;</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">    } else if (depparsePath.size() &lt;= 17) {</span>
+<span class="nc" id="L411">      distanceBucket = &quot;&lt;=17&quot;;</span>
+    }
+<span class="nc" id="L413">    indicator(feats, &quot;parse_distance_between_entities_bucket&quot;, distanceBucket);</span>
+
+    // Add the path features
+<span class="nc bnc" id="L416" title="All 4 branches missed.">    if (depparsePath.size() &gt; 2 &amp;&amp; depparsePath.size() &lt;= 7) {</span>
+//      indicator(feats, &quot;deppath&quot;, StringUtils.join(depparsePath.subList(1, depparsePath.size() - 1), &quot;&quot;));
+//      indicator(feats, &quot;deppath_unlex&quot;, StringUtils.join(depparsePath.subList(1, depparsePath.size() - 1).stream().filter(x -&gt; x.startsWith(&quot;-&quot;) || x.startsWith(&quot;&lt;&quot;)), &quot;&quot;));
+<span class="nc" id="L419">      indicator(feats, &quot;deppath_w/tag&quot;,</span>
+<span class="nc" id="L420">          sentence.posTag(subjectHead) + StringUtils.join(depparsePath.subList(1, depparsePath.size() - 1), &quot;&quot;) + sentence.posTag(objectHead));</span>
+<span class="nc" id="L421">      indicator(feats, &quot;deppath_w/ner&quot;,</span>
+<span class="nc" id="L422">          input.subjectType + StringUtils.join(depparsePath.subList(1, depparsePath.size() - 1), &quot;&quot;) + input.objectType);</span>
+    }
+
+    // Add the edge features
+    //noinspection Convert2streamapi
+<span class="nc bnc" id="L427" title="All 2 branches missed.">    for (String node : depparsePath) {</span>
+<span class="nc bnc" id="L428" title="All 4 branches missed.">      if (!node.startsWith(&quot;-&quot;) &amp;&amp; !node.startsWith(&quot;&lt;-&quot;)) {</span>
+<span class="nc" id="L429">        indicator(feats, &quot;deppath_word&quot;, node);</span>
+      }
+<span class="nc" id="L431">    }</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">    for (int i = 0; i &lt; depparsePath.size() - 1; ++i) {</span>
+<span class="nc" id="L433">      indicator(feats, &quot;deppath_edge&quot;, depparsePath.get(i) + depparsePath.get(i + 1));</span>
+    }
+<span class="nc bnc" id="L435" title="All 2 branches missed.">    for (int i = 0; i &lt; depparsePath.size() - 2; ++i) {</span>
+<span class="nc" id="L436">      indicator(feats, &quot;deppath_chunk&quot;, depparsePath.get(i) + depparsePath.get(i + 1) + depparsePath.get(i + 2));</span>
+    }
+<span class="nc" id="L438">  }</span>
+
+
+  @SuppressWarnings(&quot;UnusedParameters&quot;)
+  private static void relationSpecificFeatures(KBPInput input, Sentence sentence, ClassicCounter&lt;String&gt; feats) {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">    if (input.objectType.equals(KBPRelationExtractor.NERTag.NUMBER)) {</span>
+      // Bucket the object value if it is a number
+      // This is to prevent things like &quot;age:9000&quot; and to soft penalize &quot;age:one&quot;
+      // The following features are extracted:
+      //   1. Whether the object parses as a number (should always be true)
+      //   2. Whether the object is an integer
+      //   3. If the object is an integer, around what value is it (bucketed around common age values)
+      //   4. Was the number spelled out, or written as a numeric number
+      try {
+<span class="nc" id="L452">        Number number = NumberNormalizer.wordToNumber(input.getObjectText());</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (number != null) {</span>
+<span class="nc" id="L454">          indicator(feats, &quot;obj_parsed_as_num&quot;, &quot;t&quot;);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">          if (number.equals(number.intValue())) {</span>
+<span class="nc" id="L456">            indicator(feats, &quot;obj_isint&quot;, &quot;t&quot;);</span>
+<span class="nc" id="L457">            int numAsInt = number.intValue();</span>
+<span class="nc" id="L458">            String bucket = &quot;&lt;0&quot;;</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            if (numAsInt == 0) {</span>
+<span class="nc" id="L460">              bucket = &quot;0&quot;;</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            } else if (numAsInt == 1) {</span>
+<span class="nc" id="L462">              bucket = &quot;1&quot;;</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            } else if (numAsInt &lt; 5) {</span>
+<span class="nc" id="L464">              bucket = &quot;&lt;5&quot;;</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            } else if (numAsInt &lt; 18) {</span>
+<span class="nc" id="L466">              bucket = &quot;&lt;18&quot;;</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            } else if (numAsInt &lt; 25) {</span>
+<span class="nc" id="L468">              bucket = &quot;&lt;25&quot;;</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            } else if (numAsInt &lt; 50) {</span>
+<span class="nc" id="L470">              bucket = &quot;&lt;50&quot;;</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            } else if (numAsInt &lt; 80) {</span>
+<span class="nc" id="L472">              bucket = &quot;&lt;80&quot;;</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            } else if (numAsInt &lt; 125) {</span>
+<span class="nc" id="L474">              bucket = &quot;&lt;125&quot;;</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">            } else if (numAsInt &gt;= 100) {</span>
+<span class="nc" id="L476">              bucket = &quot;&gt;125&quot;;</span>
+            }
+<span class="nc" id="L478">            indicator(feats, &quot;obj_number_bucket&quot;, bucket);</span>
+<span class="nc" id="L479">          } else {</span>
+<span class="nc" id="L480">            indicator(feats, &quot;obj_isint&quot;, &quot;f&quot;);</span>
+          }
+<span class="nc bnc" id="L482" title="All 2 branches missed.">          if (input.getObjectText().replace(&quot;,&quot;, &quot;&quot;).equalsIgnoreCase(number.toString())) {</span>
+<span class="nc" id="L483">            indicator(feats, &quot;obj_spelledout_num&quot;, &quot;f&quot;);</span>
+          } else {
+<span class="nc" id="L485">            indicator(feats, &quot;obj_spelledout_num&quot;, &quot;t&quot;);</span>
+          }
+        } else {
+<span class="nc" id="L488">          indicator(feats, &quot;obj_parsed_as_num&quot;, &quot;f&quot;);</span>
+        }
+<span class="nc" id="L490">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L491">        indicator(feats, &quot;obj_parsed_as_num&quot;, &quot;f&quot;);</span>
+<span class="nc" id="L492">      }</span>
+      // Special case dashes and the String &quot;one&quot;
+<span class="nc bnc" id="L494" title="All 2 branches missed.">      if (input.getObjectText().contains(&quot;-&quot;)) {</span>
+<span class="nc" id="L495">        indicator(feats, &quot;obj_num_has_dash&quot;, &quot;t&quot;);</span>
+      } else {
+<span class="nc" id="L497">        indicator(feats, &quot;obj_num_has_dash&quot;, &quot;f&quot;);</span>
+      }
+<span class="nc bnc" id="L499" title="All 2 branches missed.">      if (input.getObjectText().equalsIgnoreCase(&quot;one&quot;)) {</span>
+<span class="nc" id="L500">        indicator(feats, &quot;obj_num_is_one&quot;, &quot;t&quot;);</span>
+      } else {
+<span class="nc" id="L502">        indicator(feats, &quot;obj_num_is_one&quot;, &quot;f&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    if (</span>
+<span class="nc bnc" id="L507" title="All 4 branches missed.">        (input.subjectType == KBPRelationExtractor.NERTag.PERSON &amp;&amp; input.objectType.equals(KBPRelationExtractor.NERTag.ORGANIZATION)) ||</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            (input.subjectType == KBPRelationExtractor.NERTag.ORGANIZATION &amp;&amp; input.objectType.equals(KBPRelationExtractor.NERTag.PERSON))</span>
+        ) {
+      // Try to capture some denser features for employee_of
+      // These are:
+      //   1. Whether a TITLE tag occurs either before, after, or inside the relation span
+      //   2. Whether a top employee trigger occurs either before, after, or inside the relation span
+<span class="nc" id="L514">      Span relationSpan = Span.union(input.subjectSpan, input.objectSpan);</span>
+      // (triggers before span)
+<span class="nc bnc" id="L516" title="All 2 branches missed.">      for (int i = Math.max(0, relationSpan.start() - 5); i &lt; relationSpan.start(); ++i) {</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (&quot;TITLE&quot;.equals(sentence.nerTag(i))) {</span>
+<span class="nc" id="L518">          indicator(feats, &quot;title_before&quot;, &quot;t&quot;);</span>
+        }
+<span class="nc bnc" id="L520" title="All 2 branches missed.">        if (TOP_EMPLOYEE_TRIGGERS.contains(sentence.word(i).toLowerCase())) {</span>
+<span class="nc" id="L521">          indicator(feats, &quot;top_employee_trigger_before&quot;, &quot;t&quot;);</span>
+        }
+      }
+      // (triggers after span)
+<span class="nc bnc" id="L525" title="All 2 branches missed.">      for (int i = relationSpan.end(); i &lt; Math.min(sentence.length(), relationSpan.end()); ++i) {</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">        if (&quot;TITLE&quot;.equals(sentence.nerTag(i))) {</span>
+<span class="nc" id="L527">          indicator(feats, &quot;title_after&quot;, &quot;t&quot;);</span>
+        }
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        if (TOP_EMPLOYEE_TRIGGERS.contains(sentence.word(i).toLowerCase())) {</span>
+<span class="nc" id="L530">          indicator(feats, &quot;top_employee_trigger_after&quot;, &quot;t&quot;);</span>
+        }
+      }
+      // (triggers inside span)
+<span class="nc bnc" id="L534" title="All 2 branches missed.">      for (int i : relationSpan) {</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (&quot;TITLE&quot;.equals(sentence.nerTag(i))) {</span>
+<span class="nc" id="L536">          indicator(feats, &quot;title_inside&quot;, &quot;t&quot;);</span>
+        }
+<span class="nc bnc" id="L538" title="All 2 branches missed.">        if (TOP_EMPLOYEE_TRIGGERS.contains(sentence.word(i).toLowerCase())) {</span>
+<span class="nc" id="L539">          indicator(feats, &quot;top_employee_trigger_inside&quot;, &quot;t&quot;);</span>
+        }
+<span class="nc" id="L541">      }</span>
+    }
+<span class="nc" id="L543">  }</span>
+
+  public static Counter&lt;String&gt; features(KBPInput input) {
+    
+    // Get useful variables
+<span class="nc" id="L548">    ClassicCounter&lt;String&gt; feats = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L549" title="All 6 branches missed.">    if (Span.overlaps(input.subjectSpan, input.objectSpan) || input.subjectSpan.size() == 0 || input.objectSpan.size() == 0) {</span>
+<span class="nc" id="L550">      return new ClassicCounter&lt;&gt;();</span>
+    }
+
+    // Actually featurize
+<span class="nc" id="L554">    denseFeatures(input, input.sentence, feats);</span>
+<span class="nc" id="L555">    surfaceFeatures(input, input.sentence, feats);</span>
+<span class="nc" id="L556">    dependencyFeatures(input, input.sentence, feats);</span>
+<span class="nc" id="L557">    relationSpecificFeatures(input, input.sentence, feats);</span>
+
+<span class="nc" id="L559">    return feats;</span>
+  }
+
+
+  /**
+   * Create a classifier factory
+   * @param &lt;L&gt; The label class of the factory
+   * @return A factory to minimize a classifier against.
+   */
+  private static &lt;L&gt; LinearClassifierFactory&lt;L, String&gt; initFactory(double sigma) {
+<span class="nc" id="L569">    LinearClassifierFactory&lt;L,String&gt; factory = new LinearClassifierFactory&lt;&gt;();</span>
+    Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; minimizerFactory;
+<span class="nc bnc" id="L571" title="All 5 branches missed.">    switch(minimizer) {</span>
+      case QN:
+<span class="nc" id="L573">        minimizerFactory = () -&gt; new QNMinimizer(15);</span>
+<span class="nc" id="L574">        break;</span>
+      case SGD:
+<span class="nc" id="L576">        minimizerFactory = () -&gt; new SGDMinimizer&lt;&gt;(sigma, 100, 1000);</span>
+<span class="nc" id="L577">        break;</span>
+      case HYBRID:
+<span class="nc" id="L579">        factory.useHybridMinimizerWithInPlaceSGD(100, 1000, sigma);</span>
+<span class="nc" id="L580">        minimizerFactory = () -&gt; {</span>
+<span class="nc" id="L581">          SGDMinimizer&lt;DiffFunction&gt; firstMinimizer = new SGDMinimizer&lt;&gt;(sigma, 50, 1000);</span>
+<span class="nc" id="L582">          QNMinimizer secondMinimizer = new QNMinimizer(15);</span>
+<span class="nc" id="L583">          return new HybridMinimizer(firstMinimizer, secondMinimizer, 50);</span>
+        };
+<span class="nc" id="L585">        break;</span>
+      case L1:
+<span class="nc" id="L587">        minimizerFactory = () -&gt; {</span>
+          try {
+<span class="nc" id="L589">            return MetaClass.create(&quot;edu.stanford.nlp.optimization.OWLQNMinimizer&quot;).createInstance(sigma);</span>
+<span class="nc" id="L590">          } catch (Exception e) {</span>
+<span class="nc" id="L591">            log.err(&quot;Could not create l1 minimizer! Reverting to l2.&quot;);</span>
+<span class="nc" id="L592">            return new QNMinimizer(15);</span>
+          }
+        };
+<span class="nc" id="L595">        break;</span>
+      default:
+<span class="nc" id="L597">        throw new IllegalStateException(&quot;Unknown minimizer: &quot; + minimizer);</span>
+    }
+<span class="nc" id="L599">    factory.setMinimizerCreator(minimizerFactory);</span>
+<span class="nc" id="L600">    return factory;</span>
+  }
+
+
+  /**
+   * Train a multinomial classifier off of the provided dataset.
+   * @param dataset The dataset to train the classifier off of.
+   * @return A classifier.
+   */
+  public static Classifier&lt;String, String&gt; trainMultinomialClassifier(
+      GeneralDataset&lt;String, String&gt; dataset,
+      int featureThreshold,
+      double sigma) {
+    // Set up the dataset and factory
+<span class="nc" id="L614">    log.info(&quot;Applying feature threshold (&quot; + featureThreshold + &quot;)...&quot;);</span>
+<span class="nc" id="L615">    dataset.applyFeatureCountThreshold(featureThreshold);</span>
+<span class="nc" id="L616">    log.info(&quot;Randomizing dataset...&quot;);</span>
+<span class="nc" id="L617">    dataset.randomize(42l);</span>
+<span class="nc" id="L618">    log.info(&quot;Creating factory...&quot;);</span>
+<span class="nc" id="L619">    LinearClassifierFactory&lt;String,String&gt; factory = initFactory(sigma);</span>
+
+    // Train the final classifier
+<span class="nc" id="L622">    log.info(&quot;BEGIN training&quot;);</span>
+<span class="nc" id="L623">    LinearClassifier&lt;String, String&gt; classifier = factory.trainClassifier(dataset);</span>
+<span class="nc" id="L624">    log.info(&quot;END training&quot;);</span>
+
+    // Debug
+<span class="nc" id="L627">    Accuracy trainAccuracy = new Accuracy();</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">    for (Datum&lt;String, String&gt; datum : dataset) {</span>
+<span class="nc" id="L629">      String guess = classifier.classOf(datum);</span>
+<span class="nc" id="L630">      trainAccuracy.predict(Collections.singleton(guess), Collections.singleton(datum.label()));</span>
+<span class="nc" id="L631">    }</span>
+<span class="nc" id="L632">    log.info(&quot;Training accuracy:&quot;);</span>
+<span class="nc" id="L633">    log.info(trainAccuracy.toString());</span>
+<span class="nc" id="L634">    log.info(&quot;&quot;);</span>
+
+    // Return the classifier
+<span class="nc" id="L637">    return classifier;</span>
+  }
+
+
+  /**
+   * The implementing classifier of this extractor.
+   */
+  public final Classifier&lt;String, String&gt; classifier;
+
+  /**
+   * Create a new KBP relation extractor, from the given implementing classifier.
+   * @param classifier The implementing classifier.
+   */
+<span class="nc" id="L650">  public KBPStatisticalExtractor(Classifier&lt;String, String&gt; classifier) {</span>
+<span class="nc" id="L651">    this.classifier = classifier;</span>
+<span class="nc" id="L652">  }</span>
+
+
+  /**
+   * Score the given input, returning both the classification decision and the
+   * probability of that decision.
+   * Note that this method will not return a relation which does not type check.
+   *
+   *
+   * @param input The input to classify.
+   * @return A pair with the relation we classified into, along with its confidence.
+   */
+  public Pair&lt;String,Double&gt; classify(KBPInput input) {
+<span class="nc" id="L665">    RVFDatum&lt;String, String&gt; datum = new RVFDatum&lt;&gt;(features(input));</span>
+<span class="nc" id="L666">    Counter&lt;String&gt; scores =  classifier.scoresOf(datum);</span>
+<span class="nc" id="L667">    Counters.expInPlace(scores);</span>
+<span class="nc" id="L668">    Counters.normalize(scores);</span>
+<span class="nc" id="L669">    String best = Counters.argmax(scores);</span>
+    // While it doesn't type check, continue going down the list.
+    // NO_RELATION is always an option somewhere in there, so safe to keep going...
+<span class="nc bnc" id="L672" title="All 4 branches missed.">    while (!NO_RELATION.equals(best) &amp;&amp; scores.size() &gt; 1 &amp;&amp;</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">        (!KBPRelationExtractor.RelationType.fromString(best).get().validNamedEntityLabels.contains(input.objectType) ||</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">         RelationType.fromString(best).get().entityType != input.subjectType) ) {</span>
+<span class="nc" id="L675">      scores.remove(best);</span>
+<span class="nc" id="L676">      Counters.normalize(scores);</span>
+<span class="nc" id="L677">      best = Counters.argmax(scores);</span>
+    }
+<span class="nc" id="L679">    return Pair.makePair(best, scores.getCount(best));</span>
+  }
+
+
+  public static void main(String[] args) throws IOException, ClassNotFoundException {
+<span class="nc" id="L684">    RedwoodConfiguration.standard().apply();  // Disable SLF4J crap.</span>
+<span class="nc" id="L685">    ArgumentParser.fillOptions(KBPStatisticalExtractor.class, args);  // Fill command-line options</span>
+
+    // Load the test (or dev) data
+<span class="nc" id="L688">    forceTrack(&quot;Test data&quot;);</span>
+<span class="nc" id="L689">    List&lt;Pair&lt;KBPInput, String&gt;&gt; testExamples = KBPRelationExtractor.readDataset(TEST_FILE);</span>
+<span class="nc" id="L690">    log.info(&quot;Read &quot; + testExamples.size() + &quot; examples&quot;);</span>
+<span class="nc" id="L691">    endTrack(&quot;Test data&quot;);</span>
+
+    // If we can't find an existing model, train one
+<span class="nc bnc" id="L694" title="All 2 branches missed.">    if (!IOUtils.existsInClasspathOrFileSystem(MODEL_FILE)) {</span>
+<span class="nc" id="L695">      forceTrack(&quot;Training data&quot;);</span>
+<span class="nc" id="L696">      List&lt;Pair&lt;KBPInput, String&gt;&gt; trainExamples = KBPRelationExtractor.readDataset(TRAIN_FILE);</span>
+<span class="nc" id="L697">      log.info(&quot;Read &quot; + trainExamples.size() + &quot; examples&quot;);</span>
+<span class="nc" id="L698">      log.info(&quot;&quot; + trainExamples.stream().map(Pair::second).filter(NO_RELATION::equals).count() + &quot; are &quot; + NO_RELATION);</span>
+<span class="nc" id="L699">      endTrack(&quot;Training data&quot;);</span>
+
+      // Featurize + create the dataset
+<span class="nc" id="L702">      forceTrack(&quot;Creating dataset&quot;);</span>
+<span class="nc" id="L703">      RVFDataset&lt;String, String&gt; dataset = new RVFDataset&lt;&gt;();</span>
+<span class="nc" id="L704">      final AtomicInteger i = new AtomicInteger(0);</span>
+<span class="nc" id="L705">      long beginTime = System.currentTimeMillis();</span>
+<span class="nc" id="L706">      trainExamples.stream().parallel().forEach(example -&gt; {</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">        if (i.incrementAndGet() % 1000 == 0) {</span>
+<span class="nc" id="L708">          log.info(&quot;[&quot; + Redwood.formatTimeDifference(System.currentTimeMillis() - beginTime) +</span>
+<span class="nc" id="L709">              &quot;] Featurized &quot; + i.get() + &quot; / &quot; + trainExamples.size() + &quot; examples&quot;);</span>
+        }
+<span class="nc" id="L711">        Counter&lt;String&gt; features = features(example.first);  // This takes a while per example</span>
+<span class="nc" id="L712">        synchronized (dataset) {</span>
+<span class="nc" id="L713">          dataset.add(new RVFDatum&lt;&gt;(features, example.second));</span>
+<span class="nc" id="L714">        }</span>
+<span class="nc" id="L715">      });</span>
+<span class="nc" id="L716">      trainExamples.clear();  // Free up some memory</span>
+<span class="nc" id="L717">      endTrack(&quot;Creating dataset&quot;);</span>
+
+      // Train the classifier
+<span class="nc" id="L720">      log.info(&quot;Training classifier:&quot;);</span>
+<span class="nc" id="L721">      Classifier&lt;String, String&gt; classifier = trainMultinomialClassifier(dataset, FEATURE_THRESHOLD, SIGMA);</span>
+<span class="nc" id="L722">      dataset.clear();  // Free up some memory</span>
+
+      // Save the classifier
+<span class="nc" id="L725">      IOUtils.writeObjectToFile(new KBPStatisticalExtractor(classifier), MODEL_FILE);</span>
+    }
+
+    // Read either a newly-trained or pre-trained model
+<span class="nc" id="L729">    Object model = IOUtils.readObjectFromURLOrClasspathOrFileSystem(MODEL_FILE);</span>
+    KBPStatisticalExtractor classifier;
+<span class="nc bnc" id="L731" title="All 2 branches missed.">    if (model instanceof Classifier) {</span>
+      //noinspection unchecked
+<span class="nc" id="L733">      classifier = new KBPStatisticalExtractor((Classifier&lt;String, String&gt;) model);</span>
+    } else {
+<span class="nc" id="L735">      classifier = ((KBPStatisticalExtractor) model);</span>
+    }
+
+    // Evaluate the model
+<span class="nc" id="L739">    classifier.computeAccuracy(testExamples.stream(), PREDICTIONS.map(x -&gt; {</span>
+      try {
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        return &quot;stdout&quot;.equalsIgnoreCase(x) ? System.out : new PrintStream(new FileOutputStream(x));</span>
+<span class="nc" id="L742">      } catch (IOException e) {</span>
+<span class="nc" id="L743">        throw new RuntimeIOException(e);</span>
+      }
+    }));
+<span class="nc" id="L746">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

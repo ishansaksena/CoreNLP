@@ -1,0 +1,577 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ChineseCharacterBasedLexicon.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">ChineseCharacterBasedLexicon.java</span></div><h1>ChineseCharacterBasedLexicon.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser;
+
+import java.io.*;
+import java.util.*;
+
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.Distribution;
+import edu.stanford.nlp.stats.GeneralizedCounter;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.international.pennchinese.RadicalMap;
+import java.util.function.Function;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Timing;
+
+/**
+ * @author Galen Andrew
+ */
+<span class="nc bnc" id="L21" title="All 2 branches missed.">public class ChineseCharacterBasedLexicon implements Lexicon {</span>
+
+  private final double lengthPenalty;
+  // penaltyType should be set as follows:
+  // 0: no length penalty
+  // 1: quadratic length penalty
+  // 2: penalty for continuation chars only
+  private final int penaltyType;
+
+  private Map&lt;List,Distribution&lt;Symbol&gt;&gt; charDistributions;
+  private Set&lt;Symbol&gt; knownChars;
+
+  private Distribution&lt;String&gt; POSDistribution;
+
+  private final boolean useUnknownCharacterModel;
+
+  private static final int CONTEXT_LENGTH = 2;
+
+  private final Index&lt;String&gt; wordIndex;
+  private final Index&lt;String&gt; tagIndex;
+
+  public ChineseCharacterBasedLexicon(ChineseTreebankParserParams params,
+                                      Index&lt;String&gt; wordIndex,
+<span class="nc" id="L44">                                      Index&lt;String&gt; tagIndex) {</span>
+<span class="nc" id="L45">    this.wordIndex = wordIndex;</span>
+<span class="nc" id="L46">    this.tagIndex = tagIndex;</span>
+<span class="nc" id="L47">    this.lengthPenalty = params.lengthPenalty;</span>
+<span class="nc" id="L48">    this.penaltyType = params.penaltyType;</span>
+<span class="nc" id="L49">    this.useUnknownCharacterModel = params.useUnknownCharacterModel;</span>
+<span class="nc" id="L50">  }</span>
+
+  // We need to make two passes over the data, whereas the calling
+  // routines only pass in the sentences or trees once, so we keep all
+  // the sentences and then process them at the end
+  private transient List&lt;List&lt;TaggedWord&gt;&gt; trainingSentences;
+
+  @Override
+  public void initializeTraining(double numTrees) {
+<span class="nc" id="L59">    trainingSentences = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L60">  }</span>
+
+  /**
+   * Train this lexicon on the given set of trees.
+   */
+  @Override
+  public void train(Collection&lt;Tree&gt; trees) {
+<span class="nc bnc" id="L67" title="All 2 branches missed.">    for (Tree tree : trees) {</span>
+<span class="nc" id="L68">      train(tree, 1.0);</span>
+<span class="nc" id="L69">    }</span>
+<span class="nc" id="L70">  }</span>
+
+  /**
+   * Train this lexicon on the given set of trees.
+   */
+  @Override
+  public void train(Collection&lt;Tree&gt; trees, double weight) {
+<span class="nc bnc" id="L77" title="All 2 branches missed.">    for (Tree tree : trees) {</span>
+<span class="nc" id="L78">      train(tree, weight);</span>
+<span class="nc" id="L79">    }</span>
+<span class="nc" id="L80">  }</span>
+
+  /**
+   * TODO: make this method do something with the weight
+   */
+  @Override
+  public void train(Tree tree, double weight) {
+<span class="nc" id="L87">    trainingSentences.add(tree.taggedYield());</span>
+<span class="nc" id="L88">  }</span>
+
+  @Override
+  public void trainUnannotated(List&lt;TaggedWord&gt; sentence, double weight) {
+    // TODO: for now we just punt on these
+<span class="nc" id="L93">    throw new UnsupportedOperationException(&quot;This version of the parser does not support non-tree training data&quot;);</span>
+  }
+
+  @Override
+  public void incrementTreesRead(double weight) {
+<span class="nc" id="L98">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public void train(TaggedWord tw, int loc, double weight) {
+<span class="nc" id="L103">    throw new UnsupportedOperationException();</span>
+  }
+
+
+  @Override
+  public void train(List&lt;TaggedWord&gt; sentence, double weight) {
+<span class="nc" id="L109">    trainingSentences.add(sentence);</span>
+<span class="nc" id="L110">  }</span>
+
+  @Override
+  public void finishTraining() {
+<span class="nc" id="L114">    Timing.tick(&quot;Counting characters...&quot;);</span>
+<span class="nc" id="L115">    ClassicCounter&lt;Symbol&gt; charCounter = new ClassicCounter&lt;&gt;();</span>
+
+    // first find all chars that occur only once
+<span class="nc bnc" id="L118" title="All 2 branches missed.">    for (List&lt;TaggedWord&gt; labels : trainingSentences) {</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">      for (TaggedWord label : labels) {</span>
+<span class="nc" id="L120">        String word = label.word();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (word.equals(BOUNDARY)) {</span>
+<span class="nc" id="L122">          continue;</span>
+        }
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        for (int j = 0, length = word.length(); j &lt; length; j++) {</span>
+<span class="nc" id="L125">          Symbol sym = Symbol.cannonicalSymbol(word.charAt(j));</span>
+<span class="nc" id="L126">          charCounter.incrementCount(sym);</span>
+        }
+<span class="nc" id="L128">        charCounter.incrementCount(Symbol.END_WORD);</span>
+<span class="nc" id="L129">      }</span>
+<span class="nc" id="L130">    }</span>
+
+<span class="nc" id="L132">    Set&lt;Symbol&gt; singletons = Counters.keysBelow(charCounter, 1.5);</span>
+<span class="nc" id="L133">    knownChars = Generics.newHashSet(charCounter.keySet());</span>
+
+<span class="nc" id="L135">    Timing.tick(&quot;Counting nGrams...&quot;);</span>
+<span class="nc" id="L136">    GeneralizedCounter[] POSspecificCharNGrams = new GeneralizedCounter[CONTEXT_LENGTH + 1];</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">    for (int i = 0; i &lt;= CONTEXT_LENGTH; i++) {</span>
+<span class="nc" id="L138">      POSspecificCharNGrams[i] = new GeneralizedCounter(i + 2);</span>
+    }
+
+<span class="nc" id="L141">    ClassicCounter&lt;String&gt; POSCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L142">    List&lt;Serializable&gt; context = new ArrayList&lt;&gt;(CONTEXT_LENGTH + 1);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    for (List&lt;TaggedWord&gt; words : trainingSentences) {</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">      for (TaggedWord taggedWord : words) {</span>
+<span class="nc" id="L145">        String word = taggedWord.word();</span>
+<span class="nc" id="L146">        String tag = taggedWord.tag();</span>
+<span class="nc" id="L147">        tagIndex.add(tag);</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (word.equals(BOUNDARY)) {</span>
+<span class="nc" id="L149">          continue;</span>
+        }
+<span class="nc" id="L151">        POSCounter.incrementCount(tag);</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        for (int i = 0, size = word.length(); i &lt;= size; i++) {</span>
+          Symbol sym;
+<span class="nc" id="L154">          Symbol unknownCharClass = null;</span>
+<span class="nc" id="L155">          context.clear();</span>
+<span class="nc" id="L156">          context.add(tag);</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">          if (i &lt; size) {</span>
+<span class="nc" id="L158">            char thisCh = word.charAt(i);</span>
+<span class="nc" id="L159">            sym = Symbol.cannonicalSymbol(thisCh);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            if (singletons.contains(sym)) {</span>
+<span class="nc" id="L161">              unknownCharClass = unknownCharClass(sym);</span>
+<span class="nc" id="L162">              charCounter.incrementCount(unknownCharClass);</span>
+            }
+<span class="nc" id="L164">          } else {</span>
+<span class="nc" id="L165">            sym = Symbol.END_WORD;</span>
+          }
+<span class="nc" id="L167">          POSspecificCharNGrams[0].incrementCount(context, sym); // POS-specific 1-gram</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">          if (unknownCharClass != null) {</span>
+<span class="nc" id="L169">            POSspecificCharNGrams[0].incrementCount(context, unknownCharClass); // for unknown ch model</span>
+          }
+
+          // context is constructed incrementally:
+          // tag prevChar prevPrevChar
+          // this could be made faster using .sublist like in score
+<span class="nc bnc" id="L175" title="All 2 branches missed.">          for (int j = 1; j &lt;= CONTEXT_LENGTH; j++) { // poly grams</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if (i - j &lt; 0) {</span>
+<span class="nc" id="L177">              context.add(Symbol.BEGIN_WORD);</span>
+<span class="nc" id="L178">              POSspecificCharNGrams[j].incrementCount(context, sym);</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">              if (unknownCharClass != null) {</span>
+<span class="nc" id="L180">                POSspecificCharNGrams[j].incrementCount(context, unknownCharClass); // for unknown ch model</span>
+              }
+              break;
+            } else {
+<span class="nc" id="L184">              Symbol prev = Symbol.cannonicalSymbol(word.charAt(i - j));</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">              if (singletons.contains(prev)) {</span>
+<span class="nc" id="L186">                context.add(unknownCharClass(prev));</span>
+              } else {
+<span class="nc" id="L188">                context.add(prev);</span>
+              }
+<span class="nc" id="L190">              POSspecificCharNGrams[j].incrementCount(context, sym);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">              if (unknownCharClass != null) {</span>
+<span class="nc" id="L192">                POSspecificCharNGrams[j].incrementCount(context, unknownCharClass); // for unknown ch model</span>
+              }
+            }
+          }
+        }
+<span class="nc" id="L197">      }</span>
+<span class="nc" id="L198">    }</span>
+
+<span class="nc" id="L200">    POSDistribution = Distribution.getDistribution(POSCounter);</span>
+<span class="nc" id="L201">    Timing.tick(&quot;Creating character prior distribution...&quot;);</span>
+
+<span class="nc" id="L203">    charDistributions = Generics.newHashMap();</span>
+    //    charDistributions = Generics.newHashMap();  // 1.5
+    //    charCounter.incrementCount(Symbol.UNKNOWN, singletons.size());
+<span class="nc" id="L206">    int numberOfKeys = charCounter.size() + singletons.size();</span>
+<span class="nc" id="L207">    Distribution&lt;Symbol&gt; prior = Distribution.goodTuringSmoothedCounter(charCounter, numberOfKeys);</span>
+<span class="nc" id="L208">    charDistributions.put(Collections.EMPTY_LIST, prior);</span>
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">    for (int i = 0; i &lt;= CONTEXT_LENGTH; i++) {</span>
+<span class="nc" id="L211">      Set&lt;Map.Entry&lt;List&lt;Serializable&gt;, ClassicCounter&lt;Symbol&gt;&gt;&gt; counterEntries = POSspecificCharNGrams[i].lowestLevelCounterEntrySet();</span>
+<span class="nc" id="L212">      Timing.tick(&quot;Creating &quot; + counterEntries.size() + &quot; character &quot; + (i + 1) + &quot;-gram distributions...&quot;);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">      for (Map.Entry&lt;List&lt;Serializable&gt;, ClassicCounter&lt;Symbol&gt;&gt; entry : counterEntries) {</span>
+<span class="nc" id="L214">        context = entry.getKey();</span>
+<span class="nc" id="L215">        ClassicCounter&lt;Symbol&gt; c = entry.getValue();</span>
+<span class="nc" id="L216">        Distribution&lt;Symbol&gt; thisPrior = charDistributions.get(context.subList(0, context.size() - 1));</span>
+<span class="nc" id="L217">        double priorWeight = thisPrior.getNumberOfKeys() / 200.0;</span>
+<span class="nc" id="L218">        Distribution&lt;Symbol&gt; newDist = Distribution.dynamicCounterWithDirichletPrior(c, thisPrior, priorWeight);</span>
+<span class="nc" id="L219">        charDistributions.put(context, newDist);</span>
+<span class="nc" id="L220">      }</span>
+    }
+<span class="nc" id="L222">  }</span>
+
+  public Distribution&lt;String&gt; getPOSDistribution() {
+<span class="nc" id="L225">    return POSDistribution;</span>
+  }
+
+  public static boolean isForeign(String s) {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">    for (int i = 0; i &lt; s.length(); i++) {</span>
+<span class="nc" id="L230">      int num = Character.getNumericValue(s.charAt(i));</span>
+<span class="nc bnc" id="L231" title="All 4 branches missed.">      if (num &lt; 10 || num &gt; 35) {</span>
+<span class="nc" id="L232">        return false;</span>
+      }
+    }
+<span class="nc" id="L235">    return true;</span>
+  }
+
+  private Symbol unknownCharClass(Symbol ch) {
+<span class="nc bnc" id="L239" title="All 2 branches missed.">    if (useUnknownCharacterModel) {</span>
+<span class="nc" id="L240">      return new Symbol(Character.toString(RadicalMap.getRadical(ch.getCh()))).intern();</span>
+    } else {
+<span class="nc" id="L242">      return Symbol.UNKNOWN;</span>
+    }
+  }
+
+  @Override
+  public float score(IntTaggedWord iTW, int loc, String word, String featureSpec) {
+<span class="nc" id="L248">    String tag = tagIndex.get(iTW.tag);</span>
+<span class="nc bnc" id="L249" title="All 4 branches missed.">    assert !word.equals(BOUNDARY);</span>
+<span class="nc" id="L250">    char[] chars = word.toCharArray();</span>
+<span class="nc" id="L251">    List&lt;Serializable&gt; charList = new ArrayList&lt;&gt;(chars.length + CONTEXT_LENGTH + 1); // this starts of storing Symbol's and then starts storing String's. Clean this up someday!</span>
+
+    // charList is constructed backward
+    // END_WORD char[length-1] char[length-2] ... char[0] BEGIN_WORD BEGIN_WORD
+<span class="nc" id="L255">    charList.add(Symbol.END_WORD);</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">    for (int i = chars.length - 1; i &gt;= 0; i--) {</span>
+<span class="nc" id="L257">      Symbol ch = Symbol.cannonicalSymbol(chars[i]);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">      if (knownChars.contains(ch)) {</span>
+<span class="nc" id="L259">        charList.add(ch);</span>
+      } else {
+<span class="nc" id="L261">        charList.add(unknownCharClass(ch));</span>
+      }
+    }
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    for (int i = 0; i &lt; CONTEXT_LENGTH; i++) {</span>
+<span class="nc" id="L265">      charList.add(Symbol.BEGIN_WORD);</span>
+    }
+
+<span class="nc" id="L268">    double score = 0.0;</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    for (int i = 0, size = charList.size(); i &lt; size - CONTEXT_LENGTH; i++) {</span>
+<span class="nc" id="L270">      Symbol nextChar = (Symbol) charList.get(i);</span>
+<span class="nc" id="L271">      charList.set(i, tag);</span>
+<span class="nc" id="L272">      double charScore = getBackedOffDist(charList.subList(i, i + CONTEXT_LENGTH + 1)).probabilityOf(nextChar);</span>
+<span class="nc" id="L273">      score += Math.log(charScore);</span>
+    }
+
+<span class="nc bnc" id="L276" title="All 4 branches missed.">    switch (penaltyType) {</span>
+      case 0:
+<span class="nc" id="L278">        break;</span>
+
+      case 1:
+<span class="nc" id="L281">        score -= (chars.length * (chars.length + 1)) * (lengthPenalty / 2);</span>
+<span class="nc" id="L282">        break;</span>
+
+      case 2:
+<span class="nc" id="L285">        score -= (chars.length - 1) * lengthPenalty;</span>
+        break;
+    }
+<span class="nc" id="L288">    return (float) score;</span>
+  }
+
+
+  // this is where we do backing off for unseen contexts
+  // (backing off for rarely seen contexts is done implicitly
+  // because the distributions are smoothed)
+  private Distribution&lt;Symbol&gt; getBackedOffDist(List&lt;Serializable&gt; context) {
+    // context contains [tag prevChar prevPrevChar]
+<span class="nc bnc" id="L297" title="All 2 branches missed.">    for (int i = CONTEXT_LENGTH + 1; i &gt;= 0; i--) {</span>
+<span class="nc" id="L298">      List&lt;Serializable&gt; l = context.subList(0, i);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      if (charDistributions.containsKey(l)) {</span>
+<span class="nc" id="L300">        return charDistributions.get(l);</span>
+      }
+    }
+<span class="nc" id="L303">    throw new RuntimeException(&quot;OOPS... no prior distribution...?&quot;);</span>
+  }
+
+  /**
+   * Samples from the distribution over words with this POS according to the lexicon.
+   *
+   * @param tag the POS of the word to sample
+   * @return a sampled word
+   */
+  public String sampleFrom(String tag) {
+<span class="nc" id="L313">    StringBuilder buf = new StringBuilder();</span>
+<span class="nc" id="L314">    List&lt;Serializable&gt; context = new ArrayList&lt;&gt;(CONTEXT_LENGTH + 1);</span>
+
+    // context must contain [tag prevChar prevPrevChar]
+<span class="nc" id="L317">    context.add(tag);</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">    for (int i = 0; i &lt; CONTEXT_LENGTH; i++) {</span>
+<span class="nc" id="L319">      context.add(Symbol.BEGIN_WORD);</span>
+    }
+<span class="nc" id="L321">    Distribution&lt;Symbol&gt; d = getBackedOffDist(context);</span>
+<span class="nc" id="L322">    Symbol gen = d.sampleFrom();</span>
+    genLoop:
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    while (gen != Symbol.END_WORD) {</span>
+<span class="nc" id="L325">      buf.append(gen.getCh());</span>
+<span class="nc bnc" id="L326" title="All 3 branches missed.">      switch (penaltyType) {</span>
+        case 1:
+<span class="nc bnc" id="L328" title="All 2 branches missed.">          if (Math.random() &gt; Math.pow(lengthPenalty, buf.length())) {</span>
+<span class="nc" id="L329">            break genLoop;</span>
+          }
+          break;
+        case 2:
+<span class="nc bnc" id="L333" title="All 2 branches missed.">          if (Math.random() &gt; lengthPenalty) {</span>
+<span class="nc" id="L334">            break genLoop;</span>
+          }
+          break;
+      }
+<span class="nc bnc" id="L338" title="All 2 branches missed.">      for (int i = 1; i &lt; CONTEXT_LENGTH; i++) {</span>
+<span class="nc" id="L339">        context.set(i + 1, context.get(i));</span>
+      }
+<span class="nc" id="L341">      context.set(1, gen);</span>
+<span class="nc" id="L342">      d = getBackedOffDist(context);</span>
+<span class="nc" id="L343">      gen = d.sampleFrom();</span>
+    }
+
+<span class="nc" id="L346">    return buf.toString();</span>
+  }
+
+  /**
+   * Samples over words regardless of POS: first samples POS, then samples
+   * word according to that POS
+   *
+   * @return a sampled word
+   */
+  public String sampleFrom() {
+<span class="nc" id="L356">    String POS = POSDistribution.sampleFrom();</span>
+<span class="nc" id="L357">    return sampleFrom(POS);</span>
+  }
+
+  // don't think this should be used, but just in case...
+  @Override
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(int word, int loc, String featureSpec) {
+<span class="nc" id="L363">    throw new UnsupportedOperationException(&quot;ChineseCharacterBasedLexicon has no rule iterator!&quot;);</span>
+  }
+
+  // don't think this should be used, but just in case...
+  @Override
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(String word, int loc, String featureSpec) {
+<span class="nc" id="L369">    throw new UnsupportedOperationException(&quot;ChineseCharacterBasedLexicon has no rule iterator!&quot;);</span>
+  }
+
+  /** Returns the number of rules (tag rewrites as word) in the Lexicon.
+   *  This method isn't yet implemented in this class.
+   *  It currently just returns 0, which may or may not be helpful.
+   */
+  @Override
+  public int numRules() {
+<span class="nc" id="L378">    return 0;</span>
+  }
+
+  private Distribution&lt;Integer&gt; getWordLengthDistribution() {
+<span class="nc" id="L382">    int samples = 0;</span>
+<span class="nc" id="L383">    ClassicCounter&lt;Integer&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">    while (samples++ &lt; 10000) {</span>
+<span class="nc" id="L385">      String s = sampleFrom();</span>
+<span class="nc" id="L386">      c.incrementCount(Integer.valueOf(s.length()));</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">      if (samples % 1000 == 0) {</span>
+<span class="nc" id="L388">        System.out.print(&quot;.&quot;);</span>
+      }
+<span class="nc" id="L390">    }</span>
+<span class="nc" id="L391">    System.out.println();</span>
+<span class="nc" id="L392">    Distribution&lt;Integer&gt; genWordLengthDist = Distribution.getDistribution(c);</span>
+<span class="nc" id="L393">    return genWordLengthDist;</span>
+  }
+
+  @Override
+  public void readData(BufferedReader in) throws IOException {
+<span class="nc" id="L398">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public void writeData(Writer w) throws IOException {
+<span class="nc" id="L403">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public boolean isKnown(int word) {
+<span class="nc" id="L408">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public boolean isKnown(String word) {
+<span class="nc" id="L413">    throw new UnsupportedOperationException();</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;String&gt; tagSet(Function&lt;String,String&gt; basicCategoryFunction) {
+<span class="nc" id="L419">    Set&lt;String&gt; tagSet = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">    for (String tag : tagIndex.objectsList()) {</span>
+<span class="nc" id="L421">      tagSet.add(basicCategoryFunction.apply(tag));</span>
+<span class="nc" id="L422">    }</span>
+<span class="nc" id="L423">    return tagSet;</span>
+  }
+
+
+<span class="nc bnc" id="L427" title="All 2 branches missed.">  static class Symbol implements Serializable {</span>
+    private static final int UNKNOWN_TYPE = 0;
+    private static final int DIGIT_TYPE = 1;
+    private static final int LETTER_TYPE = 2;
+    private static final int BEGIN_WORD_TYPE = 3;
+    private static final int END_WORD_TYPE = 4;
+    private static final int CHAR_TYPE = 5;
+    private static final int UNK_CLASS_TYPE = 6;
+
+    private char ch;
+    private String unkClass;
+
+    int type;
+
+<span class="nc" id="L441">    public static final Symbol UNKNOWN = new Symbol(UNKNOWN_TYPE);</span>
+<span class="nc" id="L442">    public static final Symbol DIGIT = new Symbol(DIGIT_TYPE);</span>
+<span class="nc" id="L443">    public static final Symbol LETTER = new Symbol(LETTER_TYPE);</span>
+<span class="nc" id="L444">    public static final Symbol BEGIN_WORD = new Symbol(BEGIN_WORD_TYPE);</span>
+<span class="nc" id="L445">    public static final Symbol END_WORD = new Symbol(END_WORD_TYPE);</span>
+
+<span class="nc" id="L447">    public static final Interner&lt;Symbol&gt; interner = new Interner&lt;&gt;();</span>
+
+<span class="nc" id="L449">    public Symbol(char ch) {</span>
+<span class="nc" id="L450">      type = CHAR_TYPE;</span>
+<span class="nc" id="L451">      this.ch = ch;</span>
+<span class="nc" id="L452">    }</span>
+
+<span class="nc" id="L454">    public Symbol(String unkClass) {</span>
+<span class="nc" id="L455">      type = UNK_CLASS_TYPE;</span>
+<span class="nc" id="L456">      this.unkClass = unkClass;</span>
+<span class="nc" id="L457">    }</span>
+
+<span class="nc" id="L459">    public Symbol(int type) {</span>
+<span class="nc bnc" id="L460" title="All 4 branches missed.">      assert type != CHAR_TYPE;</span>
+<span class="nc" id="L461">      this.type = type;</span>
+<span class="nc" id="L462">    }</span>
+
+    public static Symbol cannonicalSymbol(char ch) {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">      if (Character.isDigit(ch)) {</span>
+<span class="nc" id="L466">        return DIGIT; //{ Digits.add(new Character(ch)); return DIGIT; }</span>
+      }
+
+<span class="nc bnc" id="L469" title="All 4 branches missed.">      if (Character.getNumericValue(ch) &gt;= 10 &amp;&amp; Character.getNumericValue(ch) &lt;= 35) {</span>
+<span class="nc" id="L470">        return LETTER; //{ Letters.add(new Character(ch)); return LETTER; }</span>
+      }
+
+<span class="nc" id="L473">      return new Symbol(ch);</span>
+    }
+
+    public char getCh() {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">      if (type == CHAR_TYPE) {</span>
+<span class="nc" id="L478">        return ch;</span>
+      } else {
+<span class="nc" id="L480">        return '*';</span>
+      }
+    }
+
+    public Symbol intern() {
+<span class="nc" id="L485">      return interner.intern(this);</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc bnc" id="L490" title="All 2 branches missed.">      if (type == CHAR_TYPE) {</span>
+<span class="nc" id="L491">        return &quot;[u&quot; + (int) ch + &quot;]&quot;;</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">      } else if (type == UNK_CLASS_TYPE) {</span>
+<span class="nc" id="L493">        return &quot;UNK:&quot; + unkClass;</span>
+      } else {
+<span class="nc" id="L495">        return Integer.toString(type);</span>
+      }
+    }
+
+    protected Object readResolve() throws ObjectStreamException {
+<span class="nc bnc" id="L500" title="All 8 branches missed.">      switch (type) {</span>
+        case CHAR_TYPE:
+<span class="nc" id="L502">          return intern();</span>
+        case UNK_CLASS_TYPE:
+<span class="nc" id="L504">          return intern();</span>
+        case UNKNOWN_TYPE:
+<span class="nc" id="L506">          return UNKNOWN;</span>
+        case DIGIT_TYPE:
+<span class="nc" id="L508">          return DIGIT;</span>
+        case LETTER_TYPE:
+<span class="nc" id="L510">          return LETTER;</span>
+        case BEGIN_WORD_TYPE:
+<span class="nc" id="L512">          return BEGIN_WORD;</span>
+        case END_WORD_TYPE:
+<span class="nc" id="L514">          return END_WORD;</span>
+        default: // impossible...
+<span class="nc" id="L516">          throw new InvalidObjectException(&quot;ILLEGAL VALUE IN SERIALIZED SYMBOL&quot;);</span>
+      }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L522" title="All 2 branches missed.">      if (this == o) {</span>
+<span class="nc" id="L523">        return true;</span>
+      }
+<span class="nc bnc" id="L525" title="All 2 branches missed.">      if (!(o instanceof Symbol)) {</span>
+<span class="nc" id="L526">        return false;</span>
+      }
+
+<span class="nc" id="L529">      final Symbol symbol = (Symbol) o;</span>
+
+<span class="nc bnc" id="L531" title="All 2 branches missed.">      if (ch != symbol.ch) {</span>
+<span class="nc" id="L532">        return false;</span>
+      }
+<span class="nc bnc" id="L534" title="All 2 branches missed.">      if (type != symbol.type) {</span>
+<span class="nc" id="L535">        return false;</span>
+      }
+<span class="nc bnc" id="L537" title="All 6 branches missed.">      if (unkClass != null ? !unkClass.equals(symbol.unkClass) : symbol.unkClass != null) {</span>
+<span class="nc" id="L538">        return false;</span>
+      }
+
+<span class="nc" id="L541">      return true;</span>
+    }
+
+    @Override
+    public int hashCode() {
+      int result;
+<span class="nc" id="L547">      result = ch;</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      result = 29 * result + (unkClass != null ? unkClass.hashCode() : 0);</span>
+<span class="nc" id="L549">      result = 29 * result + type;</span>
+<span class="nc" id="L550">      return result;</span>
+    }
+
+    private static final long serialVersionUID = 8925032621317022510L;
+
+  } // end class Symbol
+
+  private static final long serialVersionUID = -5357655683145854069L;
+
+  @Override
+  public UnknownWordModel getUnknownWordModel() {
+    // TODO Auto-generated method stub
+<span class="nc" id="L562">    return null;</span>
+  }
+
+  @Override
+  public void setUnknownWordModel(UnknownWordModel uwm) {
+    // TODO Auto-generated method stub
+
+<span class="nc" id="L569">  }</span>
+
+  @Override
+  public void train(Collection&lt;Tree&gt; trees, Collection&lt;Tree&gt; rawTrees) {
+<span class="nc" id="L573">    train(trees);</span>
+<span class="nc" id="L574">  }</span>
+
+} // end class ChineseCharacterBasedLexicon
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

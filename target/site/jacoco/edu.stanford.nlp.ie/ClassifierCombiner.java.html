@@ -1,0 +1,652 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClassifierCombiner.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">ClassifierCombiner.java</span></div><h1>ClassifierCombiner.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ie.crf.CRFClassifier;
+import edu.stanford.nlp.ie.ner.CMMClassifier;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.pipeline.DefaultPaths;
+import edu.stanford.nlp.sequences.DocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.ErasureUtils;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.PropertiesUtils;
+
+/**
+ * Merges the outputs of two or more AbstractSequenceClassifiers according to
+ * a simple precedence scheme: any given base classifier contributes only
+ * classifications of labels that do not exist in the base classifiers specified
+ * before, and that do not have any token overlap with labels assigned by
+ * higher priority classifiers.
+ * &lt;p&gt;
+ * This is a pure AbstractSequenceClassifier, i.e., it sets the AnswerAnnotation label.
+ * If you work with NER classifiers, you should use NERClassifierCombiner. This class
+ * inherits from ClassifierCombiner, and takes care that all AnswerAnnotations are also
+ * copied to NERAnnotation.
+ * &lt;p&gt;
+ * You can specify up to 10 base classifiers using the -loadClassifier1 to -loadClassifier10
+ * properties. We also maintain the older usage when only two base classifiers were accepted,
+ * specified using -loadClassifier and -loadAuxClassifier.
+ * &lt;p&gt;
+ * ms 2009: removed all NER functionality (see NERClassifierCombiner), changed code so it
+ * accepts an arbitrary number of base classifiers, removed dead code.
+ *
+ * @author Chris Cox
+ * @author Mihai Surdeanu
+ */
+<span class="pc bpc" id="L56" title="1 of 2 branches missed.">public class ClassifierCombiner&lt;IN extends CoreMap &amp; HasWord&gt; extends AbstractSequenceClassifier&lt;IN&gt;  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L59">  private static Redwood.RedwoodChannels log = Redwood.channels(ClassifierCombiner.class);</span>
+
+  private static final boolean DEBUG = false;
+
+  private List&lt;AbstractSequenceClassifier&lt;IN&gt;&gt; baseClassifiers;
+
+  /**
+   * NORMAL means that if one classifier uses PERSON, later classifiers can't also add PERSON, for example. &lt;br&gt;
+   * HIGH_RECALL allows later models do set PERSON as long as it doesn't clobber existing annotations.
+   */
+<span class="pc" id="L69">  enum CombinationMode {</span>
+<span class="fc" id="L70">    NORMAL, HIGH_RECALL</span>
+  }
+
+<span class="fc" id="L73">  static final CombinationMode DEFAULT_COMBINATION_MODE = CombinationMode.NORMAL;</span>
+  static final String COMBINATION_MODE_PROPERTY = &quot;ner.combinationMode&quot;;
+  final CombinationMode combinationMode;
+
+  // keep track of properties used to initialize
+  public Properties initProps;
+  // keep track of paths used to load CRFs
+<span class="nc" id="L80">  private List&lt;String&gt; initLoadPaths = new ArrayList&lt;&gt;();</span>
+
+  /**
+   * @param p Properties File that specifies &lt;code&gt;loadClassifier&lt;/code&gt;
+   * and &lt;code&gt;loadAuxClassifier&lt;/code&gt; properties or, alternatively, &lt;code&gt;loadClassifier[1-10]&lt;/code&gt; properties.
+   * @throws FileNotFoundException If classifier files not found
+   */
+  public ClassifierCombiner(Properties p) throws IOException {
+<span class="nc" id="L88">    super(p);</span>
+<span class="nc" id="L89">    this.combinationMode = extractCombinationModeSafe(p);</span>
+    String loadPath1, loadPath2;
+<span class="nc" id="L91">    List&lt;String&gt; paths = new ArrayList&lt;&gt;();</span>
+
+    //
+    // preferred configuration: specify up to 10 base classifiers using loadClassifier1 to loadClassifier10 properties
+    //
+<span class="nc bnc" id="L96" title="All 4 branches missed.">    if((loadPath1 = p.getProperty(&quot;loadClassifier1&quot;)) != null &amp;&amp; (loadPath2 = p.getProperty(&quot;loadClassifier2&quot;)) != null) {</span>
+<span class="nc" id="L97">      paths.add(loadPath1);</span>
+<span class="nc" id="L98">      paths.add(loadPath2);</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">      for(int i = 3; i &lt;= 10; i ++){</span>
+        String path;
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        if ((path = p.getProperty(&quot;loadClassifier&quot; + i)) != null) {</span>
+<span class="nc" id="L102">          paths.add(path);</span>
+        }
+      }
+<span class="nc" id="L105">      loadClassifiers(p, paths);</span>
+    }
+
+    //
+    // second accepted setup (backward compatible): two classifier given in loadClassifier and loadAuxClassifier
+    //
+<span class="nc bnc" id="L111" title="All 4 branches missed.">    else if((loadPath1 = p.getProperty(&quot;loadClassifier&quot;)) != null &amp;&amp; (loadPath2 = p.getProperty(&quot;loadAuxClassifier&quot;)) != null){</span>
+<span class="nc" id="L112">      paths.add(loadPath1);</span>
+<span class="nc" id="L113">      paths.add(loadPath2);</span>
+<span class="nc" id="L114">      loadClassifiers(p, paths);</span>
+    }
+
+    //
+    // fall back strategy: use the two default paths on NLP machines
+    //
+    else {
+<span class="nc" id="L121">      paths.add(DefaultPaths.DEFAULT_NER_THREECLASS_MODEL);</span>
+<span class="nc" id="L122">      paths.add(DefaultPaths.DEFAULT_NER_MUC_MODEL);</span>
+<span class="nc" id="L123">      loadClassifiers(p, paths);</span>
+    }
+<span class="nc" id="L125">    this.initLoadPaths = new ArrayList&lt;&gt;(paths);</span>
+<span class="nc" id="L126">    this.initProps = p;</span>
+<span class="nc" id="L127">  }</span>
+
+  /** Loads a series of base classifiers from the paths specified using the
+   *  Properties specified.
+   *
+   *  @param props Properties for the classifier to use (encodings, output format, etc.)
+   *  @param combinationMode How to handle multiple classifiers specifying the same entity type
+   *  @param loadPaths Paths to the base classifiers
+   *  @throws IOException If IO errors in loading classifier files
+   */
+  public ClassifierCombiner(Properties props, CombinationMode combinationMode, String... loadPaths) throws IOException {
+<span class="nc" id="L138">    super(props);</span>
+<span class="nc" id="L139">    this.combinationMode = combinationMode;</span>
+<span class="nc" id="L140">    List&lt;String&gt; paths = new ArrayList&lt;&gt;(Arrays.asList(loadPaths));</span>
+<span class="nc" id="L141">    loadClassifiers(props, paths);</span>
+<span class="nc" id="L142">    this.initLoadPaths = new ArrayList&lt;&gt;(paths);</span>
+<span class="nc" id="L143">    this.initProps = props;</span>
+<span class="nc" id="L144">  }</span>
+
+  /** Loads a series of base classifiers from the paths specified using the
+   *  Properties specified.
+   *
+   *  @param combinationMode How to handle multiple classifiers specifying the same entity type
+   *  @param loadPaths Paths to the base classifiers
+   *  @throws IOException If IO errors in loading classifier files
+   */
+  public ClassifierCombiner(CombinationMode combinationMode, String... loadPaths) throws IOException {
+<span class="nc" id="L154">    this(new Properties(), combinationMode, loadPaths);</span>
+<span class="nc" id="L155">  }</span>
+
+  /** Loads a series of base classifiers from the paths specified.
+   *
+   * @param loadPaths Paths to the base classifiers
+   * @throws FileNotFoundException If classifier files not found
+   */
+  public ClassifierCombiner(String... loadPaths) throws IOException {
+<span class="nc" id="L163">    this(DEFAULT_COMBINATION_MODE, loadPaths);</span>
+<span class="nc" id="L164">  }</span>
+
+
+  /** Combines a series of base classifiers.
+   *
+   * @param classifiers The base classifiers
+   */
+  @SafeVarargs
+  public ClassifierCombiner(AbstractSequenceClassifier&lt;IN&gt;... classifiers) {
+<span class="nc" id="L173">    super(new Properties());</span>
+<span class="nc" id="L174">    this.combinationMode = DEFAULT_COMBINATION_MODE;</span>
+<span class="nc" id="L175">    baseClassifiers = new ArrayList&lt;&gt;(Arrays.asList(classifiers));</span>
+<span class="nc" id="L176">    flags.backgroundSymbol = baseClassifiers.get(0).flags.backgroundSymbol;</span>
+<span class="nc" id="L177">    this.initProps = new Properties();</span>
+<span class="nc" id="L178">  }</span>
+
+  // constructor for building a ClassifierCombiner from an ObjectInputStream
+  public ClassifierCombiner(ObjectInputStream ois, Properties props) throws IOException, ClassNotFoundException, ClassCastException {
+    // read the initial Properties out of the ObjectInputStream so you can properly start the AbstractSequenceClassifier
+    // note now we load in props from command line and overwrite any that are given for command line
+<span class="nc" id="L184">    super(PropertiesUtils.overWriteProperties((Properties) ois.readObject(),props));</span>
+    // read another copy of initProps that I have helpfully included
+    // TODO: probably set initProps in AbstractSequenceClassifier to avoid this writing twice thing, its hacky
+<span class="nc" id="L187">    this.initProps = PropertiesUtils.overWriteProperties((Properties) ois.readObject(),props);</span>
+    // read the initLoadPaths
+<span class="nc" id="L189">    this.initLoadPaths = (ArrayList&lt;String&gt;) ois.readObject();</span>
+    // read the combinationMode from the serialized version
+<span class="nc" id="L191">    String cm = (String) ois.readObject();</span>
+    // see if there is a commandline override for the combinationMode, else set newCM to the serialized version
+    CombinationMode newCM;
+<span class="nc bnc" id="L194" title="All 2 branches missed.">    if (props.getProperty(&quot;ner.combinationMode&quot;) != null) {</span>
+      // there is a possible commandline override, have to see if its valid
+      try {
+        // see if the commandline has a proper value
+<span class="nc" id="L198">        newCM = CombinationMode.valueOf(props.getProperty(&quot;ner.combinationMode&quot;));</span>
+<span class="nc" id="L199">      } catch (IllegalArgumentException e) {</span>
+        // the commandline override did not have a proper value, so just use the serialized version
+<span class="nc" id="L201">        newCM = CombinationMode.valueOf(cm);</span>
+<span class="nc" id="L202">      }</span>
+    } else {
+      // there was no commandline override given, so just use the serialized version
+<span class="nc" id="L205">      newCM = CombinationMode.valueOf(cm);</span>
+    }
+<span class="nc" id="L207">    this.combinationMode = newCM;</span>
+    // read in the base classifiers
+<span class="nc" id="L209">    Integer numClassifiers = ois.readInt();</span>
+    // set up the list of base classifiers
+<span class="nc" id="L211">    this.baseClassifiers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L212">    int i = 0;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    while (i &lt; numClassifiers) {</span>
+      try {
+<span class="nc" id="L215">        log.info(&quot;loading CRF...&quot;);</span>
+<span class="nc" id="L216">        CRFClassifier newCRF = ErasureUtils.uncheckedCast(CRFClassifier.getClassifier(ois, props));</span>
+<span class="nc" id="L217">        baseClassifiers.add(newCRF);</span>
+<span class="nc" id="L218">        i++;</span>
+<span class="nc" id="L219">      } catch (Exception e) {</span>
+        try {
+<span class="nc" id="L221">          log.info(&quot;loading CMM...&quot;);</span>
+<span class="nc" id="L222">          CMMClassifier newCMM = ErasureUtils.uncheckedCast(CMMClassifier.getClassifier(ois, props));</span>
+<span class="nc" id="L223">          baseClassifiers.add(newCMM);</span>
+<span class="nc" id="L224">          i++;</span>
+<span class="nc" id="L225">        } catch (Exception ex) {</span>
+<span class="nc" id="L226">          ex.printStackTrace();</span>
+<span class="nc" id="L227">          throw new IOException(&quot;Couldn't load classifier!&quot;);</span>
+<span class="nc" id="L228">        }</span>
+<span class="nc" id="L229">      }</span>
+    }
+<span class="nc" id="L231">  }</span>
+
+  /**
+   * Either finds COMBINATION_MODE_PROPERTY or returns a default value
+   */
+  public static CombinationMode extractCombinationMode(Properties p) {
+<span class="nc" id="L237">    String mode = p.getProperty(COMBINATION_MODE_PROPERTY);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (mode == null) {</span>
+<span class="nc" id="L239">      return DEFAULT_COMBINATION_MODE;</span>
+    } else {
+<span class="nc" id="L241">      return CombinationMode.valueOf(mode.toUpperCase());</span>
+    }
+  }
+
+  /**
+   * Either finds COMBINATION_MODE_PROPERTY or returns a default
+   * value.  If the value is not a legal value, a warning is printed.
+   */
+  public static CombinationMode extractCombinationModeSafe(Properties p) {
+    try {
+<span class="nc" id="L251">      return extractCombinationMode(p);</span>
+<span class="nc" id="L252">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L253">      log.info(&quot;Illegal value of &quot; + COMBINATION_MODE_PROPERTY + &quot;: &quot; + p.getProperty(COMBINATION_MODE_PROPERTY));</span>
+<span class="nc" id="L254">      log.info(&quot;  Legal values:&quot;);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">      for (CombinationMode mode : CombinationMode.values()) {</span>
+<span class="nc" id="L256">        log.info(&quot;  &quot; + mode);</span>
+      }
+<span class="nc" id="L258">      log.info();</span>
+<span class="nc" id="L259">      return CombinationMode.NORMAL;</span>
+    }
+  }
+
+  private void loadClassifiers(Properties props, List&lt;String&gt; paths) throws IOException {
+<span class="nc" id="L264">    baseClassifiers = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    for(String path: paths){</span>
+<span class="nc" id="L266">      AbstractSequenceClassifier&lt;IN&gt; cls = loadClassifierFromPath(props, path);</span>
+<span class="nc" id="L267">      baseClassifiers.add(cls);</span>
+      if(DEBUG){
+        System.err.printf(&quot;Successfully loaded classifier #%d from %s.%n&quot;, baseClassifiers.size(), path);
+      }
+<span class="nc" id="L271">    }</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    if (baseClassifiers.size() &gt; 0) {</span>
+<span class="nc" id="L273">      flags.backgroundSymbol = baseClassifiers.get(0).flags.backgroundSymbol;</span>
+    }
+<span class="nc" id="L275">  }</span>
+
+
+  public static &lt;INN extends CoreMap &amp; HasWord&gt; AbstractSequenceClassifier&lt;INN&gt; loadClassifierFromPath(Properties props, String path)
+      throws IOException {
+    //try loading as a CRFClassifier
+    try {
+<span class="nc" id="L282">      return ErasureUtils.uncheckedCast(CRFClassifier.getClassifier(path, props));</span>
+<span class="nc" id="L283">    } catch (Exception e) {</span>
+<span class="nc" id="L284">      e.printStackTrace();</span>
+    }
+    //try loading as a CMMClassifier
+    try {
+<span class="nc" id="L288">      return ErasureUtils.uncheckedCast(CMMClassifier.getClassifier(path));</span>
+<span class="nc" id="L289">    } catch (Exception e) {</span>
+      //fail
+      //log.info(&quot;Couldn't load classifier from path :&quot;+path);
+<span class="nc" id="L292">      throw new IOException(&quot;Couldn't load classifier from &quot; + path, e);</span>
+    }
+  }
+
+  @Override
+  public Set&lt;String&gt; labels() {
+<span class="nc" id="L298">    Set&lt;String&gt; labs = Generics.newHashSet();</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">    for(AbstractSequenceClassifier&lt;? extends CoreMap&gt; cls: baseClassifiers)</span>
+<span class="nc" id="L300">      labs.addAll(cls.labels());</span>
+<span class="nc" id="L301">    return labs;</span>
+  }
+
+
+  /**
+   * Reads the Answer annotations in the given labellings (produced by the base models)
+   *   and combines them using a priority ordering, i.e., for a given baseDocument all
+   *   labellings seen before in the baseDocuments list have higher priority.
+   *   Writes the answer to AnswerAnnotation in the labeling at position 0
+   *   (considered to be the main document).
+   *
+   *  @param baseDocuments Results of all base AbstractSequenceClassifier models
+   *  @return A List of IN with the combined annotations.  (This is an
+   *     updating of baseDocuments.get(0), not a new List.)
+   */
+  private List&lt;IN&gt; mergeDocuments(List&lt;List&lt;IN&gt;&gt; baseDocuments){
+    // we should only get here if there is something to merge
+<span class="nc bnc" id="L318" title="All 6 branches missed.">    assert(! baseClassifiers.isEmpty() &amp;&amp; ! baseDocuments.isEmpty());</span>
+    // all base outputs MUST have the same length (we generated them internally!)
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    for(int i = 1; i &lt; baseDocuments.size(); i ++)</span>
+<span class="nc bnc" id="L321" title="All 4 branches missed.">      assert(baseDocuments.get(0).size() == baseDocuments.get(i).size());</span>
+
+<span class="nc" id="L323">    String background = baseClassifiers.get(0).flags.backgroundSymbol;</span>
+
+    // baseLabels.get(i) points to the labels assigned by baseClassifiers.get(i)
+<span class="nc" id="L326">    List&lt;Set&lt;String&gt;&gt; baseLabels = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L327">    Set&lt;String&gt; seenLabels = Generics.newHashSet();</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    for (AbstractSequenceClassifier&lt;? extends CoreMap&gt; baseClassifier : baseClassifiers) {</span>
+<span class="nc" id="L329">      Set&lt;String&gt; labs = baseClassifier.labels();</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">      if (combinationMode != CombinationMode.HIGH_RECALL) {</span>
+<span class="nc" id="L331">        labs.removeAll(seenLabels);</span>
+      } else {
+<span class="nc" id="L333">        labs.remove(baseClassifier.flags.backgroundSymbol);</span>
+<span class="nc" id="L334">        labs.remove(background);</span>
+      }
+<span class="nc" id="L336">      seenLabels.addAll(labs);</span>
+<span class="nc" id="L337">      baseLabels.add(labs);</span>
+<span class="nc" id="L338">    }</span>
+
+    if (DEBUG) {
+      for(int i = 0; i &lt; baseLabels.size(); i ++)
+        log.info(&quot;mergeDocuments: Using classifier #&quot; + i + &quot; for &quot; + baseLabels.get(i));
+      log.info(&quot;mergeDocuments: Background symbol is &quot; + background);
+
+      log.info(&quot;Base model outputs:&quot;);
+      for( int i = 0; i &lt; baseDocuments.size(); i ++){
+        System.err.printf(&quot;Output of model #%d:&quot;, i);
+        for (IN l : baseDocuments.get(i)) {
+          log.info(' ');
+          log.info(l.get(CoreAnnotations.AnswerAnnotation.class));
+        }
+        log.info();
+      }
+    }
+
+    // incrementally merge each additional model with the main model (i.e., baseDocuments.get(0))
+    // this keeps adding labels from the additional models to mainDocument
+    // hence, when all is done, mainDocument contains the labels of all base models
+<span class="nc" id="L359">    List&lt;IN&gt; mainDocument = baseDocuments.get(0);</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">    for (int i = 1; i &lt; baseDocuments.size(); i ++) {</span>
+<span class="nc" id="L361">      mergeTwoDocuments(mainDocument, baseDocuments.get(i), baseLabels.get(i), background);</span>
+    }
+
+    if (DEBUG) {
+      log.info(&quot;Output of combined model:&quot;);
+      for (IN l: mainDocument) {
+        log.info(' ');
+        log.info(l.get(CoreAnnotations.AnswerAnnotation.class));
+      }
+      log.info();
+      log.info();
+    }
+
+<span class="nc" id="L374">    return mainDocument;</span>
+  }
+
+
+  /** This merges in labels from the auxDocument into the mainDocument when
+   *  tokens have one of the labels in auxLabels, and the subsequence
+   *  labeled with this auxLabel does not conflict with any non-background
+   *  labelling in the mainDocument.
+   */
+  static &lt;INN extends CoreMap &amp; HasWord&gt; void mergeTwoDocuments(List&lt;INN&gt; mainDocument, List&lt;INN&gt; auxDocument, Set&lt;String&gt; auxLabels, String background) {
+<span class="fc" id="L384">    boolean insideAuxTag = false;</span>
+<span class="fc" id="L385">    boolean auxTagValid = true;</span>
+<span class="fc" id="L386">    String prevAnswer = background;</span>
+<span class="fc" id="L387">    Collection&lt;INN&gt; constituents = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L389">    Iterator&lt;INN&gt; auxIterator = auxDocument.listIterator();</span>
+
+<span class="fc bfc" id="L391" title="All 2 branches covered.">    for (INN wMain : mainDocument) {</span>
+<span class="fc" id="L392">      String mainAnswer = wMain.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="fc" id="L393">      INN wAux = auxIterator.next();</span>
+<span class="fc" id="L394">      String auxAnswer = wAux.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="fc bfc" id="L395" title="All 2 branches covered.">      boolean insideMainTag = !mainAnswer.equals(background);</span>
+
+      /* if the auxiliary classifier gave it one of the labels unique to
+         auxClassifier, we might set the mainLabel to that. */
+<span class="fc bfc" id="L399" title="All 2 branches covered.">      if (auxLabels.contains(auxAnswer)) {</span>
+<span class="fc bfc" id="L400" title="All 4 branches covered.">        if ( ! prevAnswer.equals(auxAnswer) &amp;&amp; ! prevAnswer.equals(background)) {</span>
+<span class="fc bfc" id="L401" title="All 2 branches covered.">          if (auxTagValid){</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">            for (INN wi : constituents) {</span>
+<span class="fc" id="L403">              wi.set(CoreAnnotations.AnswerAnnotation.class, prevAnswer);</span>
+<span class="fc" id="L404">            }</span>
+          }
+<span class="fc" id="L406">          auxTagValid = true;</span>
+<span class="fc" id="L407">          constituents = new ArrayList&lt;&gt;();</span>
+        }
+<span class="fc" id="L409">        insideAuxTag = true;</span>
+<span class="fc bfc" id="L410" title="All 2 branches covered.">        if (insideMainTag) { auxTagValid = false; }</span>
+<span class="fc" id="L411">        prevAnswer = auxAnswer;</span>
+<span class="fc" id="L412">        constituents.add(wMain);</span>
+      } else {
+<span class="fc bfc" id="L414" title="All 2 branches covered.">        if (insideAuxTag) {</span>
+<span class="fc bfc" id="L415" title="All 2 branches covered.">          if (auxTagValid){</span>
+<span class="fc bfc" id="L416" title="All 2 branches covered.">            for (INN wi : constituents) {</span>
+<span class="fc" id="L417">              wi.set(CoreAnnotations.AnswerAnnotation.class, prevAnswer);</span>
+<span class="fc" id="L418">            }</span>
+          }
+<span class="fc" id="L420">          constituents = new ArrayList&lt;&gt;();</span>
+        }
+<span class="fc" id="L422">        insideAuxTag=false;</span>
+<span class="fc" id="L423">        auxTagValid = true;</span>
+<span class="fc" id="L424">        prevAnswer = background;</span>
+      }
+<span class="fc" id="L426">    }</span>
+    // deal with a sequence final auxLabel
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">    if (auxTagValid){</span>
+<span class="fc bfc" id="L429" title="All 2 branches covered.">      for (INN wi : constituents) {</span>
+<span class="fc" id="L430">        wi.set(CoreAnnotations.AnswerAnnotation.class, prevAnswer);</span>
+<span class="fc" id="L431">      }</span>
+    }
+<span class="fc" id="L433">  }</span>
+
+  /**
+   * Generates the AnswerAnnotation labels of the combined model for the given
+   * tokens, storing them in place in the tokens.
+   *
+   * @param tokens A List of IN
+   * @return The passed in parameters, which will have the AnswerAnnotation field added/overwritten
+   */
+  @Override
+  public List&lt;IN&gt; classify(List&lt;IN&gt; tokens) {
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    if (baseClassifiers.isEmpty()) {</span>
+<span class="nc" id="L445">      return tokens;</span>
+    }
+<span class="nc" id="L447">    List&lt;List&lt;IN&gt;&gt; baseOutputs = new ArrayList&lt;&gt;();</span>
+
+    // the first base model works in place, modifying the original tokens
+<span class="nc" id="L450">    List&lt;IN&gt; output = baseClassifiers.get(0).classifySentence(tokens);</span>
+    // classify(List&lt;IN&gt;) is supposed to work in place, so add AnswerAnnotation to tokens!
+<span class="nc bnc" id="L452" title="All 2 branches missed.">    for (int i = 0, sz = output.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L453">      tokens.get(i).set(CoreAnnotations.AnswerAnnotation.class, output.get(i).get(CoreAnnotations.AnswerAnnotation.class));</span>
+    }
+<span class="nc" id="L455">    baseOutputs.add(tokens);</span>
+
+<span class="nc bnc" id="L457" title="All 2 branches missed.">    for (int i = 1, sz = baseClassifiers.size(); i &lt; sz; i ++) {</span>
+      //List&lt;CoreLabel&gt; copy = deepCopy(tokens);
+      // no need for deep copy: classifySentence creates a copy of the input anyway
+      // List&lt;CoreLabel&gt; copy = tokens;
+<span class="nc" id="L461">      output = baseClassifiers.get(i).classifySentence(tokens);</span>
+<span class="nc" id="L462">      baseOutputs.add(output);</span>
+    }
+<span class="nc bnc" id="L464" title="All 4 branches missed.">    assert(baseOutputs.size() == baseClassifiers.size());</span>
+<span class="nc" id="L465">    List&lt;IN&gt; finalAnswer = mergeDocuments(baseOutputs);</span>
+
+<span class="nc" id="L467">    return finalAnswer;</span>
+  }
+
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  @Override
+  public void train(Collection&lt;List&lt;IN&gt;&gt; docs,
+                    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc" id="L475">    throw new UnsupportedOperationException();</span>
+  }
+
+  // write a ClassifierCombiner to disk, this is based on CRFClassifier code
+  @Override
+  public void serializeClassifier(String serializePath) {
+<span class="nc" id="L481">    log.info(&quot;Serializing classifier to &quot; + serializePath + &quot;...&quot;);</span>
+
+<span class="nc" id="L483">    ObjectOutputStream oos = null;</span>
+    try {
+<span class="nc" id="L485">      oos = IOUtils.writeStreamFromString(serializePath);</span>
+<span class="nc" id="L486">      serializeClassifier(oos);</span>
+<span class="nc" id="L487">      log.info(&quot;done.&quot;);</span>
+
+<span class="nc" id="L489">    } catch (Exception e) {</span>
+<span class="nc" id="L490">      throw new RuntimeIOException(&quot;Failed to save classifier&quot;, e);</span>
+    } finally {
+<span class="nc" id="L492">      IOUtils.closeIgnoringExceptions(oos);</span>
+<span class="nc" id="L493">    }</span>
+<span class="nc" id="L494">  }</span>
+
+  // method for writing a ClassifierCombiner to an ObjectOutputStream
+  public void serializeClassifier(ObjectOutputStream oos) {
+    try {
+      // record the properties used to initialize
+<span class="nc" id="L500">      oos.writeObject(initProps);</span>
+      // this is a bit of a hack, but have to write this twice so you can get it again
+      // after you initialize AbstractSequenceClassifier
+      // basically when this is read from the ObjectInputStream, I read it once to call
+      // super(props) and then I read it again so I can set this.initProps
+      // TODO: probably should have AbstractSequenceClassifier store initProps to get rid of this double writing
+<span class="nc" id="L506">      oos.writeObject(initProps);</span>
+      // record the initial loadPaths
+<span class="nc" id="L508">      oos.writeObject(initLoadPaths);</span>
+      // record the combinationMode
+<span class="nc" id="L510">      String combinationModeString = combinationMode.name();</span>
+<span class="nc" id="L511">      oos.writeObject(combinationModeString);</span>
+      // get the number of classifiers to write to disk
+<span class="nc" id="L513">      Integer numClassifiers = baseClassifiers.size();</span>
+<span class="nc" id="L514">      oos.writeInt(numClassifiers);</span>
+      // go through baseClassifiers and write each one to disk with CRFClassifier's serialize method
+<span class="nc" id="L516">      log.info(&quot;&quot;);</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">      for (AbstractSequenceClassifier&lt;IN&gt; asc : baseClassifiers) {</span>
+        //CRFClassifier crfc = (CRFClassifier) asc;
+        //log.info(&quot;Serializing a base classifier...&quot;);
+<span class="nc" id="L520">        asc.serializeClassifier(oos);</span>
+<span class="nc" id="L521">      }</span>
+<span class="nc" id="L522">    } catch (IOException e) {</span>
+<span class="nc" id="L523">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L524">    }</span>
+<span class="nc" id="L525">  }</span>
+
+  @Override
+  public void loadClassifier(ObjectInputStream in, Properties props) throws IOException, ClassCastException, ClassNotFoundException {
+<span class="nc" id="L529">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public List&lt;IN&gt; classifyWithGlobalInformation(List&lt;IN&gt; tokenSeq, CoreMap doc, CoreMap sent) {
+<span class="nc" id="L534">    return classify(tokenSeq);</span>
+  }
+
+  // static method for getting a ClassifierCombiner from a string path
+  public static ClassifierCombiner getClassifier(String loadPath, Properties props) throws IOException,
+          ClassNotFoundException, ClassCastException {
+<span class="nc" id="L540">    ObjectInputStream ois = IOUtils.readStreamFromString(loadPath);</span>
+<span class="nc" id="L541">    ClassifierCombiner returnCC = getClassifier(ois, props);</span>
+<span class="nc" id="L542">    IOUtils.closeIgnoringExceptions(ois);</span>
+<span class="nc" id="L543">    return returnCC;</span>
+  }
+
+  // static method for getting a ClassifierCombiner from ObjectInputStream
+  public static ClassifierCombiner getClassifier(ObjectInputStream ois, Properties props) throws IOException,
+          ClassCastException, ClassNotFoundException {
+<span class="nc" id="L549">    return new ClassifierCombiner(ois, props);</span>
+  }
+
+  // run a particular CRF of this ClassifierCombiner on a testFile
+  // user can say -crfToExamine 0 to get 1st element or -crfToExamine /edu/stanford/models/muc7.crf.ser.gz
+  // this does not currently support drill down on CMM's
+  public static void examineCRF(ClassifierCombiner cc, String crfNameOrIndex, SeqClassifierFlags flags,
+                                String testFile, String testFiles,
+                                DocumentReaderAndWriter&lt;CoreLabel&gt; readerAndWriter) throws Exception {
+    CRFClassifier&lt;CoreLabel&gt; crf;
+    // potential index into baseClassifiers
+    int ci;
+    // set ci with the following rules
+    // 1. first see if ci is an index into baseClassifiers
+    // 2. if its not an integer or wrong size, see if its a file name of a loadPath
+    try {
+<span class="nc" id="L565">      ci = Integer.parseInt(crfNameOrIndex);</span>
+<span class="nc bnc" id="L566" title="All 4 branches missed.">      if (ci &lt; 0 || ci &gt;= cc.baseClassifiers.size()) {</span>
+        // ci is not an int corresponding to an element in baseClassifiers, see if name of a crf loadPath
+<span class="nc" id="L568">        ci = cc.initLoadPaths.indexOf(crfNameOrIndex);</span>
+      }
+<span class="nc" id="L570">    } catch (NumberFormatException e) {</span>
+      // cannot interpret crfNameOrIndex as an integer, see if name of a crf loadPath
+<span class="nc" id="L572">      ci = cc.initLoadPaths.indexOf(crfNameOrIndex);</span>
+<span class="nc" id="L573">    }</span>
+    // if ci corresponds to an index in baseClassifiers, get the crf at that index, otherwise set crf to null
+<span class="nc bnc" id="L575" title="All 4 branches missed.">    if (ci &gt;= 0 &amp;&amp; ci &lt; cc.baseClassifiers.size()) {</span>
+      // TODO: this will break if baseClassifiers contains something that is not a CRF
+<span class="nc" id="L577">      crf = (CRFClassifier&lt;CoreLabel&gt;) cc.baseClassifiers.get(ci);</span>
+    } else {
+<span class="nc" id="L579">      crf = null;</span>
+    }
+    // if you can get a specific crf, generate the appropriate report, if null do nothing
+<span class="nc bnc" id="L582" title="All 2 branches missed.">    if (crf != null) {</span>
+      // if there is a crf and testFile was set , do the crf stuff for a single testFile
+<span class="nc bnc" id="L584" title="All 2 branches missed.">      if (testFile != null) {</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (flags.searchGraphPrefix != null) {</span>
+<span class="nc" id="L586">          crf.classifyAndWriteViterbiSearchGraph(testFile, flags.searchGraphPrefix, crf.makeReaderAndWriter());</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">        } else if (flags.printFirstOrderProbs) {</span>
+<span class="nc" id="L588">          crf.printFirstOrderProbs(testFile, readerAndWriter);</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        } else if (flags.printFactorTable) {</span>
+<span class="nc" id="L590">          crf.printFactorTable(testFile, readerAndWriter);</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">        } else if (flags.printProbs) {</span>
+<span class="nc" id="L592">          crf.printProbs(testFile, readerAndWriter);</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">        } else if (flags.useKBest) {</span>
+          // TO DO: handle if user doesn't provide kBest
+<span class="nc" id="L595">          int k = flags.kBest;</span>
+<span class="nc" id="L596">          crf.classifyAndWriteAnswersKBest(testFile, k, readerAndWriter);</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">        } else if (flags.printLabelValue) {</span>
+<span class="nc" id="L598">          crf.printLabelInformation(testFile, readerAndWriter);</span>
+        } else {
+          // no crf test flag provided
+<span class="nc" id="L601">          log.info(&quot;Warning: no crf test flag was provided, running classify and write answers&quot;);</span>
+<span class="nc" id="L602">          crf.classifyAndWriteAnswers(testFile,readerAndWriter,true);</span>
+        }
+<span class="nc bnc" id="L604" title="All 2 branches missed.">      } else if (testFiles != null) {</span>
+        // if there is a crf and testFiles was set , do the crf stuff for testFiles
+        // if testFile was set as well, testFile overrides
+<span class="nc" id="L607">        List&lt;File&gt; files = Arrays.asList(testFiles.split(&quot;,&quot;)).stream().map(File::new).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">        if (flags.printProbs) {</span>
+          // there is a crf and printProbs
+<span class="nc" id="L610">          crf.printProbs(files, crf.defaultReaderAndWriter());</span>
+        } else {
+<span class="nc" id="L612">          log.info(&quot;Warning: no crf test flag was provided, running classify files and write answers&quot;);</span>
+<span class="nc" id="L613">          crf.classifyFilesAndWriteAnswers(files, crf.defaultReaderAndWriter(), true);</span>
+        }
+      }
+    }
+<span class="nc" id="L617">  }</span>
+
+  // show some info about a ClassifierCombiner
+  public static void showCCInfo(ClassifierCombiner cc) {
+<span class="nc" id="L621">    log.info(&quot;&quot;);</span>
+<span class="nc" id="L622">    log.info(&quot;classifiers used:&quot;);</span>
+<span class="nc" id="L623">    log.info(&quot;&quot;);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">    if (cc.initLoadPaths.size() == cc.baseClassifiers.size()) {</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">      for (int i = 0 ; i &lt; cc.initLoadPaths.size() ; i++) {</span>
+<span class="nc" id="L626">        log.info(&quot;baseClassifiers index &quot;+i+&quot; : &quot;+cc.initLoadPaths.get(i));</span>
+      }
+    } else {
+<span class="nc bnc" id="L629" title="All 2 branches missed.">      for (int i = 0 ; i &lt; cc.initLoadPaths.size() ; i++) {</span>
+<span class="nc" id="L630">        log.info(&quot;baseClassifiers index &quot;+i);</span>
+      }
+    }
+<span class="nc" id="L633">    log.info(&quot;&quot;);</span>
+<span class="nc" id="L634">    log.info(&quot;combinationMode: &quot;+cc.combinationMode);</span>
+<span class="nc" id="L635">    log.info(&quot;&quot;);</span>
+<span class="nc" id="L636">  }</span>
+
+  /**
+   * Some basic testing of the ClassifierCombiner.
+   *
+   * @param args Command-line arguments as properties: -loadClassifier1 serializedFile -loadClassifier2 serializedFile
+   * @throws Exception If IO or serialization error loading classifiers
+   */
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L645">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L646">    ClassifierCombiner ec = new ClassifierCombiner(props);</span>
+
+<span class="nc" id="L648">    log.info(ec.classifyToString(&quot;Marketing : Sony Hopes to Win Much Bigger Market For Wide Range of Small-Video Products --- By Andrew B. Cohen Staff Reporter of The Wall Street Journal&quot;));</span>
+<span class="nc" id="L649">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

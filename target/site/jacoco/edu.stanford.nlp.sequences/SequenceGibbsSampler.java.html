@@ -1,0 +1,447 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SequenceGibbsSampler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.sequences</a> &gt; <span class="el_source">SequenceGibbsSampler.java</span></div><h1>SequenceGibbsSampler.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.sequences; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+import edu.stanford.nlp.util.concurrent.*;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+
+//debug
+import edu.stanford.nlp.ie.*;
+
+import java.util.*;
+import java.io.PrintStream;
+
+// TODO: change so that it uses the scoresOf() method properly
+
+/**
+ * A Gibbs sampler for sequence models. Given a sequence model implementing the SequenceModel
+ * interface, this class is capable of
+ * sampling sequences from the distribution over sequences that it defines. It can also use
+ * this sampling procedure to find the best sequence.
+ * @author grenager
+ */
+public class SequenceGibbsSampler implements BestSequenceFinder  {
+
+  /** A logger for this class */
+<span class="nc" id="L30">  private static Redwood.RedwoodChannels log = Redwood.channels(SequenceGibbsSampler.class);</span>
+
+  // a random number generator
+<span class="nc" id="L33">  private static Random random = new Random(2147483647L);</span>
+<span class="nc" id="L34">  public static int verbose = 0;</span>
+
+  private List document;
+  private int numSamples;
+  private int sampleInterval;
+<span class="nc" id="L39">  private int speedUpThreshold = -1;</span>
+  private SequenceListener listener;
+  private static final int RANDOM_SAMPLING = 0;
+  private static final int SEQUENTIAL_SAMPLING = 1;
+  private static final int CHROMATIC_SAMPLING = 2;
+
+  //debug
+<span class="nc" id="L46">  EmpiricalNERPriorBIO priorEn, priorCh = null;</span>
+
+
+<span class="nc" id="L49">  public boolean returnLastFoundSequence = false;</span>
+  private int samplingStyle;
+  // determines how many parallel threads to run in chromatic sampling
+  private int chromaticSize;
+  private List&lt;List&lt;Integer&gt;&gt; partition;
+
+  public static int[] copy(int[] a) {
+<span class="nc" id="L56">    int[] result = new int[a.length];</span>
+<span class="nc" id="L57">    System.arraycopy(a, 0, result, 0, a.length);</span>
+<span class="nc" id="L58">    return result;</span>
+  }
+
+  public static int[] getRandomSequence(SequenceModel model) {
+<span class="nc" id="L62">    int[] result = new int[model.length()];</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">    for (int i = 0; i &lt; result.length; i++) {</span>
+<span class="nc" id="L64">      int[] classes = model.getPossibleValues(i);</span>
+<span class="nc" id="L65">      result[i] = classes[random.nextInt(classes.length)];</span>
+    }
+<span class="nc" id="L67">    return result;</span>
+  }
+
+  /**
+   * Finds the best sequence by collecting numSamples samples, scoring them, and then choosing
+   * the highest scoring sample.
+   * @return the array of type int representing the highest scoring sequence
+   */
+  public int[] bestSequence(SequenceModel model) {
+<span class="nc" id="L76">    int[] initialSequence = getRandomSequence(model);</span>
+<span class="nc" id="L77">    return findBestUsingSampling(model, numSamples, sampleInterval, initialSequence);</span>
+  }
+
+  /**
+   * Finds the best sequence by collecting numSamples samples, scoring them, and then choosing
+   * the highest scoring sample.
+   * @return the array of type int representing the highest scoring sequence
+   */
+  public int[] findBestUsingSampling(SequenceModel model, int numSamples, int sampleInterval, int[] initialSequence) {
+<span class="nc" id="L86">    List samples = collectSamples(model, numSamples, sampleInterval, initialSequence);</span>
+<span class="nc" id="L87">    int[] best = null;</span>
+<span class="nc" id="L88">    double bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">    for (Object sample : samples) {</span>
+<span class="nc" id="L90">      int[] sequence = (int[]) sample;</span>
+<span class="nc" id="L91">      double score = model.scoreOf(sequence);</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">      if (score &gt; bestScore) {</span>
+<span class="nc" id="L93">        best = sequence;</span>
+<span class="nc" id="L94">        bestScore = score;</span>
+<span class="nc" id="L95">        log.info(&quot;found new best (&quot; + bestScore + &quot;)&quot;);</span>
+<span class="nc" id="L96">        log.info(ArrayMath.toString(best));</span>
+      }
+<span class="nc" id="L98">    }</span>
+<span class="nc" id="L99">    return best;</span>
+  }
+
+  public int[] findBestUsingAnnealing(SequenceModel model, CoolingSchedule schedule) {
+<span class="nc" id="L103">    int[] initialSequence = getRandomSequence(model);</span>
+<span class="nc" id="L104">    return findBestUsingAnnealing(model, schedule, initialSequence);</span>
+  }
+
+  public int[] findBestUsingAnnealing(SequenceModel model, CoolingSchedule schedule, int[] initialSequence) {
+<span class="nc bnc" id="L108" title="All 2 branches missed.">    if (verbose&gt;0) log.info(&quot;Doing annealing&quot;);</span>
+<span class="nc" id="L109">    listener.setInitialSequence(initialSequence);</span>
+<span class="nc" id="L110">    List result = new ArrayList();</span>
+    // so we don't change the initial, or the one we just stored
+<span class="nc" id="L112">    int[] sequence = copy(initialSequence);</span>
+<span class="nc" id="L113">    int[] best = null;</span>
+<span class="nc" id="L114">    double bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L115">    double score = Double.NEGATIVE_INFINITY;</span>
+    // if (!returnLastFoundSequence) {
+    //   score = model.scoreOf(sequence);
+    // }
+
+<span class="nc" id="L120">    Set&lt;Integer&gt; positionsChanged = null;</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">    if (speedUpThreshold &gt; 0)</span>
+<span class="nc" id="L122">      positionsChanged = Generics.newHashSet();</span>
+
+<span class="nc bnc" id="L124" title="All 2 branches missed.">    for (int i=0; i&lt;schedule.numIterations(); i++) {</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">      if (Thread.interrupted()) {  // Allow interrupting the parser</span>
+<span class="nc" id="L126">        throw new RuntimeInterruptedException();</span>
+      }
+<span class="nc" id="L128">      double temperature = schedule.getTemperature(i);</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">      if (speedUpThreshold &lt;= 0) {</span>
+<span class="nc" id="L130">        score = sampleSequenceForward(model, sequence, temperature, null); // modifies tagSequence</span>
+      } else {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (i &lt; speedUpThreshold) {</span>
+<span class="nc" id="L133">          score = sampleSequenceForward(model, sequence, temperature, null); // modifies tagSequence</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">          for (int j = 0; j &lt; sequence.length; j++) {</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (sequence[j] != initialSequence[j])</span>
+<span class="nc" id="L136">              positionsChanged.add(j);</span>
+          }
+        } else {
+<span class="nc" id="L139">          score = sampleSequenceForward(model, sequence, temperature, positionsChanged); // modifies tagSequence</span>
+        }
+      }
+<span class="nc" id="L142">      result.add(sequence);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">      if (returnLastFoundSequence) {</span>
+<span class="nc" id="L144">        best = sequence;</span>
+      } else {
+        // score = model.scoreOf(sequence);
+        //log.info(i+&quot; &quot;+score+&quot; &quot;+Arrays.toString(sequence));
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (score&gt;bestScore) {</span>
+<span class="nc" id="L149">          best = sequence;</span>
+<span class="nc" id="L150">          bestScore = score;</span>
+        }      
+      }
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      if (i % 50 == 0) {</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (verbose &gt; 1) log.info(&quot;itr &quot; + i + &quot;: &quot; + bestScore + &quot;\t&quot;);</span>
+      }
+<span class="nc bnc" id="L156" title="All 2 branches missed.">      if (verbose&gt;0) log.info(&quot;.&quot;);</span>
+    }
+<span class="nc bnc" id="L158" title="All 2 branches missed.">    if (verbose&gt;1) {</span>
+<span class="nc" id="L159">      log.info();</span>
+<span class="nc" id="L160">      printSamples(result, System.err);</span>
+    }
+<span class="nc bnc" id="L162" title="All 2 branches missed.">    if (verbose&gt;0) log.info(&quot;done.&quot;);</span>
+    //return sequence;
+<span class="nc" id="L164">    return best;</span>
+  }
+
+  /**
+   * Collects numSamples samples of sequences, from the distribution over sequences defined
+   * by the sequence model passed on construction.
+   * All samples collected are sampleInterval samples apart, in an attempt to reduce
+   * autocorrelation.
+   * @return a List containing the sequence samples, as arrays of type int, and their scores
+   */
+  public List&lt;int[]&gt; collectSamples(SequenceModel model, int numSamples, int sampleInterval) {
+<span class="nc" id="L175">    int[] initialSequence = getRandomSequence(model);</span>
+<span class="nc" id="L176">    return collectSamples(model, numSamples, sampleInterval, initialSequence);</span>
+  }
+
+  /**
+   * Collects numSamples samples of sequences, from the distribution over sequences defined
+   * by the sequence model passed on construction.
+   * All samples collected are sampleInterval samples apart, in an attempt to reduce
+   * autocorrelation.
+   * @return a Counter containing the sequence samples, as arrays of type int, and their scores
+   */
+  public List&lt;int[]&gt; collectSamples(SequenceModel model, int numSamples, int sampleInterval, int[] initialSequence) {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">    if (verbose&gt;0) log.info(&quot;Collecting samples&quot;);</span>
+<span class="nc" id="L188">    listener.setInitialSequence(initialSequence);</span>
+<span class="nc" id="L189">    List&lt;int[]&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L190">    int[] sequence = initialSequence;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">    for (int i=0; i&lt;numSamples; i++) {</span>
+<span class="nc" id="L192">      sequence = copy(sequence); // so we don't change the initial, or the one we just stored</span>
+<span class="nc" id="L193">      sampleSequenceRepeatedly(model, sequence, sampleInterval); // modifies tagSequence</span>
+<span class="nc" id="L194">      result.add(sequence); // save it to return later</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">      if (verbose&gt;0) log.info(&quot;.&quot;);</span>
+<span class="nc" id="L196">      System.err.flush();</span>
+    }
+<span class="nc bnc" id="L198" title="All 2 branches missed.">    if (verbose&gt;1) {</span>
+<span class="nc" id="L199">      log.info();</span>
+<span class="nc" id="L200">      printSamples(result, System.err);</span>
+    }
+<span class="nc bnc" id="L202" title="All 2 branches missed.">    if (verbose&gt;0) log.info(&quot;done.&quot;);</span>
+<span class="nc" id="L203">    return result;</span>
+  }
+
+  /**
+   * Samples the sequence repeatedly, making numSamples passes over the entire sequence.
+   */
+  public double sampleSequenceRepeatedly(SequenceModel model, int[] sequence, int numSamples) {
+<span class="nc" id="L210">    sequence = copy(sequence); // so we don't change the initial, or the one we just stored</span>
+<span class="nc" id="L211">    listener.setInitialSequence(sequence);</span>
+<span class="nc" id="L212">    double returnScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    for (int iter=0; iter&lt;numSamples; iter++) {</span>
+<span class="nc" id="L214">      returnScore = sampleSequenceForward(model, sequence);</span>
+    }
+<span class="nc" id="L216">    return returnScore;</span>
+  }
+
+  /**
+   * Samples the sequence repeatedly, making numSamples passes over the entire sequence.
+   * Destructively modifies the sequence in place.
+   */
+  public double sampleSequenceRepeatedly(SequenceModel model, int numSamples) {
+<span class="nc" id="L224">    int[] sequence = getRandomSequence(model);</span>
+<span class="nc" id="L225">    return sampleSequenceRepeatedly(model, sequence, numSamples);</span>
+  }
+
+  /**
+   * Samples the complete sequence once in the forward direction
+   * Destructively modifies the sequence in place.
+   * @param sequence the sequence to start with.
+   */
+  public double sampleSequenceForward(SequenceModel model, int[] sequence) {
+<span class="nc" id="L234">    return sampleSequenceForward(model, sequence, 1.0, null);</span>
+  }
+  /**
+   * Samples the complete sequence once in the forward direction
+   * Destructively modifies the sequence in place.
+   * @param sequence the sequence to start with.
+   */
+  public double sampleSequenceForward(final SequenceModel model, final int[] sequence, final double temperature, Set&lt;Integer&gt; onlySampleThesePositions) {
+<span class="nc" id="L242">    double returnScore = Double.NEGATIVE_INFINITY;</span>
+    // log.info(&quot;Sampling forward&quot;);
+<span class="nc bnc" id="L244" title="All 2 branches missed.">    if (onlySampleThesePositions != null) {</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">      for (int pos: onlySampleThesePositions) {</span>
+<span class="nc" id="L246">        returnScore = samplePosition(model, sequence, pos, temperature);</span>
+<span class="nc" id="L247">      }</span>
+    } else {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">      if (samplingStyle == SEQUENTIAL_SAMPLING) {</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        for (int pos=0; pos&lt;sequence.length; pos++) {</span>
+<span class="nc" id="L251">          returnScore = samplePosition(model, sequence, pos, temperature);</span>
+        }
+<span class="nc bnc" id="L253" title="All 2 branches missed.">      } else if (samplingStyle == RANDOM_SAMPLING) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        for (int aSequence : sequence) {</span>
+<span class="nc" id="L255">          int pos = random.nextInt(sequence.length);</span>
+<span class="nc" id="L256">          returnScore = samplePosition(model, sequence, pos, temperature);</span>
+        }
+<span class="nc bnc" id="L258" title="All 2 branches missed.">      } else if (samplingStyle == CHROMATIC_SAMPLING) {</span>
+        // make copies of the sequences and merge at the end
+<span class="nc" id="L260">        List&lt;Pair&lt;Integer, Integer&gt;&gt; results = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        for (List&lt;Integer&gt; indieList: partition) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">          if (indieList.size() &lt;= chromaticSize) {</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            for (int pos: indieList) {</span>
+<span class="nc" id="L264">              Pair&lt;Integer, Double&gt; newPosProb = samplePositionHelper(model, sequence, pos, temperature); </span>
+<span class="nc" id="L265">              sequence[pos] = newPosProb.first();</span>
+<span class="nc" id="L266">            }</span>
+          } else {
+<span class="nc" id="L268">            MulticoreWrapper&lt;List&lt;Integer&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; wrapper = new MulticoreWrapper&lt;&gt;(chromaticSize,</span>
+<span class="nc" id="L269">                    new ThreadsafeProcessor&lt;List&lt;Integer&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt;() {</span>
+                      @Override
+                      public List&lt;Pair&lt;Integer, Integer&gt;&gt; process(List&lt;Integer&gt; posList) {
+<span class="nc" id="L272">                        List&lt;Pair&lt;Integer, Integer&gt;&gt; allPos = new ArrayList&lt;&gt;(posList.size());</span>
+<span class="nc" id="L273">                        Pair&lt;Integer, Double&gt; newPosProb = null;</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">                        for (int pos : posList) {</span>
+<span class="nc" id="L275">                          newPosProb = samplePositionHelper(model, sequence, pos, temperature);</span>
+                          // returns the position to sample in first place and new label in second place
+<span class="nc" id="L277">                          allPos.add(new Pair&lt;&gt;(pos, newPosProb.first()));</span>
+<span class="nc" id="L278">                        }</span>
+<span class="nc" id="L279">                        return allPos;</span>
+                      }
+
+                      @Override
+                      public ThreadsafeProcessor&lt;List&lt;Integer&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; newInstance() {
+<span class="nc" id="L284">                        return this;</span>
+                      }
+                    });
+<span class="nc" id="L287">            results.clear();</span>
+<span class="nc" id="L288">            int interval = Math.max(1, indieList.size() / chromaticSize);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            for (int begin = 0, end = 0, indieListSize = indieList.size(); end &lt; indieListSize; begin += interval) {</span>
+<span class="nc" id="L290">              end = Math.min(begin + interval, indieListSize);</span>
+<span class="nc" id="L291">              wrapper.put(indieList.subList(begin, end));</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">              while (wrapper.peek()) {</span>
+<span class="nc" id="L293">                results.addAll(wrapper.poll());</span>
+              }
+            }
+<span class="nc" id="L296">            wrapper.join();</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            while (wrapper.peek()) {</span>
+<span class="nc" id="L298">              results.addAll(wrapper.poll());</span>
+            }
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            for(Pair&lt;Integer, Integer&gt; posVal : results) {</span>
+<span class="nc" id="L301">              sequence[posVal.first()] = posVal.second();</span>
+<span class="nc" id="L302">            }</span>
+          }
+<span class="nc" id="L304">        }</span>
+<span class="nc" id="L305">        returnScore = model.scoreOf(sequence);</span>
+      }
+    }
+<span class="nc" id="L308">    return returnScore;</span>
+  }
+
+  /**
+   * Samples the complete sequence once in the backward direction
+   * Destructively modifies the sequence in place.
+   * @param sequence the sequence to start with.
+   */
+  public double sampleSequenceBackward(SequenceModel model, int[] sequence) {
+<span class="nc" id="L317">    return sampleSequenceBackward(model, sequence, 1.0);</span>
+  }
+  /**
+   * Samples the complete sequence once in the backward direction
+   * Destructively modifies the sequence in place.
+   * @param sequence the sequence to start with.
+   */
+  public double sampleSequenceBackward(SequenceModel model, int[] sequence, double temperature) {
+<span class="nc" id="L325">    double returnScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">    for (int pos=sequence.length-1; pos&gt;=0; pos--) {</span>
+<span class="nc" id="L327">      returnScore = samplePosition(model, sequence, pos, temperature);</span>
+    }
+<span class="nc" id="L329">    return returnScore;</span>
+  }
+
+  /**
+   * Samples a single position in the sequence.
+   * Destructively modifies the sequence in place.
+   * returns the score of the new sequence
+   * @param sequence the sequence to start with
+   * @param pos the position to sample.
+   */
+  public double samplePosition(SequenceModel model, int[] sequence, int pos) {
+<span class="nc" id="L340">    return samplePosition(model, sequence, pos, 1.0);</span>
+  }
+
+  /**
+   * Samples a single position in the sequence.
+   * Does not modify the sequence passed in.
+   * returns the score of the new label for the position to sample
+   * @param sequence the sequence to start with
+   * @param pos the position to sample.
+   * @param temperature the temperature to control annealing
+   */
+  private Pair&lt;Integer, Double&gt; samplePositionHelper(SequenceModel model, int[] sequence, int pos, double temperature) {
+<span class="nc" id="L352">    double[] distribution = model.scoresOf(sequence, pos);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    if (temperature!=1.0) {</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">      if (temperature==0.0) {</span>
+        // set the max to 1.0
+<span class="nc" id="L356">        int argmax = ArrayMath.argmax(distribution);</span>
+<span class="nc" id="L357">        Arrays.fill(distribution, Double.NEGATIVE_INFINITY);</span>
+<span class="nc" id="L358">        distribution[argmax] = 0.0;</span>
+<span class="nc" id="L359">      } else {</span>
+        // take all to a power
+        // use the temperature to increase/decrease the entropy of the sampling distribution
+<span class="nc" id="L362">        ArrayMath.multiplyInPlace(distribution, 1.0/temperature);</span>
+      }
+    }
+<span class="nc" id="L365">    ArrayMath.logNormalize(distribution);</span>
+<span class="nc" id="L366">    ArrayMath.expInPlace(distribution);</span>
+<span class="nc" id="L367">    int newTag = ArrayMath.sampleFromDistribution(distribution, random);</span>
+<span class="nc" id="L368">    double newProb = distribution[newTag];</span>
+<span class="nc" id="L369">    return new Pair&lt;&gt;(newTag, newProb);</span>
+  }
+
+  /**
+   * Samples a single position in the sequence.
+   * Destructively modifies the sequence in place.
+   * returns the score of the new sequence
+   * @param sequence the sequence to start with
+   * @param pos the position to sample.
+   * @param temperature the temperature to control annealing
+   */
+  public double samplePosition(SequenceModel model, int[] sequence, int pos, double temperature) {
+<span class="nc" id="L381">    int oldTag = sequence[pos];</span>
+<span class="nc" id="L382">    Pair&lt;Integer, Double&gt; newPosProb = samplePositionHelper(model, sequence, pos, temperature); </span>
+<span class="nc" id="L383">    int newTag = newPosProb.first();</span>
+//    System.out.println(&quot;Sampled &quot; + oldTag + &quot;-&gt;&quot; + newTag);
+<span class="nc" id="L385">    sequence[pos] = newTag;</span>
+<span class="nc" id="L386">    listener.updateSequenceElement(sequence, pos, oldTag);</span>
+<span class="nc" id="L387">    return newPosProb.second();</span>
+  }
+
+  public void printSamples(List samples, PrintStream out) {
+<span class="nc bnc" id="L391" title="All 2 branches missed.">    for (int i = 0; i &lt; document.size(); i++) {</span>
+<span class="nc" id="L392">      HasWord word = (HasWord) document.get(i);</span>
+<span class="nc" id="L393">      String s = &quot;null&quot;;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">      if (word!=null) {</span>
+<span class="nc" id="L395">        s = word.word();</span>
+      }
+<span class="nc" id="L397">      out.print(StringUtils.padOrTrim(s, 10));</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">      for (Object sample : samples) {</span>
+<span class="nc" id="L399">        int[] sequence = (int[]) sample;</span>
+<span class="nc" id="L400">        out.print(&quot; &quot; + StringUtils.padLeft(sequence[i], 2));</span>
+<span class="nc" id="L401">      }</span>
+<span class="nc" id="L402">      out.println();</span>
+    }
+<span class="nc" id="L404">  }</span>
+
+  /**
+   * @param document the underlying document which is a list of HasWord; a slight abstraction violation, but useful for debugging!!
+   */
+  public SequenceGibbsSampler(int numSamples, int sampleInterval, SequenceListener listener, List document,
+<span class="nc" id="L410">      boolean returnLastFoundSequence, int samplingStyle, int chromaticSize, List&lt;List&lt;Integer&gt;&gt; partition, int speedUpThreshold, EmpiricalNERPriorBIO priorEn, EmpiricalNERPriorBIO priorCh) {</span>
+<span class="nc" id="L411">    this.numSamples = numSamples;</span>
+<span class="nc" id="L412">    this.sampleInterval = sampleInterval;</span>
+<span class="nc" id="L413">    this.listener = listener;</span>
+<span class="nc" id="L414">    this.document = document;</span>
+<span class="nc" id="L415">    this.returnLastFoundSequence = returnLastFoundSequence;</span>
+<span class="nc" id="L416">    this.samplingStyle = samplingStyle;</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">    if (verbose &gt; 0) {</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">      if (samplingStyle == RANDOM_SAMPLING) {</span>
+<span class="nc" id="L419">        log.info(&quot;Using random sampling&quot;);</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">      } else if (samplingStyle == CHROMATIC_SAMPLING) {</span>
+<span class="nc" id="L421">        log.info(&quot;Using chromatic sampling with &quot; + chromaticSize + &quot; threads&quot;);</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">      } else if (samplingStyle == SEQUENTIAL_SAMPLING) {</span>
+<span class="nc" id="L423">        log.info(&quot;Using sequential sampling&quot;);</span>
+      }
+    }
+<span class="nc" id="L426">    this.chromaticSize = chromaticSize;</span>
+<span class="nc" id="L427">    this.partition = partition;</span>
+<span class="nc" id="L428">    this.speedUpThreshold = speedUpThreshold;</span>
+    //debug
+<span class="nc" id="L430">    this.priorEn = priorEn;</span>
+<span class="nc" id="L431">    this.priorCh = priorCh;</span>
+<span class="nc" id="L432">  }</span>
+
+  public SequenceGibbsSampler(int numSamples, int sampleInterval, SequenceListener listener, List document) {
+<span class="nc" id="L435">    this(numSamples, sampleInterval, listener, document, false, 1, 0, null, -1, null, null);</span>
+<span class="nc" id="L436">  }</span>
+
+  public SequenceGibbsSampler(int numSamples, int sampleInterval, SequenceListener listener) {
+<span class="nc" id="L439">    this(numSamples, sampleInterval, listener, null);</span>
+<span class="nc" id="L440">  }</span>
+
+  public SequenceGibbsSampler(int numSamples, int sampleInterval, SequenceListener listener,
+      int samplingStyle, int chromaticSize, List&lt;List&lt;Integer&gt;&gt; partition, int speedUpThreshold, EmpiricalNERPriorBIO priorEn, EmpiricalNERPriorBIO priorCh) {
+<span class="nc" id="L444">    this(numSamples, sampleInterval, listener, null, false, samplingStyle, chromaticSize, partition, speedUpThreshold, priorEn, priorCh);</span>
+<span class="nc" id="L445">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

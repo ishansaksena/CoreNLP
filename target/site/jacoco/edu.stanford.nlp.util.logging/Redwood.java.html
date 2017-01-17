@@ -1,0 +1,1511 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Redwood.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.util.logging</a> &gt; <span class="el_source">Redwood.java</span></div><h1>Redwood.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.util.logging;
+
+import java.io.BufferedWriter;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+
+import edu.stanford.nlp.util.*;
+
+/**
+ * A hierarchical channel-based logger. Log messages are arranged hierarchically by depth
+ * (e.g. main-&amp;gt;tagging-&amp;gt;sentence 2) using the startTrack() and endTrack() methods.
+ * Furthermore, messages can be flagged with a number of channels, which allow filtering by channel.
+ * Log levels are implemented as channels (ERROR, WARNING, etc).
+ *
+ * Details on the handlers used are documented in their respective classes, which all implement
+ * {@link LogRecordHandler}.
+ * New handlers should implement this class.
+ *
+ * Details on configuring Redwood can be found in the {@link RedwoodConfiguration} class.
+ * New configuration methods should be implemented in this class, following the standard
+ * builder paradigm.
+ *
+ * There is a &lt;a href=&quot;http://nlp.stanford.edu/javanlp/tutorials/Redwood.pdf&quot;&gt; tutorial on Redwood &lt;/a&gt; on the
+ * NLP website.
+ *
+ * @author Gabor Angeli (angeli at cs.stanford)
+ * @author David McClosky
+ */
+
+<span class="pc bpc" id="L41" title="1 of 2 branches missed.">public class Redwood  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L44">  private static final Redwood.RedwoodChannels log = Redwood.channels(Redwood.class);</span>
+
+  /*
+      ---------------------------------------------------------
+      VARIABLES
+      ---------------------------------------------------------
+   */
+  // -- UTILITIES --
+<span class="fc" id="L52">  public static final Flag ERR    = Flag.ERROR;</span>
+<span class="fc" id="L53">  public static final Flag WARN   = Flag.WARN;</span>
+<span class="fc" id="L54">  public static final Flag DBG    = Flag.DEBUG;</span>
+<span class="fc" id="L55">  public static final Flag FORCE  = Flag.FORCE;</span>
+<span class="fc" id="L56">  public static final Flag STDOUT = Flag.STDOUT;</span>
+<span class="fc" id="L57">  public static final Flag STDERR = Flag.STDERR;</span>
+
+  // -- STREAMS --
+  /**
+   * The real System.out stream
+   */
+<span class="fc" id="L63">  protected static final PrintStream realSysOut = System.out;</span>
+  /**
+   * The real System.err stream
+   */
+<span class="fc" id="L67">  protected static final PrintStream realSysErr = System.err;</span>
+
+  // -- BASIC LOGGING --
+  /**
+   * The tree of handlers
+   */
+<span class="fc" id="L73">  private static RecordHandlerTree handlers = new RecordHandlerTree();</span>
+  /**
+   * The current depth of the logger
+   */
+<span class="fc" id="L77">  private static int depth = 0;</span>
+  /**
+   * The stack of track titles, for consistency checking
+   * the endTrack() call
+   */
+<span class="fc" id="L82">  private static final Stack&lt;String&gt; titleStack = new Stack&lt;&gt;();</span>
+  /**
+   * Signals that no more log messages should be accepted by Redwood
+   */
+<span class="fc" id="L86">  private static boolean isClosed = false;</span>
+
+  // -- THREADED ENVIRONMENT --
+  /**
+   * Queue of tasks to be run in various threads
+   */
+<span class="fc" id="L92">  private static final Map&lt;Long,Queue&lt;Runnable&gt;&gt; threadedLogQueue = new HashMap&lt;&gt;();  // Don't replace with Generics.newHashMap()! Classloader goes haywire</span>
+  /**
+   * Thread id which currently has control of the Redwood
+   */
+<span class="fc" id="L96">  private static long currentThread = -1L;</span>
+  /**
+   * Threads which have something they wish to log, but do not yet
+   * have control of Redwood
+   */
+<span class="fc" id="L101">  private static final Queue&lt;Long&gt; threadsWaiting = new LinkedList&lt;&gt;();</span>
+  /**
+   * Indicator that messages are coming from multiple threads
+   */
+<span class="fc" id="L105">  private static boolean isThreaded = false;</span>
+
+  /**
+   * Synchronization
+   */
+<span class="fc" id="L110">  private static final ReentrantLock control = new ReentrantLock();</span>
+
+<span class="nc" id="L112">  private Redwood() {} // static class</span>
+
+  /*
+      ---------------------------------------------------------
+      HELPER METHODS
+      ---------------------------------------------------------
+   */
+
+  private static void queueTask(long threadId, Runnable toRun){
+<span class="nc bnc" id="L121" title="All 4 branches missed.">    assert control.isHeldByCurrentThread();</span>
+<span class="nc bnc" id="L122" title="All 4 branches missed.">    assert threadId != currentThread;</span>
+    //(get queue)
+<span class="nc bnc" id="L124" title="All 2 branches missed.">    if(!threadedLogQueue.containsKey(threadId)){</span>
+<span class="nc" id="L125">      threadedLogQueue.put(threadId, new LinkedList&lt;&gt;());</span>
+    }
+<span class="nc" id="L127">    Queue&lt;Runnable&gt; threadLogQueue = threadedLogQueue.get(threadId);</span>
+    //(add to queue)
+<span class="nc" id="L129">    threadLogQueue.offer( toRun );</span>
+    //(register this thread as waiting)
+<span class="nc bnc" id="L131" title="All 2 branches missed.">    if(!threadsWaiting.contains(threadId)){</span>
+<span class="nc" id="L132">      threadsWaiting.offer(threadId);</span>
+<span class="nc bnc" id="L133" title="All 6 branches missed.">      assert threadedLogQueue.get(threadId) != null &amp;&amp; !threadedLogQueue.get(threadId).isEmpty();</span>
+    }
+<span class="nc" id="L135">  }</span>
+
+  private static void releaseThreadControl(long threadId){
+<span class="nc bnc" id="L138" title="All 6 branches missed.">    assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="nc bnc" id="L139" title="All 6 branches missed.">    assert currentThread &lt; 0L || currentThread == threadId;</span>
+    //(release control)
+<span class="nc" id="L141">    currentThread = -1L;</span>
+<span class="nc" id="L142">  }</span>
+
+  private static void attemptThreadControl(long threadId, Runnable r){
+    //(get lock)
+<span class="nc" id="L146">    boolean tookLock = false;</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">    if(!control.isHeldByCurrentThread()){</span>
+<span class="nc" id="L148">      control.lock();</span>
+<span class="nc" id="L149">      tookLock = true;</span>
+    }
+    //(perform action)
+<span class="nc" id="L152">    attemptThreadControlThreadsafe(threadId);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">    if(threadId == currentThread){</span>
+<span class="nc" id="L154">      r.run();</span>
+    } else {
+<span class="nc" id="L156">      queueTask(threadId, r);</span>
+    }
+    //(release lock)
+<span class="nc bnc" id="L159" title="All 4 branches missed.">    assert control.isHeldByCurrentThread();</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">    if(tookLock){</span>
+<span class="nc" id="L161">      control.unlock();</span>
+    }
+<span class="nc" id="L163">  }</span>
+
+  private static void attemptThreadControlThreadsafe(long threadId){
+    //--Assertions
+<span class="nc bnc" id="L167" title="All 4 branches missed.">    assert control.isHeldByCurrentThread();</span>
+    //--Update Current Thread
+<span class="nc" id="L169">    boolean hopeless = true;</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">    if(currentThread &lt; 0L){</span>
+      //(case: no one has control)
+<span class="nc bnc" id="L172" title="All 2 branches missed.">      if(threadsWaiting.isEmpty()){</span>
+<span class="nc" id="L173">        currentThread = threadId;</span>
+      } else {
+<span class="nc" id="L175">        currentThread = threadsWaiting.poll();</span>
+<span class="nc" id="L176">        hopeless = false;</span>
+<span class="nc bnc" id="L177" title="All 6 branches missed.">        assert threadedLogQueue.get(currentThread) == null || !threadedLogQueue.get(currentThread).isEmpty();</span>
+      }
+<span class="nc bnc" id="L179" title="All 2 branches missed.">    } else if(currentThread == threadId) {</span>
+      //(case: we have control)
+<span class="nc" id="L181">      threadsWaiting.remove(currentThread);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">    } else if(currentThread &gt;= 0L){</span>
+      //(case: someone else has control
+<span class="nc" id="L184">      threadsWaiting.remove(currentThread);</span>
+    } else {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">      assert false;</span>
+    }
+    //--Clear Backlog
+<span class="nc" id="L189">    long activeThread = currentThread;</span>
+<span class="nc" id="L190">    Queue&lt;Runnable&gt; backlog = threadedLogQueue.get(currentThread);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">    if(backlog != null){</span>
+      //(run backlog)
+<span class="nc bnc" id="L193" title="All 4 branches missed.">      while(!backlog.isEmpty() &amp;&amp; currentThread &gt;= 0L){</span>
+<span class="nc" id="L194">        backlog.poll().run();</span>
+      }
+      //(requeue, if applicable)
+<span class="nc bnc" id="L197" title="All 4 branches missed.">      if(currentThread &lt; 0L &amp;&amp; !backlog.isEmpty()){</span>
+<span class="nc" id="L198">        threadsWaiting.offer(activeThread);</span>
+<span class="nc" id="L199">        hopeless = false;</span>
+      }
+    }
+    //--Recursive
+<span class="nc bnc" id="L203" title="All 4 branches missed.">    if(!hopeless &amp;&amp;  currentThread != threadId){</span>
+<span class="nc" id="L204">      attemptThreadControlThreadsafe(threadId);</span>
+    }
+<span class="nc bnc" id="L206" title="All 4 branches missed.">    assert !threadsWaiting.contains(currentThread);</span>
+<span class="nc bnc" id="L207" title="All 4 branches missed.">    assert control.isHeldByCurrentThread();</span>
+<span class="nc" id="L208">  }</span>
+
+  protected static RecordHandlerTree rootHandler() {
+<span class="fc" id="L211">    return handlers;</span>
+  }
+
+  /**
+   * Remove all log handlers from Redwood, presumably in order to
+   * construct a custom pipeline afterwards
+   */
+  protected static void clearHandlers(){
+<span class="fc" id="L219">    handlers = new RecordHandlerTree();</span>
+<span class="fc" id="L220">  }</span>
+
+  /**
+   * Get a handler based on its class
+   * @param clazz The class of the Handler to return.
+   *              If multiple Handlers exist, the first one is returned.
+   * @param &lt;E&gt; The class of the handler to return.
+   * @return The handler matching the class name.
+   */
+  @Deprecated
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private static &lt;E extends LogRecordHandler&gt; E getHandler(Class&lt;E&gt; clazz){
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    for(LogRecordHandler cand : handlers){</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">      if(clazz == cand.getClass()){</span>
+<span class="nc" id="L234">        return (E) cand;</span>
+      }
+<span class="nc" id="L236">    }</span>
+<span class="nc" id="L237">    return null;</span>
+  }
+
+  /**
+   * Captures System.out and System.err and redirects them
+   * to Redwood logging.
+   * @param captureOut True is System.out should be captured
+   * @param captureErr True if System.err should be captured
+   */
+  protected static void captureSystemStreams(boolean captureOut, boolean captureErr){
+<span class="nc bnc" id="L247" title="All 2 branches missed.">    if(captureOut){</span>
+<span class="nc" id="L248">      System.setOut(new RedwoodPrintStream(STDOUT, realSysOut));</span>
+    } else {
+<span class="nc" id="L250">      System.setOut(realSysOut);</span>
+    }
+<span class="nc bnc" id="L252" title="All 2 branches missed.">    if(captureErr){</span>
+<span class="nc" id="L253">      System.setErr(new RedwoodPrintStream(STDERR, realSysErr));</span>
+    } else {
+<span class="nc" id="L255">      System.setErr(realSysErr);</span>
+    }
+<span class="nc" id="L257">  }</span>
+
+  /**
+   * Restores System.out and System.err to their original values
+   */
+  protected static void restoreSystemStreams(){
+<span class="fc" id="L263">    System.setOut(realSysOut);</span>
+<span class="fc" id="L264">    System.setErr(realSysErr);</span>
+<span class="fc" id="L265">  }</span>
+
+  /*
+      ---------------------------------------------------------
+      TRUE PUBLIC FACING METHODS
+      ---------------------------------------------------------
+   */
+
+  /**
+   * Log a message. The last argument to this object is the message to log
+   * (usually a String); the first arguments are the channels to log to.
+   *
+   * For example:
+   *
+   * log(Redwood.ERR,&quot;tag&quot;,&quot;this message is tagged with ERROR and tag&quot;)
+   *
+   * @param args The last argument is the message; the first arguments are the channels.
+   */
+  public static void log(Object... args) {
+    //--Argument Check
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">    if(args.length == 0){ return; }</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">    if(isClosed){ return; }</span>
+    //--Create Record
+<span class="fc" id="L288">    final Object content = args[args.length-1];</span>
+<span class="fc" id="L289">    final Object[] tags = new Object[args.length-1];</span>
+<span class="fc" id="L290">    System.arraycopy(args,0,tags,0,args.length-1);</span>
+<span class="fc" id="L291">    final long timestamp = System.currentTimeMillis();</span>
+    //--Handle Record
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">    if(isThreaded){</span>
+      //(case: multithreaded)
+<span class="nc" id="L295">      final Runnable log = () -&gt; {</span>
+<span class="nc bnc" id="L296" title="All 6 branches missed.">        assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="nc" id="L297">        Record toPass = new Record(content,tags,depth,timestamp);</span>
+<span class="nc" id="L298">        handlers.process(toPass, MessageType.SIMPLE,depth, toPass.timesstamp);</span>
+<span class="nc bnc" id="L299" title="All 6 branches missed.">        assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="nc" id="L300">      };</span>
+<span class="nc" id="L301">      long threadId = Thread.currentThread().getId();</span>
+<span class="nc" id="L302">      attemptThreadControl( threadId, log );</span>
+<span class="nc" id="L303">    } else {</span>
+      //(case: no threading)
+<span class="fc" id="L305">      Record toPass = new Record(content,tags,depth,timestamp);</span>
+<span class="fc" id="L306">      handlers.process(toPass, MessageType.SIMPLE,depth, toPass.timesstamp);</span>
+    }
+<span class="fc" id="L308">  }</span>
+
+  /**
+   * The Redwood equivalent to printf().
+   * @param format The format string, as per java's Formatter.format() object.
+   * @param args The arguments to format.
+   */
+  public static void logf(String format, Object... args){
+<span class="nc" id="L316">    log((Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L317">  }</span>
+
+  /**
+   * The Redwood equivalent to printf(), with a logging level.
+   * For including more channels, use {@link edu.stanford.nlp.util.logging.Redwood.RedwoodChannels}.
+   * @param level The logging level to log at.
+   * @param format The format string, as per java's Formatter.format() object.
+   * @param args The arguments to format.
+   */
+  public static void logf(Flag level, String format, Object... args){
+<span class="nc" id="L327">    log(level, (Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L328">  }</span>
+
+  /**
+   * Begin a &quot;track;&quot; that is, begin logging at one level deeper.
+   * Channels other than the FORCE channel are ignored.
+   * @param args The title of the track to begin, with an optional FORCE flag.
+   */
+  public static void startTrack(final Object... args){
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">    if(isClosed){ return; }</span>
+    //--Create Record
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">    final int len = args.length == 0 ? 0 : args.length-1;</span>
+<span class="pc bpc" id="L339" title="1 of 2 branches missed.">    final Object content = args.length == 0 ? &quot;&quot; : args[len];</span>
+<span class="fc" id="L340">    final Object[] tags = new Object[len];</span>
+<span class="fc" id="L341">    final long timestamp = System.currentTimeMillis();</span>
+<span class="fc" id="L342">    System.arraycopy(args,0,tags,0,len);</span>
+    //--Create Task
+<span class="fc" id="L344">    final Runnable startTrack = () -&gt; {</span>
+<span class="pc bpc" id="L345" title="4 of 6 branches missed.">      assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="fc" id="L346">      Record toPass = new Record(content,tags,depth,timestamp);</span>
+<span class="fc" id="L347">      depth += 1;</span>
+<span class="pc bpc" id="L348" title="1 of 2 branches missed.">      titleStack.push(args.length == 0 ? &quot;&quot; : args[len].toString());</span>
+<span class="fc" id="L349">      handlers.process(toPass, MessageType.START_TRACK, depth, toPass.timesstamp);</span>
+<span class="pc bpc" id="L350" title="4 of 6 branches missed.">      assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="fc" id="L351">    };</span>
+    //--Run Task
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">    if(isThreaded){</span>
+      //(case: multithreaded)
+<span class="nc" id="L355">      long threadId = Thread.currentThread().getId();</span>
+<span class="nc" id="L356">      attemptThreadControl( threadId, startTrack );</span>
+<span class="nc" id="L357">    } else {</span>
+      //(case: no threading)
+<span class="fc" id="L359">      startTrack.run();</span>
+    }
+<span class="fc" id="L361">  }</span>
+
+  /**
+   * Helper method to start a track on the FORCE channel.
+   * @param name The track name to print
+   */
+  public static void forceTrack(Object name) {
+<span class="nc" id="L368">    startTrack(FORCE, name);</span>
+<span class="nc" id="L369">  }</span>
+
+  /**
+   * Helper method to start an anonymous track on the FORCE channel.
+   */
+  public static void forceTrack() {
+<span class="nc" id="L375">    startTrack(FORCE, &quot;&quot;);</span>
+<span class="nc" id="L376">  }</span>
+
+  /**
+   * End a &quot;track;&quot; that is, return to logging at one level shallower.
+   * @param title A title that should match the beginning of this track.
+   */
+  public static void endTrack(final String title){
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">    if(isClosed){ return; }</span>
+    //--Make Task
+<span class="fc" id="L385">    final long timestamp = System.currentTimeMillis();</span>
+<span class="fc" id="L386">    Runnable endTrack = () -&gt; {</span>
+<span class="pc bpc" id="L387" title="4 of 6 branches missed.">      assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="fc" id="L388">      String expected = titleStack.pop();</span>
+      //(check name match)
+<span class="pc bpc" id="L390" title="2 of 4 branches missed.">      if (!isThreaded &amp;&amp; !expected.equalsIgnoreCase(title)){</span>
+<span class="nc" id="L391">        log(Flag.ERROR, &quot;Track names do not match: expected: &quot; + expected + &quot; found: &quot; + title);</span>
+//        throw new IllegalArgumentException(&quot;Track names do not match: expected: &quot; + expected + &quot; found: &quot; + title);
+      }
+      //(decrement depth)
+<span class="fc" id="L395">      depth -= 1;</span>
+      //(send signal)
+<span class="fc" id="L397">      handlers.process(null, MessageType.END_TRACK, depth, timestamp);</span>
+<span class="pc bpc" id="L398" title="4 of 6 branches missed.">      assert !isThreaded || control.isHeldByCurrentThread();</span>
+<span class="fc" id="L399">    };</span>
+    //--Run Task
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">    if(isThreaded){</span>
+      //(case: multithreaded)
+<span class="nc" id="L403">      long threadId = Thread.currentThread().getId();</span>
+<span class="nc" id="L404">      attemptThreadControl( threadId, endTrack );</span>
+<span class="nc" id="L405">    } else {</span>
+      //(case: no threading)
+<span class="fc" id="L407">      endTrack.run();</span>
+    }
+<span class="fc" id="L409">  }</span>
+
+  /**
+   * A utility method for closing calls to the anonymous startTrack() call.
+   */
+<span class="nc" id="L414">  public static void endTrack(){ endTrack(&quot;&quot;); }</span>
+
+
+  /**
+   * Start a multithreaded logging environment. Log messages will be real time
+   * from one of the threads; as each thread finishes, another thread begins logging,
+   * first by making up the backlog, and then by printing any new log messages.
+   * A thread signals that it has finished logging with the finishThread() function;
+   * the multithreaded environment is ended with the endThreads() function
+   * @param title The name of the thread group being started
+   */
+  public static void startThreads(String title){
+<span class="nc bnc" id="L426" title="All 2 branches missed.">    if(isThreaded){</span>
+<span class="nc" id="L427">      throw new IllegalStateException(&quot;Cannot nest Redwood threaded environments&quot;);</span>
+    }
+<span class="nc" id="L429">    startTrack(FORCE,&quot;Threads( &quot;+title+&quot; )&quot;);</span>
+<span class="nc" id="L430">    isThreaded = true;</span>
+<span class="nc" id="L431">  }</span>
+
+  /**
+   * Signal that this thread will not log any more messages in the multithreaded
+   * environment
+   */
+  public static void finishThread(){
+    //--Create Task
+<span class="nc" id="L439">    final long threadId = Thread.currentThread().getId();</span>
+<span class="nc" id="L440">    Runnable finish = () -&gt; releaseThreadControl(threadId);</span>
+    //--Run Task
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    if(isThreaded){</span>
+      //(case: multithreaded)
+<span class="nc" id="L444">      attemptThreadControl( threadId, finish );</span>
+    } else {
+      //(case: no threading)
+<span class="nc" id="L447">      Redwood.log(Flag.WARN, &quot;finishThreads() called outside of threaded environment&quot;);</span>
+    }
+<span class="nc" id="L449">  }</span>
+
+  /**
+   * Signal that all threads have run to completion, and the multithreaded
+   * environment is over.
+   * @param check The name of the thread group passed to startThreads()
+   */
+  public static void endThreads(String check){
+    //(error check)
+<span class="nc" id="L458">    isThreaded = false;</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">    if(currentThread != -1L){</span>
+<span class="nc" id="L460">      Redwood.log(Flag.WARN, &quot;endThreads() called, but thread &quot; + currentThread + &quot; has not finished (exception in thread?)&quot;);</span>
+    }
+    //(end threaded environment)
+<span class="nc bnc" id="L463" title="All 4 branches missed.">    assert !control.isHeldByCurrentThread();</span>
+    //(write remaining threads)
+<span class="nc" id="L465">    boolean cleanPass = false;</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">    while(!cleanPass){</span>
+<span class="nc" id="L467">      cleanPass = true;</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">      for(long thread : threadedLogQueue.keySet()){</span>
+<span class="nc bnc" id="L469" title="All 4 branches missed.">        assert currentThread &lt; 0L;</span>
+<span class="nc bnc" id="L470" title="All 4 branches missed.">        if(threadedLogQueue.get(thread) != null &amp;&amp; !threadedLogQueue.get(thread).isEmpty()){</span>
+          //(mark queue as unclean)
+<span class="nc" id="L472">          cleanPass = false;</span>
+          //(variables)
+<span class="nc" id="L474">          Queue&lt;Runnable&gt; backlog = threadedLogQueue.get(thread);</span>
+<span class="nc" id="L475">          currentThread = thread;</span>
+          //(clear buffer)
+<span class="nc bnc" id="L477" title="All 2 branches missed.">          while(currentThread &gt;= 0){</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            if(backlog.isEmpty()){ Redwood.log(Flag.WARN, &quot;Forgot to call finishThread() on thread &quot; + currentThread); }</span>
+<span class="nc bnc" id="L479" title="All 4 branches missed.">            assert !control.isHeldByCurrentThread();</span>
+<span class="nc" id="L480">            backlog.poll().run();</span>
+          }
+          //(unregister thread)
+<span class="nc" id="L483">          threadsWaiting.remove(thread);</span>
+        }
+<span class="nc" id="L485">      }</span>
+    }
+<span class="nc bnc" id="L487" title="All 2 branches missed.">    while(threadsWaiting.size() &gt; 0){</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">      assert currentThread &lt; 0L;</span>
+<span class="nc bnc" id="L489" title="All 4 branches missed.">      assert control.tryLock();</span>
+<span class="nc bnc" id="L490" title="All 4 branches missed.">      assert !threadsWaiting.isEmpty();</span>
+<span class="nc" id="L491">      control.lock();</span>
+<span class="nc" id="L492">      attemptThreadControlThreadsafe(-1);</span>
+<span class="nc" id="L493">      control.unlock();</span>
+    }
+    //(clean up)
+<span class="nc bnc" id="L496" title="All 2 branches missed.">    for(Map.Entry&lt;Long, Queue&lt;Runnable&gt;&gt; longQueueEntry : threadedLogQueue.entrySet()){</span>
+<span class="nc bnc" id="L497" title="All 4 branches missed.">      assert longQueueEntry.getValue().isEmpty();</span>
+<span class="nc" id="L498">    }</span>
+<span class="nc bnc" id="L499" title="All 4 branches missed.">    assert threadsWaiting.isEmpty();</span>
+<span class="nc bnc" id="L500" title="All 4 branches missed.">    assert currentThread == -1L;</span>
+<span class="nc" id="L501">    endTrack(&quot;Threads( &quot;+check+&quot; )&quot;);</span>
+<span class="nc" id="L502">  }</span>
+
+  /**
+   * Create an object representing a group of channels.
+   * {@link RedwoodChannels} contains a more complete description.
+   *
+   * @see RedwoodChannels
+   */
+  public static RedwoodChannels channels(Object... channelNames) {
+<span class="fc" id="L511">    return new RedwoodChannels(channelNames);</span>
+  }
+
+  /**
+   * Hide multiple channels.  All other channels will be unaffected.
+   * @param channels The channels to hide
+   */
+  public static void hideChannelsEverywhere(Object... channels){
+<span class="nc bnc" id="L519" title="All 2 branches missed.">    for(LogRecordHandler handler : handlers){</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">      if(handler instanceof VisibilityHandler){</span>
+<span class="nc" id="L521">        VisibilityHandler visHandler = (VisibilityHandler) handler;</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        for (Object channel : channels) {</span>
+<span class="nc" id="L523">          visHandler.alsoHide(channel);</span>
+        }
+      }
+<span class="nc" id="L526">    }</span>
+<span class="nc" id="L527">  }</span>
+
+  /**
+   * Stop Redwood, closing all tracks and prohibiting future log messages.
+   */
+  public static void stop(){
+    //--Close logger
+<span class="nc" id="L534">    isClosed = true; // &lt;- not a thread-safe boolean</span>
+<span class="nc" id="L535">    Thread.yield(); //poor man's synchronization attempt (let everything else log that wants to)</span>
+<span class="nc" id="L536">    Thread.yield();</span>
+    //--Close Tracks
+<span class="nc bnc" id="L538" title="All 2 branches missed.">    while(depth &gt; 0){</span>
+<span class="nc" id="L539">      depth -= 1;</span>
+      //(send signal to handlers)
+<span class="nc" id="L541">      handlers.process(null, MessageType.END_TRACK, depth, System.currentTimeMillis());</span>
+    }
+    //--Shutdown
+<span class="nc" id="L544">    handlers.process(null, MessageType.SHUTDOWN, 0, System.currentTimeMillis());</span>
+<span class="nc" id="L545">  }</span>
+
+  /*
+      ---------------------------------------------------------
+      UTILITY METHODS
+      ---------------------------------------------------------
+   */
+
+  /**
+   * Utility method for formatting a time difference (maybe this should go to a util class?)
+   * @param diff Time difference in milliseconds
+   * @param b The string builder to append to
+   */
+  protected static void formatTimeDifference(long diff, StringBuilder b){
+    //--Get Values
+<span class="nc" id="L560">    int mili = (int) diff % 1000;</span>
+<span class="nc" id="L561">    long rest = diff / 1000;</span>
+<span class="nc" id="L562">    int sec = (int) rest % 60;</span>
+<span class="nc" id="L563">    rest = rest / 60;</span>
+<span class="nc" id="L564">    int min = (int) rest % 60;</span>
+<span class="nc" id="L565">    rest = rest / 60;</span>
+<span class="nc" id="L566">    int hr = (int) rest % 24;</span>
+<span class="nc" id="L567">    rest = rest / 24;</span>
+<span class="nc" id="L568">    int day = (int) rest;</span>
+    //--Make String
+<span class="nc bnc" id="L570" title="All 4 branches missed.">    if(day &gt; 0) b.append(day).append(day &gt; 1 ? &quot; days, &quot; : &quot; day, &quot;);</span>
+<span class="nc bnc" id="L571" title="All 4 branches missed.">    if(hr &gt; 0) b.append(hr).append(hr &gt; 1 ? &quot; hours, &quot; : &quot; hour, &quot;);</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">    if(min &gt; 0) {</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">      if(min &lt; 10){ b.append(&quot;0&quot;); }</span>
+<span class="nc" id="L574">      b.append(min).append(&quot;:&quot;);</span>
+    }
+<span class="nc bnc" id="L576" title="All 4 branches missed.">    if(min &gt; 0 &amp;&amp; sec &lt; 10){ b.append(&quot;0&quot;); }</span>
+<span class="nc" id="L577">    b.append(sec).append(&quot;.&quot;).append(String.format(&quot;%04d&quot;, mili));</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">    if(min &gt; 0) b.append(&quot; minutes&quot;);</span>
+<span class="nc" id="L579">    else b.append(&quot; seconds&quot;);</span>
+<span class="nc" id="L580">  }</span>
+
+  public static String formatTimeDifference(long diff){
+<span class="nc" id="L583">    StringBuilder b = new StringBuilder();</span>
+<span class="nc" id="L584">    formatTimeDifference(diff, b);</span>
+<span class="nc" id="L585">    return b.toString();</span>
+  }
+
+
+  /**
+   * Check if the console supports ANSI escape codes.
+   */
+  public static final boolean supportsAnsi;
+  static {
+<span class="fc" id="L594">    String os = System.getProperty(&quot;os.name&quot;).toLowerCase();</span>
+<span class="pc bpc" id="L595" title="3 of 6 branches missed.">    boolean isUnix = os.contains(&quot;unix&quot;) || os.contains(&quot;linux&quot;) || os.contains(&quot;solaris&quot;);</span>
+<span class="pc bpc" id="L596" title="2 of 4 branches missed.">    supportsAnsi = Boolean.getBoolean(&quot;Ansi&quot;) || isUnix;</span>
+  }
+
+  /*
+   * Set up the default logger.
+   * If SLF4J is in the code's classpath
+   */
+  static {
+<span class="fc" id="L604">    RedwoodConfiguration config = RedwoodConfiguration.minimal();</span>
+    try {
+<span class="fc" id="L606">      MetaClass.create(&quot;org.slf4j.LoggerFactory&quot;).createInstance();</span>
+<span class="fc" id="L607">      config = RedwoodConfiguration.slf4j();</span>
+<span class="pc" id="L608">    } catch (Exception ignored) { }</span>
+<span class="fc" id="L609">    config.apply();</span>
+<span class="fc" id="L610">  }</span>
+
+  /**
+   * An enumeration of the types of &quot;messages&quot; you can send a handler
+   */
+<span class="pc" id="L615">  private enum MessageType{ SIMPLE, START_TRACK, SHUTDOWN, END_TRACK }</span>
+
+  /**
+   * A tree structure of record handlers
+   */
+  protected static class RecordHandlerTree implements Iterable&lt;LogRecordHandler&gt;{
+    // -- Overhead --
+    private final boolean isRoot;
+    private final LogRecordHandler head;
+<span class="fc" id="L624">    private final List&lt;RecordHandlerTree&gt; children = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L626">    public RecordHandlerTree() {</span>
+<span class="fc" id="L627">      isRoot = true;</span>
+<span class="fc" id="L628">      head = null;</span>
+<span class="fc" id="L629">    }</span>
+
+<span class="fc" id="L631">    public RecordHandlerTree(LogRecordHandler head) {</span>
+<span class="fc" id="L632">      this.isRoot = false;</span>
+<span class="fc" id="L633">      this.head = head;</span>
+<span class="fc" id="L634">    }</span>
+
+    // -- Core Tree Methods --
+    public LogRecordHandler head(){
+<span class="nc" id="L638">      return head;</span>
+    }
+    public Iterator&lt;RecordHandlerTree&gt; children(){
+<span class="fc" id="L641">      return children.iterator();</span>
+    }
+    // -- Utility Methods --
+    public void addChild(LogRecordHandler handler){
+<span class="pc bpc" id="L645" title="1 of 2 branches missed.">      if(Redwood.depth != 0){</span>
+<span class="nc" id="L646">        throw new IllegalStateException(&quot;Cannot modify Redwood when within a track&quot;);</span>
+      }
+<span class="fc" id="L648">      children.add(new RecordHandlerTree(handler));</span>
+<span class="fc" id="L649">    }</span>
+    protected void addChildTree(RecordHandlerTree tree){
+<span class="pc bpc" id="L651" title="1 of 2 branches missed.">      if(Redwood.depth != 0){</span>
+<span class="nc" id="L652">        throw new IllegalStateException(&quot;Cannot modify Redwood when within a track&quot;);</span>
+      }
+<span class="fc" id="L654">      children.add(tree);</span>
+<span class="fc" id="L655">    }</span>
+    public LogRecordHandler removeChild(LogRecordHandler handler){
+<span class="nc bnc" id="L657" title="All 2 branches missed.">      if(Redwood.depth != 0){</span>
+<span class="nc" id="L658">        throw new IllegalStateException(&quot;Cannot modify Redwood when within a track&quot;);</span>
+      }
+<span class="nc" id="L660">      Iterator&lt;RecordHandlerTree&gt; iter = children();</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">      while(iter.hasNext()){</span>
+<span class="nc" id="L662">        LogRecordHandler cand = iter.next().head();</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">        if(cand == handler){</span>
+<span class="nc" id="L664">          iter.remove();</span>
+<span class="nc" id="L665">          return cand;</span>
+        }
+<span class="nc" id="L667">      }</span>
+<span class="nc" id="L668">      return null;</span>
+    }
+    public RecordHandlerTree find(LogRecordHandler toFind){
+<span class="nc bnc" id="L671" title="All 2 branches missed.">      if(toFind == head()){</span>
+<span class="nc" id="L672">        return this;</span>
+      } else {
+<span class="nc" id="L674">        Iterator&lt;RecordHandlerTree&gt; iter = children();</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">        while(iter.hasNext()){</span>
+<span class="nc" id="L676">          RecordHandlerTree cand = iter.next().find(toFind);</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">          if(cand != null){ return cand; }</span>
+<span class="nc" id="L678">        }</span>
+      }
+<span class="nc" id="L680">      return null;</span>
+    }
+    @Override
+    public Iterator&lt;LogRecordHandler&gt; iterator() {
+<span class="nc" id="L684">      return new Iterator&lt;LogRecordHandler&gt;(){</span>
+        // -- Variables
+<span class="nc" id="L686">        private boolean seenHead = isRoot;</span>
+<span class="nc" id="L687">        private final Iterator&lt;RecordHandlerTree&gt; childrenIter = children();</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">        private final RecordHandlerTree childOnPrix = childrenIter.hasNext() ? childrenIter.next() : null;</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">        private Iterator&lt;LogRecordHandler&gt; childIter = childOnPrix == null ? null : childOnPrix.iterator();</span>
+<span class="nc" id="L690">        private LogRecordHandler lastReturned = null;</span>
+        // -- HasNext
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L694" title="All 4 branches missed.">          while(childIter != null &amp;&amp; !childIter.hasNext()){</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            if(!childrenIter.hasNext()) {</span>
+<span class="nc" id="L696">              break;</span>
+            } else {
+<span class="nc" id="L698">              childIter = childrenIter.next().iterator();</span>
+            }
+          }
+<span class="nc bnc" id="L701" title="All 6 branches missed.">          return !seenHead || (childIter != null &amp;&amp; childIter.hasNext());</span>
+        }
+        // -- Next
+        @Override
+        public LogRecordHandler next() {
+<span class="nc bnc" id="L706" title="All 2 branches missed.">          if(!seenHead){ seenHead = true; return head(); }</span>
+<span class="nc" id="L707">          lastReturned = childIter.next();</span>
+<span class="nc" id="L708">          return lastReturned;</span>
+        }
+        // -- Remove
+        @Override
+        public void remove() {
+<span class="nc bnc" id="L713" title="All 2 branches missed.">          if(!seenHead){ throw new IllegalStateException(&quot;INTERNAL: this shouldn't happen...&quot;); }</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">          if(lastReturned == null){ throw new IllegalStateException(&quot;Called remove() before any elements returned&quot;); }</span>
+<span class="nc bnc" id="L715" title="All 4 branches missed.">          if(childOnPrix != null &amp;&amp; lastReturned == childOnPrix.head()){</span>
+<span class="nc" id="L716">            childrenIter.remove();</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">          } else if(childIter != null){</span>
+<span class="nc" id="L718">            childIter.remove();</span>
+          } else {
+<span class="nc" id="L720">            throw new IllegalStateException(&quot;INTERNAL: not sure what we're removing&quot;);</span>
+          }
+<span class="nc" id="L722">        }</span>
+      };
+    }
+
+    private static List&lt;Record&gt; append(List&lt;Record&gt; lst, Record toAppend){
+<span class="pc bpc" id="L727" title="1 of 2 branches missed.">      if(lst == LogRecordHandler.EMPTY){</span>
+<span class="nc" id="L728">        lst = new ArrayList&lt;&gt;();</span>
+      }
+<span class="fc" id="L730">      lst.add(toAppend);</span>
+<span class="fc" id="L731">      return lst;</span>
+    }
+
+    private void process(Record toPass, MessageType type, int newDepth, long timestamp){
+      //--Handle Message
+      //(records to pass on)
+      List&lt;Record&gt; toPassOn;
+<span class="fc bfc" id="L738" title="All 2 branches covered.">      if(head != null){</span>
+        //(case: not root)
+<span class="pc bpc" id="L740" title="2 of 5 branches missed.">        switch(type){</span>
+          case SIMPLE:
+            //(case: simple log message)
+<span class="fc" id="L743">            toPassOn = head.handle(toPass);</span>
+<span class="fc" id="L744">            break;</span>
+          case START_TRACK:
+            //(case: begin a new track)
+<span class="fc" id="L747">            toPassOn = head.signalStartTrack(toPass);</span>
+<span class="fc" id="L748">            break;</span>
+          case END_TRACK:
+            //case: end a track)
+<span class="fc" id="L751">            toPassOn = head.signalEndTrack(newDepth, timestamp);</span>
+<span class="fc" id="L752">            break;</span>
+          case SHUTDOWN:
+            //case: end a track)
+<span class="nc" id="L755">            toPassOn = head.signalShutdown();</span>
+<span class="nc" id="L756">            break;</span>
+          default:
+<span class="nc" id="L758">            throw new IllegalStateException(&quot;MessageType was non-exhaustive: &quot; + type);</span>
+        }
+      } else {
+        //(case: is root)
+<span class="fc" id="L762">        toPassOn = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L763" title="2 of 5 branches missed.">        switch(type){</span>
+          case SIMPLE:
+<span class="fc" id="L765">            toPassOn = append(toPassOn, toPass);</span>
+<span class="fc" id="L766">            break;</span>
+<span class="fc" id="L767">          case START_TRACK: break;</span>
+<span class="fc" id="L768">          case END_TRACK: break;</span>
+<span class="nc" id="L769">          case SHUTDOWN: break;</span>
+<span class="nc" id="L770">          default: throw new IllegalStateException(&quot;MessageType was non-exhaustive: &quot; + type);</span>
+        }
+      }
+      //--Propagate Children
+<span class="fc" id="L774">      Iterator&lt;RecordHandlerTree&gt; iter = children();</span>
+<span class="fc bfc" id="L775" title="All 2 branches covered.">      while(iter.hasNext()){       //for each child...</span>
+<span class="fc" id="L776">        RecordHandlerTree child = iter.next();</span>
+        // (auxiliary records)
+<span class="fc bfc" id="L778" title="All 2 branches covered.">        for(Record r : toPassOn){  //for each record...</span>
+<span class="fc" id="L779">          child.process(r, MessageType.SIMPLE, newDepth, timestamp);</span>
+<span class="fc" id="L780">        }</span>
+        // (special record)
+<span class="pc bpc" id="L782" title="1 of 3 branches missed.">        switch(type){</span>
+          case START_TRACK:
+          case END_TRACK:
+          case SHUTDOWN:
+<span class="fc" id="L786">            child.process(toPass, type, newDepth, timestamp);</span>
+<span class="fc" id="L787">            break;</span>
+<span class="fc" id="L788">          case SIMPLE: break;</span>
+<span class="nc" id="L789">          default: throw new IllegalStateException(&quot;MessageType was non-exhaustive: &quot; + type);</span>
+        }
+<span class="fc" id="L791">      }</span>
+<span class="fc" id="L792">    }</span>
+
+    private StringBuilder toStringHelper(StringBuilder b, int depth){
+<span class="nc bnc" id="L795" title="All 2 branches missed.">      for(int i=0; i&lt;depth; i++){</span>
+<span class="nc" id="L796">        b.append(&quot;  &quot;);</span>
+      }
+<span class="nc bnc" id="L798" title="All 2 branches missed.">      b.append(head == null ? &quot;ROOT&quot; : head).append(&quot;\n&quot;);</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">      for(RecordHandlerTree child : children){</span>
+<span class="nc" id="L800">        child.toStringHelper(b, depth+1);</span>
+<span class="nc" id="L801">      }</span>
+<span class="nc" id="L802">      return b;</span>
+    }
+    @Override
+    public String toString(){
+<span class="nc" id="L806">      return toStringHelper(new StringBuilder(), 0).toString();</span>
+    }
+  }
+
+  /**
+   * A log record, which encapsulates the information needed
+   * to eventually display the enclosed message.
+   */
+  public static class Record {
+
+    //(filled in at construction)
+    public final Object content;
+    private final Object[] channels;
+    public final int depth;
+    public final long timesstamp;
+    //(known at creation)
+<span class="fc" id="L822">    public final long thread = Thread.currentThread().getId();</span>
+    //(state)
+<span class="fc" id="L824">    private boolean channelsSorted = false;</span>
+
+    /**
+     * Create a new Record, based on the content of the log, the channels, and
+     * the depth
+     * @param content An object (usually String) representing the log contents
+     * @param channels A set of channels to publish this record to
+     * @param depth The depth of the log message
+     */
+<span class="fc" id="L833">    protected Record(Object content, Object[] channels, int depth, long timestamp) {</span>
+<span class="fc" id="L834">      this.content = content;</span>
+<span class="fc" id="L835">      this.channels = channels;</span>
+<span class="fc" id="L836">      this.depth = depth;</span>
+<span class="fc" id="L837">      this.timesstamp = timestamp;</span>
+<span class="fc" id="L838">    }</span>
+
+    /**
+     * Sort the channels alphabetically, with the standard channels in front.
+     * Note that the special FORCE tag is always first.
+     */
+    @SuppressWarnings(&quot;ConstantConditions&quot;)
+    private void sort(){
+      //(sort flags)
+<span class="pc bpc" id="L847" title="1 of 4 branches missed.">      if (!channelsSorted &amp;&amp; channels.length == 2) {</span>
+        // Efficiency tweak for when we only have two channels. More than two, it's worth just sorting.
+<span class="pc bpc" id="L849" title="1 of 4 branches missed.">        if (channels[1] instanceof Flag &amp;&amp; !(channels[0] instanceof Flag)) {</span>
+          // Case: second element is a flag, but first isn't.
+          // Action: put the flag first
+<span class="fc" id="L852">          Object tmp = channels[0];</span>
+<span class="fc" id="L853">          channels[0] = channels[1];</span>
+<span class="fc" id="L854">          channels[1] = tmp;</span>
+<span class="pc bpc" id="L855" title="3 of 4 branches missed.">        } else if (!(channels[0] instanceof Flag) &amp;&amp; !(channels[1] instanceof Flag) &amp;&amp;</span>
+<span class="nc bnc" id="L856" title="All 2 branches missed.">                    channels[0].toString().compareTo(channels[1].toString()) &gt; 0) {</span>
+          // Case: neither element is a flag, and the second argument comes before the first
+          // Action: sort the two arguments
+<span class="nc" id="L859">          Object tmp = channels[0];</span>
+<span class="nc" id="L860">          channels[0] = channels[1];</span>
+<span class="nc" id="L861">          channels[1] = tmp;</span>
+<span class="nc" id="L862">        }</span>
+        // Misc case: both elements are flags, or the flag is already first.
+        // In both of these cases, we don't need to do anything
+<span class="pc bpc" id="L865" title="2 of 4 branches missed.">      } else if(!channelsSorted &amp;&amp; channels.length &gt; 2){</span>
+<span class="nc" id="L866">        Arrays.sort(channels, (a, b) -&gt; {</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">          if (a == FORCE) {</span>
+<span class="nc" id="L868">            return -1;</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">          } else if (b == FORCE) {</span>
+<span class="nc" id="L870">            return 1;</span>
+<span class="nc bnc" id="L871" title="All 4 branches missed.">          } else if (a instanceof Flag &amp;&amp; !(b instanceof Flag)) {</span>
+<span class="nc" id="L872">            return -1;</span>
+<span class="nc bnc" id="L873" title="All 4 branches missed.">          } else if (b instanceof Flag &amp;&amp; !(a instanceof Flag)) {</span>
+<span class="nc" id="L874">            return 1;</span>
+          } else {
+<span class="nc" id="L876">            return a.toString().compareTo(b.toString());</span>
+          }
+        });
+      }
+<span class="fc" id="L880">    }</span>
+
+    /**
+     * Returns whether this log message wants to be forced to be printed
+     * @return true if the FORCE flag is set on this message
+     */
+<span class="fc bfc" id="L886" title="All 4 branches covered.">    public boolean force(){ sort(); return this.channels.length &gt; 0 &amp;&amp; this.channels[0] == FORCE; }</span>
+
+    /**
+     * Returns the channels for this record, in sorted order (special channels first, then alphabetical)
+     * @return A sorted list of channels
+     */
+<span class="fc" id="L892">    public Object[] channels(){ sort(); return this.channels; }</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L896">      return &quot;Record [content=&quot; + content + &quot;, depth=&quot; + depth</span>
+<span class="nc" id="L897">          + &quot;, channels=&quot; + Arrays.toString(channels()) + &quot;, thread=&quot; + thread + &quot;, timesstamp=&quot; + timesstamp + &quot;]&quot;;</span>
+    }
+  }
+
+  /**
+   * Default output handler which actually prints things to the real System.out
+   */
+  public static class ConsoleHandler extends OutputHandler {
+    PrintStream stream;
+<span class="fc" id="L906">    private ConsoleHandler(PrintStream stream){</span>
+<span class="fc" id="L907">      this.stream = stream;</span>
+<span class="fc" id="L908">    }</span>
+    /**
+     * Print a string to the console, without the trailing newline
+     * @param channels The channel this line is being printed to;
+     *                 not relevant for this handler.
+     * @param line The string to be printed.
+     */
+    @Override
+    public void print(Object[] channels, String line) {
+<span class="nc" id="L917">      stream.print(line); stream.flush();</span>
+<span class="nc" id="L918">    }</span>
+<span class="nc" id="L919">    @Override public boolean supportsAnsi() { return true; }</span>
+<span class="fc" id="L920">    public static ConsoleHandler out(){ return new ConsoleHandler(realSysOut); }</span>
+<span class="nc" id="L921">    public static ConsoleHandler err(){ return new ConsoleHandler(realSysErr); }</span>
+  }
+
+  /**
+   * Handler which prints to a specified file
+   * TODO: make constructors for other ways of describing files (File, for example!)
+   */
+  public static class FileHandler extends OutputHandler {
+    private PrintWriter printWriter;
+
+<span class="nc" id="L931">    public FileHandler(String filename) {</span>
+      try {
+<span class="nc" id="L933">        printWriter = new PrintWriter(new BufferedWriter(new OutputStreamWriter(new FileOutputStream(filename), &quot;utf-8&quot;)));</span>
+<span class="nc" id="L934">      } catch (IOException e) {</span>
+<span class="nc" id="L935">        Redwood.log(Flag.ERROR, e);</span>
+<span class="nc" id="L936">      }</span>
+<span class="nc" id="L937">    }</span>
+
+    /** {@inheritDoc} */
+    @Override
+    public void print(Object[] channels, String line) {
+<span class="nc bnc" id="L942" title="All 2 branches missed.">      printWriter.write(line == null ? &quot;null&quot; : line);</span>
+<span class="nc" id="L943">      printWriter.flush();</span>
+<span class="nc" id="L944">    }</span>
+  }
+
+  /**
+   * A utility class for Redwood intended for static import
+   * (import static edu.stanford.nlp.util.logging.Redwood.Util.*;),
+   * providing a wrapper for Redwood functions and adding utility shortcuts
+   */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  public static class Util {
+
+<span class="nc" id="L955">    private Util() {} // static methods</span>
+
+    private static Object[] revConcat(Object[] B, Object... A) {
+      // A is empty whenever do info level logging; B is only empty for blank logging line
+<span class="fc bfc" id="L959" title="All 2 branches covered.">      if (A.length == 0) {</span>
+<span class="fc" id="L960">        return B;</span>
+      }
+<span class="fc" id="L962">      Object[] C = new Object[A.length+B.length];</span>
+<span class="fc" id="L963">      System.arraycopy(A, 0, C, 0, A.length);</span>
+<span class="fc" id="L964">      System.arraycopy(B, 0, C, A.length, B.length);</span>
+<span class="fc" id="L965">      return C;</span>
+    }
+
+<span class="fc" id="L968">    public static final Flag ERR    = Flag.ERROR;</span>
+<span class="fc" id="L969">    public static final Flag WARN   = Flag.WARN;</span>
+<span class="fc" id="L970">    public static final Flag DBG    = Flag.DEBUG;</span>
+<span class="fc" id="L971">    public static final Flag FORCE  = Flag.FORCE;</span>
+<span class="fc" id="L972">    public static final Flag STDOUT = Flag.STDOUT;</span>
+<span class="fc" id="L973">    public static final Flag STDERR = Flag.STDERR;</span>
+
+<span class="nc" id="L975">    public static void prettyLog(Object obj){ PrettyLogger.log(obj); }</span>
+<span class="nc" id="L976">    public static void prettyLog(String description, Object obj){ PrettyLogger.log(description, obj); }</span>
+<span class="fc" id="L977">    public static void log(Object...objs){ Redwood.log(objs); }</span>
+<span class="nc" id="L978">    public static void logf(String format, Object... args){ Redwood.logf(format, args); }</span>
+<span class="nc" id="L979">    public static void warn(Object...objs){ Redwood.log(revConcat(objs, WARN)); }</span>
+<span class="nc" id="L980">    public static void warning(Object...objs){ Redwood.log(revConcat(objs, WARN)); }</span>
+<span class="nc" id="L981">    public static void debug(Object...objs){ Redwood.log(revConcat(objs, DBG)); }</span>
+<span class="nc" id="L982">    public static void err(Object...objs){ Redwood.log(revConcat(objs, ERR, FORCE)); }</span>
+<span class="nc" id="L983">    public static void error(Object...objs){ Redwood.log(revConcat(objs, ERR, FORCE)); }</span>
+<span class="nc" id="L984">    public static void fatal(Object...objs){ Redwood.log(revConcat(objs, ERR, FORCE)); System.exit(1); }</span>
+<span class="nc" id="L985">    public static void runtimeException(Object...objs){ Redwood.log(revConcat(objs, ERR, FORCE)); throw new RuntimeException(Arrays.toString(objs)); }</span>
+<span class="nc" id="L986">    public static void println(Object o){ System.out.println(o); }</span>
+
+    /** Exits with a given status code */
+<span class="nc" id="L989">    public static void exit(int exitCode){ Redwood.stop(); System.exit(exitCode); }</span>
+    /** Exits with status code 0, stopping Redwood first */
+<span class="nc" id="L991">    public static void exit(){ exit(0); }</span>
+    /** Create a RuntimeException with arguments */
+    public static RuntimeException fail(Object msg){
+<span class="nc bnc" id="L994" title="All 2 branches missed.">      if(msg instanceof String){</span>
+<span class="nc" id="L995">        return new RuntimeException((String) msg);</span>
+<span class="nc bnc" id="L996" title="All 2 branches missed.">      } else if(msg instanceof RuntimeException){</span>
+<span class="nc" id="L997">        return (RuntimeException) msg;</span>
+<span class="nc bnc" id="L998" title="All 2 branches missed.">      } else if(msg instanceof Throwable){</span>
+<span class="nc" id="L999">        return new RuntimeException((Throwable) msg);</span>
+      } else {
+<span class="nc" id="L1001">        throw new RuntimeException(msg.toString());</span>
+      }
+    }
+    /** Create a new RuntimeException with no arguments */
+<span class="nc" id="L1005">    public static RuntimeException fail(){ return new RuntimeException(); }</span>
+
+<span class="fc" id="L1007">    public static void startTrack(Object...objs){ Redwood.startTrack(objs); }</span>
+<span class="fc" id="L1008">    public static void forceTrack(String title){ Redwood.startTrack(FORCE, title); }</span>
+<span class="fc" id="L1009">    public static void endTrack(String check){ Redwood.endTrack(check); }</span>
+<span class="nc" id="L1010">    public static void endTrack(){ Redwood.endTrack(); }</span>
+    public static void endTrackIfOpen(String check) {
+<span class="nc bnc" id="L1012" title="All 4 branches missed.">      if (!Redwood.titleStack.empty() &amp;&amp; Redwood.titleStack.peek().equals(check)) { Redwood.endTrack(check); }</span>
+<span class="nc" id="L1013">    }</span>
+    public static void endTracksUntil(String check) {
+<span class="nc bnc" id="L1015" title="All 4 branches missed.">     while (!Redwood.titleStack.empty() &amp;&amp; !Redwood.titleStack.peek().equals(check)) { Redwood.endTrack(Redwood.titleStack.peek()); }</span>
+<span class="nc" id="L1016">    }</span>
+<span class="nc" id="L1017">    public static void endTracksTo(String check) { endTracksUntil(check); endTrack(check); }</span>
+
+<span class="nc" id="L1019">    public static void startThreads(String title){ Redwood.startThreads(title); }</span>
+<span class="nc" id="L1020">    public static void finishThread(){ Redwood.finishThread(); }</span>
+<span class="nc" id="L1021">    public static void endThreads(String check){ Redwood.endThreads(check); }</span>
+
+<span class="nc" id="L1023">    public static RedwoodChannels channels(Object... channels) { return new RedwoodChannels(channels); }</span>
+
+    /**
+     * Wrap a collection of threads (Runnables) to be logged by Redwood.
+     * Each thread will be logged as a continuous chunk; concurrent threads will be queued
+     * and logged after the &quot;main&quot; thread has finished.
+     * This means that every Runnable passed to this method will run as a chunk, though in possibly
+     * random order.
+     *
+     * The handlers set up will operate on the output as if it were not concurrent -- timing will be preserved
+     * but repeated records will be collapsed as per the order the logs are actually output, rather than based
+     * on timestamp.
+     * @param title A title for the group of threads being run
+     * @param runnables The Runnables representing the tasks being run, without the Redwood overhead
+     * @return A new collection of Runnables with the Redwood overhead taken care of
+     */
+    public static Iterable&lt;Runnable&gt; thread(final String title, Iterable&lt;Runnable&gt; runnables){
+      //--Preparation
+      //(variables)
+<span class="nc" id="L1042">      final AtomicBoolean haveStarted = new AtomicBoolean(false);</span>
+<span class="nc" id="L1043">      final ReentrantLock metaInfoLock = new ReentrantLock();</span>
+<span class="nc" id="L1044">      final AtomicInteger numPending = new AtomicInteger(0);</span>
+<span class="nc" id="L1045">      final Iterator&lt;Runnable&gt; iter = runnables.iterator();</span>
+      //--Create Runnables
+<span class="nc" id="L1047">      return new IterableIterator&lt;&gt;(new Iterator&lt;Runnable&gt;() {</span>
+        @Override
+        public boolean hasNext() {
+<span class="nc" id="L1050">          synchronized (iter) {</span>
+<span class="nc" id="L1051">            return iter.hasNext();</span>
+<span class="nc" id="L1052">          }</span>
+        }
+
+        @Override
+        public synchronized Runnable next() {
+          final Runnable runnable;
+<span class="nc" id="L1058">          synchronized (iter) {</span>
+<span class="nc" id="L1059">            runnable = iter.next();</span>
+<span class="nc" id="L1060">          }</span>
+          // (don't flood the queue)
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">          while (numPending.get() &gt; 100) {</span>
+            try {
+<span class="nc" id="L1064">              Thread.sleep(100);</span>
+<span class="nc" id="L1065">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L1066">              throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1067">            }</span>
+          }
+<span class="nc" id="L1069">          numPending.incrementAndGet();</span>
+          // (add the job)
+<span class="nc" id="L1071">          return () -&gt; {</span>
+<span class="nc" id="L1072">            boolean threadFinished = false;</span>
+            try {
+              //(signal start of threads)
+<span class="nc" id="L1075">              metaInfoLock.lock();</span>
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">              if (!haveStarted.getAndSet(true)) {</span>
+<span class="nc" id="L1077">                startThreads(title); //&lt;--this must be a blocking operation</span>
+              }
+<span class="nc" id="L1079">              metaInfoLock.unlock();</span>
+              //(run runnable)
+              try {
+<span class="nc" id="L1082">                runnable.run();</span>
+<span class="nc" id="L1083">              } catch (Exception | AssertionError e) {</span>
+<span class="nc" id="L1084">                e.printStackTrace();</span>
+<span class="nc" id="L1085">                System.exit(1);</span>
+<span class="nc" id="L1086">              }</span>
+              //(signal end of thread)
+<span class="nc" id="L1088">              finishThread();</span>
+<span class="nc" id="L1089">              threadFinished = true;</span>
+              //(signal end of threads)
+<span class="nc" id="L1091">              int numStillPending = numPending.decrementAndGet();</span>
+<span class="nc" id="L1092">              synchronized (iter) {</span>
+<span class="nc bnc" id="L1093" title="All 4 branches missed.">                if (numStillPending &lt;= 0 &amp;&amp; !iter.hasNext()) {</span>
+<span class="nc" id="L1094">                  endThreads(title);</span>
+                }
+<span class="nc" id="L1096">              }</span>
+<span class="nc" id="L1097">            } catch (Throwable t) {</span>
+<span class="nc" id="L1098">              t.printStackTrace();</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">              if (!threadFinished) {</span>
+<span class="nc" id="L1100">                finishThread();</span>
+              }
+<span class="nc" id="L1102">            }</span>
+<span class="nc" id="L1103">          };</span>
+        }
+
+        @Override
+        public void remove() {
+<span class="nc" id="L1108">          synchronized (iter) {</span>
+<span class="nc" id="L1109">            iter.remove();</span>
+<span class="nc" id="L1110">          }</span>
+<span class="nc" id="L1111">        }</span>
+      });
+    }
+
+<span class="nc" id="L1115">    public static Iterable&lt;Runnable&gt; thread(Iterable&lt;Runnable&gt; runnables){ return thread(&quot;&quot;, runnables); }</span>
+
+    /**
+     * Thread a collection of Runnables, and run them via a java Executor.
+     * This is a utility function; the Redwood-specific changes happen in the
+     * thread() method.
+     *
+     * @param title A title for the group of threads being run
+     * @param runnables The Runnables representing the tasks being run, without the Redwood overhead --
+     *                  particularly, these should NOT have been passed to thread() yet.
+     * @param numThreads The number of threads to run on
+     */
+    public static void threadAndRun(String title, Iterable&lt;Runnable&gt; runnables, int numThreads){
+      // (short circuit if single thread)
+<span class="nc bnc" id="L1129" title="All 8 branches missed.">      if (numThreads &lt;= 1 || isThreaded || (runnables instanceof Collection &amp;&amp; ((Collection&lt;Runnable&gt;) runnables).size() &lt;= 1)) {</span>
+<span class="nc" id="L1130">        startTrack( &quot;Threads (&quot; + title + &quot;)&quot; );</span>
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">        for (Runnable toRun : runnables) { toRun.run(); }</span>
+<span class="nc" id="L1132">        endTrack( &quot;Threads (&quot; + title + &quot;)&quot; );</span>
+<span class="nc" id="L1133">        return;</span>
+      }
+      //(create executor)
+<span class="nc" id="L1136">      ExecutorService exec = Executors.newFixedThreadPool(numThreads);</span>
+      //(add threads)
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">      for(Runnable toRun : thread(title,runnables)){</span>
+<span class="nc" id="L1139">        exec.submit(toRun);</span>
+<span class="nc" id="L1140">      }</span>
+      //(await finish)
+<span class="nc" id="L1142">      exec.shutdown();</span>
+      try {
+<span class="nc" id="L1144">        exec.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);</span>
+<span class="nc" id="L1145">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L1146">        throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1147">      }</span>
+<span class="nc" id="L1148">    }</span>
+    public static void threadAndRun(String title, Iterable&lt;Runnable&gt; runnables){
+<span class="nc" id="L1150">      threadAndRun(title,runnables,Runtime.getRuntime().availableProcessors());</span>
+<span class="nc" id="L1151">    }</span>
+    public static void threadAndRun(Iterable&lt;Runnable&gt; runnables, int numThreads){
+<span class="nc" id="L1153">      threadAndRun(String.valueOf(numThreads), runnables, numThreads);</span>
+<span class="nc" id="L1154">    }</span>
+    public static void threadAndRun(Iterable&lt;Runnable&gt; runnables){
+<span class="nc" id="L1156">      threadAndRun(runnables, ArgumentParser.threads);</span>
+<span class="nc" id="L1157">    }</span>
+
+    /**
+     * Print (to console) a margin with the channels of a given log message.
+     * Note that this does not affect File printing.
+     * @param width The width of the margin to print (must be &amp;gt;2)
+     */
+    public static void printChannels(int width){
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">      for(LogRecordHandler handler : handlers){</span>
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">        if(handler instanceof OutputHandler){</span>
+<span class="nc" id="L1167">          ((OutputHandler) handler).leftMargin = width;</span>
+        }
+<span class="nc" id="L1169">      }</span>
+<span class="nc" id="L1170">    }</span>
+
+<span class="fc" id="L1172">    public static final Style BOLD      = Style.BOLD;</span>
+<span class="fc" id="L1173">    public static final Style DIM       = Style.DIM;</span>
+<span class="fc" id="L1174">    public static final Style ITALIC    = Style.ITALIC;</span>
+<span class="fc" id="L1175">    public static final Style UNDERLINE = Style.UNDERLINE;</span>
+<span class="fc" id="L1176">    public static final Style BLINK     = Style.BLINK;</span>
+<span class="fc" id="L1177">    public static final Style CROSS_OUT = Style.CROSS_OUT;</span>
+
+<span class="fc" id="L1179">    public static final Color BLACK   = Color.BLACK;</span>
+<span class="fc" id="L1180">    public static final Color RED     = Color.RED;</span>
+<span class="fc" id="L1181">    public static final Color GREEN   = Color.GREEN;</span>
+<span class="fc" id="L1182">    public static final Color YELLOW  = Color.YELLOW;</span>
+<span class="fc" id="L1183">    public static final Color BLUE    = Color.BLUE;</span>
+<span class="fc" id="L1184">    public static final Color MAGENTA = Color.MAGENTA;</span>
+<span class="fc" id="L1185">    public static final Color CYAN    = Color.CYAN;</span>
+<span class="fc" id="L1186">    public static final Color WHITE   = Color.WHITE;</span>
+  }
+
+  /**
+   * Represents a collection of channels. This lets you decouple selecting
+   * channels from logging messages, similar to traditional logging systems.
+   * {@link RedwoodChannels} have log and logf methods. Unlike Redwood.log and
+   * Redwood.logf, these do not take channel names since those are specified
+   * inside {@link RedwoodChannels}.
+   *
+   * Required if you want to use logf with a channel. This follows the
+   * Builder Pattern so Redwood.channels(&quot;chanA&quot;, &quot;chanB&quot;).log(&quot;message&quot;) is equivalent to
+   * Redwood.channels(&quot;chanA&quot;).channels(&quot;chanB&quot;).log(&quot;message&quot;)
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  public static class RedwoodChannels {
+    private final Object[] channelNames;
+
+<span class="fc" id="L1204">    public RedwoodChannels(Object... channelNames) {</span>
+<span class="fc" id="L1205">      this.channelNames = channelNames;</span>
+<span class="fc" id="L1206">    }</span>
+
+    /**
+     * Creates a new RedwoodChannels object, concatenating the channels from
+     * this RedwoodChannels with some additional channels.
+     * @param moreChannelNames The channel names to also include
+     * @return A RedwoodChannels representing the current and new channels.
+     */
+    public RedwoodChannels channels(Object... moreChannelNames) {
+      //(copy array)
+<span class="nc" id="L1216">      Object[] result = new Object[channelNames.length + moreChannelNames.length];</span>
+<span class="nc" id="L1217">      System.arraycopy(channelNames, 0, result, 0, channelNames.length);</span>
+<span class="nc" id="L1218">      System.arraycopy(moreChannelNames, 0, result, channelNames.length, moreChannelNames.length);</span>
+      //(create channels)
+<span class="nc" id="L1220">      return new RedwoodChannels(result);</span>
+    }
+
+    /**
+     * Log a message to the channels specified in this RedwoodChannels object.
+     * @param obj The object to log
+     */
+    public void log(Object... obj) {
+<span class="fc" id="L1228">      Object[] newArgs = new Object[channelNames.length+obj.length];</span>
+<span class="fc" id="L1229">      System.arraycopy(channelNames,0,newArgs,0,channelNames.length);</span>
+<span class="fc" id="L1230">      System.arraycopy(obj,0,newArgs,channelNames.length,obj.length);</span>
+<span class="fc" id="L1231">      Redwood.log(newArgs);</span>
+<span class="fc" id="L1232">    }</span>
+
+    /**
+     * Log a printf-style formatted message to the channels specified in this RedwoodChannels object.
+     * @param format The format string for the printf function
+     * @param args The arguments to the printf function
+     */
+    public void logf(String format, Object... args) {
+<span class="nc" id="L1240">      log((Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L1241">    }</span>
+
+    /**
+     * Log a printf-style formatted message to the channels specified in this RedwoodChannels object.
+     * @param level The log level to log with.
+     * @param format The format string for the printf function
+     * @param args The arguments to the printf function
+     */
+    public void logf(Flag level, String format, Object... args) {
+<span class="nc" id="L1250">      log(level, (Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L1251">    }</span>
+
+    /** Log to the debug channel. @see RedwoodChannels#logf(Flag, String, Object...) */
+    public void debugf(String format, Object... args) {
+<span class="nc" id="L1255">      debug((Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L1256">    }</span>
+
+    /** Log to the warn channel. @see RedwoodChannels#logf(Flag, String, Object...) */
+    public void warnf(String format, Object... args) {
+<span class="nc" id="L1260">      warn((Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L1261">    }</span>
+
+    /** Log to the error channel. @see RedwoodChannels#logf(Flag, String, Object...) */
+    public void errf(String format, Object... args) {
+<span class="nc" id="L1265">      err((Supplier&lt;String&gt;) () -&gt; new Formatter().format(format, args).toString());</span>
+<span class="nc" id="L1266">    }</span>
+
+    /**
+     * PrettyLog an object using these channels.  A default description will be created
+     * based on the type of obj.
+     */
+    public void prettyLog(Object obj) {
+<span class="nc" id="L1273">      PrettyLogger.log(this, obj);</span>
+<span class="nc" id="L1274">    }</span>
+
+    /**
+     * PrettyLog an object with a description using these channels.
+     */
+    public void prettyLog(String description, Object obj) {
+<span class="nc" id="L1280">      PrettyLogger.log(this, description, obj);</span>
+<span class="nc" id="L1281">    }</span>
+
+<span class="fc" id="L1283">    public void info(Object... objs) { log(Util.revConcat(objs)); }</span>
+<span class="fc" id="L1284">    public void warn(Object... objs) { log(Util.revConcat(objs, WARN)); }</span>
+<span class="nc" id="L1285">    public void warning(Object... objs) { log(Util.revConcat(objs, WARN)); }</span>
+<span class="nc" id="L1286">    public void debug(Object... objs) { log(Util.revConcat(objs, DBG)); }</span>
+<span class="nc" id="L1287">    public void err(Object... objs) { log(Util.revConcat(objs, ERR, FORCE)); }</span>
+<span class="nc" id="L1288">    public void error(Object... objs) { log(Util.revConcat(objs, ERR, FORCE)); }</span>
+<span class="nc" id="L1289">    public void fatal(Object... objs) { log(Util.revConcat(objs, ERR, FORCE)); System.exit(1); }</span>
+  }
+
+   /**
+   * Standard channels; enum for the sake of efficiency
+   */
+<span class="pc" id="L1295">  protected enum Flag {</span>
+<span class="fc" id="L1296">    ERROR,</span>
+<span class="fc" id="L1297">    WARN,</span>
+<span class="fc" id="L1298">    DEBUG,</span>
+<span class="fc" id="L1299">    STDOUT,</span>
+<span class="fc" id="L1300">    STDERR,</span>
+<span class="fc" id="L1301">    FORCE</span>
+  }
+
+
+
+  /**
+   * Various informal tests of Redwood functionality
+   * @param args Unused
+   *
+   */
+  // TODO(gabor) update this with the new RedwoodConfiguration
+  @SuppressWarnings(&quot;deprecation&quot;)
+  public static void main(String[] args){
+
+<span class="nc" id="L1315">    RedwoodConfiguration.current().listenOnChannels(record -&gt; {</span>
+<span class="nc" id="L1316">      System.out.println(&quot;&gt;&gt;&gt; &quot; + record.content.toString());</span>
+<span class="nc" id="L1317">    }, Redwood.ERR).apply();</span>
+<span class="nc" id="L1318">    Redwood.log(&quot;hello world!&quot;);</span>
+<span class="nc" id="L1319">    Redwood.log(Redwood.ERR, &quot;an error!&quot;);</span>
+
+<span class="nc" id="L1321">    System.exit(1);</span>
+
+    // -- STRESS TEST THREADS --
+<span class="nc" id="L1324">    LinkedList&lt;Runnable&gt; tasks = new LinkedList&lt;&gt;();</span>
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">    for(int i=0; i&lt;1000; i++){</span>
+<span class="nc" id="L1326">      final int fI = i;</span>
+<span class="nc" id="L1327">      tasks.add(() -&gt; {</span>
+<span class="nc" id="L1328">        startTrack(&quot;Runnable &quot; + fI);</span>
+<span class="nc" id="L1329">        log(Thread.currentThread().getId());</span>
+<span class="nc" id="L1330">        log(&quot;message &quot; + fI + &quot;.1&quot;);</span>
+<span class="nc" id="L1331">        log(&quot;message &quot; + fI + &quot;.2&quot;);</span>
+<span class="nc" id="L1332">        log(&quot;message &quot; + fI + &quot;.3&quot;);</span>
+<span class="nc" id="L1333">        log(FORCE,&quot;message &quot; + fI + &quot;.4&quot;);</span>
+<span class="nc" id="L1334">        log(&quot;message &quot; + fI + &quot;.5&quot;);</span>
+<span class="nc" id="L1335">        forceTrack(&quot;Runnable &quot; + fI + &quot;.1&quot;);</span>
+<span class="nc" id="L1336">        endTrack(&quot;Runnable &quot; + fI + &quot;.1&quot;);</span>
+<span class="nc" id="L1337">        forceTrack(&quot;Runnable &quot; + fI + &quot;.2&quot;);</span>
+<span class="nc" id="L1338">        log(&quot;a message&quot;);</span>
+<span class="nc" id="L1339">        endTrack(&quot;Runnable &quot; + fI + &quot;.2&quot;);</span>
+<span class="nc" id="L1340">        forceTrack(&quot;Runnable &quot; + fI + &quot;.3&quot;);</span>
+<span class="nc" id="L1341">        log(&quot;a message&quot;);</span>
+<span class="nc" id="L1342">        log(FORCE,&quot;A forced message&quot;);</span>
+<span class="nc" id="L1343">        endTrack(&quot;Runnable &quot; + fI + &quot;.3&quot;);</span>
+<span class="nc" id="L1344">        endTrack(&quot;Runnable &quot; + fI);</span>
+<span class="nc" id="L1345">      });</span>
+    }
+<span class="nc" id="L1347">    startTrack(&quot;Wrapper&quot;);</span>
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){</span>
+<span class="nc" id="L1349">      Util.threadAndRun(tasks, 100);</span>
+    }
+<span class="nc" id="L1351">    endTrack(&quot;Wrapper&quot;);</span>
+<span class="nc" id="L1352">    System.exit(1);</span>
+
+<span class="nc" id="L1354">    forceTrack(&quot;Track 1&quot;);</span>
+<span class="nc" id="L1355">    log(&quot;tag&quot;, ERR, &quot;hello world&quot;);</span>
+<span class="nc" id="L1356">    startTrack(&quot;Hidden&quot;);</span>
+<span class="nc" id="L1357">    startTrack(&quot;Subhidden&quot;);</span>
+<span class="nc" id="L1358">    endTrack(&quot;Subhidden&quot;);</span>
+<span class="nc" id="L1359">    endTrack(&quot;Hidden&quot;);</span>
+<span class="nc" id="L1360">    startTrack(FORCE, &quot;Shown&quot;);</span>
+<span class="nc" id="L1361">    startTrack(FORCE,&quot;Subshown&quot;);</span>
+<span class="nc" id="L1362">    endTrack(&quot;Subshown&quot;);</span>
+<span class="nc" id="L1363">    endTrack(&quot;Shown&quot;);</span>
+<span class="nc" id="L1364">    log(&quot;^shown should have appeared above&quot;);</span>
+<span class="nc" id="L1365">    startTrack(&quot;Track 1.1&quot;);</span>
+<span class="nc" id="L1366">    log(WARN, &quot;some&quot;, &quot;something in 1.1&quot;);</span>
+<span class="nc" id="L1367">    log(&quot;some&quot;,ERR,&quot;something in 1.1&quot;);</span>
+<span class="nc" id="L1368">    log(FORCE,&quot;some&quot;,WARN,&quot;something in 1.1&quot;);</span>
+<span class="nc" id="L1369">    log(WARN,FORCE,&quot;some&quot;,&quot;something in 1.1&quot;);</span>
+<span class="nc" id="L1370">    logf(&quot;format string %s then int %d&quot;, &quot;hello&quot;, 7);</span>
+<span class="nc" id="L1371">    endTrack(&quot;Track 1.1&quot;);</span>
+<span class="nc" id="L1372">    startTrack();</span>
+<span class="nc" id="L1373">    log(&quot;In an anonymous track&quot;);</span>
+<span class="nc" id="L1374">    endTrack();</span>
+<span class="nc" id="L1375">    endTrack(&quot;Track 1&quot;);</span>
+<span class="nc" id="L1376">    log(&quot;outside of a track&quot;);</span>
+<span class="nc" id="L1377">    log(&quot;these&quot;,&quot;channels&quot;,&quot;should&quot;,&quot;be&quot;,&quot;in&quot;,DBG,&quot;alphabetical&quot;,&quot;order&quot;, &quot;a log item with lots of channels&quot;);</span>
+<span class="nc" id="L1378">    log(&quot;these&quot;,&quot;channels&quot;,&quot;should&quot;,&quot;be&quot;,&quot;in&quot;,DBG,&quot;alphabetical&quot;,&quot;order&quot;, &quot;a log item\nthat spans\nmultiple\nlines&quot;);</span>
+<span class="nc" id="L1379">    log(DBG,&quot;a last log item&quot;);</span>
+<span class="nc" id="L1380">    log(ERR,null);</span>
+
+    //--Repeated Records
+//    RedwoodConfiguration.current().collapseExact().apply();
+    //(simple case)
+<span class="nc" id="L1385">    forceTrack(&quot;Strict Equality&quot;);</span>
+<span class="nc bnc" id="L1386" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){ log(&quot;this is a message&quot;); }</span>
+<span class="nc" id="L1387">    endTrack(&quot;Strict Equality&quot;);</span>
+    //(in-track change)
+<span class="nc" id="L1389">    forceTrack(&quot;Change&quot;);</span>
+<span class="nc bnc" id="L1390" title="All 2 branches missed.">    for(int i=0; i&lt;10; i++){ log(&quot;this is a message&quot;); }</span>
+<span class="nc bnc" id="L1391" title="All 2 branches missed.">    for(int i=0; i&lt;10; i++){ log(&quot;this is a another message&quot;); }</span>
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">    for(int i=0; i&lt;10; i++){ log(&quot;this is a third message&quot;); }</span>
+<span class="nc bnc" id="L1393" title="All 2 branches missed.">    for(int i=0; i&lt;5; i++){ log(&quot;this is a fourth message&quot;); }</span>
+<span class="nc" id="L1394">    log(FORCE,&quot;this is a fourth message&quot;);</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">    for(int i=0; i&lt;5; i++){ log(&quot;this is a fourth message&quot;); }</span>
+<span class="nc" id="L1396">    log(&quot;^middle 'fourth message' was forced&quot;);</span>
+<span class="nc" id="L1397">    endTrack(&quot;Change&quot;);</span>
+    //(suppress tracks)
+<span class="nc" id="L1399">    forceTrack(&quot;Repeated Tracks&quot;);</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){ startTrack(&quot;Track type 1&quot;); log(&quot;a message&quot;); endTrack(&quot;Track type 1&quot;); }</span>
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){ startTrack(&quot;Track type 2&quot;); log(&quot;a message&quot;); endTrack(&quot;Track type 2&quot;); }</span>
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){ startTrack(&quot;Track type 3&quot;); log(&quot;a message&quot;); endTrack(&quot;Track type 3&quot;); }</span>
+<span class="nc" id="L1403">    startTrack(&quot;Track type 3&quot;); startTrack(&quot;nested&quot;); log(FORCE,&quot;this should show up&quot;); endTrack(&quot;nested&quot;); endTrack(&quot;Track type 3&quot;);</span>
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">    for(int i=0; i&lt;5; i++){ startTrack(&quot;Track type 3&quot;); log(FORCE,&quot;this should show up&quot;); endTrack(&quot;Track type 3&quot;); }</span>
+<span class="nc" id="L1405">    log(WARN,&quot;The log message 'this should show up' should show up 6 (5+1) times above&quot;);</span>
+<span class="nc" id="L1406">    endTrack(&quot;Repeated Tracks&quot;);</span>
+    //(tracks with invisible things)
+//    Redwood.hideOnlyChannels(DBG);
+<span class="nc" id="L1409">    forceTrack(&quot;Hidden Subtracks&quot;);</span>
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){</span>
+<span class="nc" id="L1411">      startTrack(&quot;Only has debug messages&quot;);</span>
+<span class="nc" id="L1412">      log(DBG,&quot;You shouldn't see me&quot;);</span>
+<span class="nc" id="L1413">      endTrack(&quot;Only has debug messages&quot;);</span>
+    }
+<span class="nc" id="L1415">    log(&quot;You shouldn't see any other messages or 'skipped tracks' here&quot;);</span>
+<span class="nc" id="L1416">    endTrack(&quot;Hidden Subtracks&quot;);</span>
+    //(fuzzy repeats)
+<span class="nc" id="L1418">    RedwoodConfiguration.standard().apply();</span>
+//    RedwoodConfiguration.current().collapseApproximate().apply();
+<span class="nc" id="L1420">    forceTrack(&quot;Fuzzy Equality&quot;);</span>
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){ log(&quot;iter &quot; + i + &quot; ended with value &quot; + (-34587292534.0+Math.sqrt(i)*3000000000.0)); }</span>
+<span class="nc" id="L1422">    endTrack(&quot;Fuzzy Equality&quot;);</span>
+<span class="nc" id="L1423">    forceTrack(&quot;Fuzzy Equality (timing)&quot;);</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){</span>
+<span class="nc" id="L1425">      log(&quot;iter &quot; + i + &quot; ended with value &quot; + (-34587292534.0+Math.sqrt(i)*3000000000.0));</span>
+      try {
+<span class="nc" id="L1427">        Thread.sleep(50);</span>
+<span class="nc" id="L1428">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L1429">        throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1430">      }</span>
+    }
+<span class="nc" id="L1432">    endTrack(&quot;Fuzzy Equality (timing)&quot;);</span>
+
+    //--Util Helper
+<span class="nc" id="L1435">    Util.log(&quot;hello world&quot;);</span>
+<span class="nc" id="L1436">    Util.log(DBG, &quot;hello world&quot;);</span>
+<span class="nc" id="L1437">    Util.debug(&quot;hello world&quot;);</span>
+<span class="nc" id="L1438">    Util.debug(&quot;atag&quot;, &quot;hello world&quot;);</span>
+
+    //--Show Name at Track Finish
+<span class="nc" id="L1441">    Redwood.getHandler(ConsoleHandler.class).minLineCountForTrackNameReminder = 5;</span>
+<span class="nc" id="L1442">    startTrack(&quot;Long Track&quot;);</span>
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">    for(int i=0; i&lt;10; i++){ log(FORCE,&quot;contents of long track&quot;); }</span>
+<span class="nc" id="L1444">    endTrack(&quot;Long TracK&quot;);</span>
+<span class="nc" id="L1445">    startTrack(&quot;Long Track&quot;);</span>
+<span class="nc" id="L1446">    startTrack(&quot;But really this is the long one&quot;);</span>
+    try {
+<span class="nc" id="L1448">      Thread.sleep(3000);</span>
+<span class="nc" id="L1449">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L1450">      throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1451">    }</span>
+<span class="nc bnc" id="L1452" title="All 2 branches missed.">    for(int i=0; i&lt;10; i++){ log(FORCE,&quot;contents of long track&quot;); }</span>
+<span class="nc" id="L1453">    endTrack(&quot;But really this is the long one&quot;);</span>
+<span class="nc" id="L1454">    endTrack(&quot;Long TracK&quot;);</span>
+<span class="nc" id="L1455">    Redwood.getHandler(ConsoleHandler.class).minLineCountForTrackNameReminder = 50;</span>
+
+    //--Multithreading
+<span class="nc" id="L1458">    ExecutorService exec = Executors.newFixedThreadPool(10);</span>
+<span class="nc" id="L1459">    startThreads(&quot;name&quot;);</span>
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">    for(int i=0; i&lt;50; i++){</span>
+<span class="nc" id="L1461">      final int theI = i;</span>
+<span class="nc" id="L1462">      exec.execute(() -&gt; {</span>
+<span class="nc" id="L1463">        startTrack(&quot;Thread &quot; + theI + &quot; (&quot; + Thread.currentThread().getId() + &quot;)&quot;);</span>
+<span class="nc bnc" id="L1464" title="All 2 branches missed.">        for(int time=0; time&lt;5; time++){</span>
+<span class="nc" id="L1465">          log(&quot;tick &quot; + time + &quot; from &quot; + theI + &quot; (&quot; + Thread.currentThread().getId() + &quot;)&quot;);</span>
+          try {
+<span class="nc" id="L1467">            Thread.sleep(50);</span>
+<span class="nc" id="L1468">          } catch (Exception ignored) {}</span>
+        }
+<span class="nc" id="L1470">        endTrack(&quot;Thread &quot; + theI + &quot; (&quot; + Thread.currentThread().getId() + &quot;)&quot;);</span>
+<span class="nc" id="L1471">        finishThread();</span>
+<span class="nc" id="L1472">      });</span>
+
+    }
+<span class="nc" id="L1475">    exec.shutdown();</span>
+    try {
+<span class="nc" id="L1477">      exec.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);</span>
+<span class="nc" id="L1478">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L1479">      throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1480">    }</span>
+<span class="nc" id="L1481">    endThreads(&quot;name&quot;);</span>
+
+    //--System Streams
+<span class="nc" id="L1484">    Redwood.captureSystemStreams(true, true);</span>
+<span class="nc" id="L1485">    System.out.println(&quot;Hello World&quot;);</span>
+<span class="nc" id="L1486">    log.info(&quot;This is an error!&quot;);</span>
+
+    //--Neat Exit
+//    RedwoodConfiguration.standard().collapseExact().apply();
+    //(on close)
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">    for(int i=0; i&lt;100; i++){</span>
+//      startTrack();
+<span class="nc" id="L1493">      log(&quot;stuff!&quot;);</span>
+//      endTrack();
+    }
+<span class="nc" id="L1496">    Util.exit(0);</span>
+    //(on exception)
+<span class="nc" id="L1498">    System.out.println(&quot;I'm going to exception soon (on purpose)&quot;);</span>
+<span class="nc" id="L1499">    RedwoodConfiguration.current().neatExit().apply();</span>
+<span class="nc" id="L1500">    startTrack(&quot;I should close&quot;);</span>
+<span class="nc" id="L1501">    log(FORCE,&quot;so I'm nonempty...&quot;);</span>
+    try {
+<span class="nc" id="L1503">      Thread.sleep(1000);</span>
+<span class="nc" id="L1504">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L1505">      throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1506">    }</span>
+<span class="nc" id="L1507">    throw new IllegalArgumentException();</span>
+  } // end main()
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

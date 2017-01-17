@@ -1,0 +1,789 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LexicalizedParserQuery.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">LexicalizedParserQuery.java</span></div><h1>LexicalizedParserQuery.java</h1><pre class="source lang-java linenums">// Stanford Parser -- a probabilistic lexicalized NL CFG parser
+// Copyright (c) 2002 - 2011 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    parser-support@lists.stanford.edu
+//    http://nlp.stanford.edu/software/lex-parser.shtml
+
+package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.ling.SentenceUtils;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.parser.KBestViterbiParser;
+import edu.stanford.nlp.parser.common.NoSuchParseException;
+import edu.stanford.nlp.parser.common.ParserConstraint;
+import edu.stanford.nlp.parser.common.ParserQuery;
+import edu.stanford.nlp.parser.common.ParserUtils;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreePrint;
+import edu.stanford.nlp.trees.TreeTransformer;
+import edu.stanford.nlp.trees.TreebankLanguagePack;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.ScoredObject;
+import edu.stanford.nlp.util.DeltaIndex;
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+
+
+public class LexicalizedParserQuery implements ParserQuery  {
+
+  /** A logger for this class */
+<span class="nc" id="L61">  private static Redwood.RedwoodChannels log = Redwood.channels(LexicalizedParserQuery.class);</span>
+
+  private final Options op;
+  private final TreeTransformer debinarizer;
+  private final TreeTransformer boundaryRemover;
+
+  /** The PCFG parser. */
+  private final ExhaustivePCFGParser pparser;
+  /** The dependency parser. */
+  private final ExhaustiveDependencyParser dparser;
+  /** The factored parser that combines the dependency and PCFG parsers. */
+  private final KBestViterbiParser bparser;
+
+<span class="nc" id="L74">  private final boolean fallbackToPCFG = true;</span>
+
+  private final TreeTransformer subcategoryStripper;
+
+  // Whether or not the most complicated model available successfully
+  // parsed the input sentence.
+<span class="nc" id="L80">  private boolean parseSucceeded = false;</span>
+  // parseSkipped means that not only did we not succeed at parsing,
+  // but for some reason we didn't even try.  Most likely this happens
+  // when the sentence is too long or is of length 0.
+<span class="nc" id="L84">  private boolean parseSkipped = false;</span>
+  // In some sense we succeeded, but only because we used a fallback grammar
+<span class="nc" id="L86">  private boolean parseFallback = false;</span>
+  // Not enough memory to parse
+<span class="nc" id="L88">  private boolean parseNoMemory = false;</span>
+  // Horrible error
+<span class="nc" id="L90">  private boolean parseUnparsable = false;</span>
+  // If something ran out of memory, where the error occurred
+<span class="nc" id="L92">  private String whatFailed = null;</span>
+
+<span class="nc" id="L94">  public boolean parseSucceeded() { return parseSucceeded; }</span>
+<span class="nc" id="L95">  public boolean parseSkipped() { return parseSkipped; }</span>
+<span class="nc" id="L96">  public boolean parseFallback() { return parseFallback; }</span>
+<span class="nc" id="L97">  public boolean parseNoMemory() { return parseNoMemory; }</span>
+<span class="nc" id="L98">  public boolean parseUnparsable() { return parseUnparsable; }</span>
+
+  private List&lt;? extends HasWord&gt; originalSentence;
+
+  @Override
+<span class="nc" id="L103">  public List&lt;? extends HasWord&gt; originalSentence() { return originalSentence; }</span>
+
+  /** Keeps track of whether the sentence had punctuation added, which affects the expected length of the sentence */
+<span class="nc" id="L106">  private boolean addedPunct = false;</span>
+
+<span class="nc" id="L108">  private boolean saidMemMessage = false;</span>
+
+  public boolean saidMemMessage() {
+<span class="nc" id="L111">    return saidMemMessage;</span>
+  }
+
+
+<span class="nc" id="L115">  LexicalizedParserQuery(LexicalizedParser parser) {</span>
+<span class="nc" id="L116">    this.op = parser.getOp();</span>
+
+<span class="nc" id="L118">    BinaryGrammar bg = parser.bg;</span>
+<span class="nc" id="L119">    UnaryGrammar ug = parser.ug;</span>
+<span class="nc" id="L120">    Lexicon lex = parser.lex;</span>
+<span class="nc" id="L121">    DependencyGrammar dg = parser.dg;</span>
+
+<span class="nc" id="L123">    Index&lt;String&gt; stateIndex = parser.stateIndex;</span>
+<span class="nc" id="L124">    Index&lt;String&gt; wordIndex = new DeltaIndex&lt;&gt;(parser.wordIndex);</span>
+<span class="nc" id="L125">    Index&lt;String&gt; tagIndex = parser.tagIndex;</span>
+
+<span class="nc" id="L127">    this.debinarizer = new Debinarizer(op.forceCNF);</span>
+<span class="nc" id="L128">    this.boundaryRemover = new BoundaryRemover();</span>
+
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    if (op.doPCFG) {</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">      if (op.testOptions.iterativeCKY) {</span>
+<span class="nc" id="L132">        pparser = new IterativeCKYPCFGParser(bg, ug, lex, op, stateIndex, wordIndex, tagIndex);</span>
+      } else {
+<span class="nc" id="L134">        pparser = new ExhaustivePCFGParser(bg, ug, lex, op, stateIndex, wordIndex, tagIndex);</span>
+      }
+    } else {
+<span class="nc" id="L137">      pparser = null;</span>
+    }
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">    if (op.doDep) {</span>
+<span class="nc" id="L141">      dg.setLexicon(lex);</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">      if (!op.testOptions.useFastFactored) {</span>
+<span class="nc" id="L143">        dparser = new ExhaustiveDependencyParser(dg, lex, op, wordIndex, tagIndex);</span>
+      } else {
+<span class="nc" id="L145">        dparser = null;</span>
+      }
+    } else {
+<span class="nc" id="L148">      dparser = null;</span>
+    }
+
+<span class="nc bnc" id="L151" title="All 4 branches missed.">    if (op.doDep &amp;&amp; op.doPCFG) {</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">      if (op.testOptions.useFastFactored) {</span>
+<span class="nc" id="L153">        MLEDependencyGrammar mledg = (MLEDependencyGrammar) dg;</span>
+<span class="nc" id="L154">        int numToFind = 1;</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (op.testOptions.printFactoredKGood &gt; 0) {</span>
+<span class="nc" id="L156">          numToFind = op.testOptions.printFactoredKGood;</span>
+        }
+<span class="nc" id="L158">        bparser = new FastFactoredParser(pparser, mledg, op, numToFind, wordIndex, tagIndex);</span>
+<span class="nc" id="L159">      } else {</span>
+<span class="nc" id="L160">        Scorer scorer = new TwinScorer(pparser, dparser);</span>
+        //Scorer scorer = parser;
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (op.testOptions.useN5) {</span>
+<span class="nc" id="L163">          bparser = new BiLexPCFGParser.N5BiLexPCFGParser(scorer, pparser, dparser, bg, ug, dg, lex, op, stateIndex, wordIndex, tagIndex);</span>
+        } else {
+<span class="nc" id="L165">          bparser = new BiLexPCFGParser(scorer, pparser, dparser, bg, ug, dg, lex, op, stateIndex, wordIndex, tagIndex);</span>
+        }
+<span class="nc" id="L167">      }</span>
+    } else {
+<span class="nc" id="L169">      bparser = null;</span>
+    }
+
+<span class="nc" id="L172">    subcategoryStripper = op.tlpParams.subcategoryStripper();</span>
+<span class="nc" id="L173">  }</span>
+
+  @Override
+  public void setConstraints(List&lt;ParserConstraint&gt; constraints) {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">    if (pparser != null) {</span>
+<span class="nc" id="L178">      pparser.setConstraints(constraints);</span>
+    }
+<span class="nc" id="L180">  }</span>
+
+  /**
+   * Parse a sentence represented as a List of tokens.
+   * The text must already have been tokenized and
+   * normalized into tokens that are appropriate to the treebank
+   * which was used to train the parser.  The tokens can be of
+   * multiple types, and the list items need not be homogeneous as to type
+   * (in particular, only some words might be given tags):
+   * &lt;ul&gt;
+   * &lt;li&gt;If a token implements HasWord, then the word to be parsed is
+   * given by its word() value.&lt;/li&gt;
+   * &lt;li&gt;If a token implements HasTag and the tag() value is not
+   * null or the empty String, then the parser is strongly advised to assign
+   * a part of speech tag that &lt;i&gt;begins&lt;/i&gt; with this String.&lt;/li&gt;
+   * &lt;/ul&gt;
+   *
+   * @param sentence The sentence to parse
+   * @return true Iff the sentence was accepted by the grammar
+   * @throws UnsupportedOperationException If the Sentence is too long or
+   *                                       of zero length or the parse
+   *                                       otherwise fails for resource reasons
+   */
+  private boolean parseInternal(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L204">    parseSucceeded = false;</span>
+<span class="nc" id="L205">    parseNoMemory = false;</span>
+<span class="nc" id="L206">    parseUnparsable = false;</span>
+<span class="nc" id="L207">    parseSkipped = false;</span>
+<span class="nc" id="L208">    parseFallback = false;</span>
+<span class="nc" id="L209">    whatFailed = null;</span>
+<span class="nc" id="L210">    addedPunct = false;</span>
+<span class="nc" id="L211">    originalSentence = sentence;</span>
+<span class="nc" id="L212">    int length = sentence.size();</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    if (length == 0) {</span>
+<span class="nc" id="L214">      parseSkipped = true;</span>
+<span class="nc" id="L215">      throw new UnsupportedOperationException(&quot;Can't parse a zero-length sentence!&quot;);</span>
+    }
+
+    List&lt;HasWord&gt; sentenceB;
+<span class="nc bnc" id="L219" title="All 2 branches missed.">    if (op.wordFunction != null) {</span>
+<span class="nc" id="L220">      sentenceB = Generics.newArrayList();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      for (HasWord word : originalSentence) {</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (word instanceof Label) {</span>
+<span class="nc" id="L223">          Label label = (Label) word;</span>
+<span class="nc" id="L224">          Label newLabel = label.labelFactory().newLabel(label);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">          if (newLabel instanceof HasWord) {</span>
+<span class="nc" id="L226">            sentenceB.add((HasWord) newLabel);</span>
+          } else {
+<span class="nc" id="L228">            throw new AssertionError(&quot;This should have been a HasWord&quot;);</span>
+          }
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        } else if (word instanceof HasTag) {</span>
+<span class="nc" id="L231">          TaggedWord tw = new TaggedWord(word.word(), ((HasTag) word).tag());</span>
+<span class="nc" id="L232">          sentenceB.add(tw);</span>
+<span class="nc" id="L233">        } else {</span>
+<span class="nc" id="L234">          sentenceB.add(new Word(word.word()));</span>
+        }
+<span class="nc" id="L236">      }</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">      for (HasWord word : sentenceB) {</span>
+<span class="nc" id="L238">        word.setWord(op.wordFunction.apply(word.word()));</span>
+<span class="nc" id="L239">      }</span>
+    } else {
+<span class="nc" id="L241">      sentenceB = new ArrayList&lt;&gt;(sentence);</span>
+    }
+
+<span class="nc bnc" id="L244" title="All 2 branches missed.">    if (op.testOptions.addMissingFinalPunctuation) {</span>
+<span class="nc" id="L245">      addedPunct = addSentenceFinalPunctIfNeeded(sentenceB, length);</span>
+    }
+<span class="nc bnc" id="L247" title="All 2 branches missed.">    if (length &gt; op.testOptions.maxLength) {</span>
+<span class="nc" id="L248">      parseSkipped = true;</span>
+<span class="nc" id="L249">      throw new UnsupportedOperationException(&quot;Sentence too long: length &quot; + length);</span>
+    }
+<span class="nc" id="L251">    TreePrint treePrint = getTreePrint();</span>
+<span class="nc" id="L252">    PrintWriter pwOut = op.tlpParams.pw();</span>
+
+    //Insert the boundary symbol
+<span class="nc bnc" id="L255" title="All 2 branches missed.">    if(sentence.get(0) instanceof CoreLabel) {</span>
+<span class="nc" id="L256">      CoreLabel boundary = new CoreLabel();</span>
+<span class="nc" id="L257">      boundary.setWord(Lexicon.BOUNDARY);</span>
+<span class="nc" id="L258">      boundary.setValue(Lexicon.BOUNDARY);</span>
+<span class="nc" id="L259">      boundary.setTag(Lexicon.BOUNDARY_TAG);</span>
+<span class="nc" id="L260">      boundary.setIndex(sentence.size()+1);//1-based indexing used in the parser</span>
+<span class="nc" id="L261">      sentenceB.add(boundary);</span>
+<span class="nc" id="L262">    } else {</span>
+<span class="nc" id="L263">      sentenceB.add(new TaggedWord(Lexicon.BOUNDARY, Lexicon.BOUNDARY_TAG));</span>
+    }
+
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L267">      throw new RuntimeInterruptedException();</span>
+    }
+
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    if (op.doPCFG) {</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">      if (!pparser.parse(sentenceB)) {</span>
+<span class="nc" id="L272">        return parseSucceeded;</span>
+      }
+<span class="nc bnc" id="L274" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L275">        pwOut.println(&quot;PParser output&quot;);</span>
+        // getBestPCFGParse(false).pennPrint(pwOut); // with scores on nodes
+<span class="nc" id="L277">        treePrint.printTree(getBestPCFGParse(false), pwOut); // without scores on nodes</span>
+      }
+    }
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L281">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc bnc" id="L283" title="All 4 branches missed.">    if (op.doDep &amp;&amp; ! op.testOptions.useFastFactored) {</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">      if ( ! dparser.parse(sentenceB)) {</span>
+<span class="nc" id="L285">        return parseSucceeded;</span>
+      }
+      // cdm nov 2006: should move these printing bits to the main printing section,
+      // so don't calculate the best parse twice!
+<span class="nc bnc" id="L289" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L290">        pwOut.println(&quot;DParser output&quot;);</span>
+<span class="nc" id="L291">        treePrint.printTree(dparser.getBestParse(), pwOut);</span>
+      }
+    }
+<span class="nc bnc" id="L294" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L295">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc bnc" id="L297" title="All 4 branches missed.">    if (op.doPCFG &amp;&amp; op.doDep) {</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      if ( ! bparser.parse(sentenceB)) {</span>
+<span class="nc" id="L299">        return parseSucceeded;</span>
+      } else {
+<span class="nc" id="L301">        parseSucceeded = true;</span>
+      }
+    }
+<span class="nc" id="L304">    return true;</span>
+  }
+
+
+  @Override
+  public void restoreOriginalWords(Tree tree) {
+<span class="nc bnc" id="L310" title="All 4 branches missed.">    if (originalSentence == null || tree == null) {</span>
+<span class="nc" id="L311">      return;</span>
+    }
+<span class="nc" id="L313">    List&lt;Tree&gt; leaves = tree.getLeaves();</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">    int expectedSize = addedPunct ? originalSentence.size() + 1 : originalSentence.size();</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">    if (leaves.size() != expectedSize) {</span>
+<span class="nc" id="L316">      throw new IllegalStateException(&quot;originalWords and sentence of different sizes: &quot; + expectedSize + &quot; vs. &quot; + leaves.size() +</span>
+<span class="nc" id="L317">                                      &quot;\n Orig: &quot; + SentenceUtils.listToString(originalSentence) +</span>
+<span class="nc" id="L318">                                      &quot;\n Pars: &quot; + SentenceUtils.listToString(leaves));</span>
+    }
+<span class="nc" id="L320">    Iterator&lt;Tree&gt; leafIterator = leaves.iterator();</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">    for (HasWord word : originalSentence) {</span>
+<span class="nc" id="L322">      Tree leaf = leafIterator.next();</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">      if (!(word instanceof Label)) {</span>
+<span class="nc" id="L324">        continue;</span>
+      }
+<span class="nc" id="L326">      leaf.setLabel((Label) word);</span>
+<span class="nc" id="L327">    }</span>
+<span class="nc" id="L328">  }</span>
+
+
+  /**
+   * Parse a (speech) lattice with the PCFG parser.
+   *
+   * @param lr a lattice to parse
+   * @return Whether the lattice could be parsed by the grammar
+   */
+  boolean parse(HTKLatticeReader lr) {
+<span class="nc" id="L338">    TreePrint treePrint = getTreePrint();</span>
+<span class="nc" id="L339">    PrintWriter pwOut = op.tlpParams.pw();</span>
+<span class="nc" id="L340">    parseSucceeded = false;</span>
+<span class="nc" id="L341">    parseNoMemory = false;</span>
+<span class="nc" id="L342">    parseUnparsable = false;</span>
+<span class="nc" id="L343">    parseSkipped = false;</span>
+<span class="nc" id="L344">    parseFallback = false;</span>
+<span class="nc" id="L345">    whatFailed = null;</span>
+<span class="nc" id="L346">    originalSentence = null;</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">    if (lr.getNumStates() &gt; op.testOptions.maxLength + 1) {  // + 1 for boundary symbol</span>
+<span class="nc" id="L348">      parseSkipped = true;</span>
+<span class="nc" id="L349">      throw new UnsupportedOperationException(&quot;Lattice too big: &quot; + lr.getNumStates());</span>
+    }
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    if (op.doPCFG) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">      if (!pparser.parse(lr)) {</span>
+<span class="nc" id="L353">        return parseSucceeded;</span>
+      }
+<span class="nc bnc" id="L355" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L356">        pwOut.println(&quot;PParser output&quot;);</span>
+<span class="nc" id="L357">        treePrint.printTree(getBestPCFGParse(false), pwOut);</span>
+      }
+    }
+<span class="nc" id="L360">    parseSucceeded = true;</span>
+<span class="nc" id="L361">    return true;</span>
+  }
+
+  /**
+   * Return the best parse of the sentence most recently parsed.
+   * This will be from the factored parser, if it was used and it succeeded
+   * else from the PCFG if it was used and succeed, else from the dependency
+   * parser.
+   *
+   * @return The best tree
+   * @throws NoSuchParseException If no previously successfully parsed
+   *                                sentence
+   */
+  @Override
+  public Tree getBestParse() {
+<span class="nc" id="L376">    return getBestParse(true);</span>
+  }
+
+  Tree getBestParse(boolean stripSubcat) {
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    if (parseSkipped) {</span>
+<span class="nc" id="L381">      return null;</span>
+    }
+<span class="nc bnc" id="L383" title="All 4 branches missed.">    if (bparser != null &amp;&amp; parseSucceeded) {</span>
+<span class="nc" id="L384">      Tree binaryTree = bparser.getBestParse();</span>
+
+<span class="nc" id="L386">      Tree tree = debinarizer.transformTree(binaryTree);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">      if (op.nodePrune) {</span>
+<span class="nc" id="L388">        NodePruner np = new NodePruner(pparser, debinarizer);</span>
+<span class="nc" id="L389">        tree = np.prune(tree);</span>
+      }
+<span class="nc bnc" id="L391" title="All 2 branches missed.">      if (stripSubcat) {</span>
+<span class="nc" id="L392">        tree = subcategoryStripper.transformTree(tree);</span>
+      }
+<span class="nc" id="L394">      restoreOriginalWords(tree);</span>
+<span class="nc" id="L395">      return tree;</span>
+
+<span class="nc bnc" id="L397" title="All 4 branches missed.">    } else if (pparser != null &amp;&amp; pparser.hasParse() &amp;&amp; fallbackToPCFG) {</span>
+<span class="nc" id="L398">      return getBestPCFGParse();</span>
+<span class="nc bnc" id="L399" title="All 4 branches missed.">    } else if (dparser != null &amp;&amp; dparser.hasParse()) { // &amp;&amp; fallbackToDG</span>
+      // Should we strip subcategories like this?  Traditionally haven't...
+      // return subcategoryStripper.transformTree(getBestDependencyParse(true));
+<span class="nc" id="L402">      return getBestDependencyParse(true);</span>
+    } else {
+<span class="nc" id="L404">      throw new NoSuchParseException();</span>
+    }
+  }
+
+
+  /**
+   * Return the k best parses of the sentence most recently parsed.
+   *
+   * NB: The dependency parser does not implement a k-best method
+   * and the factored parser's method seems to be broken and therefore
+   * this method always returns a list of size 1 if either of these
+   * two parsers was used.
+   *
+   * @return A list of scored trees
+   * @throws NoSuchParseException If no previously successfully parsed
+   *                                sentence   */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKBestParses(int k) {
+<span class="nc bnc" id="L422" title="All 2 branches missed.">    if (parseSkipped) {</span>
+<span class="nc" id="L423">      return null;</span>
+    }
+<span class="nc bnc" id="L425" title="All 4 branches missed.">    if (bparser != null &amp;&amp; parseSucceeded) {</span>
+      //The getKGoodParses seems to be broken, so just return the best parse
+<span class="nc" id="L427">      Tree binaryTree = bparser.getBestParse();</span>
+<span class="nc" id="L428">      Tree tree = debinarizer.transformTree(binaryTree);</span>
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">      if (op.nodePrune) {</span>
+<span class="nc" id="L431">        NodePruner np = new NodePruner(pparser, debinarizer);</span>
+<span class="nc" id="L432">        tree = np.prune(tree);</span>
+      }
+<span class="nc" id="L434">      tree = subcategoryStripper.transformTree(tree);</span>
+<span class="nc" id="L435">      restoreOriginalWords(tree);</span>
+
+<span class="nc" id="L437">      double score = dparser.getBestScore();</span>
+<span class="nc" id="L438">      ScoredObject&lt;Tree&gt; so = new ScoredObject&lt;&gt;(tree, score);</span>
+<span class="nc" id="L439">      List&lt;ScoredObject&lt;Tree&gt;&gt; trees = new ArrayList&lt;&gt;(1);</span>
+<span class="nc" id="L440">      trees.add(so);</span>
+<span class="nc" id="L441">      return trees;</span>
+<span class="nc bnc" id="L442" title="All 4 branches missed.">    } else if (pparser != null &amp;&amp; pparser.hasParse() &amp;&amp; fallbackToPCFG) {</span>
+<span class="nc" id="L443">      return this.getKBestPCFGParses(k);</span>
+<span class="nc bnc" id="L444" title="All 4 branches missed.">    } else if (dparser != null &amp;&amp; dparser.hasParse()) { // &amp;&amp; fallbackToDG</span>
+      // The dependency parser doesn't support k-best parse extraction, so just
+      // return the best parse
+<span class="nc" id="L447">      Tree tree = this.getBestDependencyParse(true);</span>
+<span class="nc" id="L448">      double score = dparser.getBestScore();</span>
+<span class="nc" id="L449">      ScoredObject&lt;Tree&gt; so = new ScoredObject&lt;&gt;(tree, score);</span>
+<span class="nc" id="L450">      List&lt;ScoredObject&lt;Tree&gt;&gt; trees = new ArrayList&lt;&gt;(1);</span>
+<span class="nc" id="L451">      trees.add(so);</span>
+<span class="nc" id="L452">      return trees;</span>
+    } else {
+<span class="nc" id="L454">      throw new NoSuchParseException();</span>
+    }
+  }
+
+  /**
+   *
+   * Checks which parser (factored, PCFG, or dependency) was used and
+   * returns the score of the best parse from this parser.
+   *
+   * If no parse could be obtained, it returns Double.NEGATIVE_INFINITY.
+   *
+   * @return the score of the best parse, or Double.NEGATIVE_INFINITY
+   */
+  @Override
+  public double getBestScore() {
+<span class="nc bnc" id="L469" title="All 2 branches missed.">    if (parseSkipped) {</span>
+<span class="nc" id="L470">      return Double.NEGATIVE_INFINITY;</span>
+    }
+<span class="nc bnc" id="L472" title="All 4 branches missed.">    if (bparser != null &amp;&amp; parseSucceeded) {</span>
+<span class="nc" id="L473">      return bparser.getBestScore();</span>
+<span class="nc bnc" id="L474" title="All 4 branches missed.">    } else if (pparser != null &amp;&amp; pparser.hasParse() &amp;&amp; fallbackToPCFG) {</span>
+<span class="nc" id="L475">      return pparser.getBestScore();</span>
+<span class="nc bnc" id="L476" title="All 4 branches missed.">    } else if (dparser != null &amp;&amp; dparser.hasParse()) {</span>
+<span class="nc" id="L477">      return dparser.getBestScore();</span>
+    } else {
+<span class="nc" id="L479">      return Double.NEGATIVE_INFINITY;</span>
+    }
+  }
+
+
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getBestPCFGParses() {
+<span class="nc" id="L485">    return pparser.getBestParses();</span>
+  }
+
+  public boolean hasFactoredParse() {
+<span class="nc bnc" id="L489" title="All 2 branches missed.">    if (bparser == null) {</span>
+<span class="nc" id="L490">      return false;</span>
+    }
+<span class="nc bnc" id="L492" title="All 6 branches missed.">    return !parseSkipped &amp;&amp; parseSucceeded &amp;&amp; bparser.hasParse();</span>
+  }
+
+  public Tree getBestFactoredParse() {
+<span class="nc" id="L496">    return bparser.getBestParse();</span>
+  }
+
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKGoodFactoredParses(int k) {
+<span class="nc bnc" id="L500" title="All 4 branches missed.">    if (bparser == null || parseSkipped) {</span>
+<span class="nc" id="L501">      return null;</span>
+    }
+
+<span class="nc" id="L504">    List&lt;ScoredObject&lt;Tree&gt;&gt; binaryTrees = bparser.getKGoodParses(k);</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    if (binaryTrees == null) {</span>
+<span class="nc" id="L506">      return null;</span>
+    }
+
+<span class="nc" id="L509">    List&lt;ScoredObject&lt;Tree&gt;&gt; trees = new ArrayList&lt;&gt;(k);</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">    for (ScoredObject&lt;Tree&gt; tp : binaryTrees) {</span>
+<span class="nc" id="L511">      Tree t = debinarizer.transformTree(tp.object());</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">      if (op.nodePrune) {</span>
+<span class="nc" id="L513">        NodePruner np = new NodePruner(pparser, debinarizer);</span>
+<span class="nc" id="L514">        t = np.prune(t);</span>
+      }
+<span class="nc" id="L516">      t = subcategoryStripper.transformTree(t);</span>
+<span class="nc" id="L517">      restoreOriginalWords(t);</span>
+<span class="nc" id="L518">      trees.add(new ScoredObject&lt;&gt;(t, tp.score()));</span>
+<span class="nc" id="L519">    }</span>
+
+<span class="nc" id="L521">    return trees;</span>
+  }
+
+  /**
+   * Returns the trees (and scores) corresponding to the
+   * k-best derivations of the sentence.  This cannot be
+   * a Counter because frequently there will be multiple
+   * derivations which lead to the same parse tree.
+   *
+   * @param k The number of best parses to return
+   * @return The list of trees with their scores (log prob).
+   */
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKBestPCFGParses(int k) {
+<span class="nc bnc" id="L534" title="All 2 branches missed.">    if (pparser == null) {</span>
+<span class="nc" id="L535">      return null;</span>
+    }
+<span class="nc" id="L537">    List&lt;ScoredObject&lt;Tree&gt;&gt; binaryTrees = pparser.getKBestParses(k);</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">    if (binaryTrees == null) {</span>
+<span class="nc" id="L539">      return null;</span>
+    }
+<span class="nc" id="L541">    List&lt;ScoredObject&lt;Tree&gt;&gt; trees = new ArrayList&lt;&gt;(k);</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    for (ScoredObject&lt;Tree&gt; p : binaryTrees) {</span>
+<span class="nc" id="L543">      Tree t = debinarizer.transformTree(p.object());</span>
+<span class="nc" id="L544">      t = subcategoryStripper.transformTree(t);</span>
+<span class="nc" id="L545">      restoreOriginalWords(t);</span>
+<span class="nc" id="L546">      trees.add(new ScoredObject&lt;&gt;(t, p.score()));</span>
+<span class="nc" id="L547">    }</span>
+<span class="nc" id="L548">    return trees;</span>
+  }
+
+
+  public Tree getBestPCFGParse() {
+<span class="nc" id="L553">    return getBestPCFGParse(true);</span>
+  }
+
+  public Tree getBestPCFGParse(boolean stripSubcategories) {
+<span class="nc bnc" id="L557" title="All 6 branches missed.">    if (pparser == null || parseSkipped || parseUnparsable) {</span>
+<span class="nc" id="L558">      return null;</span>
+    }
+<span class="nc" id="L560">    Tree binaryTree = pparser.getBestParse();</span>
+
+<span class="nc bnc" id="L562" title="All 2 branches missed.">    if (binaryTree == null) {</span>
+<span class="nc" id="L563">      return null;</span>
+    }
+<span class="nc" id="L565">    Tree t = debinarizer.transformTree(binaryTree);</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">    if (stripSubcategories) {</span>
+<span class="nc" id="L567">      t = subcategoryStripper.transformTree(t);</span>
+    }
+<span class="nc" id="L569">    restoreOriginalWords(t);</span>
+<span class="nc" id="L570">    return t;</span>
+  }
+
+  @Override
+  public double getPCFGScore() {
+<span class="nc" id="L575">    return pparser.getBestScore();</span>
+  }
+
+  double getPCFGScore(String goalStr) {
+<span class="nc" id="L579">    return pparser.getBestScore(goalStr);</span>
+  }
+
+  void parsePCFG(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L583">    parseSucceeded = false;</span>
+<span class="nc" id="L584">    parseNoMemory = false;</span>
+<span class="nc" id="L585">    parseUnparsable = false;</span>
+<span class="nc" id="L586">    parseSkipped = false;</span>
+<span class="nc" id="L587">    parseFallback = false;</span>
+<span class="nc" id="L588">    whatFailed = null;</span>
+<span class="nc" id="L589">    originalSentence = sentence;</span>
+<span class="nc" id="L590">    pparser.parse(sentence);</span>
+<span class="nc" id="L591">  }</span>
+
+  public Tree getBestDependencyParse() {
+<span class="nc" id="L594">    return getBestDependencyParse(false);</span>
+  }
+
+  @Override
+  public Tree getBestDependencyParse(boolean debinarize) {
+<span class="nc bnc" id="L599" title="All 6 branches missed.">    if (dparser == null || parseSkipped || parseUnparsable) {</span>
+<span class="nc" id="L600">      return null;</span>
+    }
+<span class="nc" id="L602">    Tree t = dparser.getBestParse();</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">    if (t != null) {</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">      if (debinarize) {</span>
+<span class="nc" id="L605">        t = debinarizer.transformTree(t);</span>
+      }
+<span class="nc" id="L607">      t = boundaryRemover.transformTree(t); // remove boundary .$$. which is otherwise still there from dparser.</span>
+<span class="nc" id="L608">      restoreOriginalWords(t);</span>
+    }
+<span class="nc" id="L610">    return t;</span>
+  }
+
+  /**
+   * Parse a sentence represented as a List of tokens.
+   * The text must already have been tokenized and
+   * normalized into tokens that are appropriate to the treebank
+   * which was used to train the parser.  The tokens can be of
+   * multiple types, and the list items need not be homogeneous as to type
+   * (in particular, only some words might be given tags):
+   * &lt;ul&gt;
+   * &lt;li&gt;If a token implements HasWord, then the word to be parsed is
+   * given by its word() value.&lt;/li&gt;
+   * &lt;li&gt;If a token implements HasTag and the tag() value is not
+   * null or the empty String, then the parser is strongly advised to assign
+   * a part of speech tag that &lt;i&gt;begins&lt;/i&gt; with this String.&lt;/li&gt;
+   * &lt;/ul&gt;
+   *
+   * @param sentence The sentence to parse
+   * @return true Iff the sentence was accepted by the grammar.  If
+   *              the main grammar fails, but the PCFG succeeds, then
+   *              this still returns true, but parseFallback() will
+   *              also return true.  getBestParse() will have a valid
+   *              result iff this returns true.
+   */
+  @Override
+  public boolean parse(List&lt;? extends HasWord&gt; sentence) {
+    try {
+<span class="nc bnc" id="L638" title="All 2 branches missed.">      if (!parseInternal(sentence)) {</span>
+<span class="nc bnc" id="L639" title="All 4 branches missed.">        if (pparser != null &amp;&amp; pparser.hasParse() &amp;&amp; fallbackToPCFG) {</span>
+<span class="nc" id="L640">          parseFallback = true;</span>
+<span class="nc" id="L641">          return true;</span>
+        } else {
+<span class="nc" id="L643">          parseUnparsable = true;</span>
+<span class="nc" id="L644">          return false;</span>
+        }
+      } else {
+<span class="nc" id="L647">        return true;</span>
+      }
+<span class="nc" id="L649">    } catch (OutOfMemoryError e) {</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">      if (op.testOptions.maxLength != -0xDEADBEEF) {</span>
+        // this means they explicitly asked for a length they cannot handle.
+        // Throw exception.  Avoid string concatenation before throw it.
+<span class="nc" id="L653">        log.info(&quot;NOT ENOUGH MEMORY TO PARSE SENTENCES OF LENGTH &quot;);</span>
+<span class="nc" id="L654">        log.info(op.testOptions.maxLength);</span>
+<span class="nc" id="L655">        throw e;</span>
+      }
+<span class="nc bnc" id="L657" title="All 2 branches missed.">      if (pparser.hasParse() &amp;&amp; fallbackToPCFG) {</span>
+        try {
+<span class="nc" id="L659">          whatFailed = &quot;dependency&quot;;</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">          if (dparser.hasParse()) {</span>
+<span class="nc" id="L661">            whatFailed = &quot;factored&quot;;</span>
+          }
+<span class="nc" id="L663">          parseFallback = true;</span>
+<span class="nc" id="L664">          return true;</span>
+<span class="nc" id="L665">        } catch (OutOfMemoryError oome) {</span>
+<span class="nc" id="L666">          oome.printStackTrace();</span>
+<span class="nc" id="L667">          parseNoMemory = true;</span>
+<span class="nc" id="L668">          pparser.nudgeDownArraySize();</span>
+<span class="nc" id="L669">          return false;</span>
+        }
+      } else {
+<span class="nc" id="L672">        parseNoMemory = true;</span>
+<span class="nc" id="L673">        return false;</span>
+      }
+<span class="nc" id="L675">    } catch (UnsupportedOperationException uoe) {</span>
+<span class="nc" id="L676">      parseSkipped = true;</span>
+<span class="nc" id="L677">      return false;</span>
+    }
+  }
+
+  /**
+   * Implements the same parsing with fallback that parse() does, but
+   * also outputs status messages for failed parses to pwErr.
+   */
+  @Override
+  public boolean parseAndReport(List&lt;? extends HasWord&gt; sentence, PrintWriter pwErr) {
+<span class="nc" id="L687">    boolean result = parse(sentence);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">    if (result) {</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">      if (whatFailed != null) {</span>
+        // Something failed, probably because of memory problems.
+        // However, we still got a PCFG parse, at least.
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        if ( ! saidMemMessage) {</span>
+<span class="nc" id="L693">          ParserUtils.printOutOfMemory(pwErr);</span>
+<span class="nc" id="L694">          saidMemMessage = true;</span>
+        }
+<span class="nc" id="L696">        pwErr.println(&quot;Sentence too long for &quot; + whatFailed + &quot; parser.  Falling back to PCFG parse...&quot;);</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">      } else if (parseFallback) {</span>
+        // We had to fall back for some other reason.
+<span class="nc" id="L699">        pwErr.println(&quot;Sentence couldn't be parsed by grammar.... falling back to PCFG parse.&quot;);</span>
+      }
+<span class="nc bnc" id="L701" title="All 2 branches missed.">    } else if (parseUnparsable) {</span>
+      // No parse at all, completely failed.
+<span class="nc" id="L703">      pwErr.println(&quot;Sentence couldn't be parsed by grammar.&quot;);</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">    } else if (parseNoMemory) {</span>
+      // Ran out of memory, either with or without a possible PCFG parse.
+<span class="nc bnc" id="L706" title="All 2 branches missed.">      if (!saidMemMessage) {</span>
+<span class="nc" id="L707">        ParserUtils.printOutOfMemory(pwErr);</span>
+<span class="nc" id="L708">        saidMemMessage = true;</span>
+      }
+<span class="nc bnc" id="L710" title="All 2 branches missed.">      if (pparser.hasParse() &amp;&amp; fallbackToPCFG) {</span>
+<span class="nc" id="L711">        pwErr.println(&quot;No memory to gather PCFG parse. Skipping...&quot;);</span>
+      } else {
+<span class="nc" id="L713">        pwErr.println(&quot;Sentence has no parse using PCFG grammar (or no PCFG fallback).  Skipping...&quot;);</span>
+      }
+<span class="nc bnc" id="L715" title="All 2 branches missed.">    } else if (parseSkipped) {</span>
+<span class="nc" id="L716">      pwErr.println(&quot;Sentence too long (or zero words).&quot;);</span>
+    }
+<span class="nc" id="L718">    return result;</span>
+  }
+
+
+  /** Return a TreePrint for formatting parsed output trees.
+   *  @return A TreePrint for formatting parsed output trees.
+   */
+  public TreePrint getTreePrint() {
+<span class="nc" id="L726">    return op.testOptions.treePrint(op.tlpParams);</span>
+  }
+
+  @Override
+  public KBestViterbiParser getPCFGParser() {
+<span class="nc" id="L731">    return pparser;</span>
+  }
+
+  @Override
+  public KBestViterbiParser getDependencyParser() {
+<span class="nc" id="L736">    return dparser;</span>
+  }
+
+  @Override
+  public KBestViterbiParser getFactoredParser() {
+<span class="nc" id="L741">    return bparser;</span>
+  }
+
+  /** Adds a sentence final punctuation mark to sentences that lack one.
+   *  This method adds a period (the first sentence final punctuation word
+   *  in a parser language pack) to sentences that don't have one within
+   *  the last 3 words (to allow for close parentheses, etc.).  It checks
+   *  tags for punctuation, if available, otherwise words.
+   *
+   *  @param sentence The sentence to check
+   *  @param length The length of the sentence (just to avoid recomputation)
+   */
+  private boolean addSentenceFinalPunctIfNeeded(List&lt;HasWord&gt; sentence, int length) {
+<span class="nc" id="L754">    int start = length - 3;</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">    if (start &lt; 0) start = 0;</span>
+<span class="nc" id="L756">    TreebankLanguagePack tlp = op.tlpParams.treebankLanguagePack();</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">    for (int i = length - 1; i &gt;= start; i--) {</span>
+<span class="nc" id="L758">      HasWord item = sentence.get(i);</span>
+      // An object (e.g., CoreLabel) can implement HasTag but not actually store
+      // a tag so we need to check that there is something there for this case.
+      // If there is, use only it, since word tokens can be ambiguous.
+<span class="nc" id="L762">      String tag = null;</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">      if (item instanceof HasTag) {</span>
+<span class="nc" id="L764">        tag = ((HasTag) item).tag();</span>
+      }
+<span class="nc bnc" id="L766" title="All 4 branches missed.">      if (tag != null &amp;&amp; ! tag.isEmpty()) {</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">        if (tlp.isSentenceFinalPunctuationTag(tag)) {</span>
+<span class="nc" id="L768">          return false;</span>
+        }
+      } else {
+<span class="nc" id="L771">        String str = item.word();</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        if (tlp.isPunctuationWord(str)) {</span>
+<span class="nc" id="L773">          return false;</span>
+        }
+      }
+    }
+    // none found so add one.
+<span class="nc bnc" id="L778" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L779">      log.info(&quot;Adding missing final punctuation to sentence.&quot;);</span>
+    }
+<span class="nc" id="L781">    String[] sfpWords = tlp.sentenceFinalPunctuationWords();</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">    if (sfpWords.length &gt; 0) {</span>
+<span class="nc" id="L783">      sentence.add(new Word(sfpWords[0]));</span>
+    }
+<span class="nc" id="L785">    return true;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

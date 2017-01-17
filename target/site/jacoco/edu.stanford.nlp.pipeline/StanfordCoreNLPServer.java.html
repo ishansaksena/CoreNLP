@@ -1,0 +1,1296 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StanfordCoreNLPServer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">StanfordCoreNLPServer.java</span></div><h1>StanfordCoreNLPServer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline;
+
+import com.sun.net.httpserver.*;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.tokensregex.SequenceMatchResult;
+import edu.stanford.nlp.ling.tokensregex.TokenSequenceMatcher;
+import edu.stanford.nlp.ling.tokensregex.TokenSequencePattern;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexMatcher;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexPattern;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import javax.net.ssl.*;
+import java.io.*;
+import java.math.BigInteger;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+import static java.net.HttpURLConnection.*;
+
+/**
+ * This class creates a server that runs a new Java annotator in each thread.
+ *
+ * @author Gabor Angeli
+ * @author Arun Chaganty
+ */
+public class StanfordCoreNLPServer implements Runnable {
+
+  protected HttpServer server;
+<span class="nc" id="L53">  @ArgumentParser.Option(name=&quot;port&quot;, gloss=&quot;The port to run the server on&quot;)</span>
+  protected int serverPort = 9000;
+<span class="nc" id="L55">  @ArgumentParser.Option(name=&quot;status_port&quot;, gloss=&quot;The port to serve the status check endpoints on. If different from the server port, this will run in a separate thread.&quot;)</span>
+  protected int statusPort = serverPort;
+<span class="nc" id="L57">  @ArgumentParser.Option(name=&quot;timeout&quot;, gloss=&quot;The default timeout, in milliseconds&quot;)</span>
+  protected int timeoutMilliseconds = 15000;
+<span class="nc" id="L59">  @ArgumentParser.Option(name=&quot;strict&quot;, gloss=&quot;If true, obey strict HTTP standards (e.g., with encoding)&quot;)</span>
+  protected boolean strict = false;
+<span class="nc" id="L61">  @ArgumentParser.Option(name=&quot;quiet&quot;, gloss=&quot;If true, don't print to stdout&quot;)</span>
+  protected boolean quiet = false;
+<span class="nc" id="L63">  @ArgumentParser.Option(name=&quot;ssl&quot;, gloss=&quot;If true, start the server with an [insecure!] SSL connection&quot;)</span>
+  protected boolean ssl = false;
+  @ArgumentParser.Option(name=&quot;key&quot;, gloss=&quot;The *.jks key file to load, if -ssl is enabled. By default, it'll load the dummy key from the jar (but this is, of course, insecure!)&quot;)
+<span class="nc" id="L66">  protected static String key = &quot;edu/stanford/nlp/pipeline/corenlp.jks&quot;;</span>
+<span class="nc" id="L67">  @ArgumentParser.Option(name=&quot;username&quot;, gloss=&quot;The username component of a username/password basic auth credential&quot;)</span>
+  protected String username = null;
+<span class="nc" id="L69">  @ArgumentParser.Option(name=&quot;password&quot;, gloss=&quot;The password component of a username/password basic auth credential&quot;)</span>
+  protected String password = null;
+  @ArgumentParser.Option(name=&quot;annotators&quot;, gloss=&quot;The default annotators to run over a given sentence.&quot;)
+<span class="nc" id="L72">  protected static String defaultAnnotators = &quot;tokenize,ssplit,pos,lemma,ner,parse,depparse,mention,coref,natlog,openie,regexner,kbp&quot;;</span>
+  @ArgumentParser.Option(name=&quot;preload&quot;, gloss=&quot;Cache the following annotators on startup&quot;)
+<span class="nc" id="L74">  protected static String preloadedAnnotators = &quot;&quot;;</span>
+  @ArgumentParser.Option(name=&quot;serverProperties&quot;, gloss=&quot;Default properties file for server's StanfordCoreNLP instance&quot;)
+<span class="nc" id="L76">  protected static String serverPropertiesPath = null;</span>
+
+  protected final String shutdownKey;
+
+<span class="nc" id="L80">  public static int MAX_CHAR_LENGTH = 100000;</span>
+  public final Properties defaultProps;
+
+  /**
+   * The thread pool for the HTTP server.
+   */
+  private final ExecutorService serverExecutor;
+  /**
+   * To prevent grossly wasteful over-creation of pipeline objects, cache the last
+   * few we created, until the garbage collector decides we can kill them.
+   */
+<span class="nc" id="L91">  private final WeakHashMap&lt;Properties, StanfordCoreNLP&gt; pipelineCache = new WeakHashMap&lt;&gt;();</span>
+  /**
+   * An executor to time out CoreNLP execution with.
+   */
+  private final ExecutorService corenlpExecutor;
+
+
+  /**
+   * Create a new Stanford CoreNLP Server.
+   * @param port The port to host the server from.
+   * @param timeout The timeout (in milliseconds) for each command.
+   * @param strict If true, conform more strictly to the HTTP spec (e.g., for character encoding).
+   * @throws IOException Thrown from the underlying socket implementation.
+   */
+  public StanfordCoreNLPServer(int port, int timeout, boolean strict) throws IOException {
+<span class="nc" id="L106">    this();</span>
+<span class="nc" id="L107">    this.serverPort = port;</span>
+<span class="nc" id="L108">    this.timeoutMilliseconds = timeout;</span>
+<span class="nc" id="L109">    this.strict = strict;</span>
+<span class="nc" id="L110">  }</span>
+
+  /**
+   * Create a new Stanford CoreNLP Server, with the default parameters
+   *
+   * @throws IOException Thrown if we could not write the shutdown key to the a file.
+   */
+<span class="nc" id="L117">  public StanfordCoreNLPServer() throws IOException {</span>
+    // check if englishSR.ser.gz can be found (standard models jar doesn't have this)
+    String defaultParserPath;
+<span class="nc" id="L120">    ClassLoader classLoader = getClass().getClassLoader();</span>
+<span class="nc" id="L121">    URL srResource =</span>
+<span class="nc" id="L122">            classLoader.getResource(&quot;edu/stanford/nlp/models/srparser/englishSR.ser.gz&quot;);</span>
+<span class="nc" id="L123">    log(&quot;setting default constituency parser&quot;);</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">    if (srResource != null) {</span>
+<span class="nc" id="L125">      defaultParserPath = &quot;edu/stanford/nlp/models/srparser/englishSR.ser.gz&quot;;</span>
+<span class="nc" id="L126">      log(&quot;using SR parser: edu/stanford/nlp/models/srparser/englishSR.ser.gz&quot;);</span>
+    } else {
+<span class="nc" id="L128">      defaultParserPath = &quot;edu/stanford/nlp/models/lexparser/englishPCFG.ser.gz&quot;;</span>
+<span class="nc" id="L129">      log(&quot;warning: cannot find edu/stanford/nlp/models/srparser/englishSR.ser.gz&quot;);</span>
+<span class="nc" id="L130">      log(&quot;using: edu/stanford/nlp/models/lexparser/englishPCFG.ser.gz instead&quot;);</span>
+<span class="nc" id="L131">      log(&quot;to use shift reduce parser download English models jar from:&quot;);</span>
+<span class="nc" id="L132">      log(&quot;http://stanfordnlp.github.io/CoreNLP/download.html&quot;);</span>
+    }
+<span class="nc" id="L134">    this.defaultProps = PropertiesUtils.asProperties(</span>
+        &quot;annotators&quot;, defaultAnnotators,  // Run these annotators by default
+        &quot;mention.type&quot;, &quot;dep&quot;,  // Use dependency trees with coref by default
+        &quot;coref.mode&quot;,  &quot;statistical&quot;,  // Use the new coref
+        &quot;coref.language&quot;,  &quot;en&quot;,  // We're English by default
+        &quot;inputFormat&quot;, &quot;text&quot;,   // By default, treat the POST data like text
+        &quot;outputFormat&quot;, &quot;json&quot;,  // By default, return in JSON -- this is a server, after all.
+        &quot;prettyPrint&quot;, &quot;false&quot;,  // Don't bother pretty-printing
+        &quot;parse.model&quot;, defaultParserPath,  // SR scales linearly with sentence length. Good for a server!
+        &quot;parse.binaryTrees&quot;, &quot;true&quot;,  // needed for the Sentiment annotator
+        &quot;openie.strip_entailments&quot;, &quot;true&quot;);  // these are large to serialize, so ignore them
+
+    // overwrite all default properties with provided server properties
+    // for instance you might want to provide a default ner model
+<span class="nc bnc" id="L148" title="All 2 branches missed.">    if (serverPropertiesPath != null) {</span>
+<span class="nc" id="L149">      Properties serverProperties = StringUtils.argsToProperties(new String[]{&quot;-props&quot;, serverPropertiesPath});</span>
+<span class="nc" id="L150">      PropertiesUtils.overWriteProperties(this.defaultProps, serverProperties);</span>
+    }
+
+<span class="nc" id="L153">    this.serverExecutor = Executors.newFixedThreadPool(ArgumentParser.threads);</span>
+<span class="nc" id="L154">    this.corenlpExecutor = Executors.newFixedThreadPool(ArgumentParser.threads);</span>
+
+    // Generate and write a shutdown key
+<span class="nc" id="L157">    String tmpDir = System.getProperty(&quot;java.io.tmpdir&quot;);</span>
+<span class="nc" id="L158">    File tmpFile = new File(tmpDir + File.separator + &quot;corenlp.shutdown&quot;);</span>
+<span class="nc" id="L159">    tmpFile.deleteOnExit();</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">    if (tmpFile.exists()) {</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">      if (!tmpFile.delete()) {</span>
+<span class="nc" id="L162">        throw new IllegalStateException(&quot;Could not delete shutdown key file&quot;);</span>
+      }
+    }
+<span class="nc" id="L165">    this.shutdownKey = new BigInteger(130, new Random()).toString(32);</span>
+<span class="nc" id="L166">    IOUtils.writeStringToFile(shutdownKey, tmpFile.getPath(), &quot;utf-8&quot;);</span>
+<span class="nc" id="L167">  }</span>
+
+  /**
+   * Parse the URL parameters into a map of (key, value) pairs.
+   *
+   * @param uri The URL that was requested.
+   *
+   * @return A map of (key, value) pairs corresponding to the request parameters.
+   *
+   * @throws UnsupportedEncodingException Thrown if we could not decode the URL with utf8.
+   */
+  private static Map&lt;String, String&gt; getURLParams(URI uri) throws UnsupportedEncodingException {
+<span class="nc bnc" id="L179" title="All 2 branches missed.">    if (uri.getQuery() != null) {</span>
+<span class="nc" id="L180">      Map&lt;String, String&gt; urlParams = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L182">      String query = uri.getQuery();</span>
+<span class="nc" id="L183">      String[] queryFields = query</span>
+<span class="nc" id="L184">          .replaceAll(&quot;\\\\&amp;&quot;, &quot;___AMP___&quot;)</span>
+<span class="nc" id="L185">          .replaceAll(&quot;\\\\+&quot;, &quot;___PLUS___&quot;)</span>
+<span class="nc" id="L186">          .split(&quot;&amp;&quot;);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      for (String queryField : queryFields) {</span>
+<span class="nc" id="L188">        int firstEq = queryField.indexOf('=');</span>
+        // Convention uses &quot;+&quot; for spaces.
+<span class="nc" id="L190">        String key = URLDecoder.decode(queryField.substring(0, firstEq), &quot;utf8&quot;).replaceAll(&quot;___AMP___&quot;, &quot;&amp;&quot;).replaceAll(&quot;___PLUS___&quot;, &quot;+&quot;);</span>
+<span class="nc" id="L191">        String value = URLDecoder.decode(queryField.substring(firstEq + 1), &quot;utf8&quot;).replaceAll(&quot;___AMP___&quot;, &quot;&amp;&quot;).replaceAll(&quot;___PLUS___&quot;, &quot;+&quot;);</span>
+<span class="nc" id="L192">        urlParams.put(key, value);</span>
+      }
+<span class="nc" id="L194">      return urlParams;</span>
+    } else {
+<span class="nc" id="L196">      return Collections.emptyMap();</span>
+    }
+  }
+
+  /**
+   * Reads the POST contents of the request and parses it into an Annotation object, ready to be annotated.
+   * This method can also read a serialized document, if the input format is set to be serialized.
+   *
+   * @param props The properties we are annotating with. This is where the input format is retrieved from.
+   * @param httpExchange The exchange we are reading POST data from.
+   *
+   * @return An Annotation representing the read document.
+   *
+   * @throws IOException Thrown if we cannot read the POST data.
+   * @throws ClassNotFoundException Thrown if we cannot load the serializer.
+   */
+  private Annotation getDocument(Properties props, HttpExchange httpExchange) throws IOException, ClassNotFoundException {
+<span class="nc" id="L213">    String inputFormat = props.getProperty(&quot;inputFormat&quot;, &quot;text&quot;);</span>
+<span class="nc" id="L214">    String date = props.getProperty(&quot;date&quot;);</span>
+<span class="nc bnc" id="L215" title="All 10 branches missed.">    switch (inputFormat) {</span>
+      case &quot;text&quot;:
+        // The default encoding by the HTTP standard is ISO-8859-1, but most
+        // real users of CoreNLP would likely assume UTF-8 by default.
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        String defaultEncoding = this.strict ? &quot;ISO-8859-1&quot; : &quot;UTF-8&quot;;</span>
+        // Get the encoding
+<span class="nc" id="L221">        Headers h = httpExchange.getRequestHeaders();</span>
+        String encoding;
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (h.containsKey(&quot;Content-type&quot;)) {</span>
+<span class="nc" id="L224">          String[] charsetPair = Arrays.stream(h.getFirst(&quot;Content-type&quot;).split(&quot;;&quot;))</span>
+<span class="nc" id="L225">              .map(x -&gt; x.split(&quot;=&quot;))</span>
+<span class="nc bnc" id="L226" title="All 4 branches missed.">              .filter(x -&gt; x.length &gt; 0 &amp;&amp; &quot;charset&quot;.equals(x[0]))</span>
+<span class="nc" id="L227">              .findFirst().orElse(new String[]{&quot;charset&quot;, defaultEncoding});</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">          if (charsetPair.length == 2) {</span>
+<span class="nc" id="L229">            encoding = charsetPair[1];</span>
+          } else {
+<span class="nc" id="L231">            encoding = defaultEncoding;</span>
+          }
+<span class="nc" id="L233">        } else {</span>
+<span class="nc" id="L234">          encoding = defaultEncoding;</span>
+        }
+
+<span class="nc" id="L237">        String text = IOUtils.slurpReader(IOUtils.encodedInputStreamReader(httpExchange.getRequestBody(), encoding));</span>
+
+
+        // Remove the \ and + characters that mess up the URL decoding.
+<span class="nc" id="L241">        text = text.replaceAll(&quot;%(?![0-9a-fA-F]{2})&quot;, &quot;%25&quot;);</span>
+<span class="nc" id="L242">        text = text.replaceAll(&quot;\\+&quot;, &quot;%2B&quot;);</span>
+<span class="nc" id="L243">        text = URLDecoder.decode(text, encoding).trim();</span>
+        // Read the annotation
+<span class="nc" id="L245">        Annotation annotation = new Annotation(text);</span>
+        // Set the date (if provided)
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (date != null) {</span>
+<span class="nc" id="L248">          annotation.set(CoreAnnotations.DocDateAnnotation.class, date);</span>
+        }
+<span class="nc" id="L250">        return annotation;</span>
+      case &quot;serialized&quot;:
+<span class="nc" id="L252">        String inputSerializerName = props.getProperty(&quot;inputSerializer&quot;, ProtobufAnnotationSerializer.class.getName());</span>
+<span class="nc" id="L253">        AnnotationSerializer serializer = MetaClass.create(inputSerializerName).createInstance();</span>
+<span class="nc" id="L254">        Pair&lt;Annotation, InputStream&gt; pair = serializer.read(httpExchange.getRequestBody());</span>
+<span class="nc" id="L255">        return pair.first;</span>
+      default:
+<span class="nc" id="L257">        throw new IOException(&quot;Could not parse input format: &quot; + inputFormat);</span>
+    }
+  }
+
+
+  /**
+   * Create (or retrieve) a StanfordCoreNLP object corresponding to these properties.
+   * @param props The properties to create the object with.
+   * @return A pipeline parameterized by these properties.
+   */
+  private StanfordCoreNLP mkStanfordCoreNLP(Properties props) {
+    StanfordCoreNLP impl;
+<span class="nc" id="L269">    synchronized (pipelineCache) {</span>
+<span class="nc" id="L270">      impl = pipelineCache.get(props);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L272">        AnnotatorPool pool = StanfordCoreNLP.constructAnnotatorPool(props, new AnnotatorImplementations());</span>
+<span class="nc" id="L273">        impl = new StanfordCoreNLP(props, pool);</span>
+<span class="nc" id="L274">        pipelineCache.put(props, impl);</span>
+      }
+<span class="nc" id="L276">    }</span>
+<span class="nc" id="L277">    return impl;</span>
+  }
+
+  /**
+   * A helper function to respond to a request with an error.
+   *
+   * @param response The description of the error to send to the user.
+   * @param httpExchange The exchange to send the error over.
+   *
+   * @throws IOException Thrown if the HttpExchange cannot communicate the error.
+   */
+  private static void respondError(String response, HttpExchange httpExchange) throws IOException {
+<span class="nc" id="L289">    httpExchange.getResponseHeaders().add(&quot;Content-type&quot;, &quot;text/plain&quot;);</span>
+<span class="nc" id="L290">    httpExchange.sendResponseHeaders(HTTP_INTERNAL_ERROR, response.length());</span>
+<span class="nc" id="L291">    httpExchange.getResponseBody().write(response.getBytes());</span>
+<span class="nc" id="L292">    httpExchange.close();</span>
+<span class="nc" id="L293">  }</span>
+
+  /**
+   * A helper function to respond to a request with an error specifically indicating
+   * bad input from the user.
+   *
+   * @param response The description of the error to send to the user.
+   * @param httpExchange The exchange to send the error over.
+   *
+   * @throws IOException Thrown if the HttpExchange cannot communicate the error.
+   */
+  private static void respondBadInput(String response, HttpExchange httpExchange) throws IOException {
+<span class="nc" id="L305">    httpExchange.getResponseHeaders().add(&quot;Content-type&quot;, &quot;text/plain&quot;);</span>
+<span class="nc" id="L306">    httpExchange.sendResponseHeaders(HTTP_BAD_REQUEST, response.length());</span>
+<span class="nc" id="L307">    httpExchange.getResponseBody().write(response.getBytes());</span>
+<span class="nc" id="L308">    httpExchange.close();</span>
+<span class="nc" id="L309">  }</span>
+
+
+  /**
+   * A helper function to respond to a request with an error stating that the user is not authorized
+   * to make this request.
+   *
+   * @param httpExchange The exchange to send the error over.
+   *
+   * @throws IOException Thrown if the HttpExchange cannot communicate the error.
+   */
+  private static void respondUnauthorized(HttpExchange httpExchange) throws IOException {
+<span class="nc" id="L321">    httpExchange.getResponseHeaders().add(&quot;Content-type&quot;, &quot;application/javascript&quot;);</span>
+<span class="nc" id="L322">    byte[] content = &quot;{\&quot;message\&quot;: \&quot;Unauthorized API request\&quot;}&quot;.getBytes(&quot;utf-8&quot;);</span>
+<span class="nc" id="L323">    httpExchange.sendResponseHeaders(HTTP_UNAUTHORIZED, content.length);</span>
+<span class="nc" id="L324">    httpExchange.getResponseBody().write(content);</span>
+<span class="nc" id="L325">    httpExchange.close();</span>
+<span class="nc" id="L326">  }</span>
+
+
+  /**
+   * A callback object that lets us hook into the result of an annotation request.
+   */
+  public static class FinishedRequest {
+    public final Properties props;
+    public final Annotation document;
+    public final Optional&lt;String&gt; tokensregex;
+    public final Optional&lt;String&gt; semgrex;
+
+<span class="nc" id="L338">    public FinishedRequest(Properties props, Annotation document) {</span>
+<span class="nc" id="L339">      this.props = props;</span>
+<span class="nc" id="L340">      this.document = document;</span>
+<span class="nc" id="L341">      this.tokensregex = Optional.empty();</span>
+<span class="nc" id="L342">      this.semgrex = Optional.empty();</span>
+<span class="nc" id="L343">    }</span>
+
+<span class="nc" id="L345">    public FinishedRequest(Properties props, Annotation document, String tokensregex, String semgrex) {</span>
+<span class="nc" id="L346">      this.props = props;</span>
+<span class="nc" id="L347">      this.document = document;</span>
+<span class="nc" id="L348">      this.tokensregex = Optional.ofNullable(tokensregex);</span>
+<span class="nc" id="L349">      this.semgrex = Optional.ofNullable(semgrex);</span>
+<span class="nc" id="L350">    }</span>
+  }
+
+
+  /**
+   * A simple ping test. Responds with pong.
+   */
+<span class="nc" id="L357">  protected static class PingHandler implements HttpHandler {</span>
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+      // Return a simple text message that says pong.
+<span class="nc" id="L361">      httpExchange.getResponseHeaders().set(&quot;Content-type&quot;, &quot;text/plain&quot;);</span>
+<span class="nc" id="L362">      String response = &quot;pong\n&quot;;</span>
+<span class="nc" id="L363">      httpExchange.sendResponseHeaders(HTTP_OK, response.getBytes().length);</span>
+<span class="nc" id="L364">      httpExchange.getResponseBody().write(response.getBytes());</span>
+<span class="nc" id="L365">      httpExchange.close();</span>
+<span class="nc" id="L366">    }</span>
+  }
+
+
+  /**
+   * A handler to let the caller know if the server is alive AND ready to respond to requests.
+   * The canonical use-case for this is for Kubernetes readiness checks.
+   */
+  protected static class ReadyHandler implements HttpHandler {
+    /** If true, the server is runnning and ready for requets. */
+    public final AtomicBoolean serverReady;
+    /** The creation time of this handler. This is used to tell the caller how long we've been waiting for. */
+    public final long startTime;
+
+    /** The trivial constructor. */
+<span class="nc" id="L381">    public ReadyHandler(AtomicBoolean serverReady) {</span>
+<span class="nc" id="L382">      this.serverReady = serverReady;</span>
+<span class="nc" id="L383">      this.startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L384">    }</span>
+
+    /** {@inheritDoc} */
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+      // Return a simple text message that says pong.
+<span class="nc" id="L390">      httpExchange.getResponseHeaders().set(&quot;Content-type&quot;, &quot;text/plain&quot;);</span>
+      String response;
+      int status;
+<span class="nc bnc" id="L393" title="All 2 branches missed.">      if (this.serverReady.get()) {</span>
+<span class="nc" id="L394">        response = &quot;ready\n&quot;;</span>
+<span class="nc" id="L395">        status = HTTP_OK;</span>
+      } else {
+<span class="nc" id="L397">        response = &quot;server is not ready yet. uptime=&quot; + Redwood.formatTimeDifference(System.currentTimeMillis() - this.startTime) + &quot;\n&quot;;</span>
+<span class="nc" id="L398">        status = HTTP_UNAVAILABLE;</span>
+      }
+<span class="nc" id="L400">      httpExchange.sendResponseHeaders(status, response.getBytes().length);</span>
+<span class="nc" id="L401">      httpExchange.getResponseBody().write(response.getBytes());</span>
+<span class="nc" id="L402">      httpExchange.close();</span>
+<span class="nc" id="L403">    }</span>
+  }
+
+
+  /**
+   * A handler to let the caller know if the server is alive,
+   * but not necessarily ready to respond to requests.
+   * The canonical use-case for this is for Kubernetes liveness checks.
+   */
+<span class="nc" id="L412">  protected static class LiveHandler implements HttpHandler {</span>
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+      // Return a simple text message that says pong.
+<span class="nc" id="L416">      httpExchange.getResponseHeaders().set(&quot;Content-type&quot;, &quot;text/plain&quot;);</span>
+<span class="nc" id="L417">      String response = &quot;live\n&quot;;</span>
+<span class="nc" id="L418">      httpExchange.sendResponseHeaders(HTTP_OK, response.getBytes().length);</span>
+<span class="nc" id="L419">      httpExchange.getResponseBody().write(response.getBytes());</span>
+<span class="nc" id="L420">      httpExchange.close();</span>
+<span class="nc" id="L421">    }</span>
+  }
+
+
+  /**
+   * Sending the appropriate shutdown key will gracefully shutdown the server.
+   * This key is, by default, saved into the local file /tmp/corenlp.shutdown on the
+   * machine the server was run from.
+   */
+<span class="nc" id="L430">  protected class ShutdownHandler implements HttpHandler {</span>
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+<span class="nc" id="L433">      Map&lt;String, String&gt; urlParams = getURLParams(httpExchange.getRequestURI());</span>
+<span class="nc" id="L434">      httpExchange.getResponseHeaders().set(&quot;Content-type&quot;, &quot;text/plain&quot;);</span>
+<span class="nc" id="L435">      boolean doExit = false;</span>
+<span class="nc" id="L436">      String response = &quot;Invalid shutdown key\n&quot;;</span>
+<span class="nc bnc" id="L437" title="All 4 branches missed.">      if (urlParams.containsKey(&quot;key&quot;) &amp;&amp; urlParams.get(&quot;key&quot;).equals(shutdownKey)) {</span>
+<span class="nc" id="L438">        response = &quot;Shutdown successful!\n&quot;;</span>
+<span class="nc" id="L439">        doExit = true;</span>
+      }
+<span class="nc" id="L441">      httpExchange.sendResponseHeaders(HTTP_OK, response.getBytes().length);</span>
+<span class="nc" id="L442">      httpExchange.getResponseBody().write(response.getBytes());</span>
+<span class="nc" id="L443">      httpExchange.close();</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">      if (doExit) {</span>
+<span class="nc" id="L445">        System.exit(0);</span>
+      }
+<span class="nc" id="L447">    }</span>
+  }
+
+  /**
+   * Serve a file from the filesystem or classpath
+   */
+  public static class FileHandler implements HttpHandler {
+    private final String content;
+    private final String contentType;
+    public FileHandler(String fileOrClasspath) throws IOException {
+<span class="nc" id="L457">      this(fileOrClasspath, &quot;text/html&quot;);</span>
+<span class="nc" id="L458">    }</span>
+<span class="nc" id="L459">    public FileHandler(String fileOrClasspath, String contentType) throws IOException {</span>
+<span class="nc" id="L460">      this.content = IOUtils.slurpReader(IOUtils.readerFromString(fileOrClasspath, &quot;utf-8&quot;));</span>
+<span class="nc" id="L461">      this.contentType = contentType + &quot;; charset=utf-8&quot;;  // always encode in utf-8</span>
+<span class="nc" id="L462">    }</span>
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+<span class="nc" id="L465">      httpExchange.getResponseHeaders().set(&quot;Content-type&quot;, this.contentType);</span>
+<span class="nc" id="L466">      ByteBuffer buffer = Charset.forName(&quot;UTF-8&quot;).encode(content);</span>
+<span class="nc" id="L467">      byte[] bytes = new byte[buffer.remaining()];</span>
+<span class="nc" id="L468">      buffer.get(bytes);</span>
+<span class="nc" id="L469">      httpExchange.sendResponseHeaders(HTTP_OK, bytes.length);</span>
+<span class="nc" id="L470">      httpExchange.getResponseBody().write(bytes);</span>
+<span class="nc" id="L471">      httpExchange.close();</span>
+<span class="nc" id="L472">    }</span>
+  }
+
+  /**
+   * The main handler for taking an annotation request, and annotating it.
+   */
+  protected class CoreNLPHandler implements HttpHandler {
+    /**
+     * The default properties to use in the absence of anything sent by the client.
+     */
+    public final Properties defaultProps;
+
+    /**
+     * An authenticator to determine if we can perform this API request.
+     */
+    private final Predicate&lt;Properties&gt; authenticator;
+
+    /**
+     * A callback to call when an annotation job has finished.
+     */
+    private final Consumer&lt;FinishedRequest&gt; callback;
+
+
+    private final FileHandler homepage;
+
+    /**
+     * Create a handler for accepting annotation requests.
+     * @param props The properties file to use as the default if none were sent by the client.
+     */
+    public CoreNLPHandler(Properties props, Predicate&lt;Properties&gt; authenticator,
+                          Consumer&lt;FinishedRequest&gt; callback,
+<span class="nc" id="L503">                          FileHandler homepage) {</span>
+<span class="nc" id="L504">      this.defaultProps = props;</span>
+<span class="nc" id="L505">      this.callback = callback;</span>
+<span class="nc" id="L506">      this.authenticator = authenticator;</span>
+<span class="nc" id="L507">      this.homepage = homepage;</span>
+<span class="nc" id="L508">    }</span>
+
+    /**
+     * Get the response data type to send to the client, based off of the output format requested from
+     * CoreNLP.
+     *
+     * @param props The properties being used by CoreNLP.
+     * @param of The output format being output by CoreNLP.
+     *
+     * @return An identifier for the type of the HTTP response (e.g., 'text/json').
+     */
+    public String getContentType(Properties props, StanfordCoreNLP.OutputFormat of) {
+<span class="nc bnc" id="L520" title="All 5 branches missed.">      switch(of) {</span>
+        case JSON:
+<span class="nc" id="L522">          return &quot;application/json&quot;;</span>
+        case TEXT:
+        case CONLL:
+<span class="nc" id="L525">          return &quot;text/plain&quot;;</span>
+        case XML:
+<span class="nc" id="L527">          return &quot;text/xml&quot;;</span>
+        case SERIALIZED:
+<span class="nc" id="L529">          String outputSerializerName = props.getProperty(&quot;outputSerializer&quot;);</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">          if (outputSerializerName != null &amp;&amp;</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">              outputSerializerName.equals(ProtobufAnnotationSerializer.class.getName())) {</span>
+<span class="nc" id="L532">            return &quot;application/x-protobuf&quot;;</span>
+          }
+          //noinspection fallthrough
+        default:
+<span class="nc" id="L536">          return &quot;application/octet-stream&quot;;</span>
+      }
+    }
+
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+      // Set common response headers
+<span class="nc" id="L543">      httpExchange.getResponseHeaders().add(&quot;Access-Control-Allow-Origin&quot;, &quot;*&quot;);</span>
+
+      // Get sentence.
+      Properties props;
+      Annotation ann;
+      StanfordCoreNLP.OutputFormat of;
+      try {
+<span class="nc" id="L550">        props = getProperties(httpExchange);</span>
+
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        if (&quot;GET&quot;.equalsIgnoreCase(httpExchange.getRequestMethod())) {</span>
+          // Handle direct browser connections (i.e., not a POST request).
+<span class="nc" id="L554">          homepage.handle(httpExchange);</span>
+<span class="nc" id="L555">          return;</span>
+        } else {
+          // Handle API request
+<span class="nc bnc" id="L558" title="All 4 branches missed.">          if (authenticator != null &amp;&amp; !authenticator.test(props)) {</span>
+<span class="nc" id="L559">            respondUnauthorized(httpExchange);</span>
+<span class="nc" id="L560">            return;</span>
+          }
+<span class="nc" id="L562">          log(&quot;[&quot; + httpExchange.getRemoteAddress() + &quot;] API call w/annotators &quot; + props.getProperty(&quot;annotators&quot;, &quot;&lt;unknown&gt;&quot;));</span>
+<span class="nc" id="L563">          ann = getDocument(props, httpExchange);</span>
+<span class="nc" id="L564">          of = StanfordCoreNLP.OutputFormat.valueOf(props.getProperty(&quot;outputFormat&quot;, &quot;json&quot;).toUpperCase());</span>
+<span class="nc" id="L565">          String text = ann.get(CoreAnnotations.TextAnnotation.class).replace('\n', ' ');</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">          if (!quiet) {</span>
+<span class="nc" id="L567">            System.out.println(text);</span>
+          }
+<span class="nc bnc" id="L569" title="All 2 branches missed.">          if (text.length() &gt; MAX_CHAR_LENGTH) {</span>
+<span class="nc" id="L570">            respondBadInput(&quot;Request is too long to be handled by server: &quot; + text.length() + &quot; characters. Max length is &quot; + MAX_CHAR_LENGTH + &quot; characters.&quot;, httpExchange);</span>
+<span class="nc" id="L571">            return;</span>
+          }
+        }
+<span class="nc" id="L574">      } catch (Exception e) {</span>
+<span class="nc" id="L575">        e.printStackTrace();</span>
+<span class="nc" id="L576">        respondError(&quot;Could not handle incoming annotation&quot;, httpExchange);</span>
+<span class="nc" id="L577">        return;</span>
+<span class="nc" id="L578">      }</span>
+
+<span class="nc" id="L580">      Future&lt;Annotation&gt; completedAnnotationFuture = null;</span>
+      try {
+        // Annotate
+<span class="nc" id="L583">        StanfordCoreNLP pipeline = mkStanfordCoreNLP(props);</span>
+<span class="nc" id="L584">        completedAnnotationFuture = corenlpExecutor.submit(() -&gt; {</span>
+<span class="nc" id="L585">          pipeline.annotate(ann);</span>
+<span class="nc" id="L586">          return ann;</span>
+        });
+        Annotation completedAnnotation;
+        try {
+<span class="nc" id="L590">          int timeoutMilliseconds = Integer.parseInt(props.getProperty(&quot;timeout&quot;,</span>
+<span class="nc" id="L591">                                                     Integer.toString(StanfordCoreNLPServer.this.timeoutMilliseconds)));</span>
+          // Check for too long a timeout from an unauthorized source
+<span class="nc bnc" id="L593" title="All 2 branches missed.">          if (timeoutMilliseconds &gt; 15000) {</span>
+            // If two conditions:
+            //   (1) The server is running on corenlp.run (i.e., corenlp.stanford.edu)
+            //   (2) The request is not coming from a *.stanford.edu&quot; email address
+            // Then force the timeout to be 15 seconds
+<span class="nc bnc" id="L598" title="All 2 branches missed.">            if (&quot;corenlp.stanford.edu&quot;.equals(InetAddress.getLocalHost().getHostName()) &amp;&amp;</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                !httpExchange.getRemoteAddress().getHostName().toLowerCase().endsWith(&quot;stanford.edu&quot;)) {</span>
+<span class="nc" id="L600">              timeoutMilliseconds = 15000;</span>
+            }
+          }
+<span class="nc" id="L603">          completedAnnotation = completedAnnotationFuture.get(timeoutMilliseconds, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L604">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L605">          completedAnnotation = completedAnnotationFuture.get(StanfordCoreNLPServer.this.timeoutMilliseconds, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L606">        }</span>
+<span class="nc" id="L607">        completedAnnotationFuture = null;  // No longer any need for the future</span>
+
+        // Get output
+<span class="nc" id="L610">        ByteArrayOutputStream os = new ByteArrayOutputStream();</span>
+<span class="nc" id="L611">        AnnotationOutputter.Options options = AnnotationOutputter.getOptions(pipeline);</span>
+<span class="nc" id="L612">        StanfordCoreNLP.createOutputter(props, options).accept(completedAnnotation, os);</span>
+<span class="nc" id="L613">        os.close();</span>
+<span class="nc" id="L614">        byte[] response = os.toByteArray();</span>
+
+<span class="nc" id="L616">        String contentType = getContentType(props, of);</span>
+<span class="nc bnc" id="L617" title="All 4 branches missed.">        if (contentType.equals(&quot;application/json&quot;) || contentType.startsWith(&quot;text/&quot;)) {</span>
+<span class="nc" id="L618">          contentType += &quot;;charset=&quot; + options.encoding;</span>
+        }
+<span class="nc" id="L620">        httpExchange.getResponseHeaders().add(&quot;Content-type&quot;, contentType);</span>
+<span class="nc" id="L621">        httpExchange.getResponseHeaders().add(&quot;Content-length&quot;, Integer.toString(response.length));</span>
+<span class="nc" id="L622">        httpExchange.sendResponseHeaders(HTTP_OK, response.length);</span>
+<span class="nc" id="L623">        httpExchange.getResponseBody().write(response);</span>
+<span class="nc" id="L624">        httpExchange.close();</span>
+<span class="nc bnc" id="L625" title="All 6 branches missed.">        if (completedAnnotation != null &amp;&amp; props.getProperty(&quot;annotators&quot;) != null &amp;&amp; !&quot;&quot;.equals(props.getProperty(&quot;annotators&quot;))) {</span>
+<span class="nc" id="L626">          callback.accept(new FinishedRequest(props, completedAnnotation));</span>
+        }
+<span class="nc" id="L628">      } catch (TimeoutException e) {</span>
+        // Print the stack trace for debugging
+<span class="nc" id="L630">        e.printStackTrace();</span>
+        // Return error message.
+<span class="nc" id="L632">        respondError(&quot;CoreNLP request timed out. Your document may be too long.&quot;, httpExchange);</span>
+        // Cancel the future if it's alive
+        //noinspection ConstantConditions
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        if (completedAnnotationFuture != null) {</span>
+<span class="nc" id="L636">          completedAnnotationFuture.cancel(true);</span>
+        }
+<span class="nc" id="L638">      } catch (Exception e) {</span>
+        // Print the stack trace for debugging
+<span class="nc" id="L640">        e.printStackTrace();</span>
+        // Return error message.
+<span class="nc" id="L642">        respondError(e.getClass().getName() + &quot;: &quot; + e.getMessage(), httpExchange);</span>
+        // Cancel the future if it's alive
+        //noinspection ConstantConditions
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (completedAnnotationFuture != null) {  // just in case...</span>
+<span class="nc" id="L646">          completedAnnotationFuture.cancel(true);</span>
+        }
+<span class="nc" id="L648">      }</span>
+<span class="nc" id="L649">    }</span>
+
+    /**
+     * Parse the parameters of a connection into a CoreNLP properties file that can be passed into
+     * {@link StanfordCoreNLP}, and used in the I/O stages.
+     *
+     * @param httpExchange The http exchange; effectively, the request information.
+     *
+     * @return A {@link Properties} object corresponding to a combination of default and passed properties.
+     *
+     * @throws UnsupportedEncodingException Thrown if we could not decode the key/value pairs with UTF-8.
+     */
+    private Properties getProperties(HttpExchange httpExchange) throws UnsupportedEncodingException {
+<span class="nc" id="L662">      Map&lt;String, String&gt; urlParams = getURLParams(httpExchange.getRequestURI());</span>
+
+      // Load the default properties
+<span class="nc" id="L665">      Properties props = new Properties();</span>
+<span class="nc" id="L666">      defaultProps.entrySet().forEach(entry -&gt; props.setProperty(entry.getKey().toString(), entry.getValue().toString()));</span>
+
+      // Add GET parameters as properties
+<span class="nc" id="L669">      urlParams.entrySet().stream()</span>
+<span class="nc" id="L670">          .filter(entry -&gt;</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">              !&quot;properties&quot;.equalsIgnoreCase(entry.getKey()) &amp;&amp;</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">                  !&quot;props&quot;.equalsIgnoreCase(entry.getKey()))</span>
+<span class="nc" id="L673">          .forEach(entry -&gt; props.setProperty(entry.getKey(), entry.getValue()));</span>
+
+      // Try to get more properties from query string.
+      // (get the properties from the URL params)
+<span class="nc" id="L677">      Map&lt;String, String&gt; urlProperties = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">      if (urlParams.containsKey(&quot;properties&quot;)) {</span>
+<span class="nc" id="L679">        urlProperties = StringUtils.decodeMap(URLDecoder.decode(urlParams.get(&quot;properties&quot;), &quot;UTF-8&quot;));</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">      } else if (urlParams.containsKey(&quot;props&quot;)) {</span>
+<span class="nc" id="L681">        urlProperties = StringUtils.decodeMap(URLDecoder.decode(urlParams.get(&quot;props&quot;), &quot;UTF-8&quot;));</span>
+      }
+
+      // check to see if a specific language was set, use language specific properties
+<span class="nc" id="L685">      String language = urlParams.getOrDefault(&quot;pipelineLanguage&quot;, urlProperties.getOrDefault(&quot;pipelineLanguage&quot;, &quot;default&quot;));</span>
+<span class="nc bnc" id="L686" title="All 4 branches missed.">      if (language != null &amp;&amp; !&quot;default&quot;.equals(language)) {</span>
+<span class="nc" id="L687">        String languagePropertiesFile = LanguageInfo.getLanguagePropertiesFile(language);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">        if (languagePropertiesFile != null) {</span>
+<span class="nc" id="L689">          Properties languageSpecificProperties = new Properties();</span>
+          try {
+<span class="nc" id="L691">            languageSpecificProperties.load(</span>
+<span class="nc" id="L692">                    IOUtils.getInputStreamFromURLOrClasspathOrFileSystem(languagePropertiesFile));</span>
+<span class="nc" id="L693">            PropertiesUtils.overWriteProperties(props,languageSpecificProperties);</span>
+<span class="nc" id="L694">          } catch (IOException e) {</span>
+<span class="nc" id="L695">            err(&quot;Failure to load language specific properties.&quot;);</span>
+<span class="nc" id="L696">          }</span>
+<span class="nc" id="L697">        } else {</span>
+          try {
+<span class="nc" id="L699">            respondError(&quot;Invalid language: '&quot; + language + &quot;'&quot;, httpExchange);</span>
+<span class="nc" id="L700">          } catch (IOException e) { warn(e); }</span>
+<span class="nc" id="L701">          return new Properties();</span>
+        }
+      }
+
+      // (tweak the default properties a bit)
+<span class="nc bnc" id="L706" title="All 2 branches missed.">      if (!props.containsKey(&quot;mention.type&quot;)) {</span>
+        // Set coref head to use dependencies
+<span class="nc" id="L708">        props.setProperty(&quot;mention.type&quot;, &quot;dep&quot;);</span>
+<span class="nc bnc" id="L709" title="All 4 branches missed.">        if (urlProperties.containsKey(&quot;annotators&quot;) &amp;&amp; urlProperties.get(&quot;annotators&quot;) != null &amp;&amp;</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">            ArrayUtils.contains(urlProperties.get(&quot;annotators&quot;).split(&quot;,&quot;), &quot;parse&quot;)) {</span>
+          // (case: the properties have a parse annotator --
+          //        we don't have to use the dependency mention finder)
+<span class="nc" id="L713">          props.remove(&quot;mention.type&quot;);</span>
+        }
+      }
+
+      // (add new properties on top of the default properties)
+<span class="nc" id="L718">      urlProperties.entrySet()</span>
+<span class="nc" id="L719">          .forEach(entry -&gt; props.setProperty(entry.getKey(), entry.getValue()));</span>
+
+      // Get the annotators
+<span class="nc" id="L722">      String annotators = props.getProperty(&quot;annotators&quot;);</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">      if (PropertiesUtils.getBool(props, &quot;enforceRequirements&quot;, true)) {</span>
+<span class="nc" id="L724">        annotators = StanfordCoreNLP.ensurePrerequisiteAnnotators(props.getProperty(&quot;annotators&quot;).split(&quot;[, \t]+&quot;), props);</span>
+      }
+
+      // Make sure the properties compile
+<span class="nc" id="L728">      props.setProperty(&quot;annotators&quot;, annotators);</span>
+
+<span class="nc" id="L730">      return props;</span>
+    }
+  }
+
+
+
+  /**
+   * A handler for matching TokensRegex patterns against text.
+   */
+  protected class TokensRegexHandler implements HttpHandler {
+
+    /**
+     * A callback to call when an annotation job has finished.
+     */
+    private final Consumer&lt;FinishedRequest&gt; callback;
+
+    /**
+     * An authenticator to determine if we can perform this API request.
+     */
+    private final Predicate&lt;Properties&gt; authenticator;
+
+    /**
+     * Create a new TokensRegex Handler.
+     * @param callback The callback to call when annotation has finished.
+     */
+<span class="nc" id="L755">    public TokensRegexHandler(Predicate&lt;Properties&gt; authenticator, Consumer&lt;FinishedRequest&gt; callback) {</span>
+<span class="nc" id="L756">      this.callback = callback;</span>
+<span class="nc" id="L757">      this.authenticator = authenticator;</span>
+<span class="nc" id="L758">    }</span>
+
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+      // Set common response headers
+<span class="nc" id="L763">      httpExchange.getResponseHeaders().add(&quot;Access-Control-Allow-Origin&quot;, &quot;*&quot;);</span>
+      // Some common fields
+<span class="nc" id="L765">      Properties props = PropertiesUtils.asProperties(&quot;annotators&quot;, &quot;tokenize,ssplit,pos,lemma,ner&quot;);</span>
+<span class="nc bnc" id="L766" title="All 4 branches missed.">      if (authenticator != null &amp;&amp; !authenticator.test(props)) {</span>
+<span class="nc" id="L767">        respondUnauthorized(httpExchange);</span>
+<span class="nc" id="L768">        return;</span>
+      }
+<span class="nc" id="L770">      Map&lt;String, String&gt; params = getURLParams(httpExchange.getRequestURI());</span>
+
+<span class="nc" id="L772">      Future&lt;Pair&lt;String, Annotation&gt;&gt; future = corenlpExecutor.submit(() -&gt; {</span>
+        try {
+          // Get the document
+<span class="nc" id="L775">          Annotation doc = getDocument(props, httpExchange);</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">          if (!doc.containsKey(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L777">            StanfordCoreNLP pipeline = mkStanfordCoreNLP(props);</span>
+<span class="nc" id="L778">            pipeline.annotate(doc);</span>
+          }
+
+          // Construct the matcher
+          // (get the pattern)
+<span class="nc bnc" id="L783" title="All 2 branches missed.">          if (!params.containsKey(&quot;pattern&quot;)) {</span>
+<span class="nc" id="L784">            respondBadInput(&quot;Missing required parameter 'pattern'&quot;, httpExchange);</span>
+<span class="nc" id="L785">            return new Pair&lt;&gt;(&quot;&quot;, null);</span>
+          }
+<span class="nc" id="L787">          String pattern = params.get(&quot;pattern&quot;);</span>
+          // (get whether to filter / find)
+<span class="nc" id="L789">          String filterStr = params.getOrDefault(&quot;filter&quot;, &quot;false&quot;);</span>
+<span class="nc bnc" id="L790" title="All 4 branches missed.">          final boolean filter = filterStr.trim().isEmpty() || &quot;true&quot;.equalsIgnoreCase(filterStr.toLowerCase());</span>
+          // (create the matcher)
+<span class="nc" id="L792">          final TokenSequencePattern regex = TokenSequencePattern.compile(pattern);</span>
+
+          // Run TokensRegex
+<span class="nc" id="L795">          return new Pair&lt;&gt;(JSONOutputter.JSONWriter.objectToJSON((docWriter) -&gt; {</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">            if (filter) {</span>
+              // Case: just filter sentences
+<span class="nc" id="L798">              docWriter.set(&quot;sentences&quot;, doc.get(CoreAnnotations.SentencesAnnotation.class).stream().map(sentence -&gt;</span>
+<span class="nc" id="L799">                      regex.matcher(sentence.get(CoreAnnotations.TokensAnnotation.class)).matches()</span>
+<span class="nc" id="L800">              ).collect(Collectors.toList()));</span>
+            } else {
+              // Case: find matches
+<span class="nc" id="L803">              docWriter.set(&quot;sentences&quot;, doc.get(CoreAnnotations.SentencesAnnotation.class).stream().map(sentence -&gt; (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer sentWriter) -&gt; {</span>
+<span class="nc" id="L804">                List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L805">                TokenSequenceMatcher matcher = regex.matcher(tokens);</span>
+<span class="nc" id="L806">                int i = 0;</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">                while (matcher.find()) {</span>
+<span class="nc" id="L808">                  sentWriter.set(Integer.toString(i), (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer matchWriter) -&gt; {</span>
+<span class="nc" id="L809">                    matchWriter.set(&quot;text&quot;, matcher.group());</span>
+<span class="nc" id="L810">                    matchWriter.set(&quot;begin&quot;, matcher.start());</span>
+<span class="nc" id="L811">                    matchWriter.set(&quot;end&quot;, matcher.end());</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">                    for (int groupI = 0; groupI &lt; matcher.groupCount(); ++groupI) {</span>
+<span class="nc" id="L813">                      SequenceMatchResult.MatchedGroupInfo&lt;CoreMap&gt; info = matcher.groupInfo(groupI + 1);</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">                      matchWriter.set(info.varName == null ? Integer.toString(groupI + 1) : info.varName, (Consumer&lt;JSONOutputter.Writer&gt;) groupWriter -&gt; {</span>
+<span class="nc" id="L815">                        groupWriter.set(&quot;text&quot;, info.text);</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">                        if (info.nodes.size() &gt; 0) {</span>
+<span class="nc" id="L817">                          groupWriter.set(&quot;begin&quot;, info.nodes.get(0).get(CoreAnnotations.IndexAnnotation.class) - 1);</span>
+<span class="nc" id="L818">                          groupWriter.set(&quot;end&quot;, info.nodes.get(info.nodes.size() - 1).get(CoreAnnotations.IndexAnnotation.class));</span>
+                        }
+<span class="nc" id="L820">                      });</span>
+                    }
+<span class="nc" id="L822">                  });</span>
+<span class="nc" id="L823">                  i += 1;</span>
+                }
+<span class="nc" id="L825">                sentWriter.set(&quot;length&quot;, i);</span>
+<span class="nc" id="L826">              }));</span>
+            }
+<span class="nc" id="L828">          }), doc);</span>
+<span class="nc" id="L829">        } catch (Exception e) {</span>
+<span class="nc" id="L830">          e.printStackTrace();</span>
+          try {
+<span class="nc" id="L832">            respondError(e.getClass().getName() + &quot;: &quot; + e.getMessage(), httpExchange);</span>
+<span class="nc" id="L833">          } catch (IOException ignored) {</span>
+<span class="nc" id="L834">          }</span>
+        }
+<span class="nc" id="L836">        return new Pair&lt;&gt;(&quot;&quot;, null);</span>
+      });
+
+      // Send response
+      try {
+<span class="nc" id="L841">        Pair&lt;String, Annotation&gt; response = future.get(5, TimeUnit.SECONDS);</span>
+<span class="nc" id="L842">        byte[] content = response.first.getBytes();</span>
+<span class="nc" id="L843">        Annotation completedAnnotation = response.second;</span>
+<span class="nc" id="L844">        sendAndGetResponse(httpExchange, content);</span>
+<span class="nc bnc" id="L845" title="All 6 branches missed.">        if (completedAnnotation != null &amp;&amp; props.getProperty(&quot;annotators&quot;) != null &amp;&amp; !&quot;&quot;.equals(props.getProperty(&quot;annotators&quot;))) {</span>
+<span class="nc" id="L846">          callback.accept(new FinishedRequest(props, completedAnnotation, params.get(&quot;pattern&quot;), null));</span>
+        }
+<span class="nc" id="L848">      } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L849">        respondError(&quot;Timeout when executing TokensRegex query&quot;, httpExchange);</span>
+<span class="nc" id="L850">      }</span>
+<span class="nc" id="L851">    }</span>
+  }
+
+
+
+  /**
+   * A handler for matching semgrex patterns against dependency trees.
+   */
+  protected class SemgrexHandler implements HttpHandler {
+
+    /**
+     * A callback to call when an annotation job has finished.
+     */
+    private final Consumer&lt;FinishedRequest&gt; callback;
+
+    /**
+     * An authenticator to determine if we can perform this API request.
+     */
+    private final Predicate&lt;Properties&gt; authenticator;
+
+    /**
+     * Create a new Semgrex Handler.
+     * @param callback The callback to call when annotation has finished.
+     */
+<span class="nc" id="L875">    public SemgrexHandler(Predicate&lt;Properties&gt; authenticator, Consumer&lt;FinishedRequest&gt; callback) {</span>
+<span class="nc" id="L876">      this.callback = callback;</span>
+<span class="nc" id="L877">      this.authenticator = authenticator;</span>
+<span class="nc" id="L878">    }</span>
+
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+
+      // Set common response headers
+<span class="nc" id="L884">      httpExchange.getResponseHeaders().add(&quot;Access-Control-Allow-Origin&quot;, &quot;*&quot;);</span>
+
+      // Some common properties
+<span class="nc" id="L887">      Properties props = PropertiesUtils.asProperties(&quot;annotators&quot;, &quot;tokenize,ssplit,pos,lemma,ner,depparse&quot;);</span>
+<span class="nc bnc" id="L888" title="All 4 branches missed.">      if (authenticator != null &amp;&amp; !authenticator.test(props)) {</span>
+<span class="nc" id="L889">        respondUnauthorized(httpExchange);</span>
+<span class="nc" id="L890">        return;</span>
+      }
+<span class="nc" id="L892">      Map&lt;String, String&gt; params = getURLParams(httpExchange.getRequestURI());</span>
+
+<span class="nc" id="L894">      Future&lt;Pair&lt;String, Annotation&gt;&gt; response = corenlpExecutor.submit(() -&gt; {</span>
+        try {
+          // Get the document
+<span class="nc" id="L897">          Annotation doc = getDocument(props, httpExchange);</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">          if (!doc.containsKey(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L899">            StanfordCoreNLP pipeline = mkStanfordCoreNLP(props);</span>
+<span class="nc" id="L900">            pipeline.annotate(doc);</span>
+          }
+
+          // Construct the matcher
+          // (get the pattern)
+<span class="nc bnc" id="L905" title="All 2 branches missed.">          if (!params.containsKey(&quot;pattern&quot;)) {</span>
+<span class="nc" id="L906">            respondBadInput(&quot;Missing required parameter 'pattern'&quot;, httpExchange);</span>
+<span class="nc" id="L907">            return Pair.makePair(&quot;&quot;, null);</span>
+          }
+<span class="nc" id="L909">          String pattern = params.get(&quot;pattern&quot;);</span>
+          // (get whether to filter / find)
+<span class="nc" id="L911">          String filterStr = params.getOrDefault(&quot;filter&quot;, &quot;false&quot;);</span>
+<span class="nc bnc" id="L912" title="All 4 branches missed.">          final boolean filter = filterStr.trim().isEmpty() || &quot;true&quot;.equalsIgnoreCase(filterStr.toLowerCase());</span>
+          // (create the matcher)
+<span class="nc" id="L914">          final SemgrexPattern regex = SemgrexPattern.compile(pattern);</span>
+
+          // Run TokensRegex
+<span class="nc" id="L917">          return Pair.makePair(JSONOutputter.JSONWriter.objectToJSON((docWriter) -&gt; {</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            if (filter) {</span>
+              // Case: just filter sentences
+<span class="nc" id="L920">              docWriter.set(&quot;sentences&quot;, doc.get(CoreAnnotations.SentencesAnnotation.class).stream().map(sentence -&gt;</span>
+<span class="nc" id="L921">                      regex.matcher(sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class)).matches()</span>
+<span class="nc" id="L922">              ).collect(Collectors.toList()));</span>
+            } else {
+              // Case: find matches
+<span class="nc" id="L925">              docWriter.set(&quot;sentences&quot;, doc.get(CoreAnnotations.SentencesAnnotation.class).stream().map(sentence -&gt; (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer sentWriter) -&gt; {</span>
+<span class="nc" id="L926">                SemgrexMatcher matcher = regex.matcher(sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class));</span>
+<span class="nc" id="L927">                int i = 0;</span>
+<span class="nc bnc" id="L928" title="All 2 branches missed.">                while (matcher.find()) {</span>
+<span class="nc" id="L929">                  sentWriter.set(Integer.toString(i), (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer matchWriter) -&gt; {</span>
+<span class="nc" id="L930">                    IndexedWord match = matcher.getMatch();</span>
+<span class="nc" id="L931">                    matchWriter.set(&quot;text&quot;, match.word());</span>
+<span class="nc" id="L932">                    matchWriter.set(&quot;begin&quot;, match.index() - 1);</span>
+<span class="nc" id="L933">                    matchWriter.set(&quot;end&quot;, match.index());</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">                    for (String capture : matcher.getNodeNames()) {</span>
+<span class="nc" id="L935">                      matchWriter.set(&quot;$&quot; + capture, (Consumer&lt;JSONOutputter.Writer&gt;) groupWriter -&gt; {</span>
+<span class="nc" id="L936">                        IndexedWord node = matcher.getNode(capture);</span>
+<span class="nc" id="L937">                        groupWriter.set(&quot;text&quot;, node.word());</span>
+<span class="nc" id="L938">                        groupWriter.set(&quot;begin&quot;, node.index() - 1);</span>
+<span class="nc" id="L939">                        groupWriter.set(&quot;end&quot;, node.index());</span>
+<span class="nc" id="L940">                      });</span>
+<span class="nc" id="L941">                    }</span>
+<span class="nc" id="L942">                  });</span>
+<span class="nc" id="L943">                  i += 1;</span>
+                }
+<span class="nc" id="L945">                sentWriter.set(&quot;length&quot;, i);</span>
+<span class="nc" id="L946">              }));</span>
+            }
+<span class="nc" id="L948">          }), doc);</span>
+<span class="nc" id="L949">        } catch (Exception e) {</span>
+<span class="nc" id="L950">          e.printStackTrace();</span>
+          try {
+<span class="nc" id="L952">            respondError(e.getClass().getName() + &quot;: &quot; + e.getMessage(), httpExchange);</span>
+<span class="nc" id="L953">          } catch (IOException ignored) {</span>
+<span class="nc" id="L954">          }</span>
+        }
+<span class="nc" id="L956">        return Pair.makePair(&quot;&quot;, null);</span>
+      });
+
+      // Send response
+      try {
+<span class="nc" id="L961">        Pair&lt;String, Annotation&gt; pair = response.get(5, TimeUnit.SECONDS);</span>
+<span class="nc" id="L962">        Annotation completedAnnotation = pair.second;</span>
+<span class="nc" id="L963">        byte[] content = pair.first.getBytes();</span>
+<span class="nc" id="L964">        sendAndGetResponse(httpExchange, content);</span>
+<span class="nc bnc" id="L965" title="All 6 branches missed.">        if (completedAnnotation != null &amp;&amp; props.getProperty(&quot;annotators&quot;) != null &amp;&amp; !&quot;&quot;.equals(props.getProperty(&quot;annotators&quot;))) {</span>
+<span class="nc" id="L966">          callback.accept(new FinishedRequest(props, completedAnnotation, params.get(&quot;pattern&quot;), null));</span>
+        }
+<span class="nc" id="L968">      } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L969">        respondError(&quot;Timeout when executing Semgrex query&quot;, httpExchange);</span>
+<span class="nc" id="L970">      }</span>
+<span class="nc" id="L971">    }</span>
+  }
+
+  /**
+   * A handler for matching tregrex patterns against dependency trees.
+   */
+  protected class TregexHandler implements HttpHandler {
+
+    /**
+     * A callback to call when an annotation job has finished.
+     */
+    private final Consumer&lt;FinishedRequest&gt; callback;
+
+    /**
+     * An authenticator to determine if we can perform this API request.
+     */
+    private final Predicate&lt;Properties&gt; authenticator;
+
+    /**
+     * Create a new Tregex Handler.
+     * @param callback The callback to call when annotation has finished.
+     */
+<span class="nc" id="L993">    public TregexHandler(Predicate&lt;Properties&gt; authenticator, Consumer&lt;FinishedRequest&gt; callback) {</span>
+<span class="nc" id="L994">      this.callback = callback;</span>
+<span class="nc" id="L995">      this.authenticator = authenticator;</span>
+<span class="nc" id="L996">    }</span>
+
+    @Override
+    public void handle(HttpExchange httpExchange) throws IOException {
+
+      // Set common response headers
+<span class="nc" id="L1002">      httpExchange.getResponseHeaders().add(&quot;Access-Control-Allow-Origin&quot;, &quot;*&quot;);</span>
+
+      // Some common properties
+<span class="nc" id="L1005">      Properties props = PropertiesUtils.asProperties(&quot;annotators&quot;, &quot;tokenize,ssplit,parse&quot;);</span>
+<span class="nc bnc" id="L1006" title="All 4 branches missed.">      if (authenticator != null &amp;&amp; ! authenticator.test(props)) {</span>
+<span class="nc" id="L1007">        respondUnauthorized(httpExchange);</span>
+<span class="nc" id="L1008">        return;</span>
+      }
+<span class="nc" id="L1010">      Map&lt;String, String&gt; params = getURLParams(httpExchange.getRequestURI());</span>
+
+<span class="nc" id="L1012">      Future&lt;Pair&lt;String, Annotation&gt;&gt; response = corenlpExecutor.submit(() -&gt; {</span>
+        try {
+          // Get the document
+<span class="nc" id="L1015">          Annotation doc = getDocument(props, httpExchange);</span>
+<span class="nc bnc" id="L1016" title="All 2 branches missed.">          if ( ! doc.containsKey(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L1017">            StanfordCoreNLP pipeline = mkStanfordCoreNLP(props);</span>
+<span class="nc" id="L1018">            pipeline.annotate(doc);</span>
+          }
+
+          // Construct the matcher
+          // (get the pattern)
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">          if ( ! params.containsKey(&quot;pattern&quot;)) {</span>
+<span class="nc" id="L1024">            respondBadInput(&quot;Missing required parameter 'pattern'&quot;, httpExchange);</span>
+<span class="nc" id="L1025">            return Pair.makePair(&quot;&quot;, null);</span>
+          }
+<span class="nc" id="L1027">          String pattern = params.get(&quot;pattern&quot;);</span>
+
+          // (create the matcher)
+<span class="nc" id="L1030">          TregexPattern p = TregexPattern.compile(pattern);</span>
+
+          // Run Tregex
+<span class="nc" id="L1033">          return Pair.makePair(JSONOutputter.JSONWriter.objectToJSON((docWriter) -&gt;</span>
+<span class="nc" id="L1034">            docWriter.set(&quot;sentences&quot;, doc.get(CoreAnnotations.SentencesAnnotation.class).stream().map(sentence -&gt; (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer sentWriter) -&gt; {</span>
+<span class="nc" id="L1035">                Tree tree = sentence.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+                //sentWriter.set(&quot;tree&quot;, tree.pennString());
+<span class="nc" id="L1037">                TregexMatcher matcher = p.matcher(tree);</span>
+
+<span class="nc" id="L1039">                int i = 0;</span>
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">                while (matcher.find()) {</span>
+<span class="nc" id="L1041">                  sentWriter.set(Integer.toString(i++), (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer matchWriter) -&gt; {</span>
+<span class="nc" id="L1042">                    matchWriter.set(&quot;match&quot;, matcher.getMatch().pennString());</span>
+<span class="nc" id="L1043">                    matchWriter.set(&quot;namedNodes&quot;, matcher.getNodeNames().stream().map(nodeName -&gt; (Consumer&lt;JSONOutputter.Writer&gt;) (JSONOutputter.Writer namedNodeWriter) -&gt;</span>
+<span class="nc" id="L1044">                      namedNodeWriter.set(nodeName, matcher.getNode(nodeName).pennString())</span>
+                    ));
+<span class="nc" id="L1046">                  });</span>
+
+                }
+<span class="nc" id="L1049">            }))</span>
+          ), doc);
+<span class="nc" id="L1051">        } catch (Exception e) {</span>
+<span class="nc" id="L1052">          e.printStackTrace();</span>
+          try {
+<span class="nc" id="L1054">            respondError(e.getClass().getName() + &quot;: &quot; + e.getMessage(), httpExchange);</span>
+<span class="nc" id="L1055">          } catch (IOException ignored) {</span>
+<span class="nc" id="L1056">          }</span>
+        }
+<span class="nc" id="L1058">        return Pair.makePair(&quot;&quot;, null);</span>
+      });
+
+      // Send response
+      try {
+<span class="nc" id="L1063">        Pair&lt;String, Annotation&gt; pair = response.get(5, TimeUnit.SECONDS);</span>
+<span class="nc" id="L1064">        Annotation completedAnnotation = pair.second;</span>
+<span class="nc" id="L1065">        byte[] content = pair.first.getBytes();</span>
+<span class="nc" id="L1066">        sendAndGetResponse(httpExchange, content);</span>
+<span class="nc bnc" id="L1067" title="All 4 branches missed.">        if (completedAnnotation != null &amp;&amp; ! StringUtils.isNullOrEmpty(props.getProperty(&quot;annotators&quot;))) {</span>
+<span class="nc" id="L1068">          callback.accept(new FinishedRequest(props, completedAnnotation, params.get(&quot;pattern&quot;), null));</span>
+        }
+<span class="nc" id="L1070">      } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L1071">        respondError(&quot;Timeout when executing Tregex query&quot;, httpExchange);</span>
+<span class="nc" id="L1072">      }</span>
+<span class="nc" id="L1073">    }</span>
+  }
+
+  private static void sendAndGetResponse(HttpExchange httpExchange, byte[] response) throws IOException {
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">    if (response.length &gt; 0) {</span>
+<span class="nc" id="L1078">      httpExchange.getResponseHeaders().add(&quot;Content-type&quot;, &quot;application/json&quot;);</span>
+<span class="nc" id="L1079">      httpExchange.getResponseHeaders().add(&quot;Content-length&quot;, Integer.toString(response.length));</span>
+<span class="nc" id="L1080">      httpExchange.sendResponseHeaders(HTTP_OK, response.length);</span>
+<span class="nc" id="L1081">      httpExchange.getResponseBody().write(response);</span>
+<span class="nc" id="L1082">      httpExchange.close();</span>
+    }
+<span class="nc" id="L1084">  }</span>
+
+
+  private static HttpsServer addSSLContext(HttpsServer server) {
+<span class="nc" id="L1088">    log(&quot;Adding SSL context to server; key=&quot; + StanfordCoreNLPServer.key);</span>
+    try {
+<span class="nc" id="L1090">      KeyStore ks = KeyStore.getInstance(&quot;JKS&quot;);</span>
+<span class="nc bnc" id="L1091" title="All 4 branches missed.">      if (StanfordCoreNLPServer.key != null &amp;&amp; IOUtils.existsInClasspathOrFileSystem(StanfordCoreNLPServer.key)) {</span>
+<span class="nc" id="L1092">        ks.load(IOUtils.getInputStreamFromURLOrClasspathOrFileSystem(key), &quot;corenlp&quot;.toCharArray());</span>
+      } else {
+<span class="nc" id="L1094">        throw new IllegalArgumentException(&quot;Could not find SSL keystore at &quot; + StanfordCoreNLPServer.key);</span>
+      }
+<span class="nc" id="L1096">      KeyManagerFactory kmf = KeyManagerFactory.getInstance(&quot;SunX509&quot;);</span>
+<span class="nc" id="L1097">      kmf.init(ks, &quot;corenlp&quot;.toCharArray());</span>
+<span class="nc" id="L1098">      SSLContext sslContext = SSLContext.getInstance(&quot;TLS&quot;);</span>
+<span class="nc" id="L1099">      sslContext.init(kmf.getKeyManagers(), null, null);</span>
+
+      // Add SSL support to the server
+<span class="nc" id="L1102">      server.setHttpsConfigurator(new HttpsConfigurator(sslContext) {</span>
+        public void configure(HttpsParameters params) {
+<span class="nc" id="L1104">          SSLContext context = getSSLContext();</span>
+<span class="nc" id="L1105">          SSLEngine engine = context.createSSLEngine();</span>
+<span class="nc" id="L1106">          params.setNeedClientAuth(false);</span>
+<span class="nc" id="L1107">          params.setCipherSuites(engine.getEnabledCipherSuites());</span>
+<span class="nc" id="L1108">          params.setProtocols(engine.getEnabledProtocols());</span>
+<span class="nc" id="L1109">          params.setSSLParameters(context.getDefaultSSLParameters());</span>
+<span class="nc" id="L1110">        }</span>
+      });
+
+      // Return
+<span class="nc" id="L1114">      return server;</span>
+<span class="nc" id="L1115">    } catch (CertificateException | IOException | KeyStoreException | NoSuchAlgorithmException | KeyManagementException | UnrecoverableKeyException e) {</span>
+<span class="nc" id="L1116">      throw new RuntimeException(e);</span>
+    }
+  }
+
+
+  /**
+   * If we have a separate liveness port, start a server on a separate thread pool whose only
+   * job is to watch for when the CoreNLP server becomes ready.
+   * This will also immediately signal liveness.
+   *
+   * @param live The boolean to track when CoreNLP has initialized and the server is ready
+   *             to serve requests.
+   */
+  private void livenessServer(AtomicBoolean live) {
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">    if (this.serverPort != this.statusPort) {</span>
+      try {
+        // Create the server
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">        if (this.ssl) {</span>
+<span class="nc" id="L1134">          server = addSSLContext(HttpsServer.create(new InetSocketAddress(statusPort), 0)); // 0 is the default 'backlog'</span>
+        } else {
+<span class="nc" id="L1136">          server = HttpServer.create(new InetSocketAddress(statusPort), 0); // 0 is the default 'backlog'</span>
+        }
+        // Add the two status endpoints
+<span class="nc" id="L1139">        withAuth(server.createContext(&quot;/live&quot;, new LiveHandler()), Optional.empty());</span>
+<span class="nc" id="L1140">        withAuth(server.createContext(&quot;/ready&quot;, new ReadyHandler(live)), Optional.empty());</span>
+        // Start the server
+<span class="nc" id="L1142">        server.start();</span>
+        // Server started
+<span class="nc" id="L1144">        log(&quot;Liveness server started at &quot; + server.getAddress());</span>
+<span class="nc" id="L1145">      } catch (IOException e) {</span>
+<span class="nc" id="L1146">        err(&quot;Could not start liveness server. This will probably result in very bad things happening soon.&quot;, e);</span>
+<span class="nc" id="L1147">      }</span>
+    }
+<span class="nc" id="L1149">  }</span>
+
+
+  /**
+   * Returns the implementing Http server.
+   */
+  public Optional&lt;HttpServer&gt; getServer() {
+<span class="nc" id="L1156">    return Optional.ofNullable(server);</span>
+  }
+
+
+
+  /** @see StanfordCoreNLPServer#run(Optional, Predicate, Consumer, StanfordCoreNLPServer.FileHandler, boolean, AtomicBoolean) */
+  @Override
+  public void run() {
+    // Set the static page handler
+    try {
+<span class="nc" id="L1166">      AtomicBoolean live = new AtomicBoolean(false);</span>
+<span class="nc" id="L1167">      this.livenessServer(live);</span>
+<span class="nc" id="L1168">      FileHandler homepage = new FileHandler(&quot;edu/stanford/nlp/pipeline/demo/corenlp-brat.html&quot;);</span>
+<span class="nc" id="L1169">      run(Optional.empty(), req -&gt; true, obj -&gt; {}, homepage, false, live);</span>
+<span class="nc" id="L1170">    } catch (IOException e) {</span>
+<span class="nc" id="L1171">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1172">    }</span>
+<span class="nc" id="L1173">  }</span>
+
+
+  /**
+   * Enable authentication for this endpoint
+   *
+   * @param context The context to enable authentication for.
+   * @param credentials The optional credentials to enforce. This is a (key,value) pair
+   */
+  private void withAuth(HttpContext context, Optional&lt;Pair&lt;String,String&gt;&gt; credentials) {
+<span class="nc" id="L1183">    credentials.ifPresent(c -&gt; context.setAuthenticator(new BasicAuthenticator(&quot;corenlp&quot;) {</span>
+      @Override
+      public boolean checkCredentials(String user, String pwd) {
+<span class="nc bnc" id="L1186" title="All 4 branches missed.">        return user.equals(c.first) &amp;&amp; pwd.equals(c.second);</span>
+      }
+    }));
+<span class="nc" id="L1189">  }</span>
+
+
+  /**
+   * Run the server.
+   * This method registers the handlers, and initializes the HTTP server.
+   */
+  public void run(Optional&lt;Pair&lt;String,String&gt;&gt; basicAuth,
+                  Predicate&lt;Properties&gt; authenticator,
+                  Consumer&lt;FinishedRequest&gt; callback,
+                  FileHandler homepage,
+                  boolean https,
+                  AtomicBoolean live) {
+    try {
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">      if (https) {</span>
+<span class="nc" id="L1204">        server = addSSLContext(HttpsServer.create(new InetSocketAddress(serverPort), 0)); // 0 is the default 'backlog'</span>
+      } else {
+<span class="nc" id="L1206">        server = HttpServer.create(new InetSocketAddress(serverPort), 0); // 0 is the default 'backlog'</span>
+      }
+<span class="nc" id="L1208">      withAuth(server.createContext(&quot;/&quot;, new CoreNLPHandler(defaultProps, authenticator, callback, homepage)), basicAuth);</span>
+<span class="nc" id="L1209">      withAuth(server.createContext(&quot;/tokensregex&quot;, new TokensRegexHandler(authenticator, callback)), basicAuth);</span>
+<span class="nc" id="L1210">      withAuth(server.createContext(&quot;/semgrex&quot;, new SemgrexHandler(authenticator, callback)), basicAuth);</span>
+<span class="nc" id="L1211">      withAuth(server.createContext(&quot;/tregex&quot;, new TregexHandler(authenticator, callback)), basicAuth);</span>
+<span class="nc" id="L1212">      withAuth(server.createContext(&quot;/corenlp-brat.js&quot;, new FileHandler(&quot;edu/stanford/nlp/pipeline/demo/corenlp-brat.js&quot;, &quot;application/javascript&quot;)), basicAuth);</span>
+<span class="nc" id="L1213">      withAuth(server.createContext(&quot;/corenlp-brat.cs&quot;, new FileHandler(&quot;edu/stanford/nlp/pipeline/demo/corenlp-brat.css&quot;, &quot;text/css&quot;)), basicAuth);</span>
+<span class="nc" id="L1214">      withAuth(server.createContext(&quot;/corenlp-parseviewer.js&quot;, new FileHandler(&quot;edu/stanford/nlp/pipeline/demo/corenlp-parseviewer.js&quot;, &quot;application/javascript&quot;)), basicAuth);</span>
+<span class="nc" id="L1215">      withAuth(server.createContext(&quot;/ping&quot;, new PingHandler()), Optional.empty());</span>
+<span class="nc" id="L1216">      withAuth(server.createContext(&quot;/shutdown&quot;, new ShutdownHandler()), basicAuth);</span>
+<span class="nc bnc" id="L1217" title="All 2 branches missed.">      if (this.serverPort == this.statusPort) {</span>
+<span class="nc" id="L1218">        withAuth(server.createContext(&quot;/live&quot;, new LiveHandler()), Optional.empty());</span>
+<span class="nc" id="L1219">        withAuth(server.createContext(&quot;/ready&quot;, new ReadyHandler(live)), Optional.empty());</span>
+
+      }
+<span class="nc" id="L1222">      server.setExecutor(serverExecutor);</span>
+<span class="nc" id="L1223">      server.start();</span>
+<span class="nc" id="L1224">      live.set(true);</span>
+<span class="nc" id="L1225">      log(&quot;StanfordCoreNLPServer listening at &quot; + server.getAddress());</span>
+<span class="nc" id="L1226">    } catch (IOException e) {</span>
+<span class="nc" id="L1227">      e.printStackTrace();</span>
+<span class="nc" id="L1228">    }</span>
+<span class="nc" id="L1229">  }</span>
+
+  /**
+   * The main method.
+   * Read the command line arguments and run the server.
+   *
+   * @param args The command line arguments
+   *
+   * @throws IOException Thrown if we could not start / run the server.
+   */
+  public static void main(String[] args) throws IOException {
+    // Add a bit of logging
+<span class="nc" id="L1241">    log(&quot;--- &quot; + StanfordCoreNLPServer.class.getSimpleName() + &quot;#main() called ---&quot;);</span>
+<span class="nc" id="L1242">    String build = System.getenv(&quot;BUILD&quot;);</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">    if (build != null) {</span>
+<span class="nc" id="L1244">      log(&quot;    Build: &quot; + build);</span>
+    }
+<span class="nc" id="L1246">    Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; log(&quot;CoreNLP Server is shutting down.&quot;)));</span>
+
+    // Fill arguments
+<span class="nc" id="L1249">    ArgumentParser.fillOptions(StanfordCoreNLPServer.class, args);</span>
+<span class="nc" id="L1250">    StanfordCoreNLPServer server = new StanfordCoreNLPServer();  // must come after filling global options</span>
+<span class="nc" id="L1251">    ArgumentParser.fillOptions(server, args);</span>
+<span class="nc" id="L1252">    log(&quot;    Threads: &quot; + ArgumentParser.threads);</span>
+
+    // Start the liveness server
+<span class="nc" id="L1255">    AtomicBoolean live = new AtomicBoolean(false);</span>
+<span class="nc" id="L1256">    server.livenessServer(live);</span>
+
+    // Create the homepage
+    FileHandler homepage;
+    try {
+<span class="nc" id="L1261">      homepage = new FileHandler(&quot;edu/stanford/nlp/pipeline/demo/corenlp-brat.html&quot;);</span>
+<span class="nc" id="L1262">    } catch (IOException e) {</span>
+<span class="nc" id="L1263">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1264">    }</span>
+
+    // Pre-load the models
+<span class="nc bnc" id="L1267" title="All 4 branches missed.">    if (StanfordCoreNLPServer.preloadedAnnotators != null &amp;&amp; !&quot;&quot;.equals(StanfordCoreNLPServer.preloadedAnnotators.trim())) {</span>
+<span class="nc" id="L1268">      Properties props = new Properties();</span>
+<span class="nc" id="L1269">      server.defaultProps.entrySet().forEach(entry -&gt; props.setProperty(entry.getKey().toString(), entry.getValue().toString()));</span>
+<span class="nc" id="L1270">      props.setProperty(&quot;annotators&quot;, StanfordCoreNLPServer.preloadedAnnotators);</span>
+      try {
+<span class="nc" id="L1272">        new StanfordCoreNLP(props);</span>
+<span class="nc" id="L1273">      } catch (Throwable ignored) {</span>
+<span class="nc" id="L1274">        err(&quot;Could not pre-load annotators in server; encountered exception:&quot;);</span>
+<span class="nc" id="L1275">        ignored.printStackTrace();</span>
+<span class="nc" id="L1276">      }</span>
+    }
+
+    // Credentials
+<span class="nc" id="L1280">    Optional&lt;Pair&lt;String, String&gt;&gt; credentials = Optional.empty();</span>
+<span class="nc bnc" id="L1281" title="All 4 branches missed.">    if (server.username != null &amp;&amp; server.password != null) {</span>
+<span class="nc" id="L1282">      credentials = Optional.of(Pair.makePair(server.username, server.password));</span>
+    }
+
+    // Run the server
+<span class="nc" id="L1286">    log(&quot;Starting server...&quot;);</span>
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">    if (server.ssl) {</span>
+<span class="nc" id="L1288">      server.run(credentials, req -&gt; true, res -&gt; {}, homepage, true, live);</span>
+    } else {
+<span class="nc" id="L1290">      server.run(credentials, req -&gt; true, res -&gt; {}, homepage, false, live);</span>
+
+    }
+<span class="nc" id="L1293">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

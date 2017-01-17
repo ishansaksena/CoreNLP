@@ -1,0 +1,562 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractStochasticCachingDiffFunction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">AbstractStochasticCachingDiffFunction.java</span></div><h1>AbstractStochasticCachingDiffFunction.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+
+
+/**
+ *
+ * @author Alex Kleeman
+ */
+<span class="fc" id="L17">public abstract class AbstractStochasticCachingDiffFunction extends AbstractCachingDiffFunction  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L20">  private static final Redwood.RedwoodChannels log = Redwood.channels(AbstractStochasticCachingDiffFunction.class);</span>
+
+<span class="fc" id="L22">  public boolean hasNewVals = true;</span>
+<span class="fc" id="L23">  public boolean recalculatePrevBatch = false;</span>
+<span class="fc" id="L24">  public boolean returnPreviousValues = false;</span>
+
+<span class="fc" id="L26">  protected int lastBatchSize = 0;</span>
+<span class="fc" id="L27">  protected int[] lastBatch = null;</span>
+<span class="fc" id="L28">  protected int[] thisBatch = null;</span>
+<span class="fc" id="L29">  protected double[] lastXBatch = null;</span>
+<span class="fc" id="L30">  protected double[] lastVBatch = null;</span>
+  // protected double[] extFiniteDiffDerivative = null;
+
+<span class="fc" id="L33">  protected int lastElement = 0;</span>
+<span class="fc" id="L34">  protected double[] HdotV = null;</span>
+<span class="fc" id="L35">  protected double[] gradPerturbed = null;</span>
+<span class="fc" id="L36">  protected double[] xPerturbed = null;</span>
+<span class="fc" id="L37">  protected int curElement = 0;</span>
+
+<span class="fc" id="L39">  protected List&lt;Integer&gt; allIndices = null;</span>
+<span class="fc" id="L40">  protected Random randGenerator = new Random(1);//System.currentTimeMillis());</span>
+
+<span class="fc" id="L42">  protected boolean scaleUp = false;</span>
+
+<span class="fc" id="L44">  private int[] shuffledArray = null;</span>
+
+<span class="pc" id="L46">  public enum SamplingMethod {</span>
+<span class="fc" id="L47">    NoneSpecified,</span>
+<span class="fc" id="L48">    RandomWithReplacement,</span>
+<span class="fc" id="L49">    RandomWithoutReplacement,</span>
+<span class="fc" id="L50">    Ordered,</span>
+<span class="fc" id="L51">    Shuffled,</span>
+  }
+
+  public void incrementRandom(int numTimes) {
+<span class="nc" id="L55">    log.info(&quot;incrementing random &quot;+numTimes+&quot; times.&quot;);</span>
+<span class="nc bnc" id="L56" title="All 2 branches missed.">    for (int i = 0; i &lt; numTimes; i++) {</span>
+<span class="nc" id="L57">      randGenerator.nextInt(this.dataDimension());</span>
+    }
+<span class="nc" id="L59">  }</span>
+
+  public void scaleUp(boolean toScaleUp){
+<span class="nc" id="L62">    scaleUp = toScaleUp;</span>
+<span class="nc" id="L63">  }</span>
+
+<span class="fc" id="L65">  public StochasticCalculateMethods method = StochasticCalculateMethods.ExternalFiniteDifference;</span>
+<span class="fc" id="L66">  public SamplingMethod sampleMethod = SamplingMethod.RandomWithoutReplacement;</span>
+
+  /**
+   * finiteDifferenceStepSize - this is the fixed step size for the finite difference approximation.
+   *    a few tests were run using the SMD minimizer, and step sizes of 1e-4 to 1e-3 seemed to be ideal.
+   * (akleeman)
+   */
+<span class="fc" id="L73">  protected double finiteDifferenceStepSize = 1e-4;</span>
+
+
+  /**
+   * calculateStochastic needs to calculate a stochastic approximation to the derivative and value of
+   *    of a function for a given batch of the data.  The approximation to the derivative must be stored
+   *    in the array &lt;code&gt; derivative &lt;/code&gt;, the approximation to the value in &lt;code&gt; value &lt;/code&gt;
+   *    and the approximation to the Hessian vector product H.v in the array &lt;code&gt; HdotV &lt;/code&gt;.  Note
+   *    that the hessian vector product is used primarily with the Stochastic Meta Descent optimization
+   *    routine &lt;code&gt; SMDMinimizer &lt;/code&gt;.
+   *
+   *  Important: The stochastic approximation must be such that the sum of all stochastic calculations over
+   *    each of the batches in the data must equal the full calculation.  i.e. for a data set of size 100
+   *    the sum of the gradients for batches 1-10 , 11-20 , 21-30 .... 91-100 must be the same as the gradient
+   *    for the full calculation (at the very least in expectation).  Be sure to take into account the priors.
+   *
+   *
+   * @param x           -  value to evaluate at
+   * @param v           -  the vector for the Hessian vector product H.v
+   * @param batch       -  an array containing the indices of the data to use in the calculation, this array is being calculated
+   *                        internal to the abstract, and only needs to be handled not generated by the implementation.
+   */
+  public abstract void calculateStochastic(double[] x, double[] v, int[] batch);
+
+
+  /**
+   * Data dimension must return the size of the data used by the function.
+   */
+  public abstract int dataDimension();
+
+  /**
+   * Clears the cache in a way that doesn't require reallocation :-).
+   */
+  @Override
+  protected void clearCache() {
+<span class="nc" id="L108">    super.clearCache();</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">    if (lastXBatch != null) lastXBatch[0] = Double.NaN;</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">    if (lastVBatch != null) lastVBatch[0] = Double.NaN;</span>
+<span class="nc" id="L111">  }</span>
+
+  @Override
+  public double[] initial() {
+<span class="fc" id="L115">    double[] initial = new double[domainDimension()];</span>
+    // Arrays.fill(initial, 0.0); // not needed; Java arrays zero initialized
+<span class="fc" id="L117">    return initial;</span>
+  }
+
+  /**
+   * decrementBatch - This decrements the curElement variable by the amount batchSize.
+   *  by decrementing the batch and then calling calculate you can recalculate over the previous batch.
+   */
+  public void decrementBatch(int batchSize){
+<span class="nc" id="L125">    curElement -= batchSize;</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">    if(curElement &lt; 0){curElement = 0;}</span>
+<span class="nc" id="L127">  }</span>
+
+  /**
+   * incrementBatch will shift the curElement variable to mark the next batch.  It also resets the flags:
+   *    hasNewElements
+   *    recalculatePrevBatch
+   *    returnPreviousValues
+   */
+  public void incrementBatch(int batchSize){
+<span class="nc" id="L136">    curElement += batchSize;</span>
+<span class="nc" id="L137">    hasNewVals = false;</span>
+<span class="nc" id="L138">    recalculatePrevBatch = false;</span>
+<span class="nc" id="L139">    returnPreviousValues = false;</span>
+<span class="nc" id="L140">  }</span>
+
+
+  /**
+   * getBatch is used to generate the next sequence of indices to be passed to the actual function.
+   *  Depending on the current sample method this is done by:
+   *    Ordered - simply generates the indices 1,2,3,4,....
+   *    RandomWithReplacement - Samples uniformly from the set of possible indices
+   *    RandomWithoutReplacement - Samples from the set of possible indices removing each used index, then restarting
+   *          after each pass
+   */
+
+  //private int numCalls = 0;
+  protected void getBatch(int batchSize){
+
+//      if (numCalls == 0) {
+//        for (int i = 0; i &lt; 1538*\15; i++) {
+//          randGenerator.nextInt(this.dataDimension());
+//        }
+//      }
+//      numCalls++;
+
+<span class="nc bnc" id="L162" title="All 4 branches missed.">    if (thisBatch == null || thisBatch.length != batchSize){</span>
+<span class="nc" id="L163">      thisBatch = new int[batchSize];</span>
+    }
+
+    //-----------------------------
+    //Shuffled
+    //-----------------------------
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    if (sampleMethod == SamplingMethod.Shuffled) {</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">      if (shuffledArray == null) {</span>
+<span class="nc" id="L171">        shuffledArray = ArrayMath.range(0, this.dataDimension());</span>
+      }
+<span class="nc bnc" id="L173" title="All 2 branches missed.">      for(int i = 0; i&lt;batchSize;i++){</span>
+<span class="nc" id="L174">        thisBatch[i] = shuffledArray[(curElement + i) % this.dataDimension()] ;          //Take the next batchSize points in order</span>
+      }
+<span class="nc" id="L176">      curElement = (curElement + batchSize) % this.dataDimension();       //watch out for overflow</span>
+
+    //-----------------------------
+    //RANDOM WITH REPLACEMENT
+    //-----------------------------
+<span class="nc bnc" id="L181" title="All 2 branches missed.">    } else if (sampleMethod == SamplingMethod.RandomWithReplacement) {</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">      for(int i = 0; i&lt;batchSize;i++){</span>
+<span class="nc" id="L183">        thisBatch[i] = randGenerator.nextInt(this.dataDimension());        //Just generate a random index</span>
+//        log.info(&quot;numCalls = &quot;+(numCalls++));
+      }
+      //-----------------------------
+      //ORDERED
+      //-----------------------------
+<span class="nc bnc" id="L189" title="All 2 branches missed.">    } else if (sampleMethod == SamplingMethod.Ordered) {</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">      for(int i = 0; i&lt;batchSize;i++){</span>
+<span class="nc" id="L191">        thisBatch[i] = (curElement + i) % this.dataDimension() ;          //Take the next batchSize points in order</span>
+      }
+<span class="nc" id="L193">      curElement = (curElement + batchSize) % this.dataDimension();       //watch out for overflow</span>
+
+      //-----------------------------
+      //RANDOM WITHOUT REPLACEMENT
+      //-----------------------------
+<span class="nc bnc" id="L198" title="All 2 branches missed.">    } else if(sampleMethod == SamplingMethod.RandomWithoutReplacement) {</span>
+      //Declare the indices array if needed.
+<span class="nc bnc" id="L200" title="All 4 branches missed.">      if (allIndices == null || allIndices.size()!= this.dataDimension()){</span>
+
+<span class="nc" id="L202">        allIndices = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        for(int i=0;i&lt;this.dataDimension();i++){</span>
+<span class="nc" id="L204">          allIndices.add(i);</span>
+        }
+<span class="nc" id="L206">        Collections.shuffle(allIndices,randGenerator);</span>
+      }
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">      for(int i = 0; i&lt;batchSize;i++){</span>
+<span class="nc" id="L210">        thisBatch[i] = allIndices.get((curElement + i) % allIndices.size());  //Grab the next batchSize indices</span>
+      }
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">      if (curElement + batchSize &gt; this.dataDimension()){</span>
+<span class="nc" id="L214">        Collections.shuffle(Collections.singletonList(allIndices),randGenerator);                   //Shuffle if we got to the end of the list</span>
+      }
+
+      //watch out for overflow
+<span class="nc" id="L218">      curElement = (curElement + batchSize) % allIndices.size();          //Rollover</span>
+
+
+    } else {
+<span class="nc" id="L222">      throw new IllegalStateException(&quot;NO SAMPLING METHOD SELECTED&quot;);</span>
+    }
+
+<span class="nc" id="L225">  }</span>
+
+
+
+
+  void stochasticEnsure(double[] x, double[] v, int batchSize){
+
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    if (lastXBatch == null) {</span>
+<span class="nc" id="L233">      lastXBatch = new double[domainDimension()];</span>
+<span class="nc" id="L234">      log.info(&quot;Setting previous position (x).&quot;);</span>
+    }
+
+<span class="nc bnc" id="L237" title="All 2 branches missed.">    if (lastVBatch == null) {</span>
+<span class="nc" id="L238">      lastVBatch = new double[domainDimension()];</span>
+<span class="nc" id="L239">      log.info(&quot;Setting previous gain (v)&quot;);</span>
+    }
+
+<span class="nc bnc" id="L242" title="All 2 branches missed.">    if (derivative == null) {</span>
+<span class="nc" id="L243">      derivative = new double[domainDimension()];</span>
+<span class="nc" id="L244">      log.info(&quot;Setting Derivative.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">    if (HdotV == null) {</span>
+<span class="nc" id="L248">      HdotV = new double[domainDimension()];</span>
+<span class="nc" id="L249">      log.info(&quot;Setting HdotV.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L252" title="All 2 branches missed.">    if (lastBatch == null){</span>
+<span class="nc" id="L253">      lastBatch = new int[batchSize];</span>
+<span class="nc" id="L254">      log.info(&quot;Setting last batch&quot;);</span>
+    }
+    //If we want to recalculate using the previous batch
+<span class="nc bnc" id="L257" title="All 4 branches missed.">    if(recalculatePrevBatch &amp;&amp; batchSize == lastBatch.length){</span>
+
+<span class="nc" id="L259">      thisBatch = lastBatch;</span>
+
+    }else{
+
+      /*
+     If we dont want to calculate anything we just want the last values.  This is especially usefull if you know
+         the values have already been calculated, and you don't want to waste time comparing the entire
+         array of x's and v's.
+      */
+<span class="nc bnc" id="L268" title="All 2 branches missed.">      if(returnPreviousValues){</span>
+<span class="nc" id="L269">        returnPreviousValues = false;</span>
+<span class="nc" id="L270">        return;</span>
+      }
+
+      //If we dont know there are new values, and we havnt asked to recalculate then compare
+      //to avoid needing to recalculate
+<span class="nc bnc" id="L275" title="All 4 branches missed.">      if( !hasNewVals &amp;&amp; lastElement!=curElement ){</span>
+<span class="nc bnc" id="L276" title="All 8 branches missed.">        if ((lastBatchSize==batchSize) &amp;&amp; Arrays.equals(x, lastXBatch) &amp;&amp; Arrays.equals(v,lastVBatch) &amp;&amp; Arrays.equals(thisBatch,lastBatch)) {</span>
+<span class="nc" id="L277">          return;</span>
+        }
+      }
+
+<span class="nc" id="L281">      getBatch(batchSize);</span>
+    }
+
+
+<span class="nc" id="L285">    copy(lastXBatch,x);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">    if(lastBatch.length != batchSize){</span>
+<span class="nc" id="L287">      lastBatch = new int[batchSize];</span>
+    }
+<span class="nc" id="L289">    System.arraycopy(thisBatch,0,lastBatch,0,thisBatch.length);</span>
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">    if(v!=null){copy(lastVBatch,v);}</span>
+<span class="nc" id="L292">    lastBatchSize = batchSize;</span>
+
+<span class="nc" id="L294">    calculateStochastic(x,v,thisBatch);</span>
+
+    //This is used to make the function evaluation equal the true function in expectation.
+<span class="nc bnc" id="L297" title="All 2 branches missed.">    if(scaleUp){</span>
+<span class="nc" id="L298">      double ratio = ( (double) this.dataDimension()) / ( (double)batchSize) ;</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      for(int i=0;i&lt;x.length;i++){</span>
+<span class="nc" id="L300">        derivative[i] = derivative[i] * ratio;</span>
+      }
+<span class="nc" id="L302">      value = ratio*value;</span>
+    }
+
+<span class="nc" id="L305">    incrementBatch(batchSize);</span>
+<span class="nc" id="L306">    lastElement = curElement;</span>
+
+<span class="nc" id="L308">  }</span>
+
+  /*
+  void stochasticEnsure(double[] x, double[] v, int batchSize) {
+
+
+    if (lastXBatch == null) {
+      lastXBatch = new double[domainDimension()];
+      System.out.println(&quot;Setting previous position (x).&quot;);
+    }
+
+    if (lastVBatch == null) {
+      lastVBatch = new double[domainDimension()];
+      System.out.println(&quot;Setting previous gain (v)&quot;);
+    }
+
+    if (derivative == null) {
+      derivative = new double[domainDimension()];
+      System.out.println(&quot;Setting Derivative.&quot;);
+    }
+
+    if (HdotV == null) {
+      HdotV = new double[domainDimension()];
+      System.out.println(&quot;Setting HdotV.&quot;);
+    }
+
+
+
+    //If we want to recalculate using the previous batch
+    if(recalculatePrevBatch){
+
+      decrementBatch(batchSize);
+
+    }else{
+
+      //
+      //If we dont want to calculate anything we just want the last values.  This is especially usefull if you know
+      //   the values have already been calculated, and you don't want to waste time comparing the entire
+      //   array of x's and v's.
+      //
+      if(returnPreviousValues){
+        returnPreviousValues = false;
+        return;
+      }
+
+      //If we dont know there are new values, and we havnt asked to recalculate then compare
+      //to avoid needing to recalculate
+      if( !hasNewVals &amp;&amp; lastElement!=curElement ){
+        if ((lastBatchSize==batchSize) &amp;&amp; Arrays.equals(x, lastXBatch) &amp;&amp; Arrays.equals(v,lastVBatch)) {
+          return;
+        }
+      }
+
+    }
+
+
+    copy(lastXBatch,x);
+    if(v!=null){copy(lastVBatch,v);}
+    lastBatchSize = batchSize;
+    calculateStochastic(x,v,batchSize);
+
+    lastElement = curElement;
+
+    incrementBatch(batchSize);
+
+  }
+  */
+
+
+
+
+  /**
+   *    valueAt(x,batchSize)   derivativeAt(x,batchSize)
+   *
+   * invokes the calculateStochastic function to get the current value at x for the next batchSize data points.  Will
+   *    not return a HdotV since it passes v = null;
+   *
+   */
+
+  public double valueAt(double[] x, int batchSize){
+<span class="nc" id="L388">    stochasticEnsure(x,null,batchSize);</span>
+<span class="nc" id="L389">    return value;</span>
+  }
+
+  public double[] derivativeAt(double[] x, int batchSize) {
+<span class="nc" id="L393">    stochasticEnsure(x,null,batchSize);</span>
+<span class="nc" id="L394">    return derivative;</span>
+  }
+
+  /**
+   *
+   * This function will return the stochastic approximation at the point x.  the vector v is the vector
+   *    to be used in the vector product H.v.
+   *
+   * passing v = null will simply revert to a calculation without the hessian vector product.
+   *
+   *
+   */
+  public double valueAt(double[] x, double[] v, int batchSize) {
+<span class="nc" id="L407">    stochasticEnsure(x,v,batchSize);</span>
+<span class="nc" id="L408">    return value;</span>
+  }
+
+  public double[] derivativeAt(double[] x, double[] v, int batchSize) {
+<span class="nc" id="L412">    stochasticEnsure(x,v,batchSize);</span>
+<span class="nc" id="L413">    return derivative;</span>
+  }
+
+
+
+  /**
+   * Calculate the Hessian vector product with a vector v of the current function based on a finite difference approximation.
+   *    This is done using the approximation:
+   *
+   * H.v ~ ( Grad( x + h * v ) - Grad( x ) ) / h
+   *
+   * Note that this method will not be exact, and the value of h should be choosen to be small enough to avoid truncation error
+   *    due to neglecting second order taylor series terms, and big enough to avoid numerical error which is almost gaurenteed
+   *    since the operation involves subtracting similar values and dividing by a small number.  In general a step size of
+   *    h = 1e-4 has proved to provide accurate enough calculations.
+   *
+   * @param x                 the point at which the hessian should be calculated
+   * @param v                 the vector for the vector product ... thus the function will return  H(x) . v
+   * @param curDerivative     the derivative at x.  Note this must have been calculated using the same batchSize
+   */
+  private void getHdotVFiniteDifference(double[] x, double[] v, double[] curDerivative){
+
+
+<span class="nc" id="L436">    double h = finiteDifferenceStepSize;</span>
+<span class="nc" id="L437">    double hInv = 1/h;    // this avoids dividing too much since it's a bit more expensive than multiplying</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">    if (gradPerturbed == null) {</span>
+<span class="nc" id="L440">      gradPerturbed = new double[x.length];</span>
+<span class="nc" id="L441">      System.out.println(&quot;Setting approximate gradient.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    if (xPerturbed == null){</span>
+<span class="nc" id="L445">      xPerturbed = new double[x.length];</span>
+<span class="nc" id="L446">      System.out.println(&quot;Setting perturbed.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">    if (HdotV == null) {</span>
+<span class="nc" id="L450">      HdotV = new double[x.length];</span>
+<span class="nc" id="L451">      System.out.println(&quot;Setting H dot V.&quot;);</span>
+    }
+
+    //  This adds h*v to x  ---&gt;  x = x + h*v
+<span class="nc bnc" id="L455" title="All 2 branches missed.">    for( int i = 0;i&lt;x.length;i++){</span>
+<span class="nc" id="L456">      xPerturbed[i] = x[i] + h*v[i];</span>
+    }
+
+
+<span class="nc" id="L460">    double prevValue = value;</span>
+
+<span class="nc" id="L462">    recalculatePrevBatch = true;</span>
+
+<span class="nc" id="L464">    calculateStochastic(xPerturbed,null,thisBatch);  // Call the calculate function without updating the batch</span>
+
+    // System.arraycopy(derivative, 0, gradPerturbed, 0, gradPerturbed.length);
+
+    //  This comes up with the approximate difference, and renormalizes it on h.
+<span class="nc bnc" id="L469" title="All 2 branches missed.">    for( int i = 0;i&lt;x.length;i++){</span>
+<span class="nc" id="L470">      double tmp = (derivative[i]-curDerivative[i]);</span>
+<span class="nc" id="L471">      HdotV[i] = hInv*(tmp);</span>
+    }
+
+    //Make sure the original derivative is in place
+<span class="nc" id="L475">    System.arraycopy(curDerivative,0,derivative,0,derivative.length);</span>
+<span class="nc" id="L476">    value = prevValue;</span>
+<span class="nc" id="L477">    hasNewVals = false;</span>
+<span class="nc" id="L478">    recalculatePrevBatch = false;</span>
+<span class="nc" id="L479">    returnPreviousValues = false;</span>
+
+<span class="nc" id="L481">  }</span>
+
+  /**
+   *
+   * HdotVAt  will return the hessian vector product H.v at the point x for a batchSize subset of the data
+   *
+   * There are several ways to perform this calculation, as of now Finite Difference, and Algorithmic Differentiation
+   *  are the methods that have been used.  To use this function calculateStochastic must also fill the array
+   *  Hv with the hessian vector product.
+   *
+   * Alternative:  use the function getHdotVFiniteDifference which will simply make two calls to the function and
+   *    come up with an approximation to this value.
+   *
+   */
+
+  public double[] HdotVAt(double[] x, double[] v, int batchSize){
+
+<span class="nc bnc" id="L498" title="All 2 branches missed.">    if (method == StochasticCalculateMethods.ExternalFiniteDifference){</span>
+<span class="nc" id="L499">      log.info(&quot;Attempt to use ExternalFiniteDifference without passing currentDerivative&quot;);</span>
+<span class="nc" id="L500">      throw new RuntimeException();</span>
+      /*
+      if( extFiniteDiffDerivative == null )
+        extFiniteDiffDerivative = new double[x.length];
+
+      System.arraycopy(derivativeAt(x,x,batchSize),0,extFiniteDiffDerivative,0,extFiniteDiffDerivative.length);
+      getHdotVFiniteDifference(x,v,extFiniteDiffDerivative,batchSize);
+      */
+
+    } else {
+      //Call the objective Function
+<span class="nc" id="L511">      stochasticEnsure(x,v,batchSize);</span>
+    }
+<span class="nc" id="L513">    return HdotV;</span>
+  }
+
+
+  public double[] HdotVAt(double[] x, double[] v, double[] curDerivative, int batchSize){
+<span class="nc bnc" id="L518" title="All 2 branches missed.">    if (method == StochasticCalculateMethods.ExternalFiniteDifference){</span>
+      //If H.v is going to be calculated by using Finite Difference using two calls to the objective Function
+      //
+      //note:  This assumes that the derivative was calculated at x already.
+<span class="nc" id="L522">      getHdotVFiniteDifference(x,v,curDerivative);</span>
+    } else {
+      //Call the objective Function
+<span class="nc" id="L525">      stochasticEnsure(x,v,batchSize);</span>
+    }
+<span class="nc" id="L527">    return HdotV;</span>
+  }
+
+
+  public double[] HdotVAt(double[] x,double[] v){
+
+<span class="nc bnc" id="L533" title="All 2 branches missed.">    if (method == StochasticCalculateMethods.ExternalFiniteDifference){</span>
+
+<span class="nc" id="L535">      log.info(&quot;Attempt to use ExternalFiniteDifference without passing currentDerivative&quot;);</span>
+<span class="nc" id="L536">      throw new RuntimeException();</span>
+
+    }
+    //Call the objective Function
+<span class="nc" id="L540">    stochasticEnsure(x,v,this.dataDimension());</span>
+
+    //Roll back the batch to the previous val.
+<span class="nc" id="L543">    decrementBatch(this.dataDimension());</span>
+<span class="nc" id="L544">    return HdotV;</span>
+  }
+
+  public double[] lastDerivative() {
+<span class="nc" id="L548">    return derivative;</span>
+  }
+
+  @Override
+  public double lastValue() {
+<span class="nc" id="L553">    return value;</span>
+  }
+
+  // It doesn't seem like this should exist in the class and it wasn't used.
+  // public void setValue(double v) {
+  //   value = v;
+  // }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

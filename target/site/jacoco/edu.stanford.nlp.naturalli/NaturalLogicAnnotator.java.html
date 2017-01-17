@@ -1,0 +1,652 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NaturalLogicAnnotator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.naturalli</a> &gt; <span class="el_source">NaturalLogicAnnotator.java</span></div><h1>NaturalLogicAnnotator.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.naturalli;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.tokensregex.TokenSequenceMatcher;
+import edu.stanford.nlp.ling.tokensregex.TokenSequencePattern;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.pipeline.SentenceAnnotator;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexMatcher;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexPattern;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.naturalli.NaturalLogicAnnotations.*;
+
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * An annotator marking operators with their scope.
+ * Look at {@link NaturalLogicAnnotator#PATTERNS} for the full list of patterns, otherwise
+ * {@link NaturalLogicAnnotator#doOneSentence(Annotation, CoreMap)} is the main interface for this class.
+ *
+ * TODO(gabor) annotate generics as &quot;most&quot;
+ *
+ * @author Gabor Angeli
+ */
+@SuppressWarnings(&quot;unchecked&quot;)
+public class NaturalLogicAnnotator extends SentenceAnnotator  {
+
+  /** A logger for this class */
+<span class="nc" id="L38">  private static Redwood.RedwoodChannels log = Redwood.channels(NaturalLogicAnnotator.class);</span>
+
+  /**
+   * A regex for arcs that act as determiners.
+   */
+  private static final String DET = &quot;/det.*|a(dv)?mod|neg|nummod|compound|case/&quot;;
+  /**
+   * A regex for arcs that we pretend are subject arcs.
+   */
+  private static final String GEN_SUBJ = &quot;/[ni]subj(pass)?/&quot;;
+  /**
+   * A regex for arcs that we pretend are object arcs.
+   */
+  private static final String GEN_OBJ = &quot;/[di]obj|xcomp|advcl/&quot;;
+  /**
+   * A regex for arcs that we pretend are copula.
+   */
+  private static final String GEN_COP = &quot;/cop|aux(pass)?/&quot;;
+  /**
+   * A regex for arcs which denote a sub-clause (e.g., &quot;at Stanford&quot; or &quot;who are at Stanford&quot;)
+   */
+  private static final String GEN_CLAUSE = &quot;/nmod|acl:relcl/&quot;;
+  /**
+   * A regex for arcs which denote a preposition
+   */
+  private static final String GEN_PREP = &quot;/nmod|advcl|ccomp|advmod/&quot;;
+
+  /**
+   * A Semgrex fragment for matching a quantifier.
+   */
+  private static final String QUANTIFIER;
+
+  static {
+<span class="nc" id="L71">    Set&lt;String&gt; singleWordQuantifiers = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">    for (Operator q : Operator.values()) {</span>
+<span class="nc" id="L73">      String[] tokens = q.surfaceForm.split(&quot;\\s+&quot;);</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">      if (!tokens[tokens.length - 1].startsWith(&quot;_&quot;)) {</span>
+<span class="nc" id="L75">        singleWordQuantifiers.add(&quot;(&quot; + tokens[tokens.length - 1].toLowerCase() + &quot;)&quot;);</span>
+      }
+    }
+<span class="nc" id="L78">    QUANTIFIER = &quot;[ {lemma:/&quot; + StringUtils.join(singleWordQuantifiers, &quot;|&quot;) + &quot;/}=quantifier | {pos:CD}=quantifier ]&quot;;</span>
+  }
+
+  /**
+   * The patterns to use for marking quantifier scopes.
+   */
+<span class="nc" id="L84">  private static final List&lt;SemgrexPattern&gt; PATTERNS = Collections.unmodifiableList(new ArrayList&lt;SemgrexPattern&gt;() {{</span>
+    // { All cats eat mice,
+    //   All cats want milk }
+<span class="nc" id="L87">    add(SemgrexPattern.compile(&quot;{}=pivot &gt;&quot;+GEN_SUBJ+&quot; ({}=subject &gt;&gt;&quot;+DET+&quot; &quot;+QUANTIFIER+&quot;) &gt;&quot;+GEN_OBJ+&quot; {}=object&quot;));</span>
+    // { All cats are in boxes,
+    //   All cats voted for Obama,
+    //   All cats have voted for Obama }
+<span class="nc" id="L91">    add(SemgrexPattern.compile(&quot;{pos:/V.*/}=pivot &gt;&quot;+GEN_SUBJ+&quot; ({}=subject &gt;&gt;&quot;+DET+&quot; &quot;+QUANTIFIER+&quot;) &gt;&quot;+GEN_PREP+&quot; {}=object&quot;));</span>
+    // { All cats are cute,
+    //   All cats can purr }
+<span class="nc" id="L94">    add(SemgrexPattern.compile(&quot;{}=object &gt;&quot;+GEN_SUBJ+&quot; ({}=subject &gt;&gt;&quot;+DET+&quot; &quot;+QUANTIFIER+&quot;) &gt;&quot;+GEN_COP+&quot; {}=pivot&quot;));</span>
+    // { Everyone at Stanford likes cats,
+    //   Everyone who is at Stanford likes cats }
+<span class="nc" id="L97">    add(SemgrexPattern.compile(&quot;{}=pivot &gt;&quot;+GEN_SUBJ+&quot; ( &quot;+QUANTIFIER+&quot; &gt;&quot;+GEN_CLAUSE+&quot; {}=subject ) &gt;&quot;+GEN_OBJ+&quot; {}=object&quot;));</span>
+    // { Everyone at Stanford voted for Colbert }
+<span class="nc" id="L99">    add(SemgrexPattern.compile(&quot;{pos:/V.*/}=pivot &gt;&quot;+GEN_SUBJ+&quot; ( &quot;+QUANTIFIER+&quot; &gt;&quot;+GEN_CLAUSE+&quot; {}=subject ) &gt;&quot;+GEN_PREP+&quot; {}=object&quot;));</span>
+    // { Felix likes cat food }
+<span class="nc" id="L101">    add(SemgrexPattern.compile(&quot;{}=pivot &gt;&quot;+GEN_SUBJ+&quot; {pos:NNP}=Subject &gt;&quot;+GEN_OBJ+&quot; {}=object&quot;));</span>
+    // { Felix has spoken to Fido }
+    //nmod used to be prep - problem?
+<span class="nc" id="L104">    add(SemgrexPattern.compile(&quot;{pos:/V.*/}=pivot &gt;&quot;+GEN_SUBJ+&quot; {pos:NNP}=Subject &gt;/nmod|ccomp|[di]obj/ {}=object&quot;));</span>
+    // { Felix is a cat,
+    //   Felix is cute }
+<span class="nc" id="L107">    add(SemgrexPattern.compile(&quot;{}=object &gt;&quot;+GEN_SUBJ+&quot; {pos:NNP}=Subject &gt;&quot;+GEN_COP+&quot; {}=pivot&quot;));</span>
+    // { Some cats do n't like dogs }
+<span class="nc" id="L109">    add(SemgrexPattern.compile(&quot;{}=pivot &gt;neg &quot;+QUANTIFIER+&quot; &gt;&quot;+GEN_OBJ+&quot; {}=object&quot;));</span>
+    // { Obama was not born in Dallas }
+<span class="nc" id="L111">    add(SemgrexPattern.compile(&quot;{}=pivot &gt;/neg/ {}=quantifier &gt;&quot;+GEN_PREP+&quot; {}=object&quot;));</span>
+    // { All of the cats hate dogs. }
+    //nmod used to be prep - problem?
+<span class="nc" id="L114">    add(SemgrexPattern.compile(&quot;{pos:/V.*/}=pivot &gt;&quot;+GEN_SUBJ+&quot; ( &quot;+QUANTIFIER+&quot; &gt;/nmod.*/ {}=subject ) &gt;&quot;+GEN_OBJ+&quot; {}=object&quot;));</span>
+//    add(SemgrexPattern.compile(&quot;{pos:/V.*/}=pivot &gt; ( &quot;+QUANTIFIER+&quot; &gt;/nmod.*/ {}=subject ) &gt;&quot;+GEN_SUBJ+&quot; {}=object&quot;));  // as above, but handle a common parse error
+    // { Either cats or dogs have tails. }
+<span class="nc" id="L117">    add(SemgrexPattern.compile(&quot;{pos:/V.*/}=pivot &gt; {lemma:either}=quantifier &gt;&quot;+GEN_SUBJ+&quot; {}=subject &gt;&quot;+GEN_OBJ+&quot; {}=object&quot;));</span>
+    // { There are cats }
+<span class="nc" id="L119">    add(SemgrexPattern.compile(&quot;{}=quantifier &gt;&quot;+GEN_SUBJ+&quot; {}=pivot &gt;&gt;expl {}&quot;));</span>
+<span class="nc" id="L120">  }});</span>
+
+  // { Cats eat _some_ mice,
+  //   Cats eat _most_ mice }
+  /**
+   * A pattern for just trivial unary quantification, in case a quantifier doesn't match any of the patterns in
+   * {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotator#PATTERNS}.
+   */
+<span class="nc" id="L128">  private static SemgrexPattern UNARY_PATTERN = SemgrexPattern.compile(&quot;{pos:/N.*/}=subject &gt;&quot;+DET+&quot; &quot;+QUANTIFIER);</span>
+
+  /**
+   * A list of words that suggest their complement has downward polarity.
+   * For example, &quot;doubt&quot; (&quot;I doubt that X&quot;)
+   */
+<span class="nc" id="L134">  private static List&lt;String&gt; DOUBT_WORDS = Arrays.asList(&quot;doubt&quot;, &quot;skeptical&quot;);</span>
+
+  /**
+   * A pattern for recognizing the words in {@link NaturalLogicAnnotator#DOUBT_WORDS}.
+   */
+<span class="nc" id="L139">  private static TokenSequencePattern DOUBT_PATTERN</span>
+<span class="nc" id="L140">      = TokenSequencePattern.compile(&quot;(?$doubt [{ lemma:/&quot; + StringUtils.join(DOUBT_WORDS, &quot;|&quot;) + &quot;/}]) (?$target [{lemma:/that|of/}] []+ )&quot;);</span>
+
+  /** A helper method for
+   * {@link NaturalLogicAnnotator#getModifierSubtreeSpan(edu.stanford.nlp.semgraph.SemanticGraph, edu.stanford.nlp.ling.IndexedWord)} and
+   * {@link NaturalLogicAnnotator#getSubtreeSpan(edu.stanford.nlp.semgraph.SemanticGraph, edu.stanford.nlp.ling.IndexedWord)}.
+   */
+  private static Pair&lt;Integer, Integer&gt; getGeneralizedSubtreeSpan(SemanticGraph tree, IndexedWord root, Set&lt;String&gt; validArcs) {
+<span class="nc" id="L147">    int min = root.index();</span>
+<span class="nc" id="L148">    int max = root.index();</span>
+<span class="nc" id="L149">    Queue&lt;IndexedWord&gt; fringe = new LinkedList&lt;&gt;();</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">    for (SemanticGraphEdge edge : tree.outgoingEdgeIterable(root)) {</span>
+<span class="nc" id="L151">      String edgeLabel = edge.getRelation().getShortName();</span>
+<span class="nc bnc" id="L152" title="All 4 branches missed.">      if ((validArcs == null || validArcs.contains(edgeLabel)) &amp;&amp;</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">          !&quot;punct&quot;.equals(edgeLabel)) {</span>
+<span class="nc" id="L154">        fringe.add(edge.getDependent());</span>
+      }
+<span class="nc" id="L156">    }</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">    while (!fringe.isEmpty()) {</span>
+<span class="nc" id="L158">      IndexedWord node = fringe.poll();</span>
+<span class="nc" id="L159">      min = Math.min(node.index(), min);</span>
+<span class="nc" id="L160">      max = Math.max(node.index(), max);</span>
+      // ignore punctuation
+<span class="nc bnc" id="L162" title="All 2 branches missed.">      fringe.addAll(tree.getOutEdgesSorted(node).stream().filter(edge -&gt; edge.getGovernor().equals(node) &amp;&amp;</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">          !(edge.getGovernor().equals(edge.getDependent())) &amp;&amp;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">          !&quot;punct&quot;.equals(edge.getRelation().getShortName())).map(SemanticGraphEdge::getDependent).collect(Collectors.toList()));</span>
+<span class="nc" id="L165">    }</span>
+<span class="nc" id="L166">    return Pair.makePair(min, max + 1);</span>
+  }
+
+<span class="nc" id="L169">  private static final Set&lt;String&gt; MODIFIER_ARCS = Collections.unmodifiableSet(new HashSet&lt;String&gt;() {{</span>
+<span class="nc" id="L170">    add(&quot;aux&quot;);</span>
+<span class="nc" id="L171">    add(&quot;nmod&quot;);</span>
+<span class="nc" id="L172">  }});</span>
+
+<span class="nc" id="L174">  private static final Set&lt;String&gt; NOUN_COMPONENT_ARCS = Collections.unmodifiableSet(new HashSet&lt;String&gt;() {{</span>
+<span class="nc" id="L175">    add(&quot;compound&quot;);</span>
+<span class="nc" id="L176">  }});</span>
+
+  /**
+   * Returns the yield span for the word rooted at the given node, but only traversing a fixed set of relations.
+   * @param tree The dependency graph to get the span from.
+   * @param root The root word of the span.
+   * @return A one indexed span rooted at the given word.
+   */
+  private static Pair&lt;Integer, Integer&gt; getModifierSubtreeSpan(SemanticGraph tree, IndexedWord root) {
+<span class="nc" id="L185">    return getGeneralizedSubtreeSpan(tree, root, MODIFIER_ARCS);</span>
+  }
+
+  /**
+   * Returns the yield span for the word rooted at the given node, but only traversing relations indicative
+   * of staying in the same noun phrase.
+   * @param tree The dependency graph to get the span from.
+   * @param root The root word of the span.
+   * @return A one indexed span rooted at the given word.
+   */
+  private static Pair&lt;Integer, Integer&gt; getProperNounSubtreeSpan(SemanticGraph tree, IndexedWord root) {
+<span class="nc" id="L196">    return getGeneralizedSubtreeSpan(tree, root, NOUN_COMPONENT_ARCS);</span>
+  }
+
+  /**
+   * Returns the yield span for the word rooted at the given node. So, for example, all cats like dogs rooted at the word
+   * &quot;cats&quot; would yield a span (1, 3) -- &quot;all cats&quot;.
+   * @param tree The dependency graph to get the span from.
+   * @param root The root word of the span.
+   * @return A one indexed span rooted at the given word.
+   */
+  private static Pair&lt;Integer, Integer&gt; getSubtreeSpan(SemanticGraph tree, IndexedWord root) {
+<span class="nc" id="L207">    return getGeneralizedSubtreeSpan(tree, root, null);</span>
+  }
+
+  /**
+   * Effectively, merge two spans
+   */
+  private static Pair&lt;Integer, Integer&gt; includeInSpan(Pair&lt;Integer, Integer&gt; span, Pair&lt;Integer, Integer&gt; toInclude) {
+<span class="nc" id="L214">    return Pair.makePair(Math.min(span.first, toInclude.first), Math.max(span.second, toInclude.second));</span>
+  }
+
+  /**
+   * Exclude the second span from the first, if the second is on the edge of the first. If the second is in the middle, it's
+   * unclear what this function should do, so it just returns the original span.
+   */
+  private static Pair&lt;Integer, Integer&gt; excludeFromSpan(Pair&lt;Integer, Integer&gt; span, Pair&lt;Integer, Integer&gt; toExclude) {
+<span class="nc bnc" id="L222" title="All 4 branches missed.">    if (toExclude.second &lt;= span.first || toExclude.first &gt;= span.second) {</span>
+      // Case: toExclude is outside of the span anyways
+<span class="nc" id="L224">      return span;</span>
+<span class="nc bnc" id="L225" title="All 4 branches missed.">    } else if (toExclude.first &lt;= span.first &amp;&amp; toExclude.second &gt; span.first) {</span>
+      // Case: overlap on the front
+<span class="nc" id="L227">      return Pair.makePair(toExclude.second, span.second);</span>
+<span class="nc bnc" id="L228" title="All 4 branches missed.">    } else if (toExclude.first &lt; span.second &amp;&amp; toExclude.second &gt;= span.second) {</span>
+      // Case: overlap on the front
+<span class="nc" id="L230">      return Pair.makePair(span.first, toExclude.first);</span>
+<span class="nc bnc" id="L231" title="All 4 branches missed.">    } else if (toExclude.first &gt; span.first &amp;&amp; toExclude.second &lt; span.second) {</span>
+      // Case: toExclude is within the span
+<span class="nc" id="L233">      return span;</span>
+    } else {
+<span class="nc" id="L235">      throw new IllegalStateException(&quot;This case should be impossible&quot;);</span>
+    }
+  }
+
+  /**
+   * Compute the span for a given matched pattern.
+   * At a high level:
+   *
+   * &lt;ul&gt;
+   *   &lt;li&gt;If both a subject and an object exist, we take the subject minus the quantifier, and the object plus the pivot. &lt;/li&gt;
+   *   &lt;li&gt;If only an object exists, we make the subject the object, and create a dummy object to signify a one-place quantifier. &lt;/li&gt;
+   *   &lt;li&gt;If neither the subject or object exist, the pivot is the subject and there is no object. &lt;/li&gt;
+   *   &lt;li&gt;If the subject is a proper noun, only mark the object itself with the subject span. &lt;/li&gt;
+   * &lt;/ul&gt;
+   *
+   * But:
+   *
+   * &lt;ul&gt;
+   *   &lt;li&gt;If we have a two-place quantifier, the object is allowed to absorb various specific arcs from the pivot.&lt;/li&gt;
+   *   &lt;li&gt;If we have a one-place quantifier, the object is allowed to absorb only prepositions from the pivot.&lt;/li&gt;
+   * &lt;/ul&gt;
+   */
+  private static OperatorSpec computeScope(SemanticGraph tree, Operator operator,
+                                           IndexedWord pivot, Pair&lt;Integer, Integer&gt; quantifierSpan,
+                                           IndexedWord subject, boolean isProperNounSubject, IndexedWord object,
+                                           int sentenceLength) {
+    Pair&lt;Integer, Integer&gt; subjSpan;
+    Pair&lt;Integer, Integer&gt; objSpan;
+<span class="nc bnc" id="L263" title="All 4 branches missed.">    if (subject == null &amp;&amp; object == null) {</span>
+<span class="nc" id="L264">      subjSpan = getSubtreeSpan(tree, pivot);</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">      if (Span.fromPair(subjSpan).contains(Span.fromPair(quantifierSpan))) {</span>
+        // Don't consume the quantifier -- take only the part after the quantifier
+<span class="nc" id="L267">        subjSpan = Pair.makePair(Math.max(subjSpan.first, quantifierSpan.second), subjSpan.second);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        if (subjSpan.second &lt;= subjSpan.first) {</span>
+<span class="nc" id="L269">          subjSpan = Pair.makePair(subjSpan.first, subjSpan.first + 1);</span>
+        }
+      } else {
+        // Exclude the quantifier from the span
+<span class="nc" id="L273">        subjSpan = excludeFromSpan(subjSpan, quantifierSpan);</span>
+      }
+<span class="nc" id="L275">      objSpan = Pair.makePair(subjSpan.second, subjSpan.second);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">    } else if (subject == null) {</span>
+<span class="nc" id="L277">      subjSpan = includeInSpan(getSubtreeSpan(tree, object), getGeneralizedSubtreeSpan(tree, pivot, Collections.singleton(&quot;nmod&quot;)));</span>
+<span class="nc" id="L278">      objSpan = Pair.makePair(subjSpan.second, subjSpan.second);</span>
+    } else {
+      Pair&lt;Integer, Integer&gt; subjectSubtree;
+<span class="nc bnc" id="L281" title="All 2 branches missed.">      if (isProperNounSubject) {</span>
+<span class="nc" id="L282">        subjectSubtree = getProperNounSubtreeSpan(tree, subject);</span>
+      } else {
+<span class="nc" id="L284">        subjectSubtree = getSubtreeSpan(tree, subject);</span>
+      }
+<span class="nc" id="L286">      subjSpan = excludeFromSpan(subjectSubtree, quantifierSpan);</span>
+<span class="nc" id="L287">      objSpan = excludeFromSpan(includeInSpan(getSubtreeSpan(tree, object), getModifierSubtreeSpan(tree, pivot)), subjectSubtree);</span>
+    }
+
+    // Return scopes
+<span class="nc bnc" id="L291" title="All 4 branches missed.">    if (subjSpan.first &lt; quantifierSpan.second &amp;&amp; subjSpan.second &gt; quantifierSpan.second) {</span>
+<span class="nc" id="L292">      subjSpan = Pair.makePair(quantifierSpan.second, subjSpan.second);</span>
+    }
+<span class="nc" id="L294">    return new OperatorSpec(operator,</span>
+<span class="nc" id="L295">        quantifierSpan.first - 1, quantifierSpan.second - 1,</span>
+<span class="nc" id="L296">        subjSpan.first - 1, subjSpan.second - 1,</span>
+<span class="nc" id="L297">        objSpan.first - 1, objSpan.second - 1,</span>
+        sentenceLength);
+  }
+
+  /**
+   * Try to find which quantifier we matched, given that we matched the head of a quantifier at the given IndexedWord, and that
+   * this whole deal is taking place in the given sentence.
+   *
+   * @param sentence The sentence we are matching.
+   * @param quantifier The word at which we matched a quantifier.
+   * @return An optional triple consisting of the particular quantifier we matched, as well as the span of that quantifier in the sentence.
+   */
+  private static Optional&lt;Triple&lt;Operator,Integer,Integer&gt;&gt; validateQuantifierByHead(CoreMap sentence, IndexedWord quantifier) {
+    // Some useful variables
+<span class="nc" id="L311">    List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">    Function&lt;CoreLabel, String&gt; glossFn = (label) -&gt; &quot;CD&quot;.equals(label.tag()) ? &quot;--NUM--&quot; : label.lemma();</span>
+<span class="nc" id="L313">    int quantIndex = quantifier.index();</span>
+
+    // Look forward a bit too, if the head is a number.
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    int[] positiveOffsetToCheck = &quot;CD&quot;.equals(tokens.get(quantIndex - 1).tag()) ? new int[]{2, 1, 0} : new int[]{0};</span>
+
+    // Try searching backwards for the right quantifier
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    for (int offsetEnd : positiveOffsetToCheck) {</span>
+<span class="nc" id="L320">      int end = quantIndex + offsetEnd;</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">      for (int start = Math.max(0, quantIndex - 10); start &lt; quantIndex; ++start) {</span>
+<span class="nc" id="L322">        String gloss = StringUtils.join(tokens, &quot; &quot;, glossFn, start, end).toLowerCase();</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        for (Operator q : Operator.valuesByLengthDesc) {</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">          if (q.surfaceForm.equals(gloss)) {</span>
+<span class="nc" id="L325">            return Optional.of(Triple.makeTriple(q, start + 1, end + 1));</span>
+          }
+<span class="nc" id="L327">        }</span>
+      }
+    }
+<span class="nc" id="L330">    return Optional.empty();</span>
+  }
+
+
+  /**
+   * Find the operators in this sentence, annotating the head word (only!) of each operator with the
+   * {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotations.OperatorAnnotation}.
+   *
+   * @param sentence As in {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotator#doOneSentence(edu.stanford.nlp.pipeline.Annotation, edu.stanford.nlp.util.CoreMap)}
+   */
+  private void annotateOperators(CoreMap sentence) {
+<span class="nc" id="L341">    SemanticGraph tree = sentence.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class);</span>
+<span class="nc" id="L342">    List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">    if (tree == null) {</span>
+<span class="nc" id="L344">      tree = sentence.get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class);</span>
+    }
+<span class="nc bnc" id="L346" title="All 2 branches missed.">    for (SemgrexPattern pattern : PATTERNS) {</span>
+<span class="nc" id="L347">      SemgrexMatcher matcher = pattern.matcher(tree);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">      while (matcher.find()) {</span>
+
+        // Get terms
+<span class="nc" id="L351">        IndexedWord properSubject = matcher.getNode(&quot;Subject&quot;);</span>
+        IndexedWord quantifier, subject;
+<span class="nc" id="L353">        boolean namedEntityQuantifier = false;</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        if (properSubject != null) {</span>
+<span class="nc" id="L355">          quantifier = subject = properSubject;</span>
+<span class="nc" id="L356">          namedEntityQuantifier = true;</span>
+        } else {
+<span class="nc" id="L358">          quantifier = matcher.getNode(&quot;quantifier&quot;);</span>
+<span class="nc" id="L359">          subject = matcher.getNode(&quot;subject&quot;);</span>
+        }
+
+        // Validate quantifier
+        // At the end of this
+        Optional&lt;Triple&lt;Operator,Integer,Integer&gt;&gt; quantifierInfo;
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (namedEntityQuantifier) {</span>
+          // named entities have the &quot;all&quot; semantics by default.
+<span class="nc bnc" id="L367" title="All 2 branches missed.">          if (!neQuantifiers) {</span>
+<span class="nc" id="L368">            continue;</span>
+          }
+<span class="nc" id="L370">          quantifierInfo = Optional.of(Triple.makeTriple(Operator.IMPLICIT_NAMED_ENTITY, quantifier.index(), quantifier.index()));  // note: empty quantifier span given</span>
+        } else {
+          // find the quantifier, and return some info about it.
+<span class="nc" id="L373">          quantifierInfo = validateQuantifierByHead(sentence, quantifier);</span>
+        }
+
+        // Awful hacks to regularize the subject of things like &quot;one of&quot; and &quot;there are&quot;
+        // (fix up 'there are')
+<span class="nc bnc" id="L378" title="All 4 branches missed.">        if (&quot;be&quot;.equals(subject == null ? null : subject.lemma())) {</span>
+<span class="nc" id="L379">          boolean hasExpl = false;</span>
+<span class="nc" id="L380">          IndexedWord newSubject = null;</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">          for (SemanticGraphEdge outgoingEdge : tree.outgoingEdgeIterable(subject)) {</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            if (&quot;nsubj&quot;.equals(outgoingEdge.getRelation().toString())) {</span>
+<span class="nc" id="L383">              newSubject = outgoingEdge.getDependent();</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            } else if (&quot;expl&quot;.equals(outgoingEdge.getRelation().toString())) {</span>
+<span class="nc" id="L385">              hasExpl = true;</span>
+            }
+<span class="nc" id="L387">          }</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">          if (hasExpl) {</span>
+<span class="nc" id="L389">            subject = newSubject;</span>
+          }
+        }
+        // (fix up '$n$ of')
+<span class="nc bnc" id="L393" title="All 4 branches missed.">        if (&quot;CD&quot;.equals(subject == null ? null : subject.tag())) {</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">          for (SemanticGraphEdge outgoingEdge : tree.outgoingEdgeIterable(subject)) {</span>
+<span class="nc" id="L395">            String rel = outgoingEdge.getRelation().toString();</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">            if (rel.startsWith(&quot;nmod&quot;)) {</span>
+<span class="nc" id="L397">              subject = outgoingEdge.getDependent();</span>
+            }
+<span class="nc" id="L399">          }</span>
+        }
+
+        // Set tokens
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (quantifierInfo.isPresent()) {</span>
+          // Compute span
+<span class="nc" id="L405">          OperatorSpec scope = computeScope(tree, quantifierInfo.get().first,</span>
+<span class="nc" id="L406">              matcher.getNode(&quot;pivot&quot;), Pair.makePair(quantifierInfo.get().second, quantifierInfo.get().third),</span>
+<span class="nc" id="L407">              subject, namedEntityQuantifier, matcher.getNode(&quot;object&quot;), tokens.size());</span>
+          // Set annotation
+<span class="nc" id="L409">          CoreLabel token = sentence.get(CoreAnnotations.TokensAnnotation.class).get(quantifier.index() - 1);</span>
+<span class="nc" id="L410">          OperatorSpec oldScope = token.get(OperatorAnnotation.class);</span>
+<span class="nc bnc" id="L411" title="All 6 branches missed.">          if (oldScope == null || oldScope.quantifierLength() &lt; scope.quantifierLength() ||</span>
+              oldScope.instance != scope.instance) {
+<span class="nc" id="L413">            token.set(OperatorAnnotation.class, scope);</span>
+          } else {
+<span class="nc" id="L415">            token.set(OperatorAnnotation.class, OperatorSpec.merge(oldScope, scope));</span>
+          }
+        }
+<span class="nc" id="L418">      }</span>
+<span class="nc" id="L419">    }</span>
+
+    // Ensure we didn't select overlapping quantifiers. For example, &quot;a&quot; and &quot;a few&quot; can often overlap.
+    // In these cases, take the longer quantifier match.
+<span class="nc" id="L423">    List&lt;OperatorSpec&gt; quantifiers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L424">    sentence.get(CoreAnnotations.TokensAnnotation.class).stream()</span>
+<span class="nc" id="L425">        .filter(token -&gt; token.containsKey(OperatorAnnotation.class))</span>
+<span class="nc" id="L426">        .forEach(token -&gt; quantifiers.add(token.get(OperatorAnnotation.class)));</span>
+<span class="nc" id="L427">    quantifiers.sort( (x, y) -&gt; y.quantifierLength() - x.quantifierLength());</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">    for (OperatorSpec quantifier : quantifiers) {</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">      for (int i = quantifier.quantifierBegin; i &lt; quantifier.quantifierEnd; ++i) {</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        if (i != quantifier.quantifierHead) {</span>
+<span class="nc" id="L431">          tokens.get(i).remove(OperatorAnnotation.class);</span>
+        }
+      }
+<span class="nc" id="L434">    }</span>
+<span class="nc" id="L435">  }</span>
+
+  /**
+   * Annotate any unary quantifiers that weren't found in the main {@link NaturalLogicAnnotator#annotateOperators(CoreMap)} method.
+   * @param sentence The sentence to annotate.
+   */
+  private static void annotateUnaries(CoreMap sentence) {
+    // Get tree and tokens
+<span class="nc" id="L443">    SemanticGraph tree = sentence.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class);</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    if (tree == null) {</span>
+<span class="nc" id="L445">      tree = sentence.get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class);</span>
+    }
+<span class="nc" id="L447">    List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+
+    // Get operator exists mask
+<span class="nc" id="L450">    boolean[] isOperator = new boolean[tokens.size()];</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">    for (int i = 0; i &lt; isOperator.length; ++i) {</span>
+<span class="nc" id="L452">      OperatorSpec spec = tokens.get(i).get(OperatorAnnotation.class);</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">      if (spec != null) {</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        for (int k = spec.quantifierBegin; k &lt; spec.quantifierEnd; ++k) {</span>
+<span class="nc" id="L455">          isOperator[k] = true;</span>
+        }
+      }
+    }
+
+    // Match Semgrex
+<span class="nc" id="L461">    SemgrexMatcher matcher = UNARY_PATTERN.matcher(tree);</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">    while (matcher.find()) {</span>
+      // Get relevant nodes
+<span class="nc" id="L464">      IndexedWord quantifier = matcher.getNode(&quot;quantifier&quot;);</span>
+<span class="nc" id="L465">      String word = quantifier.word().toLowerCase();</span>
+<span class="nc bnc" id="L466" title="All 6 branches missed.">      if (word.equals(&quot;a&quot;) || word.equals(&quot;an&quot;) || word.equals(&quot;the&quot;) ||</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">          &quot;CD&quot;.equals(quantifier.tag())) {</span>
+<span class="nc" id="L468">        continue;  // These are absurdly common, and uninformative, and we're just going to shoot ourselves in the foot from parsing errors and idiomatic expressions.</span>
+      }
+<span class="nc" id="L470">      IndexedWord subject = matcher.getNode(&quot;subject&quot;);</span>
+      // ... If there is not already an operator there
+<span class="nc bnc" id="L472" title="All 2 branches missed.">      if (!isOperator[quantifier.index() - 1]) {</span>
+<span class="nc" id="L473">        Optional&lt;Triple&lt;Operator, Integer, Integer&gt;&gt; quantifierInfo = validateQuantifierByHead(sentence, quantifier);</span>
+        // ... and if we found a quantifier span
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        if (quantifierInfo.isPresent()) {</span>
+          // Then add the unary operator!
+<span class="nc" id="L477">          OperatorSpec scope = computeScope(tree, quantifierInfo.get().first,</span>
+<span class="nc" id="L478">              subject, Pair.makePair(quantifierInfo.get().second, quantifierInfo.get().third),</span>
+<span class="nc" id="L479">              null, false, null, tokens.size());</span>
+<span class="nc" id="L480">          CoreLabel token = tokens.get(quantifier.index() - 1);</span>
+<span class="nc" id="L481">          token.set(OperatorAnnotation.class, scope);</span>
+        }
+      }
+<span class="nc" id="L484">    }</span>
+
+    // Match TokensRegex
+<span class="nc" id="L487">    TokenSequenceMatcher tokenMatcher = DOUBT_PATTERN.matcher(tokens);</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">    while (tokenMatcher.find()) {</span>
+<span class="nc" id="L489">      List&lt;CoreLabel&gt; doubt = (List&lt;CoreLabel&gt;) tokenMatcher.groupNodes(&quot;$doubt&quot;);</span>
+<span class="nc" id="L490">      List&lt;CoreLabel&gt; target = (List&lt;CoreLabel&gt;) tokenMatcher.groupNodes(&quot;$target&quot;);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">      for (CoreLabel word : doubt) {</span>
+<span class="nc" id="L492">        OperatorSpec spec = new OperatorSpec(Operator.GENERAL_NEG_POLARITY,</span>
+<span class="nc" id="L493">            word.index() - 1, word.index(),</span>
+<span class="nc" id="L494">            target.get(0).index() - 1, target.get(target.size() - 1).index(),</span>
+            0, 0,
+<span class="nc" id="L496">            tokens.size());</span>
+<span class="nc" id="L497">        word.set(OperatorAnnotation.class, spec);</span>
+<span class="nc" id="L498">      }</span>
+
+<span class="nc" id="L500">    }</span>
+<span class="nc" id="L501">  }</span>
+
+  /**
+   * Annotate every token for its polarity, based on the operators found. This function will set the
+   * {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotations.PolarityAnnotation} for every token.
+   *
+   * @param sentence As in {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotator#doOneSentence(edu.stanford.nlp.pipeline.Annotation, edu.stanford.nlp.util.CoreMap)}
+   */
+  private static void annotatePolarity(CoreMap sentence) {
+    // Collect all the operators in this sentence
+<span class="nc" id="L511">    List&lt;OperatorSpec&gt; operators = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L512">    List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">    for (CoreLabel token : tokens) {</span>
+<span class="nc" id="L514">      OperatorSpec specOrNull = token.get(OperatorAnnotation.class);</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">      if (specOrNull != null) {</span>
+<span class="nc" id="L516">        operators.add(specOrNull);</span>
+      }
+<span class="nc" id="L518">    }</span>
+
+    // Make sure every node of the dependency tree has a polarity.
+    // This is separate from the code below in case the tokens in the dependency
+    // tree don't correspond to the tokens in the sentence. This happens at least
+    // when the constituency parser craps out on a long sentence, and the
+    // dependency tree is put together haphazardly.
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    if (sentence.containsKey(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class)) {</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">      for (IndexedWord token : sentence.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class).vertexSet()) {</span>
+<span class="nc" id="L527">        token.set(PolarityAnnotation.class, Polarity.DEFAULT);</span>
+<span class="nc" id="L528">      }</span>
+    }
+<span class="nc bnc" id="L530" title="All 2 branches missed.">    if (sentence.containsKey(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class)) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">      for (IndexedWord token : sentence.get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class).vertexSet()) {</span>
+<span class="nc" id="L532">        token.set(PolarityAnnotation.class, Polarity.DEFAULT);</span>
+<span class="nc" id="L533">      }</span>
+    }
+<span class="nc bnc" id="L535" title="All 2 branches missed.">    if (sentence.containsKey(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class)) {</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">      for (IndexedWord token : sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class).vertexSet()) {</span>
+<span class="nc" id="L537">        token.set(PolarityAnnotation.class, Polarity.DEFAULT);</span>
+<span class="nc" id="L538">      }</span>
+    }
+
+    // Set polarity for each token
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    for (int i = 0; i &lt; tokens.size(); ++i) {</span>
+<span class="nc" id="L543">      CoreLabel token = tokens.get(i);</span>
+      // Get operators in scope
+<span class="nc" id="L545">      List&lt;Triple&lt;Integer, Monotonicity, MonotonicityType&gt;&gt; inScope = new ArrayList&lt;&gt;(4);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">      for (OperatorSpec operator : operators) {</span>
+<span class="nc bnc" id="L547" title="All 4 branches missed.">        if (i &gt;= operator.subjectBegin &amp;&amp; i &lt; operator.subjectEnd) {</span>
+<span class="nc" id="L548">          inScope.add(Triple.makeTriple(operator.subjectEnd - operator.subjectBegin, operator.instance.subjMono, operator.instance.subjType));</span>
+<span class="nc bnc" id="L549" title="All 4 branches missed.">        } else if (i &gt;= operator.objectBegin &amp;&amp; i &lt; operator.objectEnd) {</span>
+<span class="nc" id="L550">          inScope.add(Triple.makeTriple(operator.objectEnd - operator.objectBegin, operator.instance.objMono, operator.instance.objType));</span>
+        }
+<span class="nc" id="L552">      }</span>
+      // Sort the operators by their scope (approximated by the size of their argument span
+<span class="nc" id="L554">      inScope.sort( (x, y) -&gt; y.first - x.first);</span>
+      // Create polarity
+<span class="nc" id="L556">      List&lt;Pair&lt;Monotonicity, MonotonicityType&gt;&gt; info = new ArrayList&lt;&gt;(inScope.size());</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">      for (Triple&lt;Integer, Monotonicity, MonotonicityType&gt; term : inScope) {</span>
+<span class="nc" id="L558">        info.add(Pair.makePair(term.second, term.third));</span>
+<span class="nc" id="L559">      }</span>
+<span class="nc" id="L560">      Polarity polarity = new Polarity(info);</span>
+      // Set polarity
+<span class="nc" id="L562">      token.set(PolarityAnnotation.class, polarity);</span>
+    }
+<span class="nc" id="L564">  }</span>
+
+  /**
+   * If false, don't annotate tokens for polarity but only find the operators and their scopes.
+   */
+<span class="nc" id="L569">  @ArgumentParser.Option(name=&quot;doPolarity&quot;, gloss=&quot;Mark polarity in addition to quantifier scopes&quot;)</span>
+  private boolean doPolarity = true;
+
+<span class="nc" id="L572">  @ArgumentParser.Option(name=&quot;neQuantifiers&quot;, gloss=&quot;If true, mark named entities as quantifiers.&quot;)</span>
+  private boolean neQuantifiers = false;
+
+  /**
+   * Create a new annotator.
+   * @param annotatorName The prefix for the properties for this annotator.
+   * @param props The properties to configure this annotator with.
+   */
+<span class="nc" id="L580">  public NaturalLogicAnnotator(String annotatorName, Properties props) {</span>
+<span class="nc" id="L581">    ArgumentParser.fillOptions(this, annotatorName, props);</span>
+<span class="nc" id="L582">  }</span>
+
+  /**
+   * @see edu.stanford.nlp.naturalli.NaturalLogicAnnotator#NaturalLogicAnnotator(String, java.util.Properties)
+   */
+  public NaturalLogicAnnotator(Properties props) {
+<span class="nc" id="L588">    this(STANFORD_NATLOG, props);</span>
+
+<span class="nc" id="L590">  }</span>
+
+  /** The default constructor */
+  public NaturalLogicAnnotator() {
+<span class="nc" id="L594">    this(&quot;__irrelevant__&quot;, new Properties());</span>
+<span class="nc" id="L595">  }</span>
+
+  /** {@inheritDoc} */
+  @Override
+  protected void doOneSentence(Annotation annotation, CoreMap sentence) {
+<span class="nc" id="L600">    annotateOperators(sentence);</span>
+<span class="nc" id="L601">    annotateUnaries(sentence);</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">    if (doPolarity) {</span>
+<span class="nc" id="L603">      annotatePolarity(sentence);</span>
+    }
+<span class="nc" id="L605">  }</span>
+
+  /** {@inheritDoc} */
+  @Override
+  protected int nThreads() {
+<span class="nc" id="L610">    return 1;</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  protected long maxTime() {
+<span class="nc" id="L616">    return -1;</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  protected void doOneFailedSentence(Annotation annotation, CoreMap sentence) {
+<span class="nc" id="L622">    log.info(&quot;Failed to annotate: &quot; + sentence.get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L623">  }</span>
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirementsSatisfied() {
+<span class="nc bnc" id="L628" title="All 2 branches missed.">    return Collections.unmodifiableSet(new ArraySet&lt;&gt;(Arrays.asList(</span>
+        doPolarity ? NaturalLogicAnnotations.PolarityAnnotation.class : null,
+        NaturalLogicAnnotations.OperatorAnnotation.class
+    )));
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requires() {
+<span class="nc" id="L637">    return Collections.unmodifiableSet(new ArraySet&lt;&gt;(Arrays.asList(</span>
+        CoreAnnotations.TextAnnotation.class,
+        CoreAnnotations.TokensAnnotation.class,
+        CoreAnnotations.IndexAnnotation.class,
+        CoreAnnotations.SentencesAnnotation.class,
+        CoreAnnotations.SentenceIndexAnnotation.class,
+        CoreAnnotations.PartOfSpeechAnnotation.class,
+        CoreAnnotations.LemmaAnnotation.class,
+        SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class,
+        SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class,
+        SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class
+    )));
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

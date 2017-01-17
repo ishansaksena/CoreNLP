@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ParseFiles.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">ParseFiles.java</span></div><h1>ParseFiles.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.Arrays;
+import java.util.List;
+import java.util.function.Function;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.SentenceUtils;
+import edu.stanford.nlp.parser.common.ParserQuery;
+import edu.stanford.nlp.parser.common.ParserUtils;
+import edu.stanford.nlp.parser.common.ParsingThreadsafeProcessor;
+import edu.stanford.nlp.parser.metrics.AbstractEval;
+import edu.stanford.nlp.process.TokenizerFactory;
+import edu.stanford.nlp.process.DocumentPreprocessor;
+import edu.stanford.nlp.process.DocumentPreprocessor.DocType;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.util.ScoredObject;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+
+
+
+/**
+ * Runs the parser over a set of files.  This is useful for making it
+ * operate in a multithreaded manner.  If you want access to the
+ * various stats it keeps, create the object and call parseFiles;
+ * otherwise, the static parseFiles is a good convenience method.
+ *
+ * @author John Bauer (refactored from existing code)
+ */
+public class ParseFiles {
+
+  private final TreebankLanguagePack tlp;
+  // todo: perhaps the output streams could be passed in
+  private final PrintWriter pwOut;
+  private final PrintWriter pwErr;
+
+<span class="nc" id="L48">  private int numWords = 0;</span>
+<span class="nc" id="L49">  private int numSents = 0;</span>
+<span class="nc" id="L50">  private int numUnparsable = 0;</span>
+<span class="nc" id="L51">  private int numNoMemory = 0;</span>
+<span class="nc" id="L52">  private int numFallback = 0;</span>
+<span class="nc" id="L53">  private int numSkipped = 0;</span>
+
+<span class="nc" id="L55">  private boolean saidMemMessage = false;</span>
+
+  private final boolean runningAverages;
+  private final boolean summary;
+
+  private final AbstractEval.ScoreEval pcfgLL;
+  private final AbstractEval.ScoreEval depLL;
+  private final AbstractEval.ScoreEval factLL;
+
+  private final Options op;
+
+  private final LexicalizedParser pqFactory;
+
+  private final TreePrint treePrint;
+
+  /** Parse the files with names given in the String array args elements from
+   *  index argIndex on.  Convenience method which builds and invokes a ParseFiles object.
+   */
+  public static void parseFiles(String[] args, int argIndex, boolean tokenized, TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory, String elementDelimiter, String sentenceDelimiter, Function&lt;List&lt;HasWord&gt;, List&lt;HasWord&gt;&gt; escaper, String tagDelimiter, Options op, TreePrint treePrint, LexicalizedParser pqFactory) {
+<span class="nc" id="L74">    ParseFiles pf = new ParseFiles(op, treePrint, pqFactory);</span>
+<span class="nc" id="L75">    pf.parseFiles(args, argIndex, tokenized, tokenizerFactory, elementDelimiter, sentenceDelimiter, escaper, tagDelimiter);</span>
+<span class="nc" id="L76">  }</span>
+
+<span class="nc" id="L78">  public ParseFiles(Options op, TreePrint treePrint, LexicalizedParser pqFactory) {</span>
+<span class="nc" id="L79">    this.op = op;</span>
+<span class="nc" id="L80">    this.pqFactory = pqFactory;</span>
+<span class="nc" id="L81">    this.treePrint = treePrint;</span>
+
+<span class="nc" id="L83">    this.tlp = op.tlpParams.treebankLanguagePack();</span>
+<span class="nc" id="L84">    this.pwOut = op.tlpParams.pw();</span>
+<span class="nc" id="L85">    this.pwErr = op.tlpParams.pw(System.err);</span>
+
+<span class="nc bnc" id="L87" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L88">      pwErr.println(&quot;Sentence final words are: &quot; + Arrays.asList(tlp.sentenceFinalPunctuationWords()));</span>
+<span class="nc" id="L89">      pwErr.println(&quot;File encoding is: &quot; + op.tlpParams.getInputEncoding());</span>
+    }
+
+    // evaluation setup
+<span class="nc" id="L93">    this.runningAverages = Boolean.parseBoolean(op.testOptions.evals.getProperty(&quot;runningAverages&quot;));</span>
+<span class="nc" id="L94">    this.summary = Boolean.parseBoolean(op.testOptions.evals.getProperty(&quot;summary&quot;));</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">    if (Boolean.parseBoolean(op.testOptions.evals.getProperty(&quot;pcfgLL&quot;))) {</span>
+<span class="nc" id="L96">      this.pcfgLL = new AbstractEval.ScoreEval(&quot;pcfgLL&quot;, runningAverages);</span>
+    } else {
+<span class="nc" id="L98">      this.pcfgLL = null;</span>
+    }
+<span class="nc bnc" id="L100" title="All 2 branches missed.">    if (Boolean.parseBoolean(op.testOptions.evals.getProperty(&quot;depLL&quot;))) {</span>
+<span class="nc" id="L101">      this.depLL = new AbstractEval.ScoreEval(&quot;depLL&quot;, runningAverages);</span>
+    } else {
+<span class="nc" id="L103">      this.depLL = null;</span>
+    }
+<span class="nc bnc" id="L105" title="All 2 branches missed.">    if (Boolean.parseBoolean(op.testOptions.evals.getProperty(&quot;factLL&quot;))) {</span>
+<span class="nc" id="L106">      this.factLL = new AbstractEval.ScoreEval(&quot;factLL&quot;, runningAverages);</span>
+    } else {
+<span class="nc" id="L108">      this.factLL = null;</span>
+    }
+
+<span class="nc" id="L111">  }</span>
+
+  public void parseFiles(String[] args, int argIndex, boolean tokenized, TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory, String elementDelimiter, String sentenceDelimiter, Function&lt;List&lt;HasWord&gt;, List&lt;HasWord&gt;&gt; escaper, String tagDelimiter) {
+<span class="nc bnc" id="L114" title="All 2 branches missed.">    final DocType docType = (elementDelimiter == null) ? DocType.Plain : DocType.XML;</span>
+
+<span class="nc bnc" id="L116" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">      if(tokenizerFactory != null)</span>
+<span class="nc" id="L118">        pwErr.println(&quot;parseFiles: Tokenizer factory is: &quot; + tokenizerFactory);</span>
+    }
+
+<span class="nc" id="L121">    final Timing timer = new Timing();</span>
+    // timer.start(); // constructor already starts it.
+
+    //Loop over the files
+<span class="nc bnc" id="L125" title="All 2 branches missed.">    for (int i = argIndex; i &lt; args.length; i++) {</span>
+<span class="nc" id="L126">      final String filename = args[i];</span>
+
+      final DocumentPreprocessor documentPreprocessor;
+<span class="nc bnc" id="L129" title="All 2 branches missed.">      if (filename.equals(&quot;-&quot;)) {</span>
+        try {
+<span class="nc" id="L131">          documentPreprocessor = new DocumentPreprocessor(IOUtils.readerFromStdin(op.tlpParams.getInputEncoding()), docType);</span>
+<span class="nc" id="L132">        } catch (IOException e) {</span>
+<span class="nc" id="L133">          throw new RuntimeIOException(e);</span>
+<span class="nc" id="L134">        }</span>
+      } else {
+<span class="nc" id="L136">        documentPreprocessor = new DocumentPreprocessor(filename,docType,op.tlpParams.getInputEncoding());</span>
+      }
+
+      //Unused values are null per the main() method invocation below
+      //null is the default for these properties
+<span class="nc" id="L141">      documentPreprocessor.setSentenceFinalPuncWords(tlp.sentenceFinalPunctuationWords());</span>
+<span class="nc" id="L142">      documentPreprocessor.setEscaper(escaper);</span>
+<span class="nc" id="L143">      documentPreprocessor.setSentenceDelimiter(sentenceDelimiter);</span>
+<span class="nc" id="L144">      documentPreprocessor.setTagDelimiter(tagDelimiter);</span>
+<span class="nc" id="L145">      documentPreprocessor.setElementDelimiter(elementDelimiter);</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">      if(tokenizerFactory == null)</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        documentPreprocessor.setTokenizerFactory((tokenized) ? null : tlp.getTokenizerFactory());</span>
+      else
+<span class="nc" id="L149">        documentPreprocessor.setTokenizerFactory(tokenizerFactory);</span>
+
+      //Setup the output
+<span class="nc" id="L152">      PrintWriter pwo = pwOut;</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      if (op.testOptions.writeOutputFiles) {</span>
+<span class="nc" id="L154">        String normalizedName = filename;</span>
+        try {
+<span class="nc" id="L156">          new URL(normalizedName); // this will exception if not a URL</span>
+<span class="nc" id="L157">          normalizedName = normalizedName.replaceAll(&quot;/&quot;,&quot;_&quot;);</span>
+<span class="nc" id="L158">        } catch (MalformedURLException e) {</span>
+          //It isn't a URL, so silently ignore
+<span class="nc" id="L160">        }</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        String ext = (op.testOptions.outputFilesExtension == null) ? &quot;stp&quot; : op.testOptions.outputFilesExtension;</span>
+<span class="nc" id="L163">        String fname = normalizedName + '.' + ext;</span>
+<span class="nc bnc" id="L164" title="All 4 branches missed.">        if (op.testOptions.outputFilesDirectory != null &amp;&amp; ! op.testOptions.outputFilesDirectory.isEmpty()) {</span>
+<span class="nc" id="L165">          String fseparator = System.getProperty(&quot;file.separator&quot;);</span>
+<span class="nc bnc" id="L166" title="All 4 branches missed.">          if (fseparator == null || fseparator.isEmpty()) {</span>
+<span class="nc" id="L167">            fseparator = &quot;/&quot;;</span>
+          }
+<span class="nc" id="L169">          File fnameFile = new File(fname);</span>
+<span class="nc" id="L170">          fname = op.testOptions.outputFilesDirectory + fseparator + fnameFile.getName();</span>
+        }
+
+        try {
+<span class="nc" id="L174">          pwo = op.tlpParams.pw(new FileOutputStream(fname));</span>
+<span class="nc" id="L175">        } catch (IOException ioe) {</span>
+<span class="nc" id="L176">          throw new RuntimeIOException(ioe);</span>
+<span class="nc" id="L177">        }</span>
+      }
+<span class="nc" id="L179">      treePrint.printHeader(pwo, op.tlpParams.getOutputEncoding());</span>
+
+
+<span class="nc" id="L182">      pwErr.println(&quot;Parsing file: &quot; + filename);</span>
+<span class="nc" id="L183">      int num = 0;</span>
+<span class="nc" id="L184">      int numProcessed = 0;</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">      if (op.testOptions.testingThreads != 1) {</span>
+<span class="nc" id="L186">        MulticoreWrapper&lt;List&lt;? extends HasWord&gt;, ParserQuery&gt; wrapper = new MulticoreWrapper&lt;&gt;(op.testOptions.testingThreads, new ParsingThreadsafeProcessor(pqFactory, pwErr));</span>
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        for (List&lt;HasWord&gt; sentence : documentPreprocessor) {</span>
+<span class="nc" id="L189">          num++;</span>
+<span class="nc" id="L190">          numSents++;</span>
+<span class="nc" id="L191">          int len = sentence.size();</span>
+<span class="nc" id="L192">          numWords += len;</span>
+<span class="nc" id="L193">          pwErr.println(&quot;Parsing [sent. &quot; + num + &quot; len. &quot; + len + &quot;]: &quot; + SentenceUtils.listToString(sentence, true));</span>
+
+<span class="nc" id="L195">          wrapper.put(sentence);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">          while (wrapper.peek()) {</span>
+<span class="nc" id="L197">            ParserQuery pq = wrapper.poll();</span>
+<span class="nc" id="L198">            processResults(pq, numProcessed++, pwo);</span>
+<span class="nc" id="L199">          }</span>
+<span class="nc" id="L200">        }</span>
+
+<span class="nc" id="L202">        wrapper.join();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        while (wrapper.peek()) {</span>
+<span class="nc" id="L204">          ParserQuery pq = wrapper.poll();</span>
+<span class="nc" id="L205">          processResults(pq, numProcessed++, pwo);</span>
+<span class="nc" id="L206">        }</span>
+<span class="nc" id="L207">      } else {</span>
+<span class="nc" id="L208">        ParserQuery pq = pqFactory.parserQuery();</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        for (List&lt;HasWord&gt; sentence : documentPreprocessor) {</span>
+<span class="nc" id="L210">          num++;</span>
+<span class="nc" id="L211">          numSents++;</span>
+<span class="nc" id="L212">          int len = sentence.size();</span>
+<span class="nc" id="L213">          numWords += len;</span>
+<span class="nc" id="L214">          pwErr.println(&quot;Parsing [sent. &quot; + num + &quot; len. &quot; + len + &quot;]: &quot; + SentenceUtils.listToString(sentence, true));</span>
+<span class="nc" id="L215">          pq.parseAndReport(sentence, pwErr);</span>
+<span class="nc" id="L216">          processResults(pq, numProcessed++, pwo);</span>
+<span class="nc" id="L217">        }</span>
+      }
+
+<span class="nc" id="L220">      treePrint.printFooter(pwo);</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      if (op.testOptions.writeOutputFiles) pwo.close();</span>
+
+<span class="nc" id="L223">      pwErr.println(&quot;Parsed file: &quot; + filename + &quot; [&quot; + num + &quot; sentences].&quot;);</span>
+    }
+
+<span class="nc" id="L226">    long millis = timer.stop();</span>
+
+<span class="nc bnc" id="L228" title="All 2 branches missed.">    if (summary) {</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">      if (pcfgLL != null) pcfgLL.display(false, pwErr);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">      if (depLL != null) depLL.display(false, pwErr);</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">      if (factLL != null) factLL.display(false, pwErr);</span>
+    }
+
+<span class="nc bnc" id="L234" title="All 2 branches missed.">    if (saidMemMessage) {</span>
+<span class="nc" id="L235">      ParserUtils.printOutOfMemory(pwErr);</span>
+    }
+<span class="nc" id="L237">    double wordspersec = numWords / (((double) millis) / 1000);</span>
+<span class="nc" id="L238">    double sentspersec = numSents / (((double) millis) / 1000);</span>
+<span class="nc" id="L239">    NumberFormat nf = new DecimalFormat(&quot;0.00&quot;); // easier way!</span>
+<span class="nc" id="L240">    pwErr.println(&quot;Parsed &quot; + numWords + &quot; words in &quot; + numSents +</span>
+<span class="nc" id="L241">        &quot; sentences (&quot; + nf.format(wordspersec) + &quot; wds/sec; &quot; +</span>
+<span class="nc" id="L242">        nf.format(sentspersec) + &quot; sents/sec).&quot;);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    if (numFallback &gt; 0) {</span>
+<span class="nc" id="L244">      pwErr.println(&quot;  &quot; + numFallback + &quot; sentences were parsed by fallback to PCFG.&quot;);</span>
+    }
+<span class="nc bnc" id="L246" title="All 6 branches missed.">    if (numUnparsable &gt; 0 || numNoMemory &gt; 0 || numSkipped &gt; 0) {</span>
+<span class="nc" id="L247">      pwErr.println(&quot;  &quot; + (numUnparsable + numNoMemory + numSkipped) + &quot; sentences were not parsed:&quot;);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">      if (numUnparsable &gt; 0) {</span>
+<span class="nc" id="L249">        pwErr.println(&quot;    &quot; + numUnparsable + &quot; were not parsable with non-zero probability.&quot;);</span>
+      }
+<span class="nc bnc" id="L251" title="All 2 branches missed.">      if (numNoMemory &gt; 0) {</span>
+<span class="nc" id="L252">        pwErr.println(&quot;    &quot; + numNoMemory + &quot; were skipped because of insufficient memory.&quot;);</span>
+      }
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if (numSkipped &gt; 0) {</span>
+<span class="nc" id="L255">        pwErr.println(&quot;    &quot; + numSkipped + &quot; were skipped as length 0 or greater than &quot; + op.testOptions.maxLength);</span>
+      }
+    }
+<span class="nc" id="L258">  } // end parseFiles</span>
+
+  public void processResults(ParserQuery parserQuery, int num, PrintWriter pwo) {
+<span class="nc bnc" id="L261" title="All 2 branches missed.">    if (parserQuery.parseSkipped()) {</span>
+<span class="nc" id="L262">      List&lt;? extends HasWord&gt; sentence = parserQuery.originalSentence();</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">      if (sentence != null) {</span>
+<span class="nc" id="L264">        numWords -= sentence.size();</span>
+      }
+<span class="nc" id="L266">      numSkipped++;</span>
+    }
+<span class="nc bnc" id="L268" title="All 2 branches missed.">    if (parserQuery.parseNoMemory()) numNoMemory++;</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    if (parserQuery.parseUnparsable()) numUnparsable++;</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    if (parserQuery.parseFallback()) numFallback++;</span>
+<span class="nc bnc" id="L271" title="All 4 branches missed.">    saidMemMessage = saidMemMessage || parserQuery.saidMemMessage();</span>
+<span class="nc" id="L272">    Tree ansTree = parserQuery.getBestParse();</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    if (ansTree == null) {</span>
+<span class="nc" id="L274">      pwo.println(&quot;(())&quot;);</span>
+<span class="nc" id="L275">      return;</span>
+    }
+<span class="nc bnc" id="L277" title="All 4 branches missed.">    if (pcfgLL != null &amp;&amp; parserQuery.getPCFGParser() != null) {</span>
+<span class="nc" id="L278">      pcfgLL.recordScore(parserQuery.getPCFGParser(), pwErr);</span>
+    }
+<span class="nc bnc" id="L280" title="All 4 branches missed.">    if (depLL != null &amp;&amp; parserQuery.getDependencyParser() != null) {</span>
+<span class="nc" id="L281">      depLL.recordScore(parserQuery.getDependencyParser(), pwErr);</span>
+    }
+<span class="nc bnc" id="L283" title="All 4 branches missed.">    if (factLL != null &amp;&amp; parserQuery.getFactoredParser() != null) {</span>
+<span class="nc" id="L284">      factLL.recordScore(parserQuery.getFactoredParser(), pwErr);</span>
+    }
+    try {
+<span class="nc" id="L287">      treePrint.printTree(ansTree, Integer.toString(num), pwo);</span>
+<span class="nc" id="L288">    } catch (RuntimeException re) {</span>
+<span class="nc" id="L289">      pwErr.println(&quot;TreePrint.printTree skipped: out of memory (or other error)&quot;);</span>
+<span class="nc" id="L290">      re.printStackTrace(pwErr);</span>
+<span class="nc" id="L291">      numNoMemory++;</span>
+      try {
+<span class="nc" id="L293">        treePrint.printTree(null, Integer.toString(num), pwo);</span>
+<span class="nc" id="L294">      } catch (Exception e) {</span>
+<span class="nc" id="L295">        pwErr.println(&quot;Sentence skipped: out of memory or error calling TreePrint.&quot;);</span>
+<span class="nc" id="L296">        pwo.println(&quot;(())&quot;);</span>
+<span class="nc" id="L297">        e.printStackTrace(pwErr);</span>
+<span class="nc" id="L298">      }</span>
+<span class="nc" id="L299">    }</span>
+    // crude addition of k-best tree printing
+    // TODO: interface with the RerankingParserQuery
+<span class="nc bnc" id="L302" title="All 6 branches missed.">    if (op.testOptions.printPCFGkBest &gt; 0 &amp;&amp; parserQuery.getPCFGParser() != null &amp;&amp; parserQuery.getPCFGParser().hasParse()) {</span>
+<span class="nc" id="L303">      List&lt;ScoredObject&lt;Tree&gt;&gt; trees = parserQuery.getKBestPCFGParses(op.testOptions.printPCFGkBest);</span>
+<span class="nc" id="L304">      treePrint.printTrees(trees, Integer.toString(num), pwo);</span>
+<span class="nc bnc" id="L305" title="All 6 branches missed.">    } else if (op.testOptions.printFactoredKGood &gt; 0 &amp;&amp; parserQuery.getFactoredParser() != null &amp;&amp; parserQuery.getFactoredParser().hasParse()) {</span>
+      // DZ: debug n best trees
+<span class="nc" id="L307">      List&lt;ScoredObject&lt;Tree&gt;&gt; trees = parserQuery.getKGoodFactoredParses(op.testOptions.printFactoredKGood);</span>
+<span class="nc" id="L308">      treePrint.printTrees(trees, Integer.toString(num), pwo);</span>
+    }
+<span class="nc" id="L310">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

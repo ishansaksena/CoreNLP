@@ -1,0 +1,764 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoordinationTransformer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees</a> &gt; <span class="el_source">CoordinationTransformer.java</span></div><h1>CoordinationTransformer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.trees; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+import edu.stanford.nlp.ling.LabelFactory;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon;
+import edu.stanford.nlp.trees.tregex.tsurgeon.TsurgeonPattern;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
+
+/**
+ * Coordination transformer transforms a PennTreebank tree containing
+ * a coordination in a flat structure in order to get the dependencies
+ * right.
+ * &lt;br&gt;
+ * The transformer goes through several steps:
+ * &lt;ul&gt;
+ * &lt;li&gt; Removes empty nodes and simplifies many tags (&lt;code&gt;DependencyTreeTransformer&lt;/code&gt;)
+ * &lt;li&gt; Relabels UCP phrases to either ADVP or NP depending on their content
+ * &lt;li&gt; Turn flat CC structures into structures with an intervening node
+ * &lt;li&gt; Add extra structure to QP phrases - combine &quot;well over&quot;, unflattened structures with CC (&lt;code&gt;QPTreeTransformer&lt;/code&gt;)
+ * &lt;li&gt; Flatten SQ structures to get the verb as the head
+ * &lt;li&gt; Rearrange structures that appear to be dates
+ * &lt;li&gt; Flatten X over only X structures
+ * &lt;li&gt; Turn some fixed conjunction phrases into CONJP, such as &quot;and yet&quot;, etc
+ * &lt;li&gt; Attach RB such as &quot;not&quot; to the next phrase to get the RB headed by the phrase it modifies
+ * &lt;li&gt; Turn SBAR to PP if parsed as SBAR in phrases such as &quot;The day after the airline was planning ...&quot;
+ * &lt;li&gt; Rearrange &quot;now that&quot; into an SBAR phrase if it was misparsed as ADVP
+ * &lt;li&gt; (Only for universal dependencies) Extracts multi-word expressions and attaches all nodes to a new MWE constituent
+ * &lt;/ul&gt;
+ *
+ * @author Marie-Catherine de Marneffe
+ * @author John Bauer
+ * @author Sebastian Schuster
+ */
+public class CoordinationTransformer implements TreeTransformer  {
+
+  /** A logger for this class */
+<span class="fc" id="L47">  private static Redwood.RedwoodChannels log = Redwood.channels(CoordinationTransformer.class);</span>
+
+<span class="pc bpc" id="L49" title="1 of 2 branches missed.">  private static final boolean VERBOSE = System.getProperty(&quot;CoordinationTransformer&quot;, null) != null;</span>
+<span class="fc" id="L50">  private final TreeTransformer tn = new DependencyTreeTransformer(); //to get rid of unwanted nodes and tag</span>
+<span class="fc" id="L51">  private final TreeTransformer dates = new DateTreeTransformer();    //to flatten date patterns</span>
+  private final TreeTransformer qp;                                   //to restructure the QP constituents
+
+  private final HeadFinder headFinder;
+  private final boolean performMWETransformation;
+
+  // default constructor
+  public CoordinationTransformer(HeadFinder hf) {
+<span class="fc" id="L59">    this(hf, false);</span>
+<span class="fc" id="L60">  }</span>
+  
+  /**
+   * Constructor
+   * 
+   * @param hf the headfinder
+   * @param performMWETransformation Parameter for backwards compatibility. 
+   * If set to false, multi-word expressions won't be attached to a new &quot;MWE&quot; node
+   */
+<span class="fc" id="L69">  public CoordinationTransformer(HeadFinder hf, boolean performMWETransformation) {</span>
+<span class="fc" id="L70">    this.headFinder = hf;</span>
+<span class="fc" id="L71">    this.performMWETransformation = performMWETransformation;</span>
+<span class="fc" id="L72">    qp = new QPTreeTransformer(performMWETransformation);</span>
+<span class="fc" id="L73">  }</span>
+
+  /**
+   * Transforms t if it contains a coordination in a flat structure (CCtransform)
+   * and transforms UCP (UCPtransform).
+   *
+   * @param t a tree to be transformed
+   * @return t transformed
+   */
+  @Override
+  public Tree transformTree(Tree t) {
+<span class="pc bpc" id="L84" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L85">      log.info(&quot;Input to CoordinationTransformer: &quot; + t);</span>
+    }
+<span class="fc" id="L87">    t = tn.transformTree(t);</span>
+<span class="pc bpc" id="L88" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L89">      log.info(&quot;After DependencyTreeTransformer:  &quot; + t);</span>
+    }
+<span class="pc bpc" id="L91" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L92">      return t;</span>
+    }
+
+<span class="fc bfc" id="L95" title="All 2 branches covered.">    if (performMWETransformation) {</span>
+<span class="fc" id="L96">      t = MWETransform(t);</span>
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L98">        log.info(&quot;After MWETransform:               &quot; + t);</span>
+      }
+
+<span class="fc" id="L101">      t = prepCCTransform(t);</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L103">        log.info(&quot;After prepCCTransform:               &quot; + t);</span>
+      }
+    }
+
+<span class="fc" id="L107">    t = UCPtransform(t);</span>
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L109">      log.info(&quot;After UCPTransformer:             &quot; + t);</span>
+    }
+<span class="fc" id="L111">    t = CCtransform(t);</span>
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L113">      log.info(&quot;After CCTransformer:              &quot; + t);</span>
+    }
+<span class="fc" id="L115">    t = qp.transformTree(t);</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L117">      log.info(&quot;After QPTreeTransformer:          &quot; + t);</span>
+    }
+<span class="fc" id="L119">    t = SQflatten(t);</span>
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L121">      log.info(&quot;After SQ flattening:              &quot; + t);</span>
+    }
+<span class="fc" id="L123">    t = dates.transformTree(t);</span>
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L125">      log.info(&quot;After DateTreeTransformer:        &quot; + t);</span>
+    }
+<span class="fc" id="L127">    t = removeXOverX(t);</span>
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L129">      log.info(&quot;After removeXoverX:               &quot; + t);</span>
+    }
+<span class="fc" id="L131">    t = combineConjp(t);</span>
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L133">      log.info(&quot;After combineConjp:               &quot; + t);</span>
+    }
+<span class="fc" id="L135">    t = moveRB(t);</span>
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L137">      log.info(&quot;After moveRB:                     &quot; + t);</span>
+    }
+<span class="fc" id="L139">    t = changeSbarToPP(t);</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L141">      log.info(&quot;After changeSbarToPP:             &quot; + t);</span>
+    }
+<span class="fc" id="L143">    t = rearrangeNowThat(t);</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L145">      log.info(&quot;After rearrangeNowThat:           &quot; + t);</span>
+    }
+
+<span class="fc" id="L148">    return t;</span>
+  }
+
+<span class="fc" id="L151">  private static TregexPattern rearrangeNowThatTregex =</span>
+<span class="fc" id="L152">    TregexPattern.compile(&quot;ADVP=advp &lt;1 (RB &lt; /^(?i:now)$/) &lt;2 (SBAR=sbar &lt;1 (IN &lt; /^(?i:that)$/))&quot;);</span>
+
+<span class="fc" id="L154">  private static TsurgeonPattern rearrangeNowThatTsurgeon =</span>
+<span class="fc" id="L155">    Tsurgeon.parseOperation(&quot;[relabel advp SBAR] [excise sbar sbar]&quot;);</span>
+
+  private static Tree rearrangeNowThat(Tree t) {
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L159">      return t;</span>
+    }
+<span class="fc" id="L161">    return Tsurgeon.processPattern(rearrangeNowThatTregex, rearrangeNowThatTsurgeon, t);</span>
+  }
+
+
+<span class="fc" id="L165">  private static TregexPattern changeSbarToPPTregex =</span>
+<span class="fc" id="L166">    TregexPattern.compile(&quot;NP &lt; (NP $++ (SBAR=sbar &lt; (IN &lt; /^(?i:after|before|until|since|during)$/ $++ S)))&quot;);</span>
+
+<span class="fc" id="L168">  private static TsurgeonPattern changeSbarToPPTsurgeon =</span>
+<span class="fc" id="L169">    Tsurgeon.parseOperation(&quot;relabel sbar PP&quot;);</span>
+
+  /**
+   * For certain phrases, we change the SBAR to a PP to get prep/pcomp
+   * dependencies.  For example, in &quot;The day after the airline was
+   * planning...&quot;, we want prep(day, after) and pcomp(after,
+   * planning).  If &quot;after the airline was planning&quot; was parsed as an
+   * SBAR, either by the parser or in the treebank, we fix that here.
+   */
+
+  private static Tree changeSbarToPP(Tree t) {
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L181">      return null;</span>
+    }
+<span class="fc" id="L183">    return Tsurgeon.processPattern(changeSbarToPPTregex, changeSbarToPPTsurgeon, t);</span>
+  }
+
+<span class="fc" id="L186">  private static TregexPattern findFlatConjpTregex =</span>
+    // TODO: add more patterns, perhaps ignore case
+    // for example, what should we do with &quot;and not&quot;?  Is it right to
+    // generally add the &quot;not&quot; to the following tree with moveRB, or
+    // should we make &quot;and not&quot; a CONJP?
+    // also, perhaps look at ADVP
+<span class="fc" id="L192">    TregexPattern.compile(&quot;/^(S|PP|VP)/ &lt; (/^(S(?!YM)|PP|VP)/ $++ (CC=start $+ (RB|ADVP $+ /^(S(?!YM)|PP|VP)/) &quot; +</span>
+                          &quot;[ (&lt; and $+ (RB=end &lt; yet)) | &quot; +  // TODO: what should be the head of &quot;and yet&quot;?
+                          &quot;  (&lt; and $+ (RB=end &lt; so)) | &quot; +
+                          &quot;  (&lt; and $+ (ADVP=end &lt; (RB|IN &lt; so))) ] ))&quot;); // TODO: this structure needs a dependency
+
+<span class="fc" id="L197">  private static TsurgeonPattern addConjpTsurgeon =</span>
+<span class="fc" id="L198">    Tsurgeon.parseOperation(&quot;createSubtree CONJP start end&quot;);</span>
+
+  private static Tree combineConjp(Tree t) {
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L202">      return null;</span>
+    }
+<span class="fc" id="L204">    return Tsurgeon.processPattern(findFlatConjpTregex, addConjpTsurgeon, t);</span>
+  }
+
+<span class="fc" id="L207">  private static TregexPattern[] moveRBTregex = {</span>
+<span class="fc" id="L208">    TregexPattern.compile(&quot;/^S|PP|VP|NP/ &lt; (/^(S|PP|VP|NP)/ $++ (/^(,|CC|CONJP)$/ [ $+ (RB=adv [ &lt; not | &lt; then ]) | $+ (ADVP=adv &lt;: RB) ])) : (=adv $+ /^(S(?!YM)|PP|VP|NP)/=dest) &quot;),</span>
+<span class="fc" id="L209">    TregexPattern.compile(&quot;/^ADVP/ &lt; (/^ADVP/ $++ (/^(,|CC|CONJP)$/ [$+ (RB=adv [ &lt; not | &lt; then ]) | $+ (ADVP=adv &lt;: RB)])) : (=adv $+ /^NP-ADV|ADVP|PP/=dest)&quot;),</span>
+<span class="fc" id="L210">    TregexPattern.compile(&quot;/^FRAG/ &lt; (ADVP|RB=adv $+ VP=dest)&quot;),</span>
+  };
+
+<span class="fc" id="L213">  private static TsurgeonPattern moveRBTsurgeon =</span>
+<span class="fc" id="L214">    Tsurgeon.parseOperation(&quot;move adv &gt;0 dest&quot;);</span>
+
+  static Tree moveRB(Tree t) {
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L218">      return null;</span>
+    }
+<span class="fc bfc" id="L220" title="All 2 branches covered.">    for (TregexPattern pattern : moveRBTregex) {</span>
+<span class="fc" id="L221">      t = Tsurgeon.processPattern(pattern, moveRBTsurgeon, t);</span>
+    }
+<span class="fc" id="L223">    return t;</span>
+  }
+
+  // Matches to be questions if the question starts with WHNP, such as
+  // Who, What, if there is an SQ after the WH question.
+  //
+  // TODO: maybe we want to catch more complicated tree structures
+  // with something in between the WH and the actual question.
+<span class="fc" id="L231">  private static TregexPattern flattenSQTregex =</span>
+<span class="fc" id="L232">    TregexPattern.compile(&quot;SBARQ &lt; ((WHNP=what &lt; WP) $+ (SQ=sq &lt; (/^VB/=verb &lt; &quot; + EnglishPatterns.copularWordRegex + &quot;) &quot; +</span>
+                          // match against &quot;is running&quot; if the verb is under just a VBG
+                          &quot; !&lt; (/^VB/ &lt; !&quot; + EnglishPatterns.copularWordRegex + &quot;) &quot; +
+                          // match against &quot;is running&quot; if the verb is under a VP - VBG
+                          &quot; !&lt; (/^V/ &lt; /^VB/ &lt; !&quot; + EnglishPatterns.copularWordRegex + &quot;) &quot; +
+                          // match against &quot;What is on the test?&quot;
+                          &quot; !&lt; (PP $- =verb) &quot; +
+                          // match against &quot;is there&quot;
+                          &quot; !&lt;, (/^VB/ &lt; &quot; + EnglishPatterns.copularWordRegex + &quot; $+ (NP &lt; (EX &lt; there)))&quot; +
+                          // match against &quot;good at&quot;
+                          &quot; !&lt; (ADJP &lt; (PP &lt;: IN|TO))))&quot;);
+
+<span class="fc" id="L244">  private static TsurgeonPattern flattenSQTsurgeon = Tsurgeon.parseOperation(&quot;excise sq sq&quot;);</span>
+
+  /**
+   * Removes the SQ structure under a WHNP question, such as &quot;Who am I
+   * to judge?&quot;.  We do this so that it is easier to pick out the head
+   * and then easier to connect that head to all of the other words in
+   * the question in this situation.  In the specific case of making
+   * the copula head, we don't do this so that the existing headfinder
+   * code can easily find the &quot;am&quot; or other copula verb.
+   */
+  public Tree SQflatten(Tree t) {
+<span class="pc bpc" id="L255" title="2 of 4 branches missed.">    if (headFinder != null &amp;&amp; (headFinder instanceof CopulaHeadFinder)) {</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">      if (((CopulaHeadFinder) headFinder).makesCopulaHead()) {</span>
+<span class="fc" id="L257">        return t;</span>
+      }
+    }
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L261">      return null;</span>
+    }
+<span class="fc" id="L263">    return Tsurgeon.processPattern(flattenSQTregex, flattenSQTsurgeon, t);</span>
+  }
+
+<span class="fc" id="L266">  private static TregexPattern removeXOverXTregex =</span>
+<span class="fc" id="L267">    TregexPattern.compile(&quot;__=repeat &lt;: (~repeat &lt; __)&quot;);</span>
+
+<span class="fc" id="L269">  private static TsurgeonPattern removeXOverXTsurgeon = Tsurgeon.parseOperation(&quot;excise repeat repeat&quot;);</span>
+
+  public static Tree removeXOverX(Tree t) {
+<span class="fc" id="L272">    return Tsurgeon.processPattern(removeXOverXTregex, removeXOverXTsurgeon, t);</span>
+  }
+
+  // UCP (JJ ...) -&gt; ADJP
+  // UCP (DT JJ ...) -&gt; ADJP
+  // UCP (... (ADJP (JJR older|younger))) -&gt; ADJP
+  // UCP (N ...) -&gt; NP
+  // UCP ADVP -&gt; ADVP
+  // Might want to look for ways to include RB for flatter structures,
+  // but then we have to watch out for (RB not) for example
+  // Note that the order of OR expressions means the older|younger
+  // pattern takes precedence
+  // By searching for everything at once, then using one tsurgeon
+  // which fixes everything at once, we can save quite a bit of time
+<span class="fc" id="L286">  private static final TregexPattern ucpRenameTregex =</span>
+<span class="fc" id="L287">    TregexPattern.compile(&quot;/^UCP/=ucp [ &lt;, /^JJ|ADJP/=adjp | ( &lt;1 DT &lt;2 /^JJ|ADJP/=adjp ) |&quot; +</span>
+                          &quot; &lt;- (ADJP=adjp &lt; (JJR &lt; /^(?i:younger|older)$/)) |&quot; +
+                          &quot; &lt;, /^N/=np | ( &lt;1 DT &lt;2 /^N/=np ) | &quot; +
+                          &quot; &lt;, /^ADVP/=advp ]&quot;);
+
+  // TODO: this turns UCP-TMP into ADVP instead of ADVP-TMP.  What do we actually want?
+<span class="fc" id="L293">  private static final TsurgeonPattern ucpRenameTsurgeon =</span>
+<span class="fc" id="L294">    Tsurgeon.parseOperation(&quot;[if exists adjp relabel ucp /^UCP(.*)$/ADJP$1/] [if exists np relabel ucp /^UCP(.*)$/NP$1/] [if exists advp relabel ucp /^UCP(.*)$/ADVP/]&quot;);</span>
+
+  /**
+   * Transforms t if it contains an UCP, it will change the UCP tag
+   * into the phrasal tag of the first word of the UCP
+   * (UCP (JJ electronic) (, ,) (NN computer) (CC and) (NN building))
+   * will become
+   * (ADJP (JJ electronic) (, ,) (NN computer) (CC and) (NN building))
+   *
+   * @param t a tree to be transformed
+   * @return t transformed
+   */
+  public static Tree UCPtransform(Tree t) {
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L308">      return null;</span>
+    }
+<span class="fc" id="L310">    return Tsurgeon.processPattern(ucpRenameTregex, ucpRenameTsurgeon, t);</span>
+  }
+
+
+  /**
+   * Transforms t if it contains a coordination in a flat structure
+   *
+   * @param t a tree to be transformed
+   * @return t transformed (give t not null, return will not be null)
+   */
+  public static Tree CCtransform(Tree t) {
+<span class="fc" id="L321">    boolean notDone = true;</span>
+<span class="fc bfc" id="L322" title="All 2 branches covered.">    while (notDone) {</span>
+<span class="fc" id="L323">      Tree cc = findCCparent(t, t);</span>
+<span class="fc bfc" id="L324" title="All 2 branches covered.">      if (cc != null) {</span>
+<span class="fc" id="L325">        t = cc;</span>
+      } else {
+<span class="fc" id="L327">        notDone = false;</span>
+      }
+<span class="fc" id="L329">    }</span>
+<span class="fc" id="L330">    return t;</span>
+  }
+
+  private static String getHeadTag(Tree t) {
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">    if (t.value().startsWith(&quot;NN&quot;)) {</span>
+<span class="nc" id="L335">      return &quot;NP&quot;;</span>
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">    } else if (t.value().startsWith(&quot;JJ&quot;)) {</span>
+<span class="nc" id="L337">      return &quot;ADJP&quot;;</span>
+    } else {
+<span class="fc" id="L339">      return &quot;NP&quot;;</span>
+    }
+  }
+
+
+  /** If things match, this method destructively changes the children list
+   *  of the tree t.  When this method is called, t is an NP and there must
+   *  be at least two children to the right of ccIndex.
+   *
+   *  @param t The tree to transform a conjunction in
+   *  @param ccIndex The index of the CC child
+   *  @return t
+   */
+  private static Tree transformCC(Tree t, int ccIndex) {
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L354">      log.info(&quot;transformCC in:  &quot; + t);</span>
+    }
+    //System.out.println(ccIndex);
+    // use the factories of t to create new nodes
+<span class="fc" id="L358">    TreeFactory tf = t.treeFactory();</span>
+<span class="fc" id="L359">    LabelFactory lf = t.label().labelFactory();</span>
+
+<span class="fc" id="L361">    Tree[] ccSiblings = t.children();</span>
+
+    //check if other CC
+<span class="fc" id="L364">    List&lt;Integer&gt; ccPositions = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L365" title="All 2 branches covered.">    for (int i = ccIndex + 1; i &lt; ccSiblings.length; i++) {</span>
+<span class="pc bpc" id="L366" title="3 of 4 branches missed.">      if (ccSiblings[i].value().startsWith(&quot;CC&quot;) &amp;&amp; i &lt; ccSiblings.length - 1) { // second conjunct to ensure that a CC we add isn't the last child</span>
+<span class="nc" id="L367">        ccPositions.add(Integer.valueOf(i));</span>
+      }
+    }
+
+    // a CC b c ... -&gt; (a CC b) c ...  with b not a DT
+<span class="fc" id="L372">    String beforeSibling = ccSiblings[ccIndex - 1].value();</span>
+<span class="pc bpc" id="L373" title="11 of 12 branches missed.">    if (ccIndex == 1 &amp;&amp; (beforeSibling.equals(&quot;DT&quot;) || beforeSibling.equals(&quot;JJ&quot;) || beforeSibling.equals(&quot;RB&quot;) || ! (ccSiblings[ccIndex + 1].value().equals(&quot;DT&quot;))) &amp;&amp; ! (beforeSibling.startsWith(&quot;NP&quot;)</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            || beforeSibling.equals(&quot;ADJP&quot;)</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            || beforeSibling.equals(&quot;NNS&quot;))) { // &amp;&amp; (ccSiblings.length == ccIndex + 3 || !ccPositions.isEmpty())) {  // something like &quot;soya or maize oil&quot;</span>
+<span class="nc" id="L376">      String leftHead = getHeadTag(ccSiblings[ccIndex - 1]);</span>
+      //create a new tree to be inserted as first child of t
+<span class="nc" id="L378">      Tree left = tf.newTreeNode(lf.newLabel(leftHead), null);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">      for (int i = 0; i &lt; ccIndex + 2; i++) {</span>
+<span class="nc" id="L380">        left.addChild(ccSiblings[i]);</span>
+      }
+<span class="nc bnc" id="L382" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L383">        System.out.println(&quot;print left tree&quot;);</span>
+<span class="nc" id="L384">        left.pennPrint();</span>
+<span class="nc" id="L385">        System.out.println();</span>
+      }
+
+      // remove all the children of t before ccIndex+2
+<span class="nc bnc" id="L389" title="All 2 branches missed.">      for (int i = 0; i &lt; ccIndex + 2; i++) {</span>
+<span class="nc" id="L390">        t.removeChild(0);</span>
+      }
+<span class="nc bnc" id="L392" title="All 4 branches missed.">      if (VERBOSE) { if (t.numChildren() == 0) { System.out.println(&quot;Youch! No t children&quot;); } }</span>
+
+      // if stuff after (like &quot;soya or maize oil and vegetables&quot;)
+      // we need to put the tree in another tree
+<span class="nc bnc" id="L396" title="All 2 branches missed.">      if (!ccPositions.isEmpty()) {</span>
+<span class="nc" id="L397">        boolean comma = false;</span>
+<span class="nc" id="L398">        int index = ccPositions.get(0);</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (VERBOSE) {log.info(&quot;more CC index &quot; +  index);}</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (ccSiblings[index - 1].value().equals(&quot;,&quot;)) {//to handle the case of a comma (&quot;soya and maize oil, and vegetables&quot;)</span>
+<span class="nc" id="L401">          index = index - 1;</span>
+<span class="nc" id="L402">          comma = true;</span>
+        }
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (VERBOSE) {log.info(&quot;more CC index &quot; +  index);}</span>
+<span class="nc" id="L405">        String head = getHeadTag(ccSiblings[index - 1]);</span>
+
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        if (ccIndex + 2 &lt; index) {</span>
+<span class="nc" id="L408">          Tree tree = tf.newTreeNode(lf.newLabel(head), null);</span>
+<span class="nc" id="L409">          tree.addChild(0, left);</span>
+
+<span class="nc" id="L411">          int k = 1;</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">          for (int j = ccIndex+2; j&lt;index; j++) {</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (VERBOSE) ccSiblings[j].pennPrint();</span>
+<span class="nc" id="L414">            t.removeChild(0);</span>
+<span class="nc" id="L415">            tree.addChild(k, ccSiblings[j]);</span>
+<span class="nc" id="L416">            k++;</span>
+          }
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">          if (VERBOSE) {</span>
+<span class="nc" id="L420">            System.out.println(&quot;print t&quot;);</span>
+<span class="nc" id="L421">            t.pennPrint();</span>
+
+<span class="nc" id="L423">            System.out.println(&quot;print tree&quot;);</span>
+<span class="nc" id="L424">            tree.pennPrint();</span>
+<span class="nc" id="L425">            System.out.println();</span>
+          }
+<span class="nc" id="L427">          t.addChild(0, tree);</span>
+<span class="nc" id="L428">        } else {</span>
+<span class="nc" id="L429">          t.addChild(0, left);</span>
+        }
+
+<span class="nc" id="L432">        Tree rightTree = tf.newTreeNode(lf.newLabel(&quot;NP&quot;), null);</span>
+<span class="nc" id="L433">        int start = 2;</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        if (comma) {</span>
+<span class="nc" id="L435">          start++;</span>
+        }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        while (start &lt; t.numChildren()) {</span>
+<span class="nc" id="L438">          Tree sib = t.getChild(start);</span>
+<span class="nc" id="L439">          t.removeChild(start);</span>
+<span class="nc" id="L440">          rightTree.addChild(sib);</span>
+<span class="nc" id="L441">        }</span>
+<span class="nc" id="L442">        t.addChild(rightTree);</span>
+<span class="nc" id="L443">      } else {</span>
+<span class="nc" id="L444">        t.addChild(0, left);</span>
+      }
+<span class="nc" id="L446">    }</span>
+    // DT a CC b c -&gt; DT (a CC b) c
+<span class="pc bpc" id="L448" title="11 of 12 branches missed.">    else if (ccIndex == 2 &amp;&amp; ccSiblings[0].value().startsWith(&quot;DT&quot;) &amp;&amp; !ccSiblings[ccIndex - 1].value().equals(&quot;NNS&quot;) &amp;&amp; (ccSiblings.length == 5 || (!ccPositions.isEmpty() &amp;&amp; ccPositions.get(0) == 5))) {</span>
+<span class="nc" id="L449">      String head = getHeadTag(ccSiblings[ccIndex - 1]);</span>
+      //create a new tree to be inserted as second child of t (after the determiner
+<span class="nc" id="L451">      Tree child = tf.newTreeNode(lf.newLabel(head), null);</span>
+
+<span class="nc bnc" id="L453" title="All 2 branches missed.">      for (int i = 1; i &lt; ccIndex + 2; i++) {</span>
+<span class="nc" id="L454">        child.addChild(ccSiblings[i]);</span>
+      }
+<span class="nc bnc" id="L456" title="All 4 branches missed.">      if (VERBOSE) { if (child.numChildren() == 0) { System.out.println(&quot;Youch! No child children&quot;); } }</span>
+
+      // remove all the children of t between the determiner and ccIndex+2
+      //System.out.println(&quot;print left tree&quot;);
+      //child.pennPrint();
+
+<span class="nc bnc" id="L462" title="All 2 branches missed.">      for (int i = 1; i &lt; ccIndex + 2; i++) {</span>
+<span class="nc" id="L463">        t.removeChild(1);</span>
+      }
+
+<span class="nc" id="L466">      t.addChild(1, child);</span>
+<span class="nc" id="L467">    }</span>
+
+    // ... a, b CC c ... -&gt; ... (a, b CC c) ...
+<span class="pc bpc" id="L470" title="4 of 6 branches missed.">    else if (ccIndex &gt; 2 &amp;&amp; ccSiblings[ccIndex - 2].value().equals(&quot;,&quot;) &amp;&amp; !ccSiblings[ccIndex - 1].value().equals(&quot;NNS&quot;)) {</span>
+<span class="nc" id="L471">      String head = getHeadTag(ccSiblings[ccIndex - 1]);</span>
+<span class="nc" id="L472">      Tree child = tf.newTreeNode(lf.newLabel(head), null);</span>
+
+<span class="nc bnc" id="L474" title="All 2 branches missed.">      for (int i = ccIndex - 3; i &lt; ccIndex + 2; i++) {</span>
+<span class="nc" id="L475">        child.addChild(ccSiblings[i]);</span>
+      }
+<span class="nc bnc" id="L477" title="All 4 branches missed.">      if (VERBOSE) { if (child.numChildren() == 0) { System.out.println(&quot;Youch! No child children&quot;); } }</span>
+
+<span class="nc" id="L479">      int i = ccIndex - 4;</span>
+<span class="nc bnc" id="L480" title="All 4 branches missed.">      while (i &gt; 0 &amp;&amp; ccSiblings[i].value().equals(&quot;,&quot;)) {</span>
+<span class="nc" id="L481">        child.addChild(0, ccSiblings[i]);    // add the comma</span>
+<span class="nc" id="L482">        child.addChild(0, ccSiblings[i - 1]);  // add the word before the comma</span>
+<span class="nc" id="L483">        i = i - 2;</span>
+      }
+
+<span class="nc bnc" id="L486" title="All 2 branches missed.">      if (i &lt; 0) {</span>
+<span class="nc" id="L487">        i = -1;</span>
+      }
+
+      // remove the old children
+<span class="nc bnc" id="L491" title="All 2 branches missed.">      for (int j = i + 1; j &lt; ccIndex + 2; j++) {</span>
+<span class="nc" id="L492">        t.removeChild(i + 1);</span>
+      }
+      // put the new tree
+<span class="nc" id="L495">      t.addChild(i + 1, child);</span>
+<span class="nc" id="L496">    }</span>
+
+    // something like &quot;the new phone book and tour guide&quot; -&gt; multiple heads
+    // we want (NP the new phone book) (CC and) (NP tour guide)
+    else {
+<span class="fc" id="L501">      boolean commaLeft = false;</span>
+<span class="fc" id="L502">      boolean commaRight = false;</span>
+<span class="fc" id="L503">      boolean preconj = false;</span>
+<span class="fc" id="L504">      int indexBegin = 0;</span>
+<span class="fc" id="L505">      Tree conjT = tf.newTreeNode(lf.newLabel(&quot;CC&quot;), null);</span>
+
+      // create the left tree
+<span class="fc" id="L508">      String leftHead = getHeadTag(ccSiblings[ccIndex - 1]);</span>
+<span class="fc" id="L509">      Tree left = tf.newTreeNode(lf.newLabel(leftHead), null);</span>
+
+
+      // handle the case of a preconjunct (either, both, neither)
+<span class="fc" id="L513">      Tree first = ccSiblings[0];</span>
+<span class="fc" id="L514">      String leaf = first.firstChild().value().toLowerCase();</span>
+<span class="pc bpc" id="L515" title="3 of 6 branches missed.">      if (leaf.equals(&quot;either&quot;) || leaf.equals(&quot;neither&quot;) || leaf.equals(&quot;both&quot;)) {</span>
+<span class="nc" id="L516">        preconj = true;</span>
+<span class="nc" id="L517">        indexBegin = 1;</span>
+<span class="nc" id="L518">        conjT.addChild(first.firstChild());</span>
+      }
+
+<span class="fc bfc" id="L521" title="All 2 branches covered.">      for (int i = indexBegin; i &lt; ccIndex - 1; i++) {</span>
+<span class="fc" id="L522">        left.addChild(ccSiblings[i]);</span>
+      }
+      // handle the case of a comma (&quot;GM soya and maize, and food ingredients&quot;)
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">      if (ccSiblings[ccIndex - 1].value().equals(&quot;,&quot;)) {</span>
+<span class="nc" id="L526">        commaLeft = true;</span>
+      } else {
+<span class="fc" id="L528">        left.addChild(ccSiblings[ccIndex - 1]);</span>
+      }
+
+      // create the CC tree
+<span class="fc" id="L532">      Tree cc = ccSiblings[ccIndex];</span>
+
+      // create the right tree
+      int nextCC;
+<span class="pc bpc" id="L536" title="1 of 2 branches missed.">      if (ccPositions.isEmpty()) {</span>
+<span class="fc" id="L537">        nextCC = ccSiblings.length;</span>
+      } else {
+<span class="nc" id="L539">        nextCC = ccPositions.get(0);</span>
+      }
+<span class="fc" id="L541">      String rightHead = getHeadTag(ccSiblings[nextCC - 1]);</span>
+<span class="fc" id="L542">      Tree right = tf.newTreeNode(lf.newLabel(rightHead), null);</span>
+<span class="fc bfc" id="L543" title="All 2 branches covered.">      for (int i = ccIndex + 1; i &lt; nextCC - 1; i++) {</span>
+<span class="fc" id="L544">        right.addChild(ccSiblings[i]);</span>
+      }
+      // handle the case of a comma (&quot;GM soya and maize, and food ingredients&quot;)
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">      if (ccSiblings[nextCC - 1].value().equals(&quot;,&quot;)) {</span>
+<span class="nc" id="L548">        commaRight = true;</span>
+      } else {
+<span class="fc" id="L550">        right.addChild(ccSiblings[nextCC - 1]);</span>
+      }
+
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        if (left.numChildren() == 0) { System.out.println(&quot;Youch! No left children&quot;); }</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        if (right.numChildren() == 0) { System.out.println(&quot;Youch! No right children&quot;); }</span>
+      }
+
+      // put trees together in old t, first we remove the old nodes
+<span class="fc bfc" id="L559" title="All 2 branches covered.">      for (int i = 0; i &lt; nextCC; i++) {</span>
+<span class="fc" id="L560">        t.removeChild(0);</span>
+      }
+<span class="pc bpc" id="L562" title="1 of 2 branches missed.">      if (!ccPositions.isEmpty()) { // need an extra level</span>
+<span class="nc" id="L563">        Tree tree = tf.newTreeNode(lf.newLabel(&quot;NP&quot;), null);</span>
+
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        if (preconj) {</span>
+<span class="nc" id="L566">          tree.addChild(conjT);</span>
+        }
+<span class="nc bnc" id="L568" title="All 2 branches missed.">        if (left.numChildren() &gt; 0) {</span>
+<span class="nc" id="L569">          tree.addChild(left);</span>
+        }
+<span class="nc bnc" id="L571" title="All 2 branches missed.">        if (commaLeft) {</span>
+<span class="nc" id="L572">          tree.addChild(ccSiblings[ccIndex - 1]);</span>
+        }
+<span class="nc" id="L574">        tree.addChild(cc);</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">        if (right.numChildren() &gt; 0) {</span>
+<span class="nc" id="L576">          tree.addChild(right);</span>
+        }
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        if (commaRight) {</span>
+<span class="nc" id="L579">          t.addChild(0, ccSiblings[nextCC - 1]);</span>
+        }
+<span class="nc" id="L581">        t.addChild(0, tree);</span>
+<span class="nc" id="L582">      } else {</span>
+<span class="pc bpc" id="L583" title="1 of 2 branches missed.">        if (preconj) {</span>
+<span class="nc" id="L584">          t.addChild(conjT);</span>
+        }
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">        if (left.numChildren() &gt; 0) {</span>
+<span class="fc" id="L587">          t.addChild(left);</span>
+        }
+<span class="pc bpc" id="L589" title="1 of 2 branches missed.">        if (commaLeft) {</span>
+<span class="nc" id="L590">          t.addChild(ccSiblings[ccIndex - 1]);</span>
+        }
+<span class="fc" id="L592">        t.addChild(cc);</span>
+<span class="pc bpc" id="L593" title="1 of 2 branches missed.">        if (right.numChildren() &gt; 0) {</span>
+<span class="fc" id="L594">          t.addChild(right);</span>
+        }
+<span class="pc bpc" id="L596" title="1 of 2 branches missed.">        if (commaRight) {</span>
+<span class="nc" id="L597">          t.addChild(ccSiblings[nextCC - 1]);</span>
+        }
+      }
+    }
+
+<span class="pc bpc" id="L602" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L603">      log.info(&quot;transformCC out: &quot; + t);</span>
+    }
+<span class="fc" id="L605">    return t;</span>
+  }
+
+  private static boolean notNP(List&lt;Tree&gt; children, int ccIndex) {
+<span class="fc bfc" id="L609" title="All 2 branches covered.">    for (int i = ccIndex, sz = children.size(); i &lt; sz; i++) {</span>
+<span class="fc bfc" id="L610" title="All 2 branches covered.">      if (children.get(i).value().startsWith(&quot;NP&quot;)) {</span>
+<span class="fc" id="L611">        return false;</span>
+      }
+    }
+<span class="fc" id="L614">    return true;</span>
+  }
+
+  /*
+   * Given a tree t, if this tree contains a CC inside a NP followed by 2 nodes
+   * (i.e. we have a flat structure that will not work for the dependencies),
+   * it will call transform CC on the NP containing the CC and the index of the
+   * CC, and then return the root of the whole transformed tree.
+   * If it finds no such tree, this method returns null.
+   */
+  private static Tree findCCparent(Tree t, Tree root) {
+<span class="fc bfc" id="L625" title="All 2 branches covered.">    if (t.isPreTerminal()) {</span>
+<span class="fc bfc" id="L626" title="All 2 branches covered.">      if (t.value().startsWith(&quot;CC&quot;)) {</span>
+<span class="fc" id="L627">        Tree parent = t.parent(root);</span>
+<span class="pc bpc" id="L628" title="1 of 4 branches missed.">        if (parent != null &amp;&amp; parent.value().startsWith(&quot;NP&quot;)) {</span>
+<span class="fc" id="L629">          List&lt;Tree&gt; children = parent.getChildrenAsList();</span>
+          //System.out.println(children);
+<span class="fc" id="L631">          int ccIndex = children.indexOf(t);</span>
+<span class="pc bpc" id="L632" title="3 of 10 branches missed.">          if (children.size() &gt; ccIndex + 2 &amp;&amp; notNP(children, ccIndex) &amp;&amp; ccIndex != 0 &amp;&amp; (ccIndex == children.size() - 1 || !children.get(ccIndex+1).value().startsWith(&quot;CC&quot;))) {</span>
+<span class="fc" id="L633">            transformCC(parent, ccIndex);</span>
+<span class="pc bpc" id="L634" title="1 of 2 branches missed.">            if (VERBOSE) {</span>
+<span class="nc" id="L635">              log.info(&quot;After transformCC:             &quot; + root);</span>
+            }
+<span class="fc" id="L637">            return root;</span>
+          }
+        }
+<span class="fc" id="L640">      }</span>
+    } else {
+<span class="fc bfc" id="L642" title="All 2 branches covered.">      for (Tree child : t.getChildrenAsList()) {</span>
+<span class="fc" id="L643">        Tree cur = findCCparent(child, root);</span>
+<span class="fc bfc" id="L644" title="All 2 branches covered.">        if (cur != null) {</span>
+<span class="fc" id="L645">          return cur;</span>
+        }
+<span class="fc" id="L647">      }</span>
+    }
+<span class="fc" id="L649">    return null;</span>
+  }
+
+  /**
+   * Multi-word expression patterns
+   */
+<span class="fc" id="L655">  private static TregexPattern[] MWE_PATTERNS = {</span>
+<span class="fc" id="L656">    TregexPattern.compile(&quot;@CONJP &lt;1 (RB=node1 &lt; /^(?i)as$/) &lt;2 (RB=node2 &lt; /^(?i)well$/) &lt;- (IN=node3 &lt; /^(?i)as$/)&quot;), //as well as</span>
+<span class="fc" id="L657">    TregexPattern.compile(&quot;@ADVP|CONJP &lt;1 (RB=node1 &lt; /^(?i)as$/) &lt;- (IN|RB=node2 &lt; /^(?i)well$/)&quot;), //as well</span>
+<span class="fc" id="L658">    TregexPattern.compile(&quot;@PP &lt; ((JJ=node1 &lt; /^(?i)such$/) $+ (IN=node2 &lt; /^(?i)as$/))&quot;), //such as</span>
+<span class="fc" id="L659">    TregexPattern.compile(&quot;@PP &lt; ((JJ|IN=node1 &lt; /^(?i)due$/) $+ (IN|TO=node2 &lt; /^(?i)to$/))&quot;), //due to </span>
+<span class="fc" id="L660">    TregexPattern.compile(&quot;@PP|CONJP &lt; ((IN|RB=node1 &lt; /^(?i)(because|instead)$/) $+ (IN=node2 &lt; of))&quot;), //because of/instead of </span>
+<span class="fc" id="L661">    TregexPattern.compile(&quot;@ADVP|SBAR &lt; ((IN|RB=node1 &lt; /^(?i)in$/) $+ (NN=node2 &lt; /^(?i)case$/))&quot;), //in case</span>
+<span class="fc" id="L662">    TregexPattern.compile(&quot;@ADVP|PP &lt; ((IN|RB=node1 &lt; /^(?i)of$/) $+ (NN|RB=node2 &lt; /^(?i)course$/))&quot;), //of course</span>
+<span class="fc" id="L663">    TregexPattern.compile(&quot;@SBAR|PP &lt; ((IN|RB=node1 &lt; /^(?i)in$/) $+ (NN|NP|RB=node2 [&lt; /^(?i)order$/ | &lt;: (NN &lt; /^(?i)order$/)]))&quot;), //in order</span>
+<span class="fc" id="L664">    TregexPattern.compile(&quot;@PP|CONJP|SBAR &lt; ((IN|RB=node1 &lt; /^(?i)rather$/) $+ (IN=node2 &lt; /^(?i)than$/))&quot;), //rather than</span>
+<span class="fc" id="L665">    TregexPattern.compile(&quot;@CONJP &lt; ((IN|RB=node1 &lt; /^(?i)not$/) $+ (TO=node2 &lt; /^(?i)to$/ $+ (VB|RB=node3 &lt; /^(?i)mention$/)))&quot;), //not to mention</span>
+<span class="fc" id="L666">    TregexPattern.compile(&quot;@PP|SBAR &lt; ((JJ|IN|RB=node1 &lt; /^(?i)so$/) $+ (IN|TO=node2 &lt; /^(?i)that$/))&quot;), //so that </span>
+<span class="fc" id="L667">    TregexPattern.compile(&quot;@SBAR &lt; ((IN|RB=node1 &lt; /^(?i)as$/) $+ (IN=node2 &lt; /^(?i)if$/))&quot;), //as if</span>
+<span class="fc" id="L668">    TregexPattern.compile(&quot;@PP &lt; ((JJ|RB=node1 &lt; /^(?i)prior$/) $+ (TO|IN=node2 &lt; /^(?i)to$/))&quot;), //prior to</span>
+<span class="fc" id="L669">    TregexPattern.compile(&quot;@PP &lt; ((IN=node1 &lt; /^(?i)as$/) $+ (TO|IN=node2 &lt; /^(?i)to$/))&quot;), //as to</span>
+<span class="fc" id="L670">    TregexPattern.compile(&quot;@ADVP &lt; ((RB|NN=node1 &lt; /^(?i)kind$/) $+ (IN|RB=node2 &lt; /^(?i)of$/))&quot;), //kind of</span>
+<span class="fc" id="L671">    TregexPattern.compile(&quot;@SBAR &lt; ((IN|RB=node1 &lt; /^(?i)whether$/) $+ (CC=node2 &lt; /^(?i)or$/ $+ (RB=node3 &lt; /^(?i)not$/)))&quot;), //whether or not</span>
+<span class="fc" id="L672">    TregexPattern.compile(&quot;@CONJP &lt; ((IN=node1 &lt; /^(?i)as$/) $+ (VBN=node2 &lt; /^(?i)opposed$/ $+ (TO|IN=node3 &lt; /^(?i)to$/)))&quot;), //as opposed to</span>
+<span class="fc" id="L673">    TregexPattern.compile(&quot;@ADVP|CONJP &lt; ((VB|RB|VBD=node1 &lt; /^(?i)let$/) $+ (RB|JJ=node2 &lt; /^(?i)alone$/))&quot;), //let alone</span>
+    //TODO: &quot;so as to&quot;
+<span class="fc" id="L675">    TregexPattern.compile(&quot;@ADVP|PP &lt; ((IN|RB=node1 &lt; /^(?i)in$/) $+ (IN|NP|PP|RB|ADVP=node2 [&lt; /^(?i)between$/ | &lt;: (IN|RB &lt; /^(?i)between$/)]))&quot;), //in between</span>
+<span class="fc" id="L676">    TregexPattern.compile(&quot;@ADVP|QP|ADJP &lt; ((DT|RB=node1 &lt; /^(?i)all$/) $+ (CC|RB|IN=node2 &lt; /^(?i)but$/))&quot;), //all but</span>
+<span class="fc" id="L677">    TregexPattern.compile(&quot;@ADVP|INTJ &lt; ((NN|DT|RB=node1 &lt; /^(?i)that$/) $+ (VBZ|RB=node2 &lt; /^(?i)is$/))&quot;), //that is</span>
+<span class="fc" id="L678">    TregexPattern.compile(&quot;@WHADVP &lt; ((WRB=node1 &lt; /^(?i:how)$/) $+ (VB=node2 &lt; /^(?i)come$/))&quot;), //how come</span>
+<span class="fc" id="L679">    TregexPattern.compile(&quot;@VP &lt; ((VBD=node1 &lt; had|'d) $+ (@PRT|ADVP=node2 &lt;: (RBR &lt; /^(?i)better$/)))&quot;), //had better</span>
+<span class="fc" id="L680">    TregexPattern.compile(&quot;@QP|XS &lt; ((JJR|RBR|IN=node1 &lt; /^(?i)(more|less)$/) $+ (IN=node2 &lt; /^(?i)than$/))&quot;), //more/less than</span>
+<span class="fc" id="L681">    TregexPattern.compile(&quot;@QP &lt; ((JJR|RBR|IN=node1 &lt; /^(?i)up$/) $+ (IN|TO=node2 &lt; /^(?i)to$/))&quot;), //up to</span>
+<span class="fc" id="L682">    TregexPattern.compile(&quot;@S|SQ|VP|ADVP|PP &lt; (@ADVP &lt; ((IN|RB=node1 &lt; /^(?i)at$/) $+ (JJS|RBS=node2 &lt; /^(?i)least$/)) !$+ (RB &lt; /(?i)(once|twice)/))&quot;), //at least</span>
+
+  };
+  
+<span class="fc" id="L686">  private static TsurgeonPattern MWE_OPERATION = Tsurgeon.parseOperation(&quot;[createSubtree MWE node1 node2] [if exists node3 move node3 $- node2]&quot;);</span>
+  
+<span class="fc" id="L688">  private static TregexPattern ACCORDING_TO_PATTERN = TregexPattern.compile(&quot;PP=pp1 &lt; (VBG=node1 &lt; /^(?i)according$/ $+ (PP=pp2 &lt; (TO|IN=node2 &lt; to)))&quot;);</span>
+<span class="fc" id="L689">  private static TsurgeonPattern ACCORDING_TO_OPERATION = Tsurgeon.parseOperation(&quot;[createSubtree MWE node1] [move node2 $- node1] [excise pp2 pp2]&quot;);</span>
+
+  /* &quot;but also&quot; is not a MWE, so break up the CONJP. */ 
+<span class="fc" id="L692">  private static TregexPattern BUT_ALSO_PATTERN = TregexPattern.compile(&quot;CONJP=conjp &lt; (CC=cc &lt; but) &lt; (RB=rb &lt; also) ?$+ (__=nextNode &lt; (__ &lt; __))&quot;);</span>
+<span class="fc" id="L693">  private static TsurgeonPattern BUT_ALSO_OPERATION = Tsurgeon.parseOperation(&quot;[move cc $- conjp] [move rb $- cc] [if exists nextNode move rb &gt;1 nextNode] [createSubtree ADVP rb] [delete conjp]&quot;);</span>
+
+  /* at least / at most / at best / at worst / ... should be treated as if &quot;at&quot;
+     was a preposition and the RBS was a noun. Assumes that the MWE &quot;at least&quot;
+     has already been extracted. */
+<span class="fc" id="L698">  private static TregexPattern AT_RBS_PATTERN = TregexPattern.compile(&quot;@ADVP|QP &lt; ((IN|RB=node1 &lt; /^(?i)at$/) $+ (JJS|RBS=node2))&quot;);</span>
+<span class="fc" id="L699">  private static TsurgeonPattern AT_RBS_OPERATION = Tsurgeon.parseOperation(&quot;[relabel node1 IN] [createSubtree ADVP node1] [move node2 $- node1] [createSubtree NP node2]&quot;);</span>
+
+  /* at all should be treated like a PP. */
+<span class="fc" id="L702">  private static TregexPattern AT_ALL_PATTERN = TregexPattern.compile(&quot;@ADVP=head &lt; (RB|IN=node1 &lt; /^(?i)at$/ $+ (RB|DT=node2 &lt; /^(?i)all$/))&quot;);</span>
+<span class="fc" id="L703">  private static TsurgeonPattern AT_ALL_OPERATION = Tsurgeon.parseOperation(&quot;[relabel head PP] [relabel node1 IN] [createSubtree NP node2]&quot;);</span>
+
+  /**
+   * Puts all multi-word expressions below a single constituent labeled &quot;MWE&quot;.
+   * Patterns for multi-word expressions are defined in MWE_PATTERNS.
+   */
+  public static Tree MWETransform(Tree t) {
+<span class="fc bfc" id="L710" title="All 2 branches covered.">    for (TregexPattern p: MWE_PATTERNS) {</span>
+<span class="fc" id="L711">      Tsurgeon.processPattern(p, MWE_OPERATION, t);</span>
+    }
+    
+<span class="fc" id="L714">    Tsurgeon.processPattern(ACCORDING_TO_PATTERN, ACCORDING_TO_OPERATION, t);</span>
+<span class="fc" id="L715">    Tsurgeon.processPattern(BUT_ALSO_PATTERN, BUT_ALSO_OPERATION, t);</span>
+<span class="fc" id="L716">    Tsurgeon.processPattern(AT_RBS_PATTERN, AT_RBS_OPERATION, t);</span>
+<span class="fc" id="L717">    Tsurgeon.processPattern(AT_ALL_PATTERN, AT_ALL_OPERATION, t);</span>
+
+<span class="fc" id="L719">    return t;</span>
+  }
+
+  
+<span class="fc" id="L723">  private static TregexPattern FLAT_PREP_CC_PATTERN = TregexPattern.compile(&quot;PP &lt;, (/^(IN|TO)$/=p1 $+ (CC=cc $+ /^(IN|TO)$/=p2))&quot;);</span>
+<span class="fc" id="L724">  private static TsurgeonPattern FLAT_PREP_CC_OPERATION = Tsurgeon.parseOperation(&quot;[createSubtree PCONJP p1 cc] [move p2 $- cc]&quot;);</span>
+  
+  public static Tree prepCCTransform(Tree t) {
+    
+<span class="fc" id="L728">    Tsurgeon.processPattern(FLAT_PREP_CC_PATTERN, FLAT_PREP_CC_OPERATION, t);</span>
+
+<span class="fc" id="L730">    return t;</span>
+  }
+  
+  public static void main(String[] args) {
+
+<span class="nc" id="L735">    CoordinationTransformer transformer = new CoordinationTransformer(null);</span>
+<span class="nc" id="L736">    Treebank tb = new MemoryTreebank();</span>
+<span class="nc" id="L737">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L738">    String treeFileName = props.getProperty(&quot;treeFile&quot;);</span>
+
+<span class="nc bnc" id="L740" title="All 2 branches missed.">    if (treeFileName != null) {</span>
+      try {
+<span class="nc" id="L742">        TreeReader tr = new PennTreeReader(new BufferedReader(new InputStreamReader(new FileInputStream(treeFileName))), new LabeledScoredTreeFactory());</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        for (Tree t ; (t = tr.readTree()) != null; ) {</span>
+<span class="nc" id="L744">          tb.add(t);</span>
+        }
+<span class="nc" id="L746">      } catch (IOException e) {</span>
+<span class="nc" id="L747">        throw new RuntimeException(&quot;File problem: &quot; + e);</span>
+<span class="nc" id="L748">      }</span>
+    }
+
+<span class="nc bnc" id="L751" title="All 2 branches missed.">    for (Tree t : tb) {</span>
+<span class="nc" id="L752">      System.out.println(&quot;Original tree&quot;);</span>
+<span class="nc" id="L753">      t.pennPrint();</span>
+<span class="nc" id="L754">      System.out.println();</span>
+<span class="nc" id="L755">      System.out.println(&quot;Tree transformed&quot;);</span>
+<span class="nc" id="L756">      Tree tree = transformer.transformTree(t);</span>
+<span class="nc" id="L757">      tree.pennPrint();</span>
+<span class="nc" id="L758">      System.out.println();</span>
+<span class="nc" id="L759">      System.out.println(&quot;----------------------------&quot;);</span>
+<span class="nc" id="L760">    }</span>
+<span class="nc" id="L761">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,704 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TreeBinarizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">TreeBinarizer.java</span></div><h1>TreeBinarizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.*;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.stats.ClassicCounter;
+
+import java.util.*;
+import java.io.Reader;
+
+/**
+ * Binarizes trees in such a way that head-argument structure is respected.
+ * Looks only at the value of input tree nodes.
+ * Produces LSTrees with CWT labels.  The input trees have to have CWT labels!
+ * Although the binarizer always respects heads, you can get left or right
+ * binarization by defining an appropriate HeadFinder.
+ * TODO: why not use CoreLabel if the input Tree used CoreLabel?
+ *
+ * @author Dan Klein
+ * @author Teg Grenager
+ * @author Christopher Manning
+ */
+public class TreeBinarizer implements TreeTransformer  {
+
+  /** A logger for this class */
+<span class="fc" id="L26">  private static Redwood.RedwoodChannels log = Redwood.channels(TreeBinarizer.class);</span>
+
+  private static final boolean DEBUG = false;
+
+  private HeadFinder hf;
+  private TreeFactory tf;
+  private TreebankLanguagePack tlp;
+  private boolean insideFactor; // true: DT JJ NN -&gt; DT &quot;JJ NN&quot;, false: DT &quot;DT&quot;
+  private boolean markovFactor;
+  private int markovOrder;
+  private boolean useWrappingLabels;
+  private double selectiveSplitThreshold;
+  private boolean markFinalStates;
+  private boolean unaryAtTop;
+<span class="fc" id="L40">  private boolean doSelectiveSplit = false;</span>
+<span class="fc" id="L41">  private ClassicCounter&lt;String&gt; stateCounter = new ClassicCounter&lt;&gt;();</span>
+  private final boolean simpleLabels;
+  private final boolean noRebinarization;
+
+
+  /**
+   * If this is set to true, then the binarizer will choose selectively whether or not to
+   * split states based on how many counts the states had in a previous run. These counts are
+   * stored in an internal counter, which will be added to when doSelectiveSplit is false.
+   * If passed false, this will initialize (clear) the counts.
+   * @param doSelectiveSplit Record this value and reset internal counter if false
+   */
+  public void setDoSelectiveSplit(boolean doSelectiveSplit) {
+<span class="nc" id="L54">    this.doSelectiveSplit = doSelectiveSplit;</span>
+<span class="nc bnc" id="L55" title="All 2 branches missed.">    if (!doSelectiveSplit) {</span>
+<span class="nc" id="L56">      stateCounter = new ClassicCounter&lt;&gt;();</span>
+    }
+<span class="nc" id="L58">  }</span>
+
+  private static String join(List&lt;Tree&gt; treeList) {
+<span class="nc" id="L61">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L62" title="All 2 branches missed.">    for (Iterator&lt;Tree&gt; i = treeList.iterator(); i.hasNext();) {</span>
+<span class="nc" id="L63">      Tree t = i.next();</span>
+<span class="nc" id="L64">      sb.append(t.label().value());</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">      if (i.hasNext()) {</span>
+<span class="nc" id="L66">        sb.append(&quot; &quot;);</span>
+      }
+<span class="nc" id="L68">    }</span>
+<span class="nc" id="L69">    return sb.toString();</span>
+  }
+
+  private static void localTreeString(Tree t, StringBuilder sb, int level) {
+<span class="nc" id="L73">    sb.append(&quot;\n&quot;);</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">    for (int i = 0; i &lt; level; i++) {</span>
+<span class="nc" id="L75">      sb.append(&quot;  &quot;);</span>
+    }
+<span class="nc" id="L77">    sb.append(&quot;(&quot;).append(t.label());</span>
+<span class="nc bnc" id="L78" title="All 4 branches missed.">    if (level == 0 || isSynthetic(t.label().value())) {</span>
+      // if it is synthetic, recurse
+<span class="nc bnc" id="L80" title="All 2 branches missed.">      for (int c = 0; c &lt; t.numChildren(); c++) {</span>
+<span class="nc" id="L81">        localTreeString(t.getChild(c), sb, level + 1);</span>
+      }
+    }
+<span class="nc" id="L84">    sb.append(&quot;)&quot;);</span>
+<span class="nc" id="L85">  }</span>
+
+  protected static boolean isSynthetic(String label) {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">    return label.indexOf('@') &gt; -1;</span>
+  }
+
+
+  Tree binarizeLocalTree(Tree t, int headNum, TaggedWord head) {
+    //System.out.println(&quot;Working on: &quot;+headNum+&quot; -- &quot;+t.label());
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">    if (markovFactor) {</span>
+<span class="nc" id="L95">      String topCat = t.label().value();</span>
+<span class="nc" id="L96">      Label newLabel = new CategoryWordTag(topCat, head.word(), head.tag());</span>
+<span class="nc" id="L97">      t.setLabel(newLabel);</span>
+      Tree t2;
+<span class="nc bnc" id="L99" title="All 2 branches missed.">      if (insideFactor) {</span>
+<span class="nc" id="L100">        t2 = markovInsideBinarizeLocalTreeNew(t, headNum, 0, t.numChildren() - 1, true);</span>
+        //          t2 = markovInsideBinarizeLocalTree(t, head, headNum, topCat, false);
+      } else {
+<span class="nc" id="L103">        t2 = markovOutsideBinarizeLocalTree(t, head, headNum, topCat, new LinkedList&lt;&gt;(), false);</span>
+      }
+
+      if (DEBUG) {
+        CategoryWordTag.printWordTag = false;
+        StringBuilder sb1 = new StringBuilder();
+        localTreeString(t, sb1, 0);
+        StringBuilder sb2 = new StringBuilder();
+        localTreeString(t2, sb2, 0);
+        System.out.println(&quot;Old Local Tree: &quot; + sb1);
+        System.out.println(&quot;New Local Tree: &quot; + sb2);
+        CategoryWordTag.printWordTag = true;
+      }
+<span class="nc" id="L116">      return t2;</span>
+    }
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">    if (insideFactor) {</span>
+<span class="nc" id="L119">      return insideBinarizeLocalTree(t, headNum, head, 0, 0);</span>
+    }
+<span class="fc" id="L121">    return outsideBinarizeLocalTree(t, t.label().value(), t.label().value(), headNum, head, 0, &quot;&quot;, 0, &quot;&quot;);</span>
+  }
+
+  private Tree markovOutsideBinarizeLocalTree(Tree t, TaggedWord head, int headLoc, String topCat, LinkedList&lt;Tree&gt; ll, boolean doneLeft) {
+<span class="nc" id="L125">    String word = head.word();</span>
+<span class="nc" id="L126">    String tag = head.tag();</span>
+<span class="nc" id="L127">    List&lt;Tree&gt; newChildren = new ArrayList&lt;&gt;(2);</span>
+    // call with t, headNum, head, topCat, false
+<span class="nc bnc" id="L129" title="All 2 branches missed.">    if (headLoc == 0) {</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">      if (!doneLeft) {</span>
+        // insert a unary to separate the sides
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (tlp.isStartSymbol(topCat)) {</span>
+<span class="nc" id="L133">          return markovOutsideBinarizeLocalTree(t, head, headLoc, topCat, new LinkedList&lt;&gt;(), true);</span>
+        }
+        String subLabelStr;
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        if (simpleLabels) {</span>
+<span class="nc" id="L137">          subLabelStr = &quot;@&quot; + topCat;</span>
+        } else {
+<span class="nc" id="L139">          String headStr = t.getChild(headLoc).label().value();</span>
+<span class="nc" id="L140">          subLabelStr = &quot;@&quot; + topCat + &quot;: &quot; + headStr + &quot; ]&quot;;</span>
+        }
+<span class="nc" id="L142">        Label subLabel = new CategoryWordTag(subLabelStr, word, tag);</span>
+<span class="nc" id="L143">        Tree subTree = tf.newTreeNode(subLabel, t.getChildrenAsList());</span>
+<span class="nc" id="L144">        newChildren.add(markovOutsideBinarizeLocalTree(subTree, head, headLoc, topCat, new LinkedList&lt;&gt;(), true));</span>
+<span class="nc" id="L145">        return tf.newTreeNode(t.label(), newChildren);</span>
+
+      }
+<span class="nc" id="L148">      int len = t.numChildren();</span>
+      // len = 1
+<span class="nc bnc" id="L150" title="All 2 branches missed.">      if (len == 1) {</span>
+<span class="nc" id="L151">        return tf.newTreeNode(t.label(), Collections.singletonList(t.getChild(0)));</span>
+      }
+<span class="nc" id="L153">      ll.addFirst(t.getChild(len - 1));</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">      if (ll.size() &gt; markovOrder) {</span>
+<span class="nc" id="L155">        ll.removeLast();</span>
+      }
+      // generate a right
+      String subLabelStr;
+<span class="nc bnc" id="L159" title="All 2 branches missed.">      if (simpleLabels) {</span>
+<span class="nc" id="L160">        subLabelStr = &quot;@&quot; + topCat;</span>
+      } else {
+<span class="nc" id="L162">        String headStr = t.getChild(headLoc).label().value();</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        String rightStr = (len &gt; markovOrder - 1 ? &quot;... &quot; : &quot;&quot;) + join(ll);</span>
+<span class="nc" id="L164">        subLabelStr = &quot;@&quot; + topCat + &quot;: &quot; + headStr + &quot; &quot; + rightStr;</span>
+      }
+<span class="nc" id="L166">      Label subLabel = new CategoryWordTag(subLabelStr, word, tag);</span>
+<span class="nc" id="L167">      Tree subTree = tf.newTreeNode(subLabel, t.getChildrenAsList().subList(0, len - 1));</span>
+<span class="nc" id="L168">      newChildren.add(markovOutsideBinarizeLocalTree(subTree, head, headLoc, topCat, ll, true));</span>
+<span class="nc" id="L169">      newChildren.add(t.getChild(len - 1));</span>
+<span class="nc" id="L170">      return tf.newTreeNode(t.label(), newChildren);</span>
+    }
+<span class="nc bnc" id="L172" title="All 2 branches missed.">    if (headLoc &gt; 0) {</span>
+<span class="nc" id="L173">      ll.addLast(t.getChild(0));</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">      if (ll.size() &gt; markovOrder) {</span>
+<span class="nc" id="L175">        ll.removeFirst();</span>
+      }
+      // generate a left
+      String subLabelStr;
+<span class="nc bnc" id="L179" title="All 2 branches missed.">      if (simpleLabels) {</span>
+<span class="nc" id="L180">        subLabelStr = &quot;@&quot; + topCat;</span>
+      } else {
+<span class="nc" id="L182">        String headStr = t.getChild(headLoc).label().value();</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        String leftStr = join(ll) + (headLoc &gt; markovOrder - 1 ? &quot; ...&quot; : &quot;&quot;);</span>
+<span class="nc" id="L184">        subLabelStr = &quot;@&quot; + topCat + &quot;: &quot; + leftStr + &quot; &quot; + headStr + &quot; ]&quot;;</span>
+      }
+<span class="nc" id="L186">      Label subLabel = new CategoryWordTag(subLabelStr, word, tag);</span>
+<span class="nc" id="L187">      Tree subTree = tf.newTreeNode(subLabel, t.getChildrenAsList().subList(1, t.numChildren()));</span>
+<span class="nc" id="L188">      newChildren.add(t.getChild(0));</span>
+<span class="nc" id="L189">      newChildren.add(markovOutsideBinarizeLocalTree(subTree, head, headLoc - 1, topCat, ll, false));</span>
+<span class="nc" id="L190">      return tf.newTreeNode(t.label(), newChildren);</span>
+    }
+<span class="nc" id="L192">    return t;</span>
+  }
+
+  /**
+   * Uses tail recursion. The Tree t that is passed never changes, only the indices left and right do.
+   */
+  private Tree markovInsideBinarizeLocalTreeNew(Tree t, int headLoc, int left, int right, boolean starting) {
+    Tree result;
+<span class="nc" id="L200">    Tree[] children = t.children();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">    if (starting) {</span>
+      // this local tree is a unary and doesn't need binarizing so just return it
+<span class="nc bnc" id="L203" title="All 4 branches missed.">      if (left == headLoc &amp;&amp; right == headLoc) {</span>
+<span class="nc" id="L204">        return t;</span>
+      }
+      // this local tree started off as a binary and the option to not
+      // rebinarized such trees is set
+<span class="nc bnc" id="L208" title="All 4 branches missed.">      if (noRebinarization &amp;&amp; children.length == 2) {</span>
+<span class="nc" id="L209">        return t;</span>
+      }
+<span class="nc bnc" id="L211" title="All 2 branches missed.">      if (unaryAtTop) {</span>
+        // if we're doing grammar compaction, we add the unary at the top
+<span class="nc" id="L213">        result = tf.newTreeNode(t.label(), Collections.singletonList(markovInsideBinarizeLocalTreeNew(t, headLoc, left, right, false)));</span>
+<span class="nc" id="L214">        return result;</span>
+      }
+    }
+    // otherwise, we're going to make a new tree node
+<span class="nc" id="L218">    List&lt;Tree&gt; newChildren = null;</span>
+    // left then right top down, this means we generate right then left on the way up
+<span class="nc bnc" id="L220" title="All 4 branches missed.">    if (left == headLoc &amp;&amp; right == headLoc) {</span>
+      // base case, we're done, just make a unary
+<span class="nc" id="L222">      newChildren = Collections.singletonList(children[headLoc]);</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    } else if (left &lt; headLoc) {</span>
+      // generate a left if we can
+<span class="nc" id="L225">      newChildren = new ArrayList&lt;&gt;(2);</span>
+<span class="nc" id="L226">      newChildren.add(children[left]);</span>
+<span class="nc" id="L227">      newChildren.add(markovInsideBinarizeLocalTreeNew(t, headLoc, left + 1, right, false));</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">    } else if (right &gt; headLoc) {</span>
+      // generate a right if we can
+<span class="nc" id="L230">      newChildren = new ArrayList&lt;&gt;(2);</span>
+<span class="nc" id="L231">      newChildren.add(markovInsideBinarizeLocalTreeNew(t, headLoc, left, right - 1, false));</span>
+<span class="nc" id="L232">      newChildren.add(children[right]);</span>
+    } else {
+      // this shouldn't happen, should have been caught above
+<span class="nc" id="L235">      log.info(&quot;UHOH, bad parameters passed to markovInsideBinarizeLocalTree&quot;);</span>
+    }
+    // newChildren should be set up now with two children
+    // make our new label
+    Label label;
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    if (starting) {</span>
+<span class="nc" id="L241">      label = t.label();</span>
+    } else {
+<span class="nc" id="L243">      label = makeSyntheticLabel(t, left, right, headLoc, markovOrder);</span>
+    }
+<span class="nc bnc" id="L245" title="All 2 branches missed.">    if (doSelectiveSplit) {</span>
+<span class="nc" id="L246">      double stateCount = stateCounter.getCount(label.value());</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">      if (stateCount &lt; selectiveSplitThreshold) { // too sparse, so</span>
+<span class="nc bnc" id="L248" title="All 4 branches missed.">        if (starting &amp;&amp; !unaryAtTop) {</span>
+          // if we're not compacting grammar, this is how we make sure the top state has the passive symbol
+<span class="nc" id="L250">          label = t.label();</span>
+        } else {
+<span class="nc" id="L252">          label = makeSyntheticLabel(t, left, right, headLoc, markovOrder - 1); // lower order</span>
+        }
+      }
+<span class="nc" id="L255">    } else {</span>
+      // otherwise, count up the states
+<span class="nc" id="L257">      stateCounter.incrementCount(label.value(), 1.0); // we only care about the category</span>
+    }
+    // finished making new label
+<span class="nc" id="L260">    result = tf.newTreeNode(label, newChildren);</span>
+<span class="nc" id="L261">    return result;</span>
+  }
+
+
+  private Label makeSyntheticLabel(Tree t, int left, int right, int headLoc, int markovOrder) {
+    Label result;
+<span class="nc bnc" id="L267" title="All 2 branches missed.">    if (simpleLabels) {</span>
+<span class="nc" id="L268">      result = makeSimpleSyntheticLabel(t);</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    } else if (useWrappingLabels) {</span>
+<span class="nc" id="L270">      result = makeSyntheticLabel2(t, left, right, headLoc, markovOrder);</span>
+    } else {
+<span class="nc" id="L272">      result = makeSyntheticLabel1(t, left, right, headLoc, markovOrder);</span>
+    }
+    //      System.out.println(&quot;order &quot; + markovOrder + &quot; yielded &quot; + result);
+<span class="nc" id="L275">    return result;</span>
+  }
+
+  /**
+   * Do nothing other than decorate the label with @
+   */
+  private static Label makeSimpleSyntheticLabel(Tree t) {
+<span class="nc" id="L282">    String topCat = t.label().value();</span>
+<span class="nc" id="L283">    String labelStr = &quot;@&quot; + topCat;</span>
+<span class="nc" id="L284">    String word = ((HasWord) t.label()).word();</span>
+<span class="nc" id="L285">    String tag = ((HasTag) t.label()).tag();</span>
+<span class="nc" id="L286">    return new CategoryWordTag(labelStr, word, tag);</span>
+  }
+
+  /**
+   * For a dotted rule VP^S -&amp;gt; RB VP NP PP . where VP is the head
+   * makes label of the form: @VP^S| [ RB [VP] ... PP ]
+   * where the constituent after the @ is the passive that we are building
+   * and  the constituent in brackets is the head
+   * and the brackets on the left and right indicate whether or not there
+   * are more constituents to add on those sides.
+   */
+  private static Label makeSyntheticLabel1(Tree t, int left, int right, int headLoc, int markovOrder) {
+<span class="nc" id="L298">    String topCat = t.label().value();</span>
+<span class="nc" id="L299">    Tree[] children = t.children();</span>
+    String leftString;
+<span class="nc bnc" id="L301" title="All 2 branches missed.">    if (left == 0) {</span>
+<span class="nc" id="L302">      leftString = &quot;[ &quot;;</span>
+    } else {
+<span class="nc" id="L304">      leftString = &quot; &quot;;</span>
+    }
+    String rightString;
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    if (right == children.length - 1) {</span>
+<span class="nc" id="L308">      rightString = &quot; ]&quot;;</span>
+    } else {
+<span class="nc" id="L310">      rightString = &quot; &quot;;</span>
+    }
+<span class="nc bnc" id="L312" title="All 2 branches missed.">    for (int i = 0; i &lt; markovOrder; i++) {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">      if (left &lt; headLoc) {</span>
+<span class="nc" id="L314">        leftString = leftString + children[left].label().value() + &quot; &quot;;</span>
+<span class="nc" id="L315">        left++;</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">      } else if (right &gt; headLoc) {</span>
+<span class="nc" id="L317">        rightString = &quot; &quot; + children[right].label().value() + rightString;</span>
+<span class="nc" id="L318">        right--;</span>
+      } else {
+        break;
+      }
+    }
+<span class="nc bnc" id="L323" title="All 2 branches missed.">    if (right &gt; headLoc) {</span>
+<span class="nc" id="L324">      rightString = &quot;...&quot; + rightString;</span>
+    }
+<span class="nc bnc" id="L326" title="All 2 branches missed.">    if (left &lt; headLoc) {</span>
+<span class="nc" id="L327">      leftString = leftString + &quot;...&quot;;</span>
+    }
+<span class="nc" id="L329">    String labelStr = &quot;@&quot; + topCat + &quot;| &quot; + leftString + &quot;[&quot; + t.getChild(headLoc).label().value() + &quot;]&quot; + rightString; // the head in brackets</span>
+<span class="nc" id="L330">    String word = ((HasWord) t.label()).word();</span>
+<span class="nc" id="L331">    String tag = ((HasTag) t.label()).tag();</span>
+<span class="nc" id="L332">    return new CategoryWordTag(labelStr, word, tag);</span>
+  }
+
+  /**
+   * for a dotted rule VP^S -&amp;gt; RB VP NP PP . where VP is the head
+   * makes label of the form: @VP^S| VP_ ... PP&amp;gt; RB[
+   */
+  private Label makeSyntheticLabel2(Tree t, int left, int right, int headLoc, int markovOrder) {
+<span class="nc" id="L340">    String topCat = t.label().value();</span>
+<span class="nc" id="L341">    Tree[] children = t.children();</span>
+    String finalPiece;
+<span class="nc" id="L343">    int i = 0;</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    if (markFinalStates) {</span>
+      // figure out which one is final
+<span class="nc bnc" id="L346" title="All 4 branches missed.">      if (headLoc != 0 &amp;&amp; left == 0) {</span>
+        // we are finishing on the left
+<span class="nc" id="L348">        finalPiece = &quot; &quot; + children[left].label().value() + &quot;[&quot;;</span>
+<span class="nc" id="L349">        left++;</span>
+<span class="nc" id="L350">        i++;</span>
+<span class="nc bnc" id="L351" title="All 6 branches missed.">      } else if (headLoc == 0 &amp;&amp; right &gt; headLoc &amp;&amp; right == children.length - 1) {</span>
+        // we are finishing on the right
+<span class="nc" id="L353">        finalPiece = &quot; &quot; + children[right].label().value() + &quot;]&quot;;</span>
+<span class="nc" id="L354">        right--;</span>
+<span class="nc" id="L355">        i++;</span>
+      } else {
+<span class="nc" id="L357">        finalPiece = &quot;&quot;;</span>
+      }
+    } else {
+<span class="nc" id="L360">      finalPiece = &quot;&quot;;</span>
+    }
+
+<span class="nc" id="L363">    String middlePiece = &quot;&quot;;</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">    for (; i &lt; markovOrder; i++) {</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">      if (left &lt; headLoc) {</span>
+<span class="nc" id="L366">        middlePiece = &quot; &quot; + children[left].label().value() + &quot;&lt;&quot; + middlePiece;</span>
+<span class="nc" id="L367">        left++;</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">      } else if (right &gt; headLoc) {</span>
+<span class="nc" id="L369">        middlePiece = &quot; &quot; + children[right].label().value() + &quot;&gt;&quot; + middlePiece;</span>
+<span class="nc" id="L370">        right--;</span>
+      } else {
+        break;
+      }
+    }
+<span class="nc bnc" id="L375" title="All 4 branches missed.">    if (right &gt; headLoc || left &lt; headLoc) {</span>
+<span class="nc" id="L376">      middlePiece = &quot; ...&quot; + middlePiece;</span>
+    }
+<span class="nc" id="L378">    String headStr = t.getChild(headLoc).label().value();</span>
+    // Optimize memory allocation for this next line, since these are the
+    // String's that linger.
+    // String labelStr = &quot;@&quot; + topCat + &quot;| &quot; + headStr + &quot;_&quot; + middlePiece + finalPiece;
+<span class="nc" id="L382">    int leng = 1 + 2 + 1 + topCat.length() + headStr.length() + middlePiece.length() + finalPiece.length();</span>
+<span class="nc" id="L383">    StringBuilder sb = new StringBuilder(leng);</span>
+<span class="nc" id="L384">    sb.append(&quot;@&quot;).append(topCat).append(&quot;| &quot;).append(headStr).append(&quot;_&quot;).append(middlePiece).append(finalPiece);</span>
+<span class="nc" id="L385">    String labelStr = sb.toString();</span>
+    // log.info(&quot;makeSyntheticLabel2: &quot; + labelStr);
+
+<span class="nc" id="L388">    String word = ((HasWord) t.label()).word();</span>
+<span class="nc" id="L389">    String tag = ((HasTag) t.label()).tag();</span>
+<span class="nc" id="L390">    return new CategoryWordTag(labelStr, word, tag);</span>
+  }
+
+  private Tree insideBinarizeLocalTree(Tree t, int headNum, TaggedWord head, int leftProcessed, int rightProcessed) {
+<span class="nc" id="L394">    String word = head.word();</span>
+<span class="nc" id="L395">    String tag = head.tag();</span>
+<span class="nc" id="L396">    List&lt;Tree&gt; newChildren = new ArrayList&lt;&gt;(2);      // check done</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">    if (t.numChildren() &lt;= leftProcessed + rightProcessed + 2) {</span>
+<span class="nc" id="L398">      Tree leftChild = t.getChild(leftProcessed);</span>
+<span class="nc" id="L399">      newChildren.add(leftChild);</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">      if (t.numChildren() == leftProcessed + rightProcessed + 1) {</span>
+        // unary ... so top level
+<span class="nc" id="L402">        String finalCat = t.label().value();</span>
+<span class="nc" id="L403">        return tf.newTreeNode(new CategoryWordTag(finalCat, word, tag), newChildren);</span>
+      }
+      // binary
+<span class="nc" id="L406">      Tree rightChild = t.getChild(leftProcessed + 1);</span>
+<span class="nc" id="L407">      newChildren.add(rightChild);</span>
+<span class="nc" id="L408">      String labelStr = t.label().value();</span>
+<span class="nc bnc" id="L409" title="All 4 branches missed.">      if (leftProcessed != 0 || rightProcessed != 0) {</span>
+<span class="nc" id="L410">        labelStr = (&quot;@ &quot; + leftChild.label().value() + &quot; &quot; + rightChild.label().value());</span>
+      }
+<span class="nc" id="L412">      return tf.newTreeNode(new CategoryWordTag(labelStr, word, tag), newChildren);</span>
+    }
+<span class="nc bnc" id="L414" title="All 2 branches missed.">    if (headNum &gt; leftProcessed) {</span>
+      // eat left word
+<span class="nc" id="L416">      Tree leftChild = t.getChild(leftProcessed);</span>
+<span class="nc" id="L417">      Tree rightChild = insideBinarizeLocalTree(t, headNum, head, leftProcessed + 1, rightProcessed);</span>
+<span class="nc" id="L418">      newChildren.add(leftChild);</span>
+<span class="nc" id="L419">      newChildren.add(rightChild);</span>
+<span class="nc" id="L420">      String labelStr = (&quot;@ &quot; + leftChild.label().value() + &quot; &quot; + rightChild.label().value().substring(2));</span>
+<span class="nc bnc" id="L421" title="All 4 branches missed.">      if (leftProcessed == 0 &amp;&amp; rightProcessed == 0) {</span>
+<span class="nc" id="L422">        labelStr = t.label().value();</span>
+      }
+<span class="nc" id="L424">      return tf.newTreeNode(new CategoryWordTag(labelStr, word, tag), newChildren);</span>
+    } else {
+      // eat right word
+<span class="nc" id="L427">      Tree leftChild = insideBinarizeLocalTree(t, headNum, head, leftProcessed, rightProcessed + 1);</span>
+<span class="nc" id="L428">      Tree rightChild = t.getChild(t.numChildren() - rightProcessed - 1);</span>
+<span class="nc" id="L429">      newChildren.add(leftChild);</span>
+<span class="nc" id="L430">      newChildren.add(rightChild);</span>
+<span class="nc" id="L431">      String labelStr = (&quot;@ &quot; + leftChild.label().value().substring(2) + &quot; &quot; + rightChild.label().value());</span>
+<span class="nc bnc" id="L432" title="All 4 branches missed.">      if (leftProcessed == 0 &amp;&amp; rightProcessed == 0) {</span>
+<span class="nc" id="L433">        labelStr = t.label().value();</span>
+      }
+<span class="nc" id="L435">      return tf.newTreeNode(new CategoryWordTag(labelStr, word, tag), newChildren);</span>
+    }
+  }
+
+  private Tree outsideBinarizeLocalTree(Tree t, String labelStr, String finalCat, int headNum, TaggedWord head, int leftProcessed, String leftStr, int rightProcessed, String rightStr) {
+<span class="fc" id="L440">    List&lt;Tree&gt; newChildren = new ArrayList&lt;&gt;(2);</span>
+<span class="fc" id="L441">    Label label = new CategoryWordTag(labelStr, head.word(), head.tag());</span>
+    // check if there are &lt;=2 children already
+<span class="fc bfc" id="L443" title="All 2 branches covered.">    if (t.numChildren() - leftProcessed - rightProcessed &lt;= 2) {</span>
+      // done, return
+<span class="fc" id="L445">      newChildren.add(t.getChild(leftProcessed));</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">      if (t.numChildren() - leftProcessed - rightProcessed == 2) {</span>
+<span class="fc" id="L447">        newChildren.add(t.getChild(leftProcessed + 1));</span>
+      }
+<span class="fc" id="L449">      return tf.newTreeNode(label, newChildren);</span>
+    }
+<span class="fc bfc" id="L451" title="All 2 branches covered.">    if (headNum &gt; leftProcessed) {</span>
+      // eat a left word
+<span class="fc" id="L453">      Tree leftChild = t.getChild(leftProcessed);</span>
+<span class="fc" id="L454">      String childLeftStr = leftStr + &quot; &quot; + leftChild.label().value();</span>
+      String childLabelStr;
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">      if (simpleLabels) {</span>
+<span class="fc" id="L457">        childLabelStr = &quot;@&quot; + finalCat;</span>
+      } else {
+<span class="nc" id="L459">        childLabelStr = &quot;@&quot; + finalCat + &quot; :&quot; + childLeftStr + &quot; ...&quot; + rightStr;</span>
+      }
+<span class="fc" id="L461">      Tree rightChild = outsideBinarizeLocalTree(t, childLabelStr, finalCat, headNum, head, leftProcessed + 1, childLeftStr, rightProcessed, rightStr);</span>
+<span class="fc" id="L462">      newChildren.add(leftChild);</span>
+<span class="fc" id="L463">      newChildren.add(rightChild);</span>
+<span class="fc" id="L464">      return tf.newTreeNode(label, newChildren);</span>
+    } else {
+      // eat a right word
+<span class="fc" id="L467">      Tree rightChild = t.getChild(t.numChildren() - rightProcessed - 1);</span>
+<span class="fc" id="L468">      String childRightStr = &quot; &quot; + rightChild.label().value() + rightStr;</span>
+      String childLabelStr;
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">      if (simpleLabels) {</span>
+<span class="fc" id="L471">        childLabelStr = &quot;@&quot; + finalCat;</span>
+      } else {
+<span class="nc" id="L473">        childLabelStr = &quot;@&quot; + finalCat + &quot; :&quot; + leftStr + &quot; ...&quot; + childRightStr;</span>
+      }
+<span class="fc" id="L475">      Tree leftChild = outsideBinarizeLocalTree(t, childLabelStr, finalCat, headNum, head, leftProcessed, leftStr, rightProcessed + 1, childRightStr);</span>
+<span class="fc" id="L476">      newChildren.add(leftChild);</span>
+<span class="fc" id="L477">      newChildren.add(rightChild);</span>
+<span class="fc" id="L478">      return tf.newTreeNode(label, newChildren);</span>
+    }
+  }
+
+
+  /** Binarizes the tree according to options set up in the constructor.
+   *  Does the whole tree by calling itself recursively.
+   *
+   *  @param t A tree to be binarized. The non-leaf nodes must already have
+   *    CategoryWordTag labels, with heads percolated.
+   *  @return A binary tree.
+   */
+  public Tree transformTree(Tree t) {
+    // handle null
+<span class="pc bpc" id="L492" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L493">      return null;</span>
+    }
+
+<span class="fc" id="L496">    String cat = t.label().value();</span>
+    // handle words
+<span class="fc bfc" id="L498" title="All 2 branches covered.">    if (t.isLeaf()) {</span>
+<span class="fc" id="L499">      Label label = new Word(cat);//new CategoryWordTag(cat,cat,&quot;&quot;);</span>
+<span class="fc" id="L500">      return tf.newLeaf(label);</span>
+    }
+    // handle tags
+<span class="fc bfc" id="L503" title="All 2 branches covered.">    if (t.isPreTerminal()) {</span>
+<span class="fc" id="L504">      Tree childResult = transformTree(t.getChild(0));</span>
+<span class="fc" id="L505">      String word = childResult.value();  // would be nicer if Word/CWT ??</span>
+<span class="fc" id="L506">      List&lt;Tree&gt; newChildren = new ArrayList&lt;&gt;(1);</span>
+<span class="fc" id="L507">      newChildren.add(childResult);</span>
+<span class="fc" id="L508">      return tf.newTreeNode(new CategoryWordTag(cat, word, cat), newChildren);</span>
+    }
+    // handle categories
+<span class="fc" id="L511">    Tree headChild = hf.determineHead(t);</span>
+    /*
+    System.out.println(&quot;### finding head for:&quot;);
+    t.pennPrint();
+    System.out.println(&quot;### its head is:&quot;);
+    headChild.pennPrint();
+    */
+<span class="pc bpc" id="L518" title="3 of 4 branches missed.">    if (headChild == null &amp;&amp; ! t.label().value().startsWith(tlp.startSymbol())) {</span>
+<span class="nc" id="L519">      log.info(&quot;### No head found for:&quot;);</span>
+<span class="nc" id="L520">      t.pennPrint();</span>
+    }
+<span class="fc" id="L522">    int headNum = -1;</span>
+<span class="fc" id="L523">    Tree[] kids = t.children();</span>
+<span class="fc" id="L524">    List&lt;Tree&gt; newChildren = new ArrayList&lt;&gt;(kids.length);</span>
+<span class="fc bfc" id="L525" title="All 2 branches covered.">    for (int childNum = 0; childNum &lt; kids.length; childNum++) {</span>
+<span class="fc" id="L526">      Tree child = kids[childNum];</span>
+<span class="fc" id="L527">      Tree childResult = transformTree(child);   // recursive call</span>
+<span class="fc bfc" id="L528" title="All 2 branches covered.">      if (child == headChild) {</span>
+<span class="fc" id="L529">        headNum = childNum;</span>
+      }
+<span class="fc" id="L531">      newChildren.add(childResult);</span>
+    }
+    Tree result;
+    // XXXXX UPTO HERE!!!  ALMOST DONE!!!
+<span class="fc bfc" id="L535" title="All 2 branches covered.">    if (t.label().value().startsWith(tlp.startSymbol())) {</span>
+      // handle the ROOT tree properly
+      /*
+      //CategoryWordTag label = (CategoryWordTag) t.label();
+      // binarize without the last kid and then add it back to the top tree
+      Tree lastKid = (Tree)newChildren.remove(newChildren.size()-1);
+      Tree tempTree = tf.newTreeNode(label, newChildren);
+      tempTree = binarizeLocalTree(tempTree, headNum, result.head);
+      newChildren = tempTree.getChildrenAsList();
+      newChildren.add(lastKid); // add it back
+      */
+<span class="fc" id="L546">      result = tf.newTreeNode(t.label(), newChildren); // label shouldn't have changed</span>
+    } else {
+//      CategoryWordTag headLabel = (CategoryWordTag) headChild.label();
+<span class="fc" id="L549">      String word = ((HasWord) headChild.label()).word();</span>
+<span class="fc" id="L550">      String tag = ((HasTag) headChild.label()).tag();</span>
+<span class="fc" id="L551">      Label label = new CategoryWordTag(cat, word, tag);</span>
+<span class="fc" id="L552">      result = tf.newTreeNode(label, newChildren);</span>
+      // cdm Mar 2005: invent a head so I don't have to rewrite all this
+      // code, but with the removal of TreeHeadPair, some of the rest of
+      // this should probably be rewritten too to not use this head variable
+<span class="fc" id="L556">      TaggedWord head = new TaggedWord(word, tag);</span>
+<span class="fc" id="L557">      result = binarizeLocalTree(result, headNum, head);</span>
+    }
+<span class="fc" id="L559">    return result;</span>
+  }
+
+  /**
+   * Builds a TreeBinarizer with all of the options set to simple values
+   */
+  public static TreeBinarizer simpleTreeBinarizer(HeadFinder hf, TreebankLanguagePack tlp) {
+<span class="fc" id="L566">    return new TreeBinarizer(hf, tlp, false, false, 0, false, false, 0.0, false, true, true);</span>
+  }
+
+  /** Build a custom binarizer for Trees.
+   *
+   * @param hf the HeadFinder to use in binarization
+   * @param tlp the TreebankLanguagePack to use
+   * @param insideFactor whether to do inside markovization
+   * @param markovFactor whether to markovize the binary rules
+   * @param markovOrder the markov order to use; only relevant with markovFactor=true
+   * @param useWrappingLabels whether to use state names (labels) that allow wrapping from right to left
+   * @param unaryAtTop Whether to actually materialize the unary that rewrites
+   *        a passive state to the active rule at the top of an original local
+   *        tree.  This is used only when compaction is happening
+   * @param selectiveSplitThreshold if selective split is used, this will be the threshold used to decide which state splits to keep
+   * @param markFinalStates whether or not to make the state names (labels) of the final active states distinctive
+   * @param noRebinarization if true, a node which already has exactly two children is not altered
+   */
+  public TreeBinarizer(HeadFinder hf, TreebankLanguagePack tlp,
+                       boolean insideFactor,
+                       boolean markovFactor, int markovOrder,
+                       boolean useWrappingLabels, boolean unaryAtTop,
+                       double selectiveSplitThreshold, boolean markFinalStates,
+<span class="fc" id="L589">                       boolean simpleLabels, boolean noRebinarization) {</span>
+<span class="fc" id="L590">    this.hf = hf;</span>
+<span class="fc" id="L591">    this.tlp = tlp;</span>
+<span class="fc" id="L592">    this.tf = new LabeledScoredTreeFactory(new CategoryWordTagFactory());</span>
+<span class="fc" id="L593">    this.insideFactor = insideFactor;</span>
+<span class="fc" id="L594">    this.markovFactor = markovFactor;</span>
+<span class="fc" id="L595">    this.markovOrder = markovOrder;</span>
+<span class="fc" id="L596">    this.useWrappingLabels = useWrappingLabels;</span>
+<span class="fc" id="L597">    this.unaryAtTop = unaryAtTop;</span>
+<span class="fc" id="L598">    this.selectiveSplitThreshold = selectiveSplitThreshold;</span>
+<span class="fc" id="L599">    this.markFinalStates = markFinalStates;</span>
+<span class="fc" id="L600">    this.simpleLabels = simpleLabels;</span>
+<span class="fc" id="L601">    this.noRebinarization = noRebinarization;</span>
+<span class="fc" id="L602">  }</span>
+
+
+  /** 
+   *  Lets you test out the TreeBinarizer on the command line.
+   *  This main method doesn't yet handle as many flags as one would like.
+   *  But it does have:
+   *  &lt;ul&gt;
+   *  &lt;li&gt; -tlp TreebankLanguagePack
+   *  &lt;li&gt;-tlpp TreebankLangParserParams
+   *  &lt;li&gt;-insideFactor
+   *  &lt;li&gt;-markovOrder
+   *  &lt;/ul&gt;
+   *
+   *  @param args Command line arguments: flags as above, as above followed by
+   *     treebankPath
+   */
+  public static void main(String[] args) {
+<span class="nc" id="L620">    TreebankLangParserParams tlpp = null;</span>
+    // TreebankLangParserParams tlpp = new EnglishTreebankParserParams();
+    // TreeReaderFactory trf = new LabeledScoredTreeReaderFactory();
+    // Looks like it must build CategoryWordTagFactory!!
+<span class="nc" id="L624">    TreeReaderFactory trf = in -&gt; new PennTreeReader(in,</span>
+            new LabeledScoredTreeFactory(
+                new CategoryWordTagFactory()),
+            new BobChrisTreeNormalizer());
+
+<span class="nc" id="L629">    String fileExt = &quot;mrg&quot;;</span>
+<span class="nc" id="L630">    HeadFinder hf = new ModCollinsHeadFinder();</span>
+<span class="nc" id="L631">    TreebankLanguagePack tlp = new PennTreebankLanguagePack();</span>
+<span class="nc" id="L632">    boolean insideFactor = false;</span>
+<span class="nc" id="L633">    boolean mf = false;</span>
+<span class="nc" id="L634">    int mo = 1;</span>
+<span class="nc" id="L635">    boolean uwl = false;</span>
+<span class="nc" id="L636">    boolean uat = false;</span>
+<span class="nc" id="L637">    double sst = 20.0;</span>
+<span class="nc" id="L638">    boolean mfs = false;</span>
+<span class="nc" id="L639">    boolean simpleLabels = false;</span>
+<span class="nc" id="L640">    boolean noRebinarization = false;</span>
+
+<span class="nc" id="L642">    int i = 0;</span>
+<span class="nc bnc" id="L643" title="All 4 branches missed.">    while (i &lt; args.length &amp;&amp; args[i].startsWith(&quot;-&quot;)) {</span>
+<span class="nc bnc" id="L644" title="All 4 branches missed.">      if (args[i].equalsIgnoreCase(&quot;-tlp&quot;) &amp;&amp; i + 1 &lt; args.length) {</span>
+	try {
+<span class="nc" id="L646">	  tlp = (TreebankLanguagePack) Class.forName(args[i+1]).newInstance();</span>
+<span class="nc" id="L647">	} catch (Exception e) {</span>
+<span class="nc" id="L648">	  log.info(&quot;Couldn't instantiate: &quot; + args[i+1]);</span>
+<span class="nc" id="L649">          throw new RuntimeException(e);</span>
+<span class="nc" id="L650">	}</span>
+<span class="nc" id="L651">	i++;</span>
+<span class="nc bnc" id="L652" title="All 4 branches missed.">      } else if (args[i].equalsIgnoreCase(&quot;-tlpp&quot;) &amp;&amp; i + 1 &lt; args.length) {</span>
+	try {
+<span class="nc" id="L654">	  tlpp = (TreebankLangParserParams) Class.forName(args[i+1]).newInstance();</span>
+<span class="nc" id="L655">	} catch (Exception e) {</span>
+<span class="nc" id="L656">	  log.info(&quot;Couldn't instantiate: &quot; + args[i+1]);</span>
+<span class="nc" id="L657">          throw new RuntimeException(e);</span>
+<span class="nc" id="L658">	}</span>
+<span class="nc" id="L659">	i++;</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">      } else if (args[i].equalsIgnoreCase(&quot;-insideFactor&quot;)) {</span>
+<span class="nc" id="L661">	insideFactor = true;</span>
+<span class="nc bnc" id="L662" title="All 4 branches missed.">      } else if (args[i].equalsIgnoreCase(&quot;-markovOrder&quot;) &amp;&amp; i + 1 &lt; args.length) {</span>
+<span class="nc" id="L663">        i++;</span>
+<span class="nc" id="L664">        mo = Integer.parseInt(args[i]);</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">      } else if (args[i].equalsIgnoreCase(&quot;-simpleLabels&quot;)) {</span>
+<span class="nc" id="L666">        simpleLabels = true;</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">      } else if (args[i].equalsIgnoreCase(&quot;-noRebinarization&quot;)) {</span>
+<span class="nc" id="L668">        noRebinarization = true;</span>
+      } else {
+<span class="nc" id="L670">        log.info(&quot;Unknown option:&quot; + args[i]);</span>
+      }
+<span class="nc" id="L672">      i++;</span>
+    }
+<span class="nc bnc" id="L674" title="All 2 branches missed.">    if (i &gt;= args.length) {</span>
+<span class="nc" id="L675">      log.info(&quot;usage: java TreeBinarizer [-tlpp class|-markovOrder int|...] treebankPath&quot;);</span>
+<span class="nc" id="L676">      System.exit(0);</span>
+    }
+    Treebank treebank;
+<span class="nc bnc" id="L679" title="All 2 branches missed.">    if (tlpp != null) {</span>
+<span class="nc" id="L680">      treebank = tlpp.memoryTreebank();</span>
+<span class="nc" id="L681">      tlp = tlpp.treebankLanguagePack();</span>
+<span class="nc" id="L682">      fileExt = tlp.treebankFileExtension();</span>
+<span class="nc" id="L683">      hf = tlpp.headFinder();</span>
+    } else {
+<span class="nc" id="L685">      treebank = new DiskTreebank(trf);</span>
+    }
+<span class="nc" id="L687">    treebank.loadPath(args[i], fileExt, true);</span>
+
+<span class="nc" id="L689">    TreeTransformer tt = new TreeBinarizer(hf, tlp, insideFactor, mf, mo,</span>
+					   uwl, uat, sst, mfs, 
+                                           simpleLabels, noRebinarization);
+
+<span class="nc bnc" id="L693" title="All 2 branches missed.">    for (Tree t : treebank) {</span>
+<span class="nc" id="L694">      Tree newT = tt.transformTree(t);</span>
+<span class="nc" id="L695">      System.out.println(&quot;Original tree:&quot;);</span>
+<span class="nc" id="L696">      t.pennPrint();</span>
+<span class="nc" id="L697">      System.out.println(&quot;Binarized tree:&quot;);</span>
+<span class="nc" id="L698">      newT.pennPrint();</span>
+<span class="nc" id="L699">      System.out.println();</span>
+<span class="nc" id="L700">    }</span>
+<span class="nc" id="L701">  } // end main</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

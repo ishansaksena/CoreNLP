@@ -1,0 +1,1053 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FileBackedCache.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.util</a> &gt; <span class="el_source">FileBackedCache.java</span></div><h1>FileBackedCache.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.util;
+
+import java.io.*;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.SoftReference;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.text.DecimalFormat;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+/**
+ * &lt;p&gt;
+ * A Map backed by the filesystem.
+ * The primary use-case for this class is in reading a large cache which is convenient to store on disk.
+ * The class will load subsets of data on demand; if the JVM is in danger of running out of memory, these will
+ * be dropped from memory, and re-queried from disk if requested again.
+ * For best results, make sure to set a maximum number of files (by default, any number of files can be created);
+ * and, make sure this number is the same when reading and writing to the database.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * The keys should have a consistent hash code.
+ * That is, the value of the hash code of an object should be consistent between runs of the JVM.
+ * Note that this is &lt;b&gt;not&lt;/b&gt; enforced in the specification of a hash code; in fact, in Java 7
+ * the hash code of a String may change between JVM invocations. The user is advised to be wary.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * Furthermore, note that many of the operations on this class are expensive, as they require traversing
+ *   a potentially large portion of disk, reading it into memory.
+ * Some operations, such as those requiring all the values to be enumerated, may cause a spike in memory
+ *   usage.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * This class is thread-safe, but not necessarily process-safe.
+ * If two processes write to the same block, there is no guarantee that both values will actually be written.
+ * This is very important -- &lt;b&gt;this class is a cache and not a database&lt;/b&gt;.
+ * If you care about data integrity, you should use a real database.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   The values in this map should not be modified once read -- the cache has no reliable way to pick up this change
+ *   and synchronize it with the disk.
+ *   To enforce this, the cache will cast collections to their unmodifiable counterparts -- to avoid class cast exceptions,
+ *   you should not parameterize the class with a particular type of collection
+ *   (e.g., use {@link java.util.Map} rather than {@link java.util.HashMap}).
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   The serialization behavior can be safely changed by overwriting:
+ * &lt;/p&gt;
+ *   &lt;ul&gt;
+ *     &lt;li&gt;@See FileBackedCache#newInputStream&lt;/li&gt;
+ *     &lt;li&gt;@See FileBackedCache#newOutputStream&lt;/li&gt;
+ *     &lt;li&gt;@See FileBackedCache#writeNextObject&lt;/li&gt;
+ *     &lt;li&gt;@See FileBackedCache#readNextObject&lt;/li&gt;
+ *   &lt;/ul&gt;
+ *
+ * @param &lt;KEY&gt; The key to cache by
+ * @param &lt;T&gt; The object to cache
+ *
+ * @author Gabor Angeli (angeli at cs)
+ */
+
+<span class="pc bpc" id="L71" title="1 of 2 branches missed.">public class FileBackedCache&lt;KEY extends Serializable, T&gt; implements Map&lt;KEY, T&gt;, Iterable &lt;Map.Entry&lt;KEY,T&gt;&gt; {</span>
+  //
+  // Variables
+  //
+  /** The directory the cached elements are being written to */
+  public final File cacheDir;
+
+  /** The maximum number of files to create in that directory ('buckets' in the hash map) */
+  public final int maxFiles;
+
+  /** The implementation of the mapping */
+<span class="fc" id="L82">  private final Map&lt;KEY, SoftReference&lt;T&gt;&gt; mapping = new ConcurrentHashMap&lt;&gt;();</span>
+
+  /** A reaper for soft references, to save memory on storing the keys */
+<span class="fc" id="L85">  private final ReferenceQueue&lt;T&gt; reaper = new ReferenceQueue&lt;&gt;();</span>
+
+  /**
+   * A file canonicalizer, so that we can synchronize on blocks -- static, as it should work between instances.
+   * In particular, an exception is thrown if the JVM attempts to take out two locks on a file.
+   */
+<span class="fc" id="L91">  private static final Interner&lt;File&gt; canonicalFile = new Interner&lt;&gt;();</span>
+  /** A map indicating whether the JVM holds a file lock on the given file */
+<span class="fc" id="L93">  private static final IdentityHashMap&lt;File, FileSemaphore&gt; fileLocks = Generics.newIdentityHashMap();</span>
+
+  //
+  // Constructors
+  //
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * or starting with an empty cache.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   */
+  public FileBackedCache(File directoryToCacheIn) {
+<span class="fc" id="L106">    this(directoryToCacheIn, -1);</span>
+<span class="fc" id="L107">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * or starting with an empty cache.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   * @param maxFiles The maximum number of files to store on disk
+   */
+<span class="fc" id="L116">  public FileBackedCache(File directoryToCacheIn, int maxFiles) {</span>
+    // Ensure directory exists
+<span class="fc bfc" id="L118" title="All 2 branches covered.">    if (!directoryToCacheIn.exists()) {</span>
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">      if (!directoryToCacheIn.mkdirs()) {</span>
+<span class="nc" id="L120">        throw new IllegalArgumentException(&quot;Could not create cache directory: &quot; + directoryToCacheIn);</span>
+      }
+    }
+    // Ensure directory is directory
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">    if (!directoryToCacheIn.isDirectory()) {</span>
+<span class="nc" id="L125">      throw new IllegalArgumentException(&quot;Cache directory must be a directory: &quot; + directoryToCacheIn);</span>
+    }
+    // Ensure directory is writable
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">    if (!directoryToCacheIn.canRead()) {</span>
+<span class="nc" id="L129">      throw new IllegalArgumentException(&quot;Cannot read cache directory: &quot; + directoryToCacheIn);</span>
+    }
+    // Save cache directory
+<span class="fc" id="L132">    this.cacheDir = directoryToCacheIn;</span>
+<span class="fc" id="L133">    this.maxFiles = maxFiles;</span>
+    // Start cache cleaner
+    /*
+    Occasionally clean up the cache, removing keys which have been garbage collected.
+   */
+<span class="fc" id="L138">    Thread mappingCleaner = new Thread() {</span>
+      @SuppressWarnings({&quot;unchecked&quot;, &quot;StatementWithEmptyBody&quot;, &quot;EmptyCatchBlock&quot;, &quot;InfiniteLoopStatement&quot;})
+      @Override
+      public void run() {
+        while (true) {
+          try {
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">            if (reaper.poll() != null) {</span>
+              // Clear reference queue
+<span class="nc bnc" id="L146" title="All 2 branches missed.">              while (reaper.poll() != null) {</span>
+              }
+              // GC stale cache entries
+<span class="nc" id="L149">              List&lt;KEY&gt; toRemove = Generics.newLinkedList();</span>
+              try {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">                for (Entry&lt;KEY, SoftReference&lt;T&gt;&gt; entry : mapping.entrySet()) {</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                  if (entry.getValue().get() == null) {</span>
+                    // Remove stale SoftReference
+<span class="nc" id="L154">                    toRemove.add(entry.getKey());</span>
+                  }
+<span class="nc" id="L156">                }</span>
+<span class="nc" id="L157">              } catch (ConcurrentModificationException e) {</span>
+                // Do nothing --
+<span class="nc" id="L159">              }</span>
+              // Actually remove entries
+<span class="nc bnc" id="L161" title="All 2 branches missed.">              for (KEY key : toRemove) {</span>
+<span class="nc" id="L162">                mapping.remove(key);</span>
+<span class="nc" id="L163">              }</span>
+            }
+            // Sleep a bit
+<span class="fc" id="L166">            Thread.sleep(100);</span>
+<span class="nc" id="L167">          } catch (InterruptedException e) {</span>
+<span class="nc" id="L168">            throw new RuntimeInterruptedException(e);</span>
+<span class="fc" id="L169">          }</span>
+        }
+      }
+    };
+<span class="fc" id="L173">    mappingCleaner.setDaemon(true);</span>
+<span class="fc" id="L174">    mappingCleaner.start();</span>
+<span class="fc" id="L175">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * with the initial mapping added, or starting with only the initial mapping.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   * @param initialMapping The initial elements to place into the cache.
+   */
+  public FileBackedCache(File directoryToCacheIn, Map&lt;KEY, T&gt; initialMapping) {
+<span class="nc" id="L185">    this(directoryToCacheIn, -1);</span>
+<span class="nc" id="L186">    putAll(initialMapping);</span>
+<span class="nc" id="L187">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * with the initial mapping added, or starting with only the initial mapping.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   * @param maxFiles The maximum number of files to store on disk
+   * @param initialMapping The initial elements to place into the cache.
+   */
+  public FileBackedCache(File directoryToCacheIn, Map&lt;KEY, T&gt; initialMapping, int maxFiles) {
+<span class="nc" id="L198">    this(directoryToCacheIn, maxFiles);</span>
+<span class="nc" id="L199">    putAll(initialMapping);</span>
+<span class="nc" id="L200">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * or starting with an empty cache.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   */
+  public FileBackedCache(String directoryToCacheIn) {
+<span class="nc" id="L209">    this(new File(directoryToCacheIn), -1);</span>
+<span class="nc" id="L210">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * or starting with an empty cache.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   * @param maxFiles The maximum number of files to store on disk
+   */
+  public FileBackedCache(String directoryToCacheIn, int maxFiles) {
+<span class="nc" id="L220">    this(new File(directoryToCacheIn), maxFiles);</span>
+<span class="nc" id="L221">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * with the initial mapping added, or starting with only the initial mapping.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   * @param initialMapping The initial elements to place into the cache.
+   */
+  public FileBackedCache(String directoryToCacheIn, Map&lt;KEY, T&gt; initialMapping) {
+<span class="nc" id="L231">    this(new File(directoryToCacheIn), initialMapping);</span>
+<span class="nc" id="L232">  }</span>
+
+  /**
+   * Create a file backed cache in a particular directory; either inheriting the elements in the directory
+   * with the initial mapping added, or starting with only the initial mapping.
+   * This constructor may exception, and will create the directory in question if it does not exist.
+   * @param directoryToCacheIn The directory to create the cache in
+   * @param initialMapping The initial elements to place into the cache.
+   * @param maxFiles The maximum number of files to store on disk
+   */
+  public FileBackedCache(String directoryToCacheIn, Map&lt;KEY, T&gt; initialMapping, int maxFiles) {
+<span class="nc" id="L243">    this(new File(directoryToCacheIn), initialMapping, maxFiles);</span>
+<span class="nc" id="L244">  }</span>
+
+  //
+  // Interface
+  //
+
+  /**
+   * Gets the size of the cache, in terms of elements on disk.
+   * Note that this is an expensive operation, as it reads the entire cache in from disk.
+   * @return The size of the cache on disk.
+   */
+  @Override
+  public int size() {
+<span class="fc" id="L257">    return readCache();</span>
+  }
+
+  /**
+   * Gets the size of the cache, in terms of elements in memory.
+   * In a multithreaded environment this is on a best-effort basis.
+   * This method makes no disk accesses.
+   * @return The size of the cache in memory.
+   */
+  public int sizeInMemory() {
+<span class="fc" id="L267">    return mapping.size();</span>
+  }
+
+  /**
+   * Gets whether the cache is empty, including elements on disk.
+   * Note that this returns true if the cache is empty.
+   */
+  @Override
+  public boolean isEmpty() {
+<span class="nc bnc" id="L276" title="All 2 branches missed.">    return size() == 0;</span>
+  }
+
+  /**
+   * Returns true if the specified key exists in the mapping (on a best-effort basis in a multithreaded
+   * environment).
+   * This method may require some disk access, up to a maximum of one file read (of unknown size a priori).
+   * @param key The key to query.
+   * @return True if this key is in the cache.
+   */
+  @Override
+  public boolean containsKey(Object key) {
+    // Early exits
+<span class="fc bfc" id="L289" title="All 2 branches covered.">    if (mapping.containsKey(key)) return true;</span>
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">    if (!tryFile(key)) return false;</span>
+    // Read the block for this key
+<span class="fc" id="L292">    Collection&lt;Pair&lt;KEY, T&gt;&gt; elementsRead = readBlock(key);</span>
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">    for (Pair&lt;KEY, T&gt; pair : elementsRead) {</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">      if (pair.first.equals(key)) return true;</span>
+<span class="nc" id="L295">    }</span>
+<span class="nc" id="L296">    return false;</span>
+  }
+
+  /**
+   * Returns true if the specified value is contained.
+   * It is nearly (if not always) a bad idea to call this method.
+   * @param value The value being queried for
+   * @return True if the specified value exists in the cache.
+   */
+  @SuppressWarnings({&quot;unchecked&quot;, &quot;SuspiciousMethodCalls&quot;})
+  @Override
+  public boolean containsValue(Object value) {
+    // Try to short circuit and save the use from their stupidity
+<span class="nc bnc" id="L309" title="All 2 branches missed.">    if (mapping.containsValue(new SoftReference(value))) { return true; }</span>
+    // Do an exhaustive check over the values
+<span class="nc" id="L311">    return values().contains(value);</span>
+  }
+
+  /**
+   * Get a cached value based on a key.
+   * If the key is in memory, this is a constant time operation.
+   * Else, this requires a single disk access, of undeterminable size but roughly correlated with the
+   * quality of the key's hash code.
+   */
+  @SuppressWarnings({&quot;SuspiciousMethodCalls&quot;, &quot;unchecked&quot;})
+  @Override
+  public T get(Object key) {
+<span class="fc" id="L323">    SoftReference&lt;T&gt; likelyReferenceOrNull = mapping.get(key);</span>
+<span class="fc bfc" id="L324" title="All 2 branches covered.">    T referenceOrNull = likelyReferenceOrNull == null ? null : likelyReferenceOrNull.get();</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">    if (likelyReferenceOrNull == null) {</span>
+      // Case: We don't know about this element being in the cache
+<span class="fc bfc" id="L327" title="All 2 branches covered.">      if (!tryFile(key)) { return null; }  // Case: there's no hope of finding this element</span>
+<span class="fc" id="L328">      Collection&lt;Pair&lt;KEY, T&gt;&gt; elemsRead = readBlock(key);  // Read the block for this key</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">      for (Pair&lt;KEY, T&gt; pair : elemsRead) {</span>
+<span class="fc bfc" id="L330" title="All 2 branches covered.">        if (pair.first.equals(key)) { return pair.second; }</span>
+<span class="fc" id="L331">      }</span>
+<span class="fc" id="L332">      return null;</span>
+<span class="pc bpc" id="L333" title="1 of 2 branches missed.">    } else if (referenceOrNull == null) {</span>
+      // Case: This element once was in the cache
+<span class="nc" id="L335">      mapping.remove(key);</span>
+<span class="nc" id="L336">      return get(key);  // try again</span>
+    } else {
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">      if (referenceOrNull instanceof Collection) {</span>
+<span class="nc" id="L339">        return (T) Collections.unmodifiableCollection((Collection) referenceOrNull);</span>
+<span class="fc bfc" id="L340" title="All 2 branches covered.">      } else if (referenceOrNull instanceof Map) {</span>
+<span class="fc" id="L341">        return (T) Collections.unmodifiableMap((Map) referenceOrNull);</span>
+      } else {
+<span class="fc" id="L343">        return referenceOrNull;</span>
+      }
+    }
+  }
+
+  @Override
+  public T put(KEY key, T value) {
+<span class="fc" id="L350">    T existing = get(key);</span>
+<span class="pc bpc" id="L351" title="2 of 6 branches missed.">    if (existing == value || (existing != null &amp;&amp; existing.equals(value))) {</span>
+      // Make sure we flush objects which have changed
+<span class="nc bnc" id="L353" title="All 4 branches missed.">      if (existing != null &amp;&amp; !existing.equals(value)) {</span>
+<span class="nc" id="L354">        updateBlockOrDelete(key, value);</span>
+      }
+      // Return the same object back
+<span class="nc" id="L357">      return existing;</span>
+    } else {
+      // In-memory
+<span class="fc" id="L360">      SoftReference&lt;T&gt; ref = new SoftReference&lt;&gt;(value, this.reaper);</span>
+<span class="fc" id="L361">      mapping.put(key, ref);</span>
+      // On Disk
+<span class="fc bfc" id="L363" title="All 2 branches covered.">      if (existing == null) {</span>
+<span class="fc" id="L364">        appendBlock(key, value);</span>
+      } else {
+<span class="fc" id="L366">        updateBlockOrDelete(key, value);</span>
+      }
+      // Return
+<span class="fc" id="L369">      return existing;</span>
+    }
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  @Override
+  public T remove(Object key) {
+<span class="nc bnc" id="L376" title="All 2 branches missed.">    if (!tryFile(key)) return null;</span>
+    try {
+<span class="nc" id="L378">      return updateBlockOrDelete((KEY) key, null);</span>
+<span class="nc" id="L379">    } catch (ClassCastException e) {</span>
+<span class="nc" id="L380">      return null;</span>
+    }
+  }
+
+  @Override
+  public void putAll(Map&lt;? extends KEY, ? extends T&gt; m) {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">    for (Entry&lt;? extends KEY, ? extends T&gt; entry : m.entrySet()) {</span>
+      try {
+<span class="nc" id="L388">        put( entry.getKey(), entry.getValue() );</span>
+<span class="nc" id="L389">      } catch (RuntimeException e) {</span>
+<span class="nc" id="L390">        err(e);</span>
+<span class="nc" id="L391">      }</span>
+<span class="nc" id="L392">    }</span>
+<span class="nc" id="L393">  }</span>
+
+  /**
+   * Clear the IN-MEMORY portion of the cache. This does not delete any files.
+   */
+  @Override
+  public void clear() {
+<span class="fc" id="L400">    mapping.clear();</span>
+<span class="fc" id="L401">  }</span>
+
+  /**
+   * Returns all the keys for this cache that are found ON DISK.
+   * This is an expensive operation.
+   * @return The set of keys for this cache as found on disk.
+   */
+  @Override
+  public Set&lt;KEY&gt; keySet() {
+<span class="nc" id="L410">    readCache();</span>
+<span class="nc" id="L411">    return mapping.keySet();</span>
+  }
+
+  /**
+   * Returns all the values for this cache that are found ON DISK.
+   * This is an expensive operation, both in terms of disk access time,
+   * and in terms of memory used.
+   * Furthermore, the memory used in this function cannot be GC collected -- you are loading the
+   * entire cache into memory.
+   * @return The set of values for this cache as found on disk.
+   */
+  @Override
+  public Collection&lt;T&gt; values() {
+<span class="nc" id="L424">    Set&lt;Entry&lt;KEY, T&gt;&gt; entries = entrySet();</span>
+<span class="nc" id="L425">    ArrayList&lt;T&gt; values = Generics.newArrayList(entries.size());</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">    for (Entry&lt;KEY, T&gt; entry : entries) {</span>
+<span class="nc" id="L427">      values.add(entry.getValue());</span>
+<span class="nc" id="L428">    }</span>
+<span class="nc" id="L429">    return values;</span>
+  }
+
+  /**
+   * Returns all the (key,value) pairs for this cache that are found ON DISK.
+   * This is an expensive operation, both in terms of disk access time,
+   * and in terms of memory used.
+   * Furthermore, the memory used in this function cannot be GC collected -- you are loading the
+   * entire cache into memory.
+   * @return The set of keys and associated values for this cache as found on disk.
+   */
+  @Override
+  public Set&lt;Entry&lt;KEY, T&gt;&gt; entrySet() {
+<span class="nc" id="L442">    readCache();</span>
+<span class="nc" id="L443">    Set&lt;Entry&lt;KEY, SoftReference&lt;T&gt;&gt;&gt; entries = mapping.entrySet();</span>
+<span class="nc" id="L444">    Set&lt;Entry&lt;KEY, T&gt;&gt; rtn = Generics.newHashSet();</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">    for (final Entry&lt;KEY, SoftReference&lt;T&gt;&gt; entry : entries) {</span>
+<span class="nc" id="L446">      T value = entry.getValue().get();</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">      if (value == null) value = get(entry.getKey());</span>
+<span class="nc" id="L448">      final T valueFinal = value;</span>
+<span class="nc" id="L449">      rtn.add(new Entry&lt;KEY, T&gt;(){</span>
+<span class="nc" id="L450">        private T valueImpl = valueFinal;</span>
+        @Override
+        public KEY getKey() {
+<span class="nc" id="L453">          return entry.getKey();</span>
+        }
+        @Override
+        public T getValue() {
+<span class="nc" id="L457">          return valueImpl;</span>
+        }
+        @Override
+        public T setValue(T value) {
+<span class="nc" id="L461">          T oldValue = valueImpl;</span>
+<span class="nc" id="L462">          valueImpl = value;</span>
+<span class="nc" id="L463">          return oldValue;</span>
+        }
+      });
+<span class="nc" id="L466">    }</span>
+<span class="nc" id="L467">    return rtn;</span>
+  }
+
+  /**
+   * Iterates over the entries of the cache.
+   * In the end, this loads the entire cache, but it can do it incrementally.
+   * @return An iterator over the entries in the cache.
+   */
+  @Override
+  public Iterator&lt;Entry&lt;KEY,T&gt;&gt; iterator() {
+<span class="fc" id="L477">    final File[] files = cacheDir.listFiles();</span>
+<span class="pc bpc" id="L478" title="2 of 4 branches missed.">    if (files == null || files.length == 0) return Generics.&lt;Entry&lt;KEY,T&gt;&gt;newLinkedList().iterator();</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">    for (int i = 0; i &lt; files.length; ++i) {</span>
+      try {
+<span class="fc" id="L481">        files[i] = canonicalFile.intern(files[i].getCanonicalFile());</span>
+<span class="nc" id="L482">      } catch (IOException e) {</span>
+<span class="nc" id="L483">        throw throwSafe(e);</span>
+<span class="fc" id="L484">      }</span>
+    }
+
+<span class="fc" id="L487">    return new Iterator&lt;Entry&lt;KEY,T&gt;&gt;() {</span>
+<span class="fc" id="L488">      Iterator&lt;Pair&lt;KEY, T&gt;&gt; elements = readBlock(files[0]).iterator();</span>
+<span class="fc" id="L489">      int index = 1;</span>
+
+      @Override
+      public boolean hasNext() {
+        // Still have elements in this block
+<span class="fc bfc" id="L494" title="All 2 branches covered.">        if (elements.hasNext()) return true;</span>
+        // Still have files to traverse
+<span class="fc" id="L496">        elements = null;</span>
+<span class="fc bfc" id="L497" title="All 4 branches covered.">        while (index &lt; files.length &amp;&amp; elements == null) {</span>
+          try {
+<span class="fc" id="L499">            elements = readBlock(files[index]).iterator();</span>
+<span class="nc" id="L500">          } catch (OutOfMemoryError e) {</span>
+<span class="nc" id="L501">            warn(&quot;FileBackedCache&quot;, &quot;Caught out of memory error (clearing cache): &quot; + e.getMessage());</span>
+<span class="nc" id="L502">            FileBackedCache.this.clear();</span>
+            //noinspection EmptyCatchBlock
+<span class="nc" id="L504">            try { Thread.sleep(1000); } catch (InterruptedException e2) {</span>
+<span class="nc" id="L505">              throw new RuntimeInterruptedException(e2);</span>
+<span class="nc" id="L506">            }</span>
+<span class="nc" id="L507">            elements = readBlock(files[index]).iterator();</span>
+<span class="nc" id="L508">          } catch (RuntimeException e) {</span>
+<span class="nc" id="L509">            err(e);</span>
+<span class="pc" id="L510">          }</span>
+<span class="fc" id="L511">          index += 1;</span>
+        }
+        // No more elements
+<span class="pc bpc" id="L514" title="1 of 4 branches missed.">        return elements != null &amp;&amp; hasNext();</span>
+      }
+      @Override
+      public Entry&lt;KEY, T&gt; next() {
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">        if (!hasNext()) throw new NoSuchElementException();</span>
+        // Convert a pair to an entry
+<span class="fc" id="L520">        final Pair&lt;KEY, T&gt; pair =  elements.next();</span>
+<span class="fc" id="L521">        return new Entry&lt;KEY, T&gt;() {</span>
+          @Override
+<span class="fc" id="L523">          public KEY getKey() { return pair.first; }</span>
+          @Override
+<span class="fc" id="L525">          public T getValue() { return pair.second; }</span>
+          @Override
+<span class="nc" id="L527">          public T setValue(T value) { throw new RuntimeException(&quot;Cannot set entry&quot;); }</span>
+        };
+      }
+      @Override
+      public void remove() {
+<span class="nc" id="L532">        throw new RuntimeException(&quot;Remove not implemented&quot;);</span>
+      }
+    };
+  }
+
+  /**
+   * Remove a given key from memory, not removing it from the disk.
+   * @param key The key to remove from memory.
+   */
+  public boolean removeFromMemory(KEY key) {
+<span class="pc bpc" id="L542" title="1 of 2 branches missed.">    return mapping.remove(key) != null;</span>
+  }
+
+  /**
+   * Get the list of files on which this JVM holds a lock.
+   * @return A collection of files on which the JVM holds a file lock.
+   */
+  public static Collection&lt;File&gt; locksHeld() {
+<span class="fc" id="L550">    ArrayList&lt;File&gt; files = Generics.newArrayList();</span>
+<span class="fc bfc" id="L551" title="All 2 branches covered.">    for (Entry&lt;File, FileSemaphore&gt; entry : fileLocks.entrySet()) {</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">      if (entry.getValue().isActive()) {</span>
+<span class="nc" id="L553">        files.add(entry.getKey());</span>
+      }
+<span class="fc" id="L555">    }</span>
+<span class="fc" id="L556">    return files;</span>
+  }
+
+  //
+  // Daemons
+  //
+
+  //
+  // Implementation
+  // These are directly called by the interface methods
+  //
+  /** Reads the cache in its entirely -- this is potentially very slow */
+  private int readCache() {
+<span class="fc" id="L569">    File[] files = cacheDir.listFiles();</span>
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">    if (files == null) { return 0; }</span>
+<span class="fc bfc" id="L571" title="All 2 branches covered.">    for (int i = 0; i &lt; files.length; ++i) {</span>
+      try {
+<span class="fc" id="L573">        files[i] = canonicalFile.intern(files[i].getCanonicalFile());</span>
+<span class="nc" id="L574">      } catch (IOException e) {</span>
+<span class="nc" id="L575">        throw throwSafe(e);</span>
+<span class="fc" id="L576">      }</span>
+    }
+<span class="fc" id="L578">    int count = 0;</span>
+<span class="fc bfc" id="L579" title="All 2 branches covered.">    for (File f : files) {</span>
+      try {
+<span class="fc" id="L581">        Collection&lt;Pair&lt;KEY, T&gt;&gt; block = readBlock(f);</span>
+<span class="fc" id="L582">        count += block.size();</span>
+<span class="nc" id="L583">      } catch (Exception e) {</span>
+<span class="nc" id="L584">        throw throwSafe(e);</span>
+<span class="fc" id="L585">      }</span>
+    }
+<span class="fc" id="L587">    return count;</span>
+  }
+
+  /** Checks for the existence of the block associated with the key */
+  private boolean tryFile(Object key) {
+    try {
+<span class="fc" id="L593">      return hash2file(key.hashCode(), false).exists();</span>
+<span class="nc" id="L594">    } catch (IOException e) {</span>
+<span class="nc" id="L595">      throw throwSafe(e);</span>
+    }
+  }
+
+  /** Reads the block specified by the key in its entirety */
+  private Collection&lt;Pair&lt;KEY, T&gt;&gt; readBlock(Object key) {
+    try {
+<span class="fc" id="L602">      return readBlock(hash2file(key.hashCode(), true));</span>
+<span class="nc" id="L603">    } catch (IOException e) {</span>
+<span class="nc" id="L604">      err(&quot;Could not read file: &quot; + cacheDir.getPath() + File.separator + fileRoot(key.hashCode()));</span>
+<span class="nc" id="L605">      throw throwSafe(e);</span>
+    }
+  }
+
+  /** Appends a value to the block specified by the key */
+  @SuppressWarnings(&quot;SynchronizationOnLocalVariableOrMethodParameter&quot;)
+  private void appendBlock(KEY key, T value) {
+<span class="fc" id="L612">    boolean haveTakenLock = false;</span>
+<span class="fc" id="L613">    Pair&lt;? extends OutputStream, CloseAction&gt; writer = null;</span>
+    try {
+      // Get File
+<span class="fc" id="L616">      File toWrite = hash2file(key.hashCode(), false);</span>
+<span class="fc" id="L617">      boolean exists = toWrite.exists();</span>
+<span class="fc" id="L618">      robustCreateFile(toWrite);</span>
+<span class="fc" id="L619">      synchronized (toWrite) {</span>
+<span class="pc bpc" id="L620" title="2 of 4 branches missed.">        assert canonicalFile.intern(toWrite.getCanonicalFile()) == toWrite;</span>
+        // Write Object
+<span class="fc" id="L622">        writer = newOutputStream(toWrite, exists);</span>
+<span class="fc" id="L623">        haveTakenLock = true;</span>
+<span class="fc" id="L624">        writeNextObject(writer.first, Pair.makePair(key, value));</span>
+<span class="fc" id="L625">        writer.second.apply();</span>
+<span class="fc" id="L626">        haveTakenLock = false;</span>
+<span class="pc" id="L627">      }</span>
+<span class="nc" id="L628">    } catch (IOException e) {</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">      try { if (haveTakenLock) { writer.second.apply(); } }</span>
+<span class="nc" id="L630">      catch (IOException e2) { throw throwSafe(e2); }</span>
+<span class="nc" id="L631">      throw throwSafe(e);</span>
+<span class="fc" id="L632">    }</span>
+<span class="fc" id="L633">  }</span>
+
+  /** Updates a block with the specified value; or deletes the block if the value is null */
+  @SuppressWarnings({&quot;unchecked&quot;, &quot;SynchronizationOnLocalVariableOrMethodParameter&quot;})
+  private T updateBlockOrDelete(KEY key, T valueOrNull) {
+<span class="fc" id="L638">    Pair&lt;? extends InputStream, CloseAction&gt; reader = null;</span>
+<span class="fc" id="L639">    Pair&lt;? extends OutputStream, CloseAction&gt; writer = null;</span>
+<span class="fc" id="L640">    boolean haveClosedReader = false;</span>
+<span class="fc" id="L641">    boolean haveClosedWriter = false;</span>
+    try {
+      // Variables
+<span class="fc" id="L644">      File blockFile = hash2file(key.hashCode(), true);</span>
+<span class="fc" id="L645">      synchronized (blockFile) {</span>
+<span class="pc bpc" id="L646" title="2 of 4 branches missed.">        assert canonicalFile.intern(blockFile.getCanonicalFile()) == blockFile;</span>
+<span class="fc" id="L647">        reader = newInputStream(blockFile);</span>
+<span class="fc" id="L648">        writer = newOutputStream(blockFile, false); // Get write lock before reading</span>
+<span class="fc" id="L649">        List&lt;Pair&lt;KEY, T&gt;&gt; block = Generics.newLinkedList();</span>
+<span class="fc" id="L650">        T existingValue = null;</span>
+        // Read
+        Pair&lt;KEY, T&gt; element;
+<span class="fc bfc" id="L653" title="All 2 branches covered.">        while ((element = readNextObjectOrNull(reader.first)) != null) {</span>
+<span class="pc bpc" id="L654" title="1 of 2 branches missed.">          if (element.first.equals(key)) {</span>
+<span class="pc bpc" id="L655" title="1 of 2 branches missed.">            if (valueOrNull != null) {</span>
+              // Update
+<span class="fc" id="L657">              existingValue = element.second;</span>
+<span class="fc" id="L658">              element.second = valueOrNull;</span>
+<span class="fc" id="L659">              block.add(element);</span>
+            }
+          } else {
+            // Spurious read
+<span class="nc" id="L663">            block.add(element);</span>
+          }
+        }
+<span class="fc" id="L666">        reader.second.apply();</span>
+<span class="fc" id="L667">        haveClosedReader = true;</span>
+        // Write
+<span class="fc bfc" id="L669" title="All 2 branches covered.">        for( Pair&lt;KEY, T&gt; elem : block ) {</span>
+<span class="fc" id="L670">          writeNextObject(writer.first, elem);</span>
+<span class="fc" id="L671">        }</span>
+<span class="fc" id="L672">        writer.second.apply();</span>
+<span class="fc" id="L673">        haveClosedWriter = true;</span>
+        // Return
+<span class="fc" id="L675">        return existingValue;</span>
+<span class="nc" id="L676">      }</span>
+<span class="nc" id="L677">    } catch (IOException | ClassNotFoundException e) {</span>
+<span class="nc" id="L678">      err(e);</span>
+<span class="nc" id="L679">      throw throwSafe(e);</span>
+    } finally {
+<span class="nc" id="L681">      try {</span>
+<span class="pc bpc" id="L682" title="6 of 8 branches missed.">        if (reader != null &amp;&amp; !haveClosedReader) { reader.second.apply(); }</span>
+<span class="pc bpc" id="L683" title="6 of 8 branches missed.">          if (writer != null &amp;&amp; !haveClosedWriter) { writer.second.apply(); }</span>
+<span class="nc" id="L684">      } catch (IOException e) {</span>
+<span class="nc" id="L685">        warn(e);</span>
+<span class="pc" id="L686">      }</span>
+    }
+  }
+
+  //
+  // Implementation Helpers
+  // These are factored bits of the implementation
+  //
+
+  /** Completely reads a block into local memory */
+  @SuppressWarnings(&quot;SynchronizationOnLocalVariableOrMethodParameter&quot;)
+  private Collection&lt;Pair&lt;KEY, T&gt;&gt; readBlock(File block) {
+<span class="fc" id="L698">    boolean haveClosed = false;</span>
+<span class="fc" id="L699">    Pair&lt;? extends InputStream, CloseAction&gt; input = null;</span>
+
+    try {
+<span class="fc" id="L702">      synchronized (block) {</span>
+<span class="pc bpc" id="L703" title="2 of 4 branches missed.">        assert canonicalFile.intern(block.getCanonicalFile()) == block;</span>
+<span class="fc" id="L704">        List&lt;Pair&lt;KEY, T&gt;&gt; read = Generics.newLinkedList();</span>
+        // Get the reader
+<span class="fc" id="L706">        input = newInputStream(block);</span>
+        // Get each object in the block
+        Pair&lt;KEY,T&gt; element;
+<span class="fc bfc" id="L709" title="All 2 branches covered.">        while ((element = readNextObjectOrNull(input.first)) != null) {</span>
+<span class="fc" id="L710">          read.add(element);</span>
+        }
+<span class="fc" id="L712">        input.second.apply();</span>
+<span class="fc" id="L713">        haveClosed = true;</span>
+        // Add elements
+<span class="fc bfc" id="L715" title="All 2 branches covered.">        for (Pair&lt;KEY, T&gt; elem : read) {</span>
+<span class="fc" id="L716">          SoftReference&lt;T&gt; ref = new SoftReference&lt;&gt;(elem.second, this.reaper);</span>
+<span class="fc" id="L717">          mapping.put(elem.first, ref);</span>
+<span class="fc" id="L718">        }</span>
+<span class="fc" id="L719">        return read;</span>
+<span class="nc" id="L720">      }</span>
+<span class="nc" id="L721">    } catch (StreamCorruptedException e) {</span>
+<span class="nc" id="L722">      warn(&quot;Stream corrupted reading &quot; + block);</span>
+      // Case: corrupted write
+<span class="nc bnc" id="L724" title="All 2 branches missed.">      if (!block.delete()) {</span>
+<span class="nc" id="L725">        throw new IllegalStateException(&quot;File corrupted, and cannot delete it: &quot; + block.getPath());</span>
+      }
+<span class="nc" id="L727">      return Generics.newLinkedList();</span>
+<span class="nc" id="L728">    } catch (EOFException e) {</span>
+<span class="nc" id="L729">      warn(&quot;Empty file (someone else is preparing to write to it?) &quot; + block);</span>
+<span class="nc" id="L730">      return Generics.newLinkedList();</span>
+<span class="nc" id="L731">    } catch (IOException e) {</span>
+      // Case: General IO Error
+<span class="nc" id="L733">      err(&quot;Could not read file: &quot; + block + &quot;: &quot; + e.getMessage());</span>
+<span class="nc" id="L734">      return Generics.newLinkedList();</span>
+<span class="nc" id="L735">    } catch (ClassNotFoundException e) {</span>
+      // Case: Couldn't read class
+<span class="nc" id="L737">      err(&quot;Could not read a class in file: &quot; + block + &quot;: &quot; + e.getMessage());</span>
+<span class="nc" id="L738">      return Generics.newLinkedList();</span>
+<span class="nc" id="L739">    } catch (RuntimeException e) {</span>
+      // Case: Unknown error -- see if it's caused by StreamCorrupted
+<span class="nc bnc" id="L741" title="All 4 branches missed.">      if (e.getCause() != null &amp;&amp; StreamCorruptedException.class.isAssignableFrom(e.getCause().getClass())) {</span>
+        // Yes -- caused by StreamCorrupted
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        if (!block.delete()) {</span>
+<span class="nc" id="L744">          throw new IllegalStateException(&quot;File corrupted, and cannot delete it: &quot; + block.getPath());</span>
+        }
+<span class="nc" id="L746">        return Generics.newLinkedList();</span>
+      } else {
+        // No -- random error (pass up)
+<span class="nc" id="L749">        throw e;</span>
+      }
+    } finally {
+<span class="pc bpc" id="L752" title="26 of 28 branches missed.">      if (input != null &amp;&amp; !haveClosed) {</span>
+        try {
+<span class="nc" id="L754">          input.second.apply();</span>
+<span class="pc" id="L755">        } catch (IOException e) { warn(e); }</span>
+      }
+    }
+  }
+
+  /** Returns a file corresponding to a hash code, ensuring it exists first */
+  private File hash2file(int hashCode, boolean create) throws IOException {
+<span class="fc" id="L762">    File candidate =  canonicalFile.intern(new File(cacheDir.getCanonicalPath() + File.separator + fileRoot(hashCode) + &quot;.block.ser.gz&quot;).getCanonicalFile());</span>
+<span class="fc bfc" id="L763" title="All 2 branches covered.">    if (create) { robustCreateFile(candidate); }</span>
+<span class="fc" id="L764">    return candidate;</span>
+  }
+
+  private int fileRoot(int hashCode) {
+<span class="pc bpc" id="L768" title="1 of 2 branches missed.">    if (this.maxFiles &lt; 0) { return hashCode; }</span>
+<span class="nc" id="L769">    else { return Math.abs(hashCode) % this.maxFiles; }</span>
+  }
+
+  //
+  // Java Hacks
+  //
+  /** Turns out, an ObjectOutputStream cannot append to a file. This is dumb. */
+  public static class AppendingObjectOutputStream extends ObjectOutputStream {
+    public AppendingObjectOutputStream(OutputStream out) throws IOException {
+<span class="fc" id="L778">      super(out);</span>
+<span class="fc" id="L779">    }</span>
+    @Override
+    protected void writeStreamHeader() throws IOException {
+      // do not write a header, but reset
+<span class="fc" id="L783">      reset();</span>
+<span class="fc" id="L784">    }</span>
+  }
+
+  private static RuntimeException throwSafe(Throwable e) {
+<span class="nc bnc" id="L788" title="All 2 branches missed.">    if (e instanceof RuntimeException) return (RuntimeException) e;</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">    else if (e.getCause() == null) return new RuntimeException(e);</span>
+<span class="nc" id="L790">    else return throwSafe(e.getCause());</span>
+  }
+
+  private static void robustCreateFile(File candidate) throws IOException {
+<span class="fc" id="L794">    int tries = 0;</span>
+<span class="fc bfc" id="L795" title="All 2 branches covered.">    while ( ! candidate.exists()) {</span>
+<span class="pc bpc" id="L796" title="1 of 2 branches missed.">      if (tries &gt; 30) { throw new IOException(&quot;Could not create file: &quot; + candidate); }</span>
+<span class="pc bpc" id="L797" title="1 of 2 branches missed.">      if (candidate.createNewFile()) { break; }</span>
+<span class="nc" id="L798">      tries++;</span>
+<span class="nc" id="L799">      try { Thread.sleep(1000); } catch (InterruptedException e) {</span>
+<span class="nc" id="L800">        log(e);</span>
+<span class="nc" id="L801">        throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L802">      }</span>
+    }
+<span class="fc" id="L804">  }</span>
+
+  public interface CloseAction {
+    void apply() throws IOException;
+  }
+
+<span class="pc bpc" id="L810" title="1 of 2 branches missed.">  public static class FileSemaphore {</span>
+<span class="fc" id="L811">    private int licenses = 1;</span>
+    private final FileLock lock;
+    private final FileChannel channel;
+
+<span class="fc" id="L815">    public FileSemaphore(FileLock lock, FileChannel channel) { this.lock = lock; this.channel = channel; }</span>
+
+    public synchronized boolean isActive() {
+<span class="pc bpc" id="L818" title="3 of 8 branches missed.">      if (licenses == 0) { assert lock == null || !lock.isValid(); }</span>
+<span class="pc bpc" id="L819" title="3 of 8 branches missed.">      if (licenses != 0 &amp;&amp; lock != null) { assert lock.isValid(); }</span>
+<span class="fc bfc" id="L820" title="All 2 branches covered.">      return licenses != 0;</span>
+    }
+
+    public synchronized void take() {
+<span class="pc bpc" id="L824" title="1 of 2 branches missed.">      if (!isActive()) { throw new IllegalStateException(&quot;Taking a file license when the licenses have all been released&quot;); }</span>
+<span class="fc" id="L825">      licenses += 1;</span>
+<span class="fc" id="L826">    }</span>
+
+    public synchronized void release() throws IOException {
+<span class="pc bpc" id="L829" title="1 of 2 branches missed.">      if (licenses &lt;= 0) { throw new IllegalStateException(&quot;Already released all semaphore licenses&quot;); }</span>
+<span class="fc" id="L830">      licenses -= 1;</span>
+<span class="fc bfc" id="L831" title="All 2 branches covered.">      if (licenses &lt;= 0) {</span>
+<span class="pc bpc" id="L832" title="1 of 2 branches missed.">        if (lock != null) { lock.release(); }</span>
+<span class="fc" id="L833">        channel.close();</span>
+      }
+<span class="fc" id="L835">    }</span>
+  }
+
+  @SuppressWarnings(&quot;SynchronizationOnLocalVariableOrMethodParameter&quot;)
+  protected FileSemaphore acquireFileLock(File f) throws IOException {
+<span class="pc bpc" id="L840" title="2 of 4 branches missed.">    assert canonicalFile.intern(f.getCanonicalFile()) == f;</span>
+<span class="fc" id="L841">    synchronized (f) {</span>
+      // Check semaphore
+<span class="fc" id="L843">      synchronized (fileLocks) {</span>
+<span class="fc bfc" id="L844" title="All 2 branches covered.">        if (fileLocks.containsKey(f)) {</span>
+<span class="fc" id="L845">          FileSemaphore sem = fileLocks.get(f);</span>
+<span class="fc bfc" id="L846" title="All 2 branches covered.">          if (sem.isActive()) {</span>
+<span class="fc" id="L847">            sem.take();</span>
+<span class="fc" id="L848">            return sem;</span>
+          } else {
+<span class="fc" id="L850">            fileLocks.remove(f);</span>
+          }
+        }
+<span class="pc" id="L853">      }</span>
+      // Get the channel
+<span class="fc" id="L855">      FileChannel channel = new RandomAccessFile(f, &quot;rw&quot;).getChannel();</span>
+<span class="fc" id="L856">      FileLock lockOrNull = null;</span>
+      // Try the lock
+<span class="pc bpc" id="L858" title="1 of 2 branches missed.">      for (int i = 0; i &lt; 1000; ++i) {</span>
+<span class="fc" id="L859">        lockOrNull = channel.tryLock();</span>
+<span class="pc bpc" id="L860" title="2 of 4 branches missed.">        if (lockOrNull == null || !lockOrNull.isValid()) {</span>
+<span class="nc" id="L861">          try { Thread.sleep(1000); } catch (InterruptedException e) {</span>
+<span class="nc" id="L862">            log(e);</span>
+<span class="nc" id="L863">            throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L864">          }</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">          if (i % 60 == 59) { warn(&quot;FileBackedCache&quot;, &quot;Lock still busy after &quot; + ((i+1)/60) + &quot; minutes&quot;); }</span>
+          //noinspection UnnecessaryContinue
+          continue;
+        } else {
+          break;
+        }
+      }
+<span class="pc bpc" id="L872" title="1 of 2 branches missed.">      if (lockOrNull == null) { warn(&quot;FileBackedCache&quot;, &quot;Could not acquire file lock! Continuing without lock&quot;); }</span>
+      // Return
+<span class="fc" id="L874">      FileSemaphore sem = new FileSemaphore(lockOrNull, channel);</span>
+<span class="fc" id="L875">      synchronized (fileLocks) {</span>
+<span class="fc" id="L876">        fileLocks.put(f, sem);</span>
+<span class="pc" id="L877">      }</span>
+<span class="fc" id="L878">      return sem;</span>
+<span class="nc" id="L879">    }</span>
+  }
+
+  //
+  //  POSSIBLE OVERRIDES
+  //
+
+  /**
+   * Create a new input stream, along with the code to close it and clean up.
+   * This code may be overridden, but should match nextObjectOrNull().
+   * IMPORTANT NOTE: acquiring a lock (well, semaphore) with FileBackedCache#acquireFileLock(File)
+   * is generally a good idea. Make sure to release() it in the close action as well.
+   *
+   * @param f The file to read from
+   * @return A pair, corresponding to the stream and the code to close it.
+   * @throws IOException
+   */
+  protected Pair&lt;? extends InputStream, CloseAction&gt; newInputStream(File f) throws IOException {
+<span class="fc" id="L897">    final FileSemaphore lock = acquireFileLock(f);</span>
+<span class="fc" id="L898">    final ObjectInputStream rtn = new ObjectInputStream(new GZIPInputStream(new BufferedInputStream(new FileInputStream(f))));</span>
+<span class="fc" id="L899">    return new Pair&lt;&gt;(rtn,</span>
+            () -&gt; {
+<span class="fc" id="L901">              lock.release();</span>
+<span class="fc" id="L902">              rtn.close();</span>
+<span class="fc" id="L903">            });</span>
+  }
+
+  /**
+   * Create a new output stream, along with the code to close it and clean up.
+   * This code may be overridden, but should match nextObjectOrNull()
+   * IMPORTANT NOTE: acquiring a lock (well, semaphore) with FileBackedCache#acquireFileLock(File)
+   * is generally a good idea. Make sure to release() it in the close action as well.
+   *
+   * @param f The file to write to
+   * @param isAppend Signals whether the file we are writing to exists, and we are appending to it.
+   * @return A pair, corresponding to the stream and the code to close it.
+   * @throws IOException
+   */
+  protected Pair&lt;? extends OutputStream, CloseAction&gt; newOutputStream(File f, boolean isAppend) throws IOException {
+<span class="fc" id="L918">    final FileOutputStream stream = new FileOutputStream(f, isAppend);</span>
+<span class="fc" id="L919">    final FileSemaphore lock = acquireFileLock(f);</span>
+<span class="fc bfc" id="L920" title="All 2 branches covered.">    final ObjectOutputStream rtn = isAppend</span>
+        ? new AppendingObjectOutputStream(new GZIPOutputStream(new BufferedOutputStream(stream)))
+        : new ObjectOutputStream(new GZIPOutputStream(new BufferedOutputStream(stream)));
+<span class="fc" id="L923">    return new Pair&lt;&gt;(rtn,</span>
+            () -&gt; {
+<span class="fc" id="L925">              rtn.flush();</span>
+<span class="fc" id="L926">              lock.release();</span>
+<span class="fc" id="L927">              rtn.close();</span>
+<span class="fc" id="L928">            });</span>
+  }
+
+  /**
+   * Return the next object in the given stream, or null if there is no such object.
+   * This method may be overwritten, but should match the implementation of newInputStream
+   * @param input The input stream to read the object from
+   * @return A (key, value) pair corresponding to the read object
+   * @throws IOException
+   * @throws ClassNotFoundException
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  protected Pair&lt;KEY, T&gt; readNextObjectOrNull(InputStream input) throws IOException, ClassNotFoundException {
+    try {
+<span class="fc" id="L942">      return (Pair&lt;KEY, T&gt;) ((ObjectInputStream) input).readObject();</span>
+<span class="fc" id="L943">    } catch (EOFException e) {</span>
+<span class="fc" id="L944">      return null; // I hate java</span>
+    }
+  }
+
+  /**
+   * Write an object to a stream
+   * This method may be overwritten, but should match the implementation of newOutputStream()
+   * @param output The output stream to write the object to.
+   * @param value The value to write to the stream, as a (key, value) pair.
+   * @throws IOException
+   */
+  protected void writeNextObject(OutputStream output, Pair&lt;KEY, T&gt; value) throws IOException {
+<span class="fc" id="L956">    ((ObjectOutputStream) output).writeObject(value);</span>
+<span class="fc" id="L957">  }</span>
+
+  /**
+   * &lt;p&gt;Merge a number of caches together. This could be useful for creating large caches,
+   * as (1) it can bypass NFS for local caching, and (2) it can allow for many small caches
+   * that are then merged together, which is more efficient as the number of entries in a bucket
+   * increases (e.g., if the cache becomes very large).&lt;/p&gt;
+   *
+   * &lt;p&gt;If there are collision, they are broken by accepting the entry in destination (if applicable),
+   *    and then by accepting the entry in the last constituent.&lt;/p&gt;
+   *
+   * &lt;p&gt;&lt;b&gt;IMPORTANT NOTE:&lt;/b&gt;: This method requires quite a bit of memory, and there is a brief time
+   * when it deletes all the files in destination, storing the data entirely in memory. If the program
+   * crashes in this state, THE DATA IN |destination| MAY BE LOST&lt;/p&gt;
+   *
+   * @param destination The cache to append to. This might not be empty, in which case all entries
+   *                   in the destination are preserved.
+   * @param constituents The constituent caches. All entries in each of these caches are added to
+   *                     the destination.
+   */
+  public static &lt;KEY extends Serializable, T extends Serializable&gt; void merge(
+      FileBackedCache&lt;KEY, T&gt; destination, FileBackedCache&lt;? extends KEY, ? extends T&gt;[] constituents) {
+<span class="fc" id="L979">    startTrack(&quot;Merging Caches&quot;);</span>
+
+    // (1) Read everything into memory
+<span class="fc" id="L982">    forceTrack(&quot;Reading Constituents&quot;);</span>
+<span class="fc" id="L983">    Map&lt;String, Map&lt;KEY, T&gt;&gt; combinedMapping = Generics.newHashMap();</span>
+    try {
+      // Accumulate constituents
+<span class="fc bfc" id="L986" title="All 2 branches covered.">      for (int i = 0; i &lt; constituents.length; ++i) {</span>
+<span class="fc" id="L987">        FileBackedCache&lt;? extends KEY, ? extends T&gt; constituent = constituents[i];</span>
+<span class="fc bfc" id="L988" title="All 2 branches covered.">        for (Entry&lt;? extends KEY, ? extends T&gt; entry : constituent) {</span>
+<span class="fc" id="L989">          String fileToWriteTo = destination.hash2file(entry.getKey().hashCode(), false).getName();</span>
+<span class="fc bfc" id="L990" title="All 2 branches covered.">          if (!combinedMapping.containsKey(fileToWriteTo)) { combinedMapping.put(fileToWriteTo, Generics.&lt;KEY,T&gt;newHashMap()); }</span>
+<span class="fc" id="L991">          combinedMapping.get(fileToWriteTo).put(entry.getKey(), entry.getValue());</span>
+<span class="fc" id="L992">        }</span>
+<span class="fc" id="L993">        log(&quot;[&quot; + new DecimalFormat(&quot;0000&quot;).format(i) + &quot;/&quot; + constituents.length + &quot;] read &quot; + constituent.cacheDir + &quot; [&quot; + (Runtime.getRuntime().freeMemory() / 1000000) + &quot;MB free memory]&quot;);</span>
+<span class="fc" id="L994">        constituent.clear();</span>
+      }
+      // Accumulate destination
+<span class="fc bfc" id="L997" title="All 2 branches covered.">      for (Entry&lt;? extends KEY, ? extends T&gt; entry : destination) {</span>
+<span class="fc" id="L998">        String fileToWriteTo = destination.hash2file(entry.getKey().hashCode(), false).getName();</span>
+<span class="pc bpc" id="L999" title="1 of 2 branches missed.">        if (!combinedMapping.containsKey(fileToWriteTo)) { combinedMapping.put(fileToWriteTo, Generics.&lt;KEY,T&gt;newHashMap()); }</span>
+<span class="fc" id="L1000">        combinedMapping.get(fileToWriteTo).put(entry.getKey(), entry.getValue());</span>
+<span class="fc" id="L1001">      }</span>
+<span class="nc" id="L1002">    } catch (IOException e) {</span>
+<span class="nc" id="L1003">      err(&quot;Found exception in merge() -- all data is intact (but passing exception up)&quot;);</span>
+<span class="nc" id="L1004">      throw new RuntimeException(e);</span>
+<span class="fc" id="L1005">    }</span>
+<span class="fc" id="L1006">    endTrack(&quot;Reading Constituents&quot;);</span>
+
+    // (2) Clear out Destination
+<span class="fc" id="L1009">    forceTrack(&quot;Clearing Destination&quot;);</span>
+<span class="pc bpc" id="L1010" title="3 of 4 branches missed.">    if (!destination.cacheDir.exists() &amp;&amp; !destination.cacheDir.mkdirs()) {</span>
+<span class="nc" id="L1011">      throw new RuntimeException(&quot;Could not create cache dir for destination (data is intact): &quot; + destination.cacheDir);</span>
+    }
+<span class="fc" id="L1013">    File[] filesInDestination = destination.cacheDir.listFiles();</span>
+<span class="pc bpc" id="L1014" title="1 of 2 branches missed.">    if (filesInDestination == null) {</span>
+<span class="nc" id="L1015">      throw new RuntimeException(&quot;Cannot list files in destination's cache dir (data is intact): &quot; + destination.cacheDir);</span>
+    }
+<span class="fc bfc" id="L1017" title="All 2 branches covered.">    for (File block : filesInDestination) {</span>
+<span class="pc bpc" id="L1018" title="1 of 2 branches missed.">      if (!block.delete()) {</span>
+<span class="nc" id="L1019">        warn(&quot;FileBackedCache&quot;, &quot;could not delete block: &quot; + block);</span>
+      }
+    }
+<span class="fc" id="L1022">    endTrack(&quot;Clearing Destination&quot;);</span>
+
+    // (3) Write new files
+<span class="fc" id="L1025">    forceTrack(&quot;Writing New Files&quot;);</span>
+    try {
+<span class="fc bfc" id="L1027" title="All 2 branches covered.">      for (Entry&lt;String, Map&lt;KEY, T&gt;&gt; blockEntry : combinedMapping.entrySet()) {</span>
+        // Get File
+<span class="fc" id="L1029">        File toWrite = canonicalFile.intern(new File(destination.cacheDir + File.separator + blockEntry.getKey()).getCanonicalFile());</span>
+<span class="fc" id="L1030">        boolean exists = toWrite.exists(); // should really be false;</span>
+        // Write Objects
+<span class="fc" id="L1032">        Pair&lt;? extends OutputStream, CloseAction&gt; writer = destination.newOutputStream(toWrite, exists);</span>
+<span class="fc bfc" id="L1033" title="All 2 branches covered.">        for (Entry&lt;KEY, T&gt; entry : blockEntry.getValue().entrySet()) {</span>
+<span class="fc" id="L1034">          destination.writeNextObject(writer.first, Pair.makePair(entry.getKey(), entry.getValue()));</span>
+<span class="fc" id="L1035">        }</span>
+<span class="fc" id="L1036">        writer.second.apply();</span>
+<span class="fc" id="L1037">      }</span>
+<span class="nc" id="L1038">    } catch (IOException e) {</span>
+<span class="nc" id="L1039">      err(&quot;Could not write constituent files to combined cache (DATA IS LOST)!&quot;);</span>
+<span class="nc" id="L1040">      throw new RuntimeException(e);</span>
+<span class="fc" id="L1041">    }</span>
+<span class="fc" id="L1042">    endTrack(&quot;Writing New Files&quot;);</span>
+<span class="fc" id="L1043">    endTrack(&quot;Merging Caches&quot;);</span>
+<span class="fc" id="L1044">  }</span>
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public static &lt;KEY extends Serializable, T extends Serializable&gt; void merge(
+      FileBackedCache&lt;KEY, T&gt; destination, Collection&lt;FileBackedCache&lt;KEY, T&gt;&gt; constituents) {
+<span class="nc" id="L1049">    merge(destination, constituents.toArray((FileBackedCache&lt;KEY,T&gt;[])new FileBackedCache[constituents.size()]));</span>
+<span class="nc" id="L1050">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

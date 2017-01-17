@@ -1,0 +1,518 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MultiWordTreeExpander.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.spanish.pipeline</a> &gt; <span class="el_source">MultiWordTreeExpander.java</span></div><h1>MultiWordTreeExpander.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.spanish.pipeline;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeFactory;
+import edu.stanford.nlp.trees.TreeNormalizer;
+import edu.stanford.nlp.trees.international.spanish.SpanishTreeNormalizer;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon;
+import edu.stanford.nlp.trees.tregex.tsurgeon.TsurgeonPattern;
+import edu.stanford.nlp.util.Pair;
+
+/**
+ * Provides routines for &quot;decompressing&quot; further the expanded trees
+ * formed by multiword token splitting.
+ *
+ * Multiword token expansion leaves constituent words as siblings in a
+ * &quot;flat&quot; tree structure. This often represents an incorrect parse of
+ * the sentence. For example, the phrase &quot;Ministerio de Finanzas&quot; should
+ * not be parsed as a flat structure like
+ *
+ *     (grup.nom (np00000 Ministerio) (sp000 de) (np00000 Finanzas))
+ *
+ * but rather a &quot;deep&quot; structure like
+ *
+ *     (grup.nom (sp (prep (sp000 de))
+ *                   (sn (grup.nom (np0000 Finanzas)))))
+ *
+ * This class provides methods for detecting common linguistic patterns
+ * that should be expanded in this way.
+ */
+<span class="nc" id="L36">public class MultiWordTreeExpander {</span>
+
+  /**
+   * Regular expression to match groups inside which we want to expand things
+   */
+  private static final String CANDIDATE_GROUPS = &quot;(^grup\\.(adv|c[cs]|[iwz]|nom|prep|pron|verb)|\\.inter)&quot;;
+
+  private static final String PREPOSITIONS =
+    &quot;(por|para|pro|al?|del?|con(?:tra)?|sobre|en(?:tre)?|hacia|sin|según|hasta|bajo)&quot;;
+
+<span class="nc" id="L46">  private final TregexPattern parentheticalExpression = TregexPattern.compile(</span>
+    &quot;fpa=left &gt; /^grup\\.nom$/ &quot; + &quot;$++ fpt=right&quot;);
+
+<span class="nc" id="L49">  private final TsurgeonPattern groupParentheticalExpression</span>
+<span class="nc" id="L50">    = Tsurgeon.parseOperation(&quot;createSubtree grup.nom.inter4 left right&quot;);</span>
+
+  /**
+   * Yes, some multiword tokens contain multiple clauses..
+   */
+<span class="nc" id="L55">  private final TregexPattern multipleClauses</span>
+<span class="nc" id="L56">    = TregexPattern.compile(</span>
+      // Nested nominal group containing period punctuation
+      &quot;/^grup\\.nom/ &gt; /^grup\\.nom/ &lt; (fp !$-- fp $- /^[^g]/=right1 $+ __=left2)&quot; +
+      // Match boundaries for subtrees created
+      &quot; &lt;, __=left1 &lt;` __=right2&quot;);
+
+<span class="nc" id="L62">  private final TsurgeonPattern expandMultipleClauses</span>
+<span class="nc" id="L63">    = Tsurgeon.parseOperation(&quot;[createSubtree grup.nom left1 right1]&quot; +</span>
+      &quot;[createSubtree grup.nom left2 right2]&quot;);
+
+<span class="nc" id="L66">  private final TregexPattern prepositionalPhrase</span>
+<span class="nc" id="L67">    = TregexPattern.compile(// Match candidate preposition</span>
+                            &quot;sp000=tag &lt; /(?i)^&quot; + PREPOSITIONS + &quot;$/&quot; +
+                            // Headed by a group that was generated from
+                            // multi-word token expansion and that we
+                            // wish to expand further
+                            &quot; &gt; (/&quot; + CANDIDATE_GROUPS + &quot;/ &lt;- __=right)&quot; +
+                            // With an NP on the left (-&gt; this is a
+                            // prep. phrase) and not preceded by any
+                            // other prepositions
+                            &quot; $+ /^([adnswz]|p[ipr])/=left !$-- sp000&quot;);
+
+<span class="nc" id="L78">  private final TregexPattern leadingPrepositionalPhrase</span>
+<span class="nc" id="L79">    = TregexPattern.compile(// Match candidate preposition</span>
+                            &quot;sp000=tag &lt; /(?i)^&quot; + PREPOSITIONS + &quot;$/&quot; +
+                            // Which is the first child in a group that
+                            // was generated from multi-word token
+                            // expansion and that we wish to expand
+                            // further
+                            &quot; &gt;, (/&quot; + CANDIDATE_GROUPS + &quot;/ &lt;- __=right)&quot; +
+                            // With an NP on the left (-&gt; this is a
+                            // prep. phrase) and not preceded by any
+                            // other prepositions
+                            &quot; $+ /^([adnswz]|p[ipr])/=left !$-- sp000&quot;);
+
+  /**
+   * First step in expanding prepositional phrases: group NP to right of
+   * preposition under a `grup.nom` subtree (specially labeled for now
+   * so that we can target it in the next step)
+   */
+<span class="nc" id="L96">  private final TsurgeonPattern expandPrepositionalPhrase1 =</span>
+<span class="nc" id="L97">    Tsurgeon.parseOperation(&quot;[createSubtree grup.nom.inter left right]&quot;);</span>
+
+  /**
+   * Matches intermediate prepositional phrase structures as produced by
+   * the first step of expansion.
+   */
+<span class="nc" id="L103">  private final TregexPattern intermediatePrepositionalPhrase</span>
+<span class="nc" id="L104">    = TregexPattern.compile(&quot;sp000=preptag $+ /^grup\\.nom\\.inter$/=gn&quot;);</span>
+
+  /**
+   * Second step: replace intermediate prepositional phrase structure
+   * with final result.
+   */
+<span class="nc" id="L110">  private final TsurgeonPattern expandPrepositionalPhrase2 =</span>
+<span class="nc" id="L111">    Tsurgeon.parseOperation(&quot;[adjoinF (sp (prep T=preptarget) (sn foot@)) gn]&quot; +</span>
+                            &quot;[relabel gn /.inter$//]&quot; +
+                            &quot;[replace preptarget preptag]&quot; +
+                            &quot;[delete preptag]&quot;);
+
+<span class="nc" id="L116">  private final TregexPattern prepositionalVP =</span>
+<span class="nc" id="L117">    TregexPattern.compile(&quot;sp000=tag &lt; /(?i)^(para|al?|del?)$/&quot; +</span>
+                          &quot; &gt; (/&quot; + CANDIDATE_GROUPS + &quot;/ &lt;- __=right)&quot; +
+                          &quot; $+ vmn0000=left !$-- sp000&quot;);
+
+<span class="nc" id="L121">  private final TsurgeonPattern expandPrepositionalVP1 =</span>
+<span class="nc" id="L122">    Tsurgeon.parseOperation(&quot;[createSubtree S.inter left right]&quot; +</span>
+                            &quot;[adjoinF (infinitiu foot@) left]&quot;);
+
+<span class="nc" id="L125">  private final TregexPattern intermediatePrepositionalVP =</span>
+<span class="nc" id="L126">    TregexPattern.compile(&quot;sp000=preptag $+ /^S\\.inter$/=si&quot;);</span>
+
+<span class="nc" id="L128">  private final TsurgeonPattern expandPrepositionalVP2 =</span>
+<span class="nc" id="L129">    Tsurgeon.parseOperation(&quot;[adjoin (sp prep=target S@) si] [move preptag &gt;0 target]&quot;);</span>
+
+<span class="nc" id="L131">  private final TregexPattern conjunctPhrase =</span>
+<span class="nc" id="L132">    TregexPattern.compile(&quot;cc=cc&quot; +</span>
+                          // In one of our expanded phrases (match
+                          // bounds of this expanded phrase; these form
+                          // the left edge of first new subtree and the
+                          // right edge of the second new subtree)
+                          &quot; &gt; (/^grup\\.nom/ &lt;, __=left1 &lt;` __=right2)&quot; +
+                          // Fetch more bounds: node to immediate left
+                          // of cc is the right edge of the first new
+                          // subtree, and node to right of cc is the
+                          // left edge of the second new subtree
+                          //
+                          // NB: left1 may the same as right1; likewise
+                          // for the second tree
+                          &quot; $- /^[^g]/=right1 $+ /^[^g]/=left2&quot;);
+
+<span class="nc" id="L147">  private final TsurgeonPattern expandConjunctPhrase =</span>
+<span class="nc" id="L148">    Tsurgeon.parseOperation(&quot;[adjoinF (conj foot@) cc]&quot; +</span>
+                            &quot;[createSubtree grup.nom.inter2 left1 right1]&quot; +
+                            &quot;[createSubtree grup.nom.inter2 left2 right2]&quot;);
+
+  /**
+   * Simple intermediate conjunct: a constituent which heads a single
+   * substantive
+   */
+<span class="nc" id="L156">  private final TregexPattern intermediateSubstantiveConjunct =</span>
+<span class="nc" id="L157">    TregexPattern.compile(&quot;/grup\\.nom\\.inter2/=target &lt;: /^[dnpw]/&quot;);</span>
+
+  /**
+   * Rename simple intermediate conjunct as a `grup.nom`
+   */
+<span class="nc" id="L162">  private final TsurgeonPattern expandIntermediateSubstantiveConjunct =</span>
+<span class="nc" id="L163">    Tsurgeon.parseOperation(&quot;[relabel target /grup.nom/]&quot;);</span>
+
+  /**
+   * Simple intermediate conjunct: a constituent which heads a single
+   * adjective
+   */
+<span class="nc" id="L169">  private final TregexPattern intermediateAdjectiveConjunct =</span>
+<span class="nc" id="L170">    TregexPattern.compile(&quot;/^grup\\.nom\\.inter2$/=target &lt;: /^a/&quot;);</span>
+
+  /**
+   * Rename simple intermediate adjective conjunct as a `grup.a`
+   */
+<span class="nc" id="L175">  private final TsurgeonPattern expandIntermediateAdjectiveConjunct =</span>
+<span class="nc" id="L176">    Tsurgeon.parseOperation(&quot;[relabel target /grup.a/]&quot;);</span>
+
+  /**
+   * Match parts of an expanded conjunct which must be labeled as a noun
+   * phrase given their children.
+   */
+<span class="nc" id="L182">  private final TregexPattern intermediateNounPhraseConjunct =</span>
+<span class="nc" id="L183">    TregexPattern.compile(&quot;/^grup\\.nom\\.inter2$/=target &lt; /^s[pn]$/&quot;);</span>
+
+<span class="nc" id="L185">  private final TsurgeonPattern expandIntermediateNounPhraseConjunct =</span>
+<span class="nc" id="L186">    Tsurgeon.parseOperation(&quot;[relabel target sn]&quot;);</span>
+
+  /**
+   * Intermediate conjunct: verb
+   */
+<span class="nc" id="L191">  private final TregexPattern intermediateVerbConjunct =</span>
+<span class="nc" id="L192">    TregexPattern.compile(&quot;/^grup\\.nom\\.inter2$/=gn &lt;: /^vmi/&quot;);</span>
+
+<span class="nc" id="L194">  private final TsurgeonPattern expandIntermediateVerbConjunct =</span>
+<span class="nc" id="L195">    Tsurgeon.parseOperation(&quot;[adjoin (S (grup.verb@)) gn]&quot;);</span>
+
+  /**
+   * Match parts of an expanded conjunct which should be labeled as
+   * nominal groups.
+   */
+<span class="nc" id="L201">  private final TregexPattern intermediateNominalGroupConjunct =</span>
+<span class="nc" id="L202">    TregexPattern.compile(&quot;/^grup\\.nom\\.inter2$/=target !&lt; /^[^n]/&quot;);</span>
+
+<span class="nc" id="L204">  private final TsurgeonPattern expandIntermediateNominalGroupConjunct =</span>
+<span class="nc" id="L205">    Tsurgeon.parseOperation(&quot;[relabel target /grup.nom/]&quot;);</span>
+
+  /**
+   * Match articles contained within nominal groups of substantives so
+   * that they can be moved out
+   */
+<span class="nc" id="L211">  private final TregexPattern articleLeadingNominalGroup =</span>
+<span class="nc" id="L212">    TregexPattern.compile(&quot;/^d[aip]/=art &gt;, (/^grup\\.nom$/=ng &gt; sn)&quot;);</span>
+
+<span class="nc" id="L214">  private final TsurgeonPattern expandArticleLeadingNominalGroup =</span>
+<span class="nc" id="L215">    Tsurgeon.parseOperation(&quot;[insert (spec=target) $+ ng] [move art &gt;0 target]&quot;);</span>
+
+<span class="nc" id="L217">  private final TregexPattern articleInsideOrphanedNominalGroup =</span>
+<span class="nc" id="L218">    TregexPattern.compile(&quot;/^d[aip]/=d &gt;, (/^grup\\.nom/=ng !&gt; sn)&quot;);</span>
+
+<span class="nc" id="L220">  private final TsurgeonPattern expandArticleInsideOrphanedNominalGroup =</span>
+<span class="nc" id="L221">    Tsurgeon.parseOperation(&quot;[adjoinF (sn=sn spec=spec foot@) ng] [move d &gt;0 spec]&quot;);</span>
+
+<span class="nc" id="L223">  private final TregexPattern determinerInsideNominalGroup =</span>
+<span class="nc" id="L224">    TregexPattern.compile(&quot;/^d[^n]/=det &gt;, (/^grup\\.nom/=ng &gt; sn) $ __&quot;);</span>
+
+<span class="nc" id="L226">  private final TsurgeonPattern expandDeterminerInsideNominalGroup =</span>
+<span class="nc" id="L227">    Tsurgeon.parseOperation(&quot;[insert (spec=target) $+ ng] [move det &gt;0 target]&quot;);</span>
+
+  // &quot;en opinion del X,&quot; &quot;además del Y&quot;
+<span class="nc" id="L230">  private final TregexPattern contractionTrailingIdiomBeforeNominalGroup</span>
+<span class="nc" id="L231">    = TregexPattern.compile(&quot;sp000 &gt;` (/^grup\\.prep$/ &gt; (__ $+ /^grup\\.nom/=ng)) &lt; /^(de|a)l$/=contraction&quot;);</span>
+
+  // -&gt; &quot;(en opinion de) (el X),&quot; &quot;(además de) (el Y)&quot;
+<span class="nc" id="L234">  private final TsurgeonPattern joinArticleWithNominalGroup</span>
+<span class="nc" id="L235">    = Tsurgeon.parseOperation(&quot;[relabel contraction /l//] [adjoinF (sn (spec (da0000 el)) foot@) ng]&quot;);</span>
+
+<span class="nc" id="L237">  private final TregexPattern contractionInSpecifier</span>
+<span class="nc" id="L238">    = TregexPattern.compile(&quot;sp000=parent &lt; /(?i)^(a|de)l$/=contraction &gt; spec&quot;);</span>
+
+<span class="nc" id="L240">  private final TregexPattern delTodo = TregexPattern.compile(&quot;del=contraction . todo &gt; sp000=parent&quot;);</span>
+
+  // &quot;del X al Y&quot;
+<span class="nc" id="L243">  private final TregexPattern contractionInRangePhrase</span>
+<span class="nc" id="L244">    = TregexPattern.compile(&quot;sp000 &lt; /(?i)^(a|de)l$/=contraction &gt;: (conj $+ (/^grup\\.(w|nom)/=group))&quot;);</span>
+
+<span class="nc" id="L246">  private final TsurgeonPattern expandContractionInRangePhrase</span>
+<span class="nc" id="L247">    = Tsurgeon.parseOperation(&quot;[relabel contraction /(?i)l//] [adjoinF (sn (spec (da0000 el)) foot@) group]&quot;);</span>
+
+  /**
+   * Operation to extract article from contraction and just put it next to the container
+   */
+<span class="nc" id="L252">  private final TsurgeonPattern extendContraction</span>
+<span class="nc" id="L253">    = Tsurgeon.parseOperation(&quot;[relabel contraction /l//] [insert (da0000 el) $- parent]&quot;);</span>
+
+  // ---------
+
+  // Final cleanup operations
+
+<span class="nc" id="L259">  private final TregexPattern terminalPrepositions</span>
+<span class="nc" id="L260">    = TregexPattern.compile(&quot;sp000=sp &lt; /&quot; + PREPOSITIONS + &quot;/ &gt;- (/^grup\\.nom/ &gt;+(/^grup\\.nom/) sn=sn &gt;&gt;- =sn)&quot;);</span>
+
+<span class="nc" id="L262">  private final TsurgeonPattern extractTerminalPrepositions = Tsurgeon.parseOperation(</span>
+    &quot;[insert (prep=prep) $- sn] [move sp &gt;0 prep]&quot;);
+
+  /**
+   * Match terminal prepositions in prepositional phrases: &quot;a lo largo de&quot;
+   */
+<span class="nc" id="L268">  private final TregexPattern terminalPrepositions2</span>
+<span class="nc" id="L269">    = TregexPattern.compile(&quot;prep=prep &gt;` (/^grup\\.nom$/ &gt;: (sn=sn &gt; /^(grup\\.prep|sp)$/))&quot;);</span>
+
+<span class="nc" id="L271">  private final TsurgeonPattern extractTerminalPrepositions2</span>
+<span class="nc" id="L272">    = Tsurgeon.parseOperation(&quot;move prep $- sn&quot;);</span>
+
+  /**
+   * Match terminal prepositions in infinitive clause within prepositional phrase: &quot;a partir de,&quot; etc.
+   */
+<span class="nc" id="L277">  private final TregexPattern terminalPrepositions3</span>
+<span class="nc" id="L278">    = TregexPattern.compile(&quot;sp000=sp $- infinitiu &gt;` (S=S &gt;` /^(grup\\.prep|sp)$/)&quot;);</span>
+
+<span class="nc" id="L280">  private final TsurgeonPattern extractTerminalPrepositions3</span>
+<span class="nc" id="L281">    = Tsurgeon.parseOperation(&quot;[insert (prep=prep) $- S] [move sp &gt;0 prep]&quot;);</span>
+
+<span class="nc" id="L283">  private final TregexPattern adverbNominalGroups = TregexPattern.compile(&quot;/^grup\\.nom./=ng &lt;: /^r[gn]/=r&quot;);</span>
+<span class="nc" id="L284">  private final TsurgeonPattern replaceAdverbNominalGroup = Tsurgeon.parseOperation(&quot;replace ng r&quot;);</span>
+
+  /**
+   * Match blocks of only adjectives (one or more) with a nominal group parent. These constituents should be rewritten
+   * beneath an adjectival group constituent.
+   */
+<span class="nc" id="L290">  private final TregexPattern adjectiveSpanInNominalGroup</span>
+<span class="nc" id="L291">    = TregexPattern.compile(&quot;/^grup\\.nom/=ng &lt;, aq0000=left &lt;` aq0000=right !&lt; /^[^a]/&quot;);</span>
+
+  /**
+   * Match dependent clauses mistakenly held under nominal groups (&quot;lo que X&quot;)
+   */
+<span class="nc" id="L296">  private final TregexPattern clauseInNominalGroup</span>
+<span class="nc" id="L297">    = TregexPattern.compile(&quot;lo . (que &gt; (pr000000=pr &gt;, /^grup\\.nom/=ng $+ (/^v/=vb &gt;` =ng)))&quot;);</span>
+
+<span class="nc" id="L299">  private final TsurgeonPattern labelClause</span>
+<span class="nc" id="L300">    = Tsurgeon.parseOperation(&quot;[relabel ng S] [adjoinF (relatiu foot@) pr] [adjoinF (grup.verb foot@) vb]&quot;);</span>
+
+  /**
+   * Infinitive clause mistakenly held under nominal group
+   */
+<span class="nc" id="L305">  private final TregexPattern clauseInNominalGroup2 = TregexPattern.compile(&quot;/^grup\\.nom/=gn $- spec &lt;: /^vmn/&quot;);</span>
+<span class="nc" id="L306">  private final TsurgeonPattern labelClause2 = Tsurgeon.parseOperation(&quot;[adjoin (S (infinitiu@)) gn]&quot;);</span>
+
+<span class="nc" id="L308">  private final TregexPattern clauseInNominalGroup3 = TregexPattern.compile(&quot;sn=sn &lt;, (/^vmn/=inf $+ (sp &gt;` =sn))&quot;);</span>
+<span class="nc" id="L309">  private final TsurgeonPattern labelClause3</span>
+<span class="nc" id="L310">    = Tsurgeon.parseOperation(&quot;[relabel sn S] [adjoinF (infinitiu foot@) inf]&quot;);</span>
+
+<span class="nc" id="L312">  private final TregexPattern loneAdjectiveInNominalGroup</span>
+<span class="nc" id="L313">    = TregexPattern.compile(&quot;/^a/=a &gt; /^grup\\.nom/ $ /^([snwz]|p[ipr])/ !$ /^a/&quot;);</span>
+<span class="nc" id="L314">  private final TsurgeonPattern labelAdjective = Tsurgeon.parseOperation(&quot;[adjoinF (s.a (grup.a foot@)) a]&quot;);</span>
+
+<span class="nc" id="L316">  private final TsurgeonPattern groupAdjectives = Tsurgeon.parseOperation(&quot;createSubtree (s.a grup.a@) left right&quot;);</span>
+
+  /**
+   * Some brute-force fixes:
+   */
+<span class="nc" id="L321">  private final TregexPattern alMenos</span>
+<span class="nc" id="L322">    = TregexPattern.compile(&quot;/(?i)^al$/ . /(?i)^menos$/ &gt; (sp000 $+ rg &gt; /^grup\\.adv$/=ga)&quot;);</span>
+<span class="nc" id="L323">  private final TsurgeonPattern fixAlMenos</span>
+<span class="nc" id="L324">    = Tsurgeon.parseOperation(&quot;replace ga (grup.adv (sp (prep (sp000 a)) (sn (spec (da0000 lo)) (grup.nom (s.a (grup.a (aq0000 menos)))))))&quot;);</span>
+<span class="nc" id="L325">  private final TregexPattern todoLoContrario</span>
+<span class="nc" id="L326">    = TregexPattern.compile(&quot;(__=ttodo &lt; /(?i)^todo$/) $+ (__=tlo &lt; /(?i)^lo$/ $+ (__=tcon &lt; /(?i)^contrario$/))&quot;);</span>
+<span class="nc" id="L327">  private final TsurgeonPattern fixTodoLoContrario</span>
+<span class="nc" id="L328">    = Tsurgeon.parseOperation(&quot;[adjoin (sn (grup.nom (pp000000@))) tlo] [adjoin (grup.a (aq0000@)) tcon]&quot;);</span>
+
+  /**
+   * Mark infinitives within verb groups (&quot;hacer ver&quot;, etc.)
+   */
+<span class="nc" id="L333">  private final TregexPattern infinitiveInVerbGroup</span>
+<span class="nc" id="L334">    = TregexPattern.compile(&quot;/^grup\\.verb$/=grup &lt; (/^v/ !$-- /^v/ $++ (/^vmn/=target !$++ /^vmn/))&quot;);</span>
+<span class="nc" id="L335">  private final TsurgeonPattern markInfinitive = Tsurgeon.parseOperation(&quot;[adjoinF (infinitiu foot@) target]&quot;);</span>
+
+  /**
+   * The corpus marks entire multiword verb tokens like &quot;teniendo en
+   * cuenta&quot; as gerunds / infinitives (by heading them with a
+   * constituent &quot;gerundi&quot; / &quot;infinitiu&quot;). Now that we've split into
+   * separate words, transfer this gerund designation so that it heads
+   * the verb only.
+   */
+<span class="nc" id="L344">  private final TregexPattern floppedGerund</span>
+<span class="nc" id="L345">    = TregexPattern.compile(&quot;/^grup\\.verb$/=grup &gt;: gerundi=ger &lt; (/^vmg/=vb !$ /^vmg/)&quot;);</span>
+<span class="nc" id="L346">  private final TsurgeonPattern unflopFloppedGerund</span>
+<span class="nc" id="L347">    = Tsurgeon.parseOperation(&quot;[adjoinF (gerundi foot@) vb] [replace ger grup]&quot;);</span>
+<span class="nc" id="L348">  private final TregexPattern floppedInfinitive</span>
+<span class="nc" id="L349">    = TregexPattern.compile(&quot;/^grup\\.verb$/=grup &gt;: infinitiu=inf &lt; (/^vmn/=vb !$ /^vmn/)&quot;);</span>
+<span class="nc" id="L350">  private final TsurgeonPattern unflopFloppedInfinitive</span>
+<span class="nc" id="L351">    = Tsurgeon.parseOperation(&quot;[adjoinF (infinitiu foot@) vb] [replace inf grup]&quot;);</span>
+
+  /**
+   * Match `sn` constituents which can (should) be rewritten as nominal groups
+   */
+<span class="nc" id="L356">  private final TregexPattern nominalGroupSubstantives =</span>
+<span class="nc" id="L357">    TregexPattern.compile(&quot;sn=target &lt; /^[adnwz]/ !&lt; /^([^adnswz]|neg)/&quot;);</span>
+
+<span class="nc" id="L359">  private final TregexPattern leftoverIntermediates =</span>
+<span class="nc" id="L360">    TregexPattern.compile(&quot;/^grup\\.nom\\.inter/=target&quot;);</span>
+
+<span class="nc" id="L362">  private final TsurgeonPattern makeNominalGroup =</span>
+<span class="nc" id="L363">    Tsurgeon.parseOperation(&quot;[relabel target /grup.nom/]&quot;);</span>
+
+<span class="nc" id="L365">  private final TregexPattern redundantNominalRewrite =</span>
+<span class="nc" id="L366">    TregexPattern.compile(&quot;/^grup\\.nom$/ &lt;: sn=child &gt;: sn=parent&quot;);</span>
+
+<span class="nc" id="L368">  private final TsurgeonPattern fixRedundantNominalRewrite =</span>
+<span class="nc" id="L369">    Tsurgeon.parseOperation(&quot;[replace parent child]&quot;);</span>
+
+<span class="nc" id="L371">  private final TregexPattern redundantPrepositionGroupRewrite =</span>
+<span class="nc" id="L372">    TregexPattern.compile(&quot;/^grup\\.prep$/=parent &lt;: sp=child &gt;: prep&quot;);</span>
+
+<span class="nc" id="L374">  private final TsurgeonPattern fixRedundantPrepositionGroupRewrite =</span>
+<span class="nc" id="L375">    Tsurgeon.parseOperation(&quot;[relabel child /grup.prep/] [replace parent child]&quot;);</span>
+
+<span class="nc" id="L377">  private final TregexPattern redundantPrepositionGroupRewrite2 = TregexPattern.compile(&quot;/^grup\\.prep$/=gp &lt;: sp=sp&quot;);</span>
+<span class="nc" id="L378">  private final TsurgeonPattern fixRedundantPrepositionGroupRewrite2 = Tsurgeon.parseOperation(&quot;replace gp sp&quot;);</span>
+
+  /**
+   * Patterns in this list turn flat structures into intermediate forms
+   * which will eventually become deep phrase structures.
+   */
+<span class="nc" id="L384">  private final List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; firstStepExpansions = Arrays.asList(</span>
+    // Should be first-ish
+          new Pair&lt;&gt;(parentheticalExpression, groupParentheticalExpression),
+          new Pair&lt;&gt;(multipleClauses, expandMultipleClauses),
+
+          new Pair&lt;&gt;(leadingPrepositionalPhrase,
+                  expandPrepositionalPhrase1),
+          new Pair&lt;&gt;(conjunctPhrase, expandConjunctPhrase),
+          new Pair&lt;&gt;(prepositionalPhrase, expandPrepositionalPhrase1),
+          new Pair&lt;&gt;(prepositionalVP, expandPrepositionalVP1),
+
+          new Pair&lt;&gt;(contractionTrailingIdiomBeforeNominalGroup,
+                  joinArticleWithNominalGroup),
+          new Pair&lt;&gt;(contractionInSpecifier, extendContraction),
+          new Pair&lt;&gt;(delTodo, extendContraction),
+          new Pair&lt;&gt;(contractionInRangePhrase,
+                  expandContractionInRangePhrase),
+
+    // Should not happen until the last moment! The function words
+    // being targeted have weaker &quot;scope&quot; than others earlier
+    // targeted, and so we don't want to clump things around them
+    // until we know we have the right to clump
+          new Pair&lt;&gt;(articleLeadingNominalGroup,
+                  expandArticleLeadingNominalGroup),
+          new Pair&lt;&gt;(articleInsideOrphanedNominalGroup,
+                  expandArticleInsideOrphanedNominalGroup),
+          new Pair&lt;&gt;(determinerInsideNominalGroup,
+                  expandDeterminerInsideNominalGroup)
+  );
+
+  /**
+   * Patterns in this list clean up &quot;intermediate&quot; phrase structures
+   * produced by previous step and produce something from them that
+   * looks like the rest of the corpus.
+   */
+<span class="nc" id="L419">  private final List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; intermediateExpansions = Arrays.asList(</span>
+          new Pair&lt;&gt;(intermediatePrepositionalPhrase,
+                  expandPrepositionalPhrase2),
+          new Pair&lt;&gt;(intermediatePrepositionalVP, expandPrepositionalVP2),
+
+          new Pair&lt;&gt;(intermediateSubstantiveConjunct,
+                  expandIntermediateSubstantiveConjunct),
+          new Pair&lt;&gt;(intermediateAdjectiveConjunct,
+                  expandIntermediateAdjectiveConjunct),
+          new Pair&lt;&gt;(intermediateNounPhraseConjunct,
+                  expandIntermediateNounPhraseConjunct),
+          new Pair&lt;&gt;(intermediateVerbConjunct,
+                  expandIntermediateVerbConjunct),
+          new Pair&lt;&gt;(intermediateNominalGroupConjunct,
+                  expandIntermediateNominalGroupConjunct)
+  );
+
+  /**
+   * Patterns in this list perform last-minute cleanup of leftover
+   * grammar mistakes which this class created.
+   */
+<span class="nc" id="L440">  private final List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; finalCleanup = Arrays.asList(</span>
+          new Pair&lt;&gt;(terminalPrepositions, extractTerminalPrepositions),
+          new Pair&lt;&gt;(terminalPrepositions2, extractTerminalPrepositions2),
+          new Pair&lt;&gt;(terminalPrepositions3, extractTerminalPrepositions3),
+
+          new Pair&lt;&gt;(nominalGroupSubstantives, makeNominalGroup),
+          new Pair&lt;&gt;(adverbNominalGroups, replaceAdverbNominalGroup),
+          new Pair&lt;&gt;(adjectiveSpanInNominalGroup, groupAdjectives),
+          new Pair&lt;&gt;(clauseInNominalGroup, labelClause),
+          new Pair&lt;&gt;(clauseInNominalGroup2, labelClause2),
+          new Pair&lt;&gt;(clauseInNominalGroup3, labelClause3),
+          new Pair&lt;&gt;(loneAdjectiveInNominalGroup, labelAdjective),
+
+    // Verb phrase-related cleanup.. order is important!
+          new Pair&lt;&gt;(infinitiveInVerbGroup, markInfinitive),
+          new Pair&lt;&gt;(floppedGerund, unflopFloppedGerund),
+          new Pair&lt;&gt;(floppedInfinitive, unflopFloppedInfinitive),
+
+    // Fixes for specific common phrases
+          new Pair&lt;&gt;(alMenos, fixAlMenos),
+          new Pair&lt;&gt;(todoLoContrario, fixTodoLoContrario),
+
+    // Lastly..
+    //
+    // These final fixes are not at all linguistically motivated -- just need to make the trees less dirty
+          new Pair&lt;&gt;(redundantNominalRewrite, fixRedundantNominalRewrite),
+
+          new Pair&lt;&gt;(redundantPrepositionGroupRewrite,
+                  fixRedundantPrepositionGroupRewrite),
+
+          new Pair&lt;&gt;(redundantPrepositionGroupRewrite2,
+                  fixRedundantPrepositionGroupRewrite2),
+          new Pair&lt;&gt;(leftoverIntermediates, makeNominalGroup)
+  );
+
+  /**
+   * Recognize candidate patterns for expansion in the given tree and
+   * perform the expansions. See the class documentation for more
+   * information.
+   */
+  public Tree expandPhrases(Tree t, TreeNormalizer tn, TreeFactory tf) {
+    // Keep running this sequence of patterns until no changes are
+    // affected. We need this for nested expressions like &quot;para tratar
+    // de regresar al empleo.&quot; This first step produces lots of
+    // &quot;intermediate&quot; tree structures which need to be cleaned up later.
+    Tree oldTree;
+    do {
+<span class="nc" id="L487">      oldTree = t.deepCopy();</span>
+<span class="nc" id="L488">      t = Tsurgeon.processPatternsOnTree(firstStepExpansions, t);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">    } while (!t.equals(oldTree));</span>
+
+    // Now clean up intermediate tree structures
+<span class="nc" id="L492">    t = Tsurgeon.processPatternsOnTree(intermediateExpansions, t);</span>
+
+    // Normalize first to allow for contraction expansion, etc.
+<span class="nc" id="L495">    t = tn.normalizeWholeTree(t, tf);</span>
+
+    // Final cleanup
+<span class="nc" id="L498">    t = Tsurgeon.processPatternsOnTree(finalCleanup, t);</span>
+
+<span class="nc" id="L500">    return t;</span>
+  }
+
+}
+
+// GOOD EXAMPLES
+// incidentes . lamentables (nested articles near middle)
+// chiquilla . vistosa (giant multiword at end)
+// espejo . deformante (article fun at start)
+// menor . coste (watch &quot;Comisión del Mercado&quot; thing at end)
+// totalmente . evitables (&quot;en opinion del&quot; at end)
+
+// TODO (corpus)
+// epígrafe . Arte (flat!)
+
+// TODO (parser)
+// debería .. encima (&quot;por encima de&quot; parse, coordinated NP)
+// manía .. catalán (&quot;castellana&quot; parsed as being under a participi constituent)
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

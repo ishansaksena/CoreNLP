@@ -1,0 +1,425 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractBatchOptimizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.loglinear.learning</a> &gt; <span class="el_source">AbstractBatchOptimizer.java</span></div><h1>AbstractBatchOptimizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.loglinear.learning; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.loglinear.model.ConcatVector;
+import edu.stanford.nlp.loglinear.model.GraphicalModel;
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+
+/**
+ * Created on 8/26/15.
+ * @author keenon
+ * &lt;p&gt;
+ * Abstract base of all the different kinds of optimizers. This exists to both facilitate sharing test between optimizers
+ * and to share certain basic bits of functionality useful for batch optimizers, like intelligent multi-thread management
+ * and user interrupt handling.
+ */
+<span class="nc" id="L24">public abstract class AbstractBatchOptimizer  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L27">  private static Redwood.RedwoodChannels log = Redwood.channels(AbstractBatchOptimizer.class);</span>
+  public &lt;T&gt; ConcatVector optimize(T[] dataset, AbstractDifferentiableFunction&lt;T&gt; fn) {
+<span class="nc" id="L29">    return optimize(dataset, fn, new ConcatVector(0), 0.0, 1.0e-5, false);</span>
+  }
+
+  public &lt;T&gt; ConcatVector optimize(T[] dataset,
+                                   AbstractDifferentiableFunction&lt;T&gt; fn,
+                                   ConcatVector initialWeights,
+                                   double l2regularization,
+                                   double convergenceDerivativeNorm,
+                                   boolean quiet) {
+<span class="nc bnc" id="L38" title="All 2 branches missed.">    if (!quiet) log.info(&quot;\n**************\nBeginning training\n&quot;);</span>
+<span class="nc" id="L39">    else log.info(&quot;[Beginning quiet training]&quot;);</span>
+
+<span class="nc" id="L41">    TrainingWorker&lt;T&gt; mainWorker = new TrainingWorker&lt;&gt;(dataset, fn, initialWeights, l2regularization, convergenceDerivativeNorm, quiet);</span>
+<span class="nc" id="L42">    new Thread(mainWorker).start();</span>
+
+<span class="nc" id="L44">    BufferedReader br = new BufferedReader(new InputStreamReader(System.in));</span>
+
+<span class="nc bnc" id="L46" title="All 2 branches missed.">    if (!quiet) {</span>
+<span class="nc" id="L47">      log.info(&quot;NOTE: you can press any key (and maybe ENTER afterwards to jog stdin) to terminate learning early.&quot;);</span>
+<span class="nc" id="L48">      log.info(&quot;The convergence criteria are quite aggressive if left uninterrupted, and will run for a while&quot;);</span>
+<span class="nc" id="L49">      log.info(&quot;if left to their own devices.\n&quot;);</span>
+
+      while (true) {
+<span class="nc bnc" id="L52" title="All 2 branches missed.">        if (mainWorker.isFinished) {</span>
+<span class="nc" id="L53">          log.info(&quot;training completed without interruption&quot;);</span>
+<span class="nc" id="L54">          return mainWorker.weights;</span>
+        }
+        try {
+<span class="nc bnc" id="L57" title="All 2 branches missed.">          if (br.ready()) {</span>
+<span class="nc" id="L58">            log.info(&quot;received quit command: quitting&quot;);</span>
+<span class="nc" id="L59">            log.info(&quot;training completed by interruption&quot;);</span>
+<span class="nc" id="L60">            mainWorker.isFinished = true;</span>
+<span class="nc" id="L61">            return mainWorker.weights;</span>
+          }
+<span class="nc" id="L63">        } catch (IOException e) {</span>
+<span class="nc" id="L64">          e.printStackTrace();</span>
+<span class="nc" id="L65">        }</span>
+      }
+    } else {
+<span class="nc bnc" id="L68" title="All 2 branches missed.">      while (!mainWorker.isFinished) {</span>
+<span class="nc" id="L69">        synchronized (mainWorker.naturalTerminationBarrier) {</span>
+          try {
+<span class="nc" id="L71">            mainWorker.naturalTerminationBarrier.wait();</span>
+<span class="nc" id="L72">          } catch (InterruptedException e) {</span>
+<span class="nc" id="L73">            throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L74">          }</span>
+<span class="nc" id="L75">        }</span>
+      }
+<span class="nc" id="L77">      log.info(&quot;[Quiet training complete]&quot;);</span>
+<span class="nc" id="L78">      return mainWorker.weights;</span>
+    }
+  }
+
+<span class="nc" id="L82">  List&lt;Constraint&gt; constraints = new ArrayList&lt;&gt;();</span>
+
+  /**
+   * This adds a constraint on the weight vector, that a certain component must be set to a sparse index=value
+   *
+   * @param component the component to fix
+   * @param index     the index of the fixed sparse component
+   * @param value     the value to fix at
+   */
+  public void addSparseConstraint(int component, int index, double value) {
+<span class="nc" id="L92">    constraints.add(new Constraint(component, index, value));</span>
+<span class="nc" id="L93">  }</span>
+
+  /**
+   * This adds a constraint on the weight vector, that a certain component must be set to a dense array
+   *
+   * @param component the component to fix
+   * @param arr       the dense array to set
+   */
+  public void addDenseConstraint(int component, double[] arr) {
+<span class="nc" id="L102">    constraints.add(new Constraint(component, arr));</span>
+<span class="nc" id="L103">  }</span>
+
+  /**
+   * A way to record a constraint on the weight vector
+   */
+  private static class Constraint {
+    int component;
+    boolean isSparse;
+
+    int index;
+    double value;
+
+    double[] arr;
+
+<span class="nc" id="L117">    public Constraint(int component, int index, double value) {</span>
+<span class="nc" id="L118">      isSparse = true;</span>
+<span class="nc" id="L119">      this.component = component;</span>
+<span class="nc" id="L120">      this.index = index;</span>
+<span class="nc" id="L121">      this.value = value;</span>
+<span class="nc" id="L122">    }</span>
+
+<span class="nc" id="L124">    public Constraint(int component, double[] arr) {</span>
+<span class="nc" id="L125">      isSparse = false;</span>
+<span class="nc" id="L126">      this.component = component;</span>
+<span class="nc" id="L127">      this.arr = arr;</span>
+<span class="nc" id="L128">    }</span>
+
+    public void applyToWeights(ConcatVector weights) {
+<span class="nc bnc" id="L131" title="All 2 branches missed.">      if (isSparse) {</span>
+<span class="nc" id="L132">        weights.setSparseComponent(component, index, value);</span>
+      } else {
+<span class="nc" id="L134">        weights.setDenseComponent(component, arr);</span>
+      }
+<span class="nc" id="L136">    }</span>
+
+    public void applyToDerivative(ConcatVector derivative) {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">      if (isSparse) {</span>
+<span class="nc" id="L140">        derivative.setSparseComponent(component, index, 0.0);</span>
+      } else {
+<span class="nc" id="L142">        derivative.setDenseComponent(component, new double[]{0.0});</span>
+      }
+<span class="nc" id="L144">    }</span>
+  }
+
+  /**
+   * This is the hook for subclassing batch optimizers to override in order to have their optimizer work.
+   *
+   * @param weights       the current weights (update these in place)
+   * @param gradient      the gradient at these weights
+   * @param logLikelihood the log likelihood at these weights
+   * @param state         any saved state the optimizer wants to keep and pass around during each optimization run
+   * @param quiet         whether or not to dump output about progress to the console
+   * @return whether or not we've converged
+   */
+  public abstract boolean updateWeights(ConcatVector weights, ConcatVector gradient, double logLikelihood, OptimizationState state, boolean quiet);
+
+  /**
+   * This is subclassed by children to store any state they need to perform optimization
+   */
+<span class="nc" id="L162">  protected abstract class OptimizationState {</span>
+  }
+
+  /**
+   * This is called at the beginning of each batch optimization. It should return a fresh OptimizationState object that
+   * will then be handed to updateWeights() on each update.
+   *
+   * @param initialWeights the initial weights for the optimizer to use
+   * @return a fresh OptimizationState
+   */
+  protected abstract OptimizationState getFreshOptimizationState(ConcatVector initialWeights);
+
+  private static class GradientWorker&lt;T&gt; implements Runnable {
+    ConcatVector localDerivative;
+<span class="nc" id="L176">    double localLogLikelihood = 0.0;</span>
+
+    TrainingWorker mainWorker;
+    int threadIdx;
+    int numThreads;
+    List&lt;T&gt; queue;
+    AbstractDifferentiableFunction&lt;T&gt; fn;
+    ConcatVector weights;
+
+<span class="nc" id="L185">    long jvmThreadId = 0;</span>
+
+    // This is to help the dynamic re-balancing of work queues
+<span class="nc" id="L188">    long finishedAtTime = 0;</span>
+<span class="nc" id="L189">    long cpuTimeRequired = 0;</span>
+
+<span class="nc" id="L191">    public GradientWorker(TrainingWorker&lt;T&gt; mainWorker, int threadIdx, int numThreads, List&lt;T&gt; queue, AbstractDifferentiableFunction&lt;T&gt; fn, ConcatVector weights) {</span>
+<span class="nc" id="L192">      this.mainWorker = mainWorker;</span>
+<span class="nc" id="L193">      this.threadIdx = threadIdx;</span>
+<span class="nc" id="L194">      this.numThreads = numThreads;</span>
+<span class="nc" id="L195">      this.queue = queue;</span>
+<span class="nc" id="L196">      this.fn = fn;</span>
+<span class="nc" id="L197">      this.weights = weights;</span>
+
+<span class="nc" id="L199">      localDerivative = weights.newEmptyClone();</span>
+<span class="nc" id="L200">    }</span>
+
+    @Override
+    public void run() {
+<span class="nc" id="L204">      long startTime = ManagementFactory.getThreadMXBean().getThreadCpuTime(jvmThreadId);</span>
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">      for (T datum : queue) {</span>
+<span class="nc" id="L207">        localLogLikelihood += fn.getSummaryForInstance(datum, weights, localDerivative);</span>
+        // Check for user interrupt
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (mainWorker.isFinished) return;</span>
+<span class="nc" id="L210">      }</span>
+
+<span class="nc" id="L212">      finishedAtTime = System.currentTimeMillis();</span>
+
+<span class="nc" id="L214">      long endTime = ManagementFactory.getThreadMXBean().getThreadCpuTime(jvmThreadId);</span>
+<span class="nc" id="L215">      cpuTimeRequired = endTime - startTime;</span>
+<span class="nc" id="L216">    }</span>
+  }
+
+<span class="nc bnc" id="L219" title="All 2 branches missed.">  private class TrainingWorker&lt;T&gt; implements Runnable {</span>
+    ConcatVector weights;
+    OptimizationState optimizationState;
+
+<span class="nc" id="L223">    boolean isFinished = false;</span>
+
+<span class="nc bnc" id="L225" title="All 2 branches missed.">    boolean useThreads = Runtime.getRuntime().availableProcessors() &gt; 1;</span>
+
+    T[] dataset;
+    AbstractDifferentiableFunction&lt;T&gt; fn;
+    double l2regularization;
+    double convergenceDerivativeNorm;
+    boolean quiet;
+
+<span class="nc" id="L233">    final Object naturalTerminationBarrier = new Object();</span>
+
+<span class="nc" id="L235">    public TrainingWorker(T[] dataset, AbstractDifferentiableFunction&lt;T&gt; fn, ConcatVector initialWeights, double l2regularization, double convergenceDerivativeNorm, boolean quiet) {</span>
+<span class="nc" id="L236">      optimizationState = getFreshOptimizationState(initialWeights);</span>
+<span class="nc" id="L237">      weights = initialWeights.deepClone();</span>
+
+<span class="nc" id="L239">      this.dataset = dataset;</span>
+<span class="nc" id="L240">      this.fn = fn;</span>
+<span class="nc" id="L241">      this.l2regularization = l2regularization;</span>
+<span class="nc" id="L242">      this.convergenceDerivativeNorm = convergenceDerivativeNorm;</span>
+<span class="nc" id="L243">      this.quiet = quiet;</span>
+<span class="nc" id="L244">    }</span>
+
+    /**
+     * This lets the system allocate work to threads evenly, which reduces the amount of blocking and can improve
+     * runtimes by 20% or more.
+     *
+     * @param datum the datum to estimate work for
+     * @return a work estimate, on a relative scale of single cpu wall time, for getting the gradient and log-likelihood
+     */
+    private int estimateRelativeRuntime(T datum) {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if (datum instanceof GraphicalModel) {</span>
+<span class="nc" id="L255">        int cost = 0;</span>
+<span class="nc" id="L256">        GraphicalModel model = (GraphicalModel) datum;</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        for (GraphicalModel.Factor f : model.factors) {</span>
+<span class="nc" id="L258">          cost += f.featuresTable.combinatorialNeighborStatesCount();</span>
+<span class="nc" id="L259">        }</span>
+<span class="nc" id="L260">        return cost;</span>
+<span class="nc" id="L261">      } else return 1;</span>
+    }
+
+    @Override
+    public void run() {
+
+      // Multithreading stuff
+
+<span class="nc" id="L269">      int numThreads = Math.max(1, Runtime.getRuntime().availableProcessors());</span>
+      @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L271">      List&lt;T&gt;[] queues = (List&lt;T&gt;[]) (new List[numThreads]);</span>
+<span class="nc" id="L272">      Random r = new Random();</span>
+
+      // Allocate work to make estimated cost of work per thread as even as possible
+
+<span class="nc bnc" id="L276" title="All 2 branches missed.">      if (useThreads) {</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        for (int i = 0; i &lt; numThreads; i++) {</span>
+<span class="nc" id="L278">          queues[i] = new ArrayList&lt;&gt;();</span>
+        }
+<span class="nc" id="L280">        int[] queueEstimatedTotalCost = new int[numThreads];</span>
+
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        for (T datum : dataset) {</span>
+<span class="nc" id="L283">          int datumEstimatedCost = estimateRelativeRuntime(datum);</span>
+
+<span class="nc" id="L285">          int minCostQueue = 0;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">          for (int i = 0; i &lt; numThreads; i++) {</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (queueEstimatedTotalCost[i] &lt; queueEstimatedTotalCost[minCostQueue]) minCostQueue = i;</span>
+          }
+
+<span class="nc" id="L290">          queueEstimatedTotalCost[minCostQueue] += datumEstimatedCost;</span>
+<span class="nc" id="L291">          queues[minCostQueue].add(datum);</span>
+        }
+      }
+
+<span class="nc bnc" id="L295" title="All 2 branches missed.">      while (!isFinished) {</span>
+
+        // Collect log-likelihood and derivatives
+
+<span class="nc" id="L299">        long startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L300">        long threadWaiting = 0;</span>
+
+<span class="nc" id="L302">        ConcatVector derivative = weights.newEmptyClone();</span>
+<span class="nc" id="L303">        double logLikelihood = 0.0;</span>
+
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        if (useThreads) {</span>
+<span class="nc" id="L306">          GradientWorker[] workers = new GradientWorker[numThreads];</span>
+<span class="nc" id="L307">          Thread[] threads = new Thread[numThreads];</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">          for (int i = 0; i &lt; workers.length; i++) {</span>
+<span class="nc" id="L309">            workers[i] = new GradientWorker(this, i, numThreads, queues[i], fn, weights);</span>
+<span class="nc" id="L310">            threads[i] = new Thread(workers[i]);</span>
+<span class="nc" id="L311">            workers[i].jvmThreadId = threads[i].getId();</span>
+<span class="nc" id="L312">            threads[i].start();</span>
+          }
+
+          // This is for logging
+<span class="nc" id="L316">          long minFinishTime = Long.MAX_VALUE;</span>
+<span class="nc" id="L317">          long maxFinishTime = Long.MIN_VALUE;</span>
+
+          // This is for re-balancing
+<span class="nc" id="L320">          long minCPUTime = Long.MAX_VALUE;</span>
+<span class="nc" id="L321">          long maxCPUTime = Long.MIN_VALUE;</span>
+<span class="nc" id="L322">          int slowestWorker = 0;</span>
+<span class="nc" id="L323">          int fastestWorker = 0;</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">          for (int i = 0; i &lt; workers.length; i++) {</span>
+            try {
+<span class="nc" id="L327">              threads[i].join();</span>
+<span class="nc" id="L328">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L329">              throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L330">            }</span>
+<span class="nc" id="L331">            logLikelihood += workers[i].localLogLikelihood;</span>
+<span class="nc" id="L332">            derivative.addVectorInPlace(workers[i].localDerivative, 1.0);</span>
+
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            if (workers[i].finishedAtTime &lt; minFinishTime) {</span>
+<span class="nc" id="L335">              minFinishTime = workers[i].finishedAtTime;</span>
+            }
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            if (workers[i].finishedAtTime &gt; maxFinishTime) {</span>
+<span class="nc" id="L338">              maxFinishTime = workers[i].finishedAtTime;</span>
+            }
+
+<span class="nc bnc" id="L341" title="All 2 branches missed.">            if (workers[i].cpuTimeRequired &lt; minCPUTime) {</span>
+<span class="nc" id="L342">              fastestWorker = i;</span>
+<span class="nc" id="L343">              minCPUTime = workers[i].cpuTimeRequired;</span>
+            }
+<span class="nc bnc" id="L345" title="All 2 branches missed.">            if (workers[i].cpuTimeRequired &gt; maxCPUTime) {</span>
+<span class="nc" id="L346">              slowestWorker = i;</span>
+<span class="nc" id="L347">              maxCPUTime = workers[i].cpuTimeRequired;</span>
+            }
+          }
+<span class="nc" id="L350">          threadWaiting = maxFinishTime - minFinishTime;</span>
+
+          // Try to reallocate work dynamically to minimize waiting on subsequent rounds
+
+          // Figure out the percentage of work represented by the waiting
+<span class="nc" id="L355">          double waitingPercentage = (double) (maxCPUTime - minCPUTime) / (double) maxCPUTime;</span>
+<span class="nc" id="L356">          int needTransferItems = (int) Math.floor(queues[slowestWorker].size() * waitingPercentage * 0.5);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">          for (int i = 0; i &lt; needTransferItems; i++) {</span>
+<span class="nc" id="L358">            int toTransfer = r.nextInt(queues[slowestWorker].size());</span>
+<span class="nc" id="L359">            T datum = queues[slowestWorker].get(toTransfer);</span>
+<span class="nc" id="L360">            queues[slowestWorker].remove(toTransfer);</span>
+<span class="nc" id="L361">            queues[fastestWorker].add(datum);</span>
+          }
+
+          // Check for user interrupt
+<span class="nc bnc" id="L365" title="All 2 branches missed.">          if (isFinished) return;</span>
+<span class="nc" id="L366">        } else {</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">          for (T datum : dataset) {</span>
+<span class="nc bnc" id="L368" title="All 4 branches missed.">            assert (datum != null);</span>
+<span class="nc" id="L369">            logLikelihood += fn.getSummaryForInstance(datum, weights, derivative);</span>
+            // Check for user interrupt
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            if (isFinished) return;</span>
+          }
+        }
+
+<span class="nc" id="L375">        logLikelihood /= dataset.length;</span>
+<span class="nc" id="L376">        derivative.mapInPlace((d) -&gt; d / dataset.length);</span>
+
+<span class="nc" id="L378">        long gradientComputationTime = System.currentTimeMillis() - startTime;</span>
+
+        // Regularization
+
+<span class="nc" id="L382">        logLikelihood = logLikelihood - (l2regularization * weights.dotProduct(weights));</span>
+<span class="nc" id="L383">        derivative.addVectorInPlace(weights, -2 * l2regularization);</span>
+
+        // Zero out the derivative on the components we're holding fixed
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        for (Constraint constraint : constraints) {</span>
+<span class="nc" id="L388">          constraint.applyToDerivative(derivative);</span>
+<span class="nc" id="L389">        }</span>
+
+        // If our derivative is sufficiently small, we've converged
+
+<span class="nc" id="L393">        double derivativeNorm = derivative.dotProduct(derivative);</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        if (derivativeNorm &lt; convergenceDerivativeNorm) {</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">          if (!quiet)</span>
+<span class="nc" id="L396">            log.info(&quot;Derivative norm &quot; + derivativeNorm + &quot; &lt; &quot; + convergenceDerivativeNorm + &quot;: quitting&quot;);</span>
+          break;
+        }
+
+        // Do the actual computation
+
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        if (!quiet) {</span>
+<span class="nc" id="L403">          log.info(&quot;[&quot; + gradientComputationTime + &quot; ms, threads waiting &quot; + threadWaiting + &quot; ms]&quot;);</span>
+        }
+<span class="nc" id="L405">        boolean converged = updateWeights(weights, derivative, logLikelihood, optimizationState, quiet);</span>
+
+        // Apply constraints to the weights vector
+
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        for (Constraint constraint : constraints) {</span>
+<span class="nc" id="L410">          constraint.applyToWeights(weights);</span>
+<span class="nc" id="L411">        }</span>
+
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        if (converged) {</span>
+<span class="nc" id="L414">          break;</span>
+        }
+<span class="nc" id="L416">      }</span>
+
+<span class="nc" id="L418">      synchronized (naturalTerminationBarrier) {</span>
+<span class="nc" id="L419">        naturalTerminationBarrier.notifyAll();</span>
+<span class="nc" id="L420">      }</span>
+<span class="nc" id="L421">      isFinished = true;</span>
+<span class="nc" id="L422">    }</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

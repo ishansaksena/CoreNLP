@@ -1,0 +1,597 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DocumentPreprocessor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.process</a> &gt; <span class="el_source">DocumentPreprocessor.java</span></div><h1>DocumentPreprocessor.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.process;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.io.Reader;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Properties;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.objectbank.XMLBeginEndIterator;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.PropertiesUtils;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * Produces a list of sentences from either a plain text or XML document.
+ * This class acts like a Reader: It allows you to make a single pass through a
+ * list of sentences in a document. If you need to pass through the document
+ * multiple times, then you need to create a second DocumentProcessor.
+ * &lt;p&gt;
+ * Tokenization: The default tokenizer is {@link PTBTokenizer}. If null is passed
+ * to {@code setTokenizerFactory}, then whitespace tokenization is assumed.
+ * &lt;p&gt;
+ * Adding a new document type requires two steps:
+ * &lt;ol&gt;
+ * &lt;li&gt; Add a new DocType.
+ * &lt;li&gt; Create an iterator for the new DocType and modify the iterator()
+ *     function to return the new iterator.
+ * &lt;/ol&gt;
+ * &lt;p&gt;
+ * NOTE: This implementation should &lt;em&gt;not&lt;/em&gt; use external libraries since it
+ * is used in the parser.
+ *
+ * @author Spence Green
+ */
+public class DocumentPreprocessor implements Iterable&lt;List&lt;HasWord&gt;&gt;  {
+
+  /** A logger for this class */
+<span class="fc" id="L58">  private static Redwood.RedwoodChannels log = Redwood.channels(DocumentPreprocessor.class);</span>
+
+<span class="pc" id="L60">  public enum DocType {Plain, XML}</span>
+
+  // todo: Should probably change this to be regex, but I've added some multi-character punctuation in the meantime
+<span class="fc" id="L63">  public static final String[] DEFAULT_SENTENCE_DELIMS = {&quot;.&quot;, &quot;?&quot;, &quot;!&quot;, &quot;!!&quot;, &quot;!!!&quot;, &quot;??&quot;, &quot;?!&quot;, &quot;!?&quot;};</span>
+
+  // inputReader is used in a fairly yucky way at the moment to communicate
+  // from a XMLIterator across to a PlainTextIterator.  Maybe redo by making
+  // the inner classes static and explicitly passing things around.
+  private Reader inputReader;
+  private final DocType docType;
+
+  //Configurable options
+<span class="pc" id="L72">  private TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory = PTBTokenizer.coreLabelFactory();</span>
+<span class="pc" id="L73">  private String[] sentenceFinalPuncWords = DEFAULT_SENTENCE_DELIMS;</span>
+  private Function&lt;List&lt;HasWord&gt;,List&lt;HasWord&gt;&gt; escaper; // = null;
+  private String sentenceDelimiter; // = null;
+  /**
+   * Example: if the words are already POS tagged and look like
+   * foo_VB, you want to set the tagDelimiter to &quot;_&quot;
+   */
+  private String tagDelimiter; // = null;
+  /**
+   * When doing XML parsing, only accept text in between tags that
+   * match this regular expression.  Defaults to everything.
+   */
+<span class="pc" id="L85">  private String elementDelimiter = &quot;.*&quot;;</span>
+
+<span class="fc" id="L87">  private static final Pattern wsPattern = Pattern.compile(&quot;\\s+&quot;);</span>
+
+  //From PTB conventions
+<span class="pc" id="L90">  private final String[] sentenceFinalFollowers = {&quot;)&quot;, &quot;]&quot;, &quot;\&quot;&quot;, &quot;\'&quot;, &quot;''&quot;, &quot;-RRB-&quot;, &quot;-RSB-&quot;, &quot;-RCB-&quot;};</span>
+
+  private boolean keepEmptySentences; // = false;
+
+
+  /**
+   * Constructs a preprocessor from an existing input stream.
+   *
+   * @param input An existing reader
+   */
+  public DocumentPreprocessor(Reader input) {
+<span class="fc" id="L101">    this(input,DocType.Plain);</span>
+<span class="fc" id="L102">  }</span>
+
+<span class="fc" id="L104">  public DocumentPreprocessor(Reader input, DocType t) {</span>
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">    if (input == null) {</span>
+<span class="nc" id="L106">      throw new IllegalArgumentException(&quot;Cannot read from null object!&quot;);</span>
+    }
+<span class="fc" id="L108">    docType = t;</span>
+<span class="fc" id="L109">    inputReader = input;</span>
+<span class="fc" id="L110">  }</span>
+
+  public DocumentPreprocessor(String docPath) {
+<span class="nc" id="L113">    this(docPath, DocType.Plain, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L114">  }</span>
+
+  public DocumentPreprocessor(String docPath, DocType t) {
+<span class="nc" id="L117">    this(docPath, t, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L118">  }</span>
+
+
+  /**
+   * Constructs a preprocessor from a file at a path, which can be either
+   * a filesystem location, a classpath entry, or a URL.
+   *
+   * @param docPath The path
+   * @param encoding The character encoding used by Readers
+   */
+<span class="nc" id="L128">  public DocumentPreprocessor(String docPath, DocType t, String encoding) {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">    if (docPath == null) {</span>
+<span class="nc" id="L130">      throw new IllegalArgumentException(&quot;Cannot open null document path!&quot;);</span>
+    }
+
+<span class="nc" id="L133">    docType = t;</span>
+    try {
+<span class="nc" id="L135">      inputReader = IOUtils.readerFromString(docPath, encoding);</span>
+<span class="nc" id="L136">    } catch (IOException ioe) {</span>
+<span class="nc" id="L137">      throw new RuntimeIOException(String.format(&quot;%s: Could not open path %s&quot;, this.getClass().getName(), docPath),</span>
+              ioe);
+<span class="nc" id="L139">    }</span>
+<span class="nc" id="L140">  }</span>
+
+  /**
+   * Set whether or not the tokenizer keeps empty sentences in
+   * whitespace mode.  Useful for programs that want to echo blank
+   * lines.  Not relevant for the non-whitespace model.
+   */
+  public void setKeepEmptySentences(boolean keepEmptySentences) {
+<span class="nc" id="L148">    this.keepEmptySentences = keepEmptySentences;</span>
+<span class="nc" id="L149">  }</span>
+
+  /**
+   * Sets the end-of-sentence delimiters.
+   * &lt;p&gt;
+   * For newline tokenization, use the argument {&quot;\n&quot;}.
+   *
+   * @param sentenceFinalPuncWords An array of words that count as sentence final punctuation.
+   */
+  public void setSentenceFinalPuncWords(String[] sentenceFinalPuncWords) {
+<span class="fc" id="L159">    this.sentenceFinalPuncWords = sentenceFinalPuncWords;</span>
+<span class="fc" id="L160">  }</span>
+
+  /**
+   * Sets the factory from which to produce a {@link Tokenizer}.  The default is
+   * {@link PTBTokenizer}.
+   * &lt;p&gt;
+   * NOTE: If a null argument is used, then the document is assumed to be tokenized
+   * and DocumentPreprocessor performs no tokenization.
+   *
+   */
+  public void setTokenizerFactory(TokenizerFactory&lt;? extends HasWord&gt; newTokenizerFactory) {
+<span class="fc" id="L171">    tokenizerFactory = newTokenizerFactory;</span>
+<span class="fc" id="L172">  }</span>
+
+  /**
+   * Set an escaper.
+   *
+   * @param e The escaper
+   */
+<span class="nc" id="L179">  public void setEscaper(Function&lt;List&lt;HasWord&gt;,List&lt;HasWord&gt;&gt; e) { escaper = e; }</span>
+
+  /**
+   * Make the processor assume that the document is already delimited
+   * by the supplied parameter.
+   *
+   * @param s The sentence delimiter
+   */
+<span class="fc" id="L187">  public void setSentenceDelimiter(String s) { sentenceDelimiter = s; }</span>
+
+  /**
+   * Split tags from tokens. The tag will be placed in the TagAnnotation of
+   * the returned label.
+   * &lt;p&gt;
+   * Note that for strings that contain two or more instances of the tag delimiter,
+   * the last instance is treated as the split point.
+   * &lt;p&gt;
+   * The tag delimiter should not contain any characters that must be escaped in a Java
+   * regex.
+   *
+   * @param s POS tag delimiter
+   */
+<span class="nc" id="L201">  public void setTagDelimiter(String s) { tagDelimiter = s; }</span>
+
+  /**
+   * Only read text from inside these XML elements if in XML mode.
+   * &lt;i&gt;Note:&lt;/i&gt; This class implements an approximation to XML via regex.
+   *
+   * Otherwise, text will read from all tokens.
+   */
+<span class="fc" id="L209">  public void setElementDelimiter(String s) { elementDelimiter = s; }</span>
+
+
+  /**
+   * Returns sentences until the document is exhausted. Calls close() if the end of the document
+   * is reached. Otherwise, the user is required to close the stream.
+   *
+   * @return An Iterator over sentences (each a List of word tokens).
+   * Although the type is given as {@code List&lt;HasWord&gt;}, in practice you get a List of CoreLabel,
+   * and you can cast down to that. (Someday we might manage to fix the generic typing....)
+   */
+  @Override
+  public Iterator&lt;List&lt;HasWord&gt;&gt; iterator() {
+    // Add new document types here
+<span class="fc bfc" id="L223" title="All 2 branches covered.">    if (docType == DocType.Plain) {</span>
+<span class="fc" id="L224">      return new PlainTextIterator();</span>
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">    } else if (docType == DocType.XML) {</span>
+<span class="fc" id="L226">      return new XMLIterator();</span>
+    } else {
+<span class="nc" id="L228">      throw new IllegalStateException(&quot;Someone didn't add a handler for a new docType.&quot;);</span>
+    }
+  }
+
+
+  private class PlainTextIterator implements Iterator&lt;List&lt;HasWord&gt;&gt; {
+
+    private final Tokenizer&lt;? extends HasWord&gt; tokenizer;
+    private final Set&lt;String&gt; sentDelims;
+    private final Set&lt;String&gt; delimFollowers;
+    private final Function&lt;String, String[]&gt; splitTag;
+    private List&lt;HasWord&gt; nextSent; // = null;
+<span class="fc" id="L240">    private final List&lt;HasWord&gt; nextSentCarryover = Generics.newArrayList();</span>
+
+<span class="fc" id="L242">    public PlainTextIterator() {</span>
+      // Establish how to find sentence boundaries
+<span class="fc" id="L244">      boolean eolIsSignificant = false;</span>
+<span class="fc" id="L245">      sentDelims = Generics.newHashSet();</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">      if (sentenceDelimiter == null) {</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">        if (sentenceFinalPuncWords != null) {</span>
+<span class="fc" id="L248">          sentDelims.addAll(Arrays.asList(sentenceFinalPuncWords));</span>
+        }
+<span class="fc" id="L250">        delimFollowers = Generics.newHashSet(Arrays.asList(sentenceFinalFollowers));</span>
+      } else {
+<span class="fc" id="L252">        sentDelims.add(sentenceDelimiter);</span>
+<span class="fc" id="L253">        delimFollowers = Generics.newHashSet();</span>
+<span class="fc" id="L254">        eolIsSignificant = wsPattern.matcher(sentenceDelimiter).matches();</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        if(eolIsSignificant) { // For Stanford English Tokenizer</span>
+<span class="fc" id="L256">          sentDelims.add(PTBLexer.NEWLINE_TOKEN);</span>
+        }
+      }
+
+      // Setup the tokenizer
+<span class="fc bfc" id="L261" title="All 2 branches covered.">      if (tokenizerFactory == null) {</span>
+<span class="fc" id="L262">        eolIsSignificant = sentDelims.contains(WhitespaceLexer.NEWLINE);</span>
+<span class="fc" id="L263">        tokenizer = WhitespaceTokenizer.</span>
+<span class="fc" id="L264">          newWordWhitespaceTokenizer(inputReader, eolIsSignificant);</span>
+      } else {
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        if (eolIsSignificant) {</span>
+<span class="nc" id="L267">          tokenizer = tokenizerFactory.getTokenizer(inputReader, &quot;tokenizeNLs&quot;);</span>
+        } else {
+<span class="fc" id="L269">          tokenizer = tokenizerFactory.getTokenizer(inputReader);</span>
+        }
+      }
+
+      // If tokens are tagged, then we must split them
+      // Note that if the token contains two or more instances of the delimiter, then the last
+      // instance is regarded as the split point.
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">      if (tagDelimiter == null) {</span>
+<span class="fc" id="L277">        splitTag = null;</span>
+      } else {
+<span class="nc" id="L279">        splitTag = new Function&lt;String,String[]&gt;() {</span>
+<span class="nc" id="L280">          private final String splitRegex = String.format(&quot;%s(?!.*%s)&quot;, tagDelimiter, tagDelimiter);</span>
+          @Override
+          public String[] apply(String in) {
+<span class="nc" id="L283">            final String[] splits = in.trim().split(splitRegex);</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if(splits.length == 2)</span>
+<span class="nc" id="L285">              return splits;</span>
+            else {
+<span class="nc" id="L287">              String[] oldStr = {in};</span>
+<span class="nc" id="L288">              return oldStr;</span>
+            }
+          }
+        };
+      }
+<span class="fc" id="L293">    }</span>
+
+    private void primeNext() {
+<span class="fc bfc" id="L296" title="All 2 branches covered.">      if (inputReader == null) {</span>
+        // we've already been out of stuff and have closed the input reader; so just return
+<span class="fc" id="L298">        return;</span>
+      }
+
+<span class="fc" id="L301">      nextSent = Generics.newArrayList(nextSentCarryover);</span>
+<span class="fc" id="L302">      nextSentCarryover.clear();</span>
+<span class="fc" id="L303">      boolean seenBoundary = false;</span>
+
+<span class="fc bfc" id="L305" title="All 2 branches covered.">      if (!tokenizer.hasNext()) {</span>
+<span class="fc" id="L306">        IOUtils.closeIgnoringExceptions(inputReader);</span>
+<span class="fc" id="L307">        inputReader = null;</span>
+        // nextSent = null; // WRONG: There may be something in it from the nextSentCarryover
+<span class="fc bfc" id="L309" title="All 2 branches covered.">        if (nextSent.isEmpty()) {</span>
+<span class="fc" id="L310">          nextSent = null;</span>
+        }
+<span class="fc" id="L312">        return;</span>
+      }
+
+      do {
+<span class="fc" id="L316">        HasWord token = tokenizer.next();</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        if (splitTag != null) {</span>
+<span class="nc" id="L318">          String[] toks = splitTag.apply(token.word());</span>
+<span class="nc" id="L319">          token.setWord(toks[0]);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">          if (token instanceof Label) {</span>
+<span class="nc" id="L321">            ((Label) token).setValue(toks[0]);</span>
+          }
+<span class="nc bnc" id="L323" title="All 4 branches missed.">          if(toks.length == 2 &amp;&amp; token instanceof HasTag) {</span>
+            //wsg2011: Some of the underlying tokenizers return old
+            //JavaNLP labels.  We could convert to CoreLabel here, but
+            //we choose a conservative implementation....
+<span class="nc" id="L327">            ((HasTag) token).setTag(toks[1]);</span>
+          }
+        }
+
+<span class="fc bfc" id="L331" title="All 2 branches covered.">        if (sentDelims.contains(token.word())) {</span>
+<span class="fc" id="L332">          seenBoundary = true;</span>
+<span class="fc bfc" id="L333" title="All 4 branches covered.">        } else if (seenBoundary &amp;&amp; !delimFollowers.contains(token.word())) {</span>
+<span class="fc" id="L334">          nextSentCarryover.add(token);</span>
+<span class="fc" id="L335">          break;</span>
+        }
+
+<span class="fc bfc" id="L338" title="All 2 branches covered.">        if ( ! (wsPattern.matcher(token.word()).matches() ||</span>
+<span class="pc bpc" id="L339" title="1 of 2 branches missed.">                token.word().equals(PTBLexer.NEWLINE_TOKEN))) {</span>
+<span class="fc" id="L340">          nextSent.add(token);</span>
+        }
+
+        // If there are no words that can follow a sentence delimiter,
+        // then there are two cases.  In one case is we already have a
+        // sentence, in which case there is no reason to look at the
+        // next token, since that just causes buffering without any
+        // chance of the current sentence being extended, since
+        // delimFollowers = {}.  In the other case, we have an empty
+        // sentence, which at this point means the sentence delimiter
+        // was a whitespace token such as \n.  We might as well keep
+        // going as if we had never seen anything.
+<span class="fc bfc" id="L352" title="All 4 branches covered.">        if (seenBoundary &amp;&amp; delimFollowers.isEmpty()) {</span>
+<span class="pc bpc" id="L353" title="1 of 4 branches missed.">          if ( ! nextSent.isEmpty() || keepEmptySentences) {</span>
+<span class="nc" id="L354">            break;</span>
+          } else {
+<span class="fc" id="L356">            seenBoundary = false;</span>
+          }
+        }
+<span class="fc bfc" id="L359" title="All 2 branches covered.">      } while (tokenizer.hasNext());</span>
+
+<span class="pc bpc" id="L361" title="5 of 6 branches missed.">      if (nextSent.isEmpty() &amp;&amp; nextSentCarryover.isEmpty() &amp;&amp; ! keepEmptySentences) {</span>
+<span class="nc" id="L362">        IOUtils.closeIgnoringExceptions(inputReader);</span>
+<span class="nc" id="L363">        inputReader = null;</span>
+<span class="nc" id="L364">        nextSent = null;</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">      } else if (escaper != null) {</span>
+<span class="nc" id="L366">        nextSent = escaper.apply(nextSent);</span>
+      }
+<span class="fc" id="L368">    }</span>
+
+    @Override
+    public boolean hasNext() {
+<span class="fc bfc" id="L372" title="All 2 branches covered.">      if (nextSent == null) {</span>
+<span class="fc" id="L373">        primeNext();</span>
+      }
+<span class="fc bfc" id="L375" title="All 2 branches covered.">      return nextSent != null;</span>
+    }
+
+    @Override
+    public List&lt;HasWord&gt; next() {
+<span class="fc bfc" id="L380" title="All 2 branches covered.">      if (nextSent == null) {</span>
+<span class="fc" id="L381">        primeNext();</span>
+      }
+<span class="fc bfc" id="L383" title="All 2 branches covered.">      if (nextSent == null) {</span>
+<span class="fc" id="L384">        throw new NoSuchElementException();</span>
+      }
+<span class="fc" id="L386">      List&lt;HasWord&gt; thisIteration = nextSent;</span>
+<span class="fc" id="L387">      nextSent = null;</span>
+<span class="fc" id="L388">      return thisIteration;</span>
+    }
+
+    @Override
+<span class="nc" id="L392">    public void remove() { throw new UnsupportedOperationException(); }</span>
+
+  }
+
+
+  private class XMLIterator implements Iterator&lt;List&lt;HasWord&gt;&gt; {
+
+    private final XMLBeginEndIterator&lt;String&gt; xmlItr;
+    private final Reader originalDocReader;
+    private PlainTextIterator plainItr; // = null;
+    private List&lt;HasWord&gt; nextSent; // = null;
+
+<span class="fc" id="L404">    public XMLIterator() {</span>
+<span class="fc" id="L405">      xmlItr = new XMLBeginEndIterator&lt;&gt;(inputReader, elementDelimiter);</span>
+<span class="fc" id="L406">      originalDocReader = inputReader;</span>
+<span class="fc" id="L407">      primeNext();</span>
+<span class="fc" id="L408">    }</span>
+
+    private void primeNext() {
+      // It is necessary to loop because if a document has a pattern
+      // that goes: &lt;tag&gt;&lt;/tag&gt; the xmlItr will return an empty
+      // string, which the plainItr will process to null.  If we
+      // didn't loop to find the next tag, the iterator would stop.
+      do {
+<span class="fc bfc" id="L416" title="All 4 branches covered.">        if (plainItr != null &amp;&amp; plainItr.hasNext()) {</span>
+<span class="fc" id="L417">          nextSent = plainItr.next();</span>
+<span class="fc bfc" id="L418" title="All 2 branches covered.">        } else if (xmlItr.hasNext()) {</span>
+<span class="fc" id="L419">          String block = xmlItr.next();</span>
+<span class="fc" id="L420">          inputReader = new BufferedReader(new StringReader(block));</span>
+<span class="fc" id="L421">          plainItr = new PlainTextIterator();</span>
+<span class="fc bfc" id="L422" title="All 2 branches covered.">          if (plainItr.hasNext()) {</span>
+<span class="fc" id="L423">            nextSent = plainItr.next();</span>
+          } else {
+<span class="fc" id="L425">            nextSent = null;</span>
+          }
+<span class="fc" id="L427">        } else {</span>
+<span class="fc" id="L428">          IOUtils.closeIgnoringExceptions(originalDocReader);</span>
+<span class="fc" id="L429">          nextSent = null;</span>
+<span class="fc" id="L430">          break;</span>
+        }
+<span class="fc bfc" id="L432" title="All 2 branches covered.">      } while (nextSent == null);</span>
+<span class="fc" id="L433">    }</span>
+
+    @Override
+    public boolean hasNext() {
+<span class="fc bfc" id="L437" title="All 2 branches covered.">      return nextSent != null;</span>
+    }
+
+    @Override
+    public List&lt;HasWord&gt; next() {
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">      if (nextSent == null) {</span>
+<span class="nc" id="L443">        throw new NoSuchElementException();</span>
+      }
+<span class="fc" id="L445">      List&lt;HasWord&gt; thisSentence = nextSent;</span>
+<span class="fc" id="L446">      primeNext();</span>
+<span class="fc" id="L447">      return thisSentence;</span>
+    }
+
+    @Override
+<span class="nc" id="L451">    public void remove() { throw new UnsupportedOperationException(); }</span>
+
+  } // end class XMLIterator
+
+
+  private static String usage() {
+<span class="nc" id="L457">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L458">    String nl = System.lineSeparator();</span>
+<span class="nc" id="L459">    sb.append(String.format(&quot;Usage: java %s [OPTIONS] [file] [&lt; file]%n%n&quot;, DocumentPreprocessor.class.getName()));</span>
+<span class="nc" id="L460">    sb.append(&quot;Options:&quot;).append(nl);</span>
+<span class="nc" id="L461">    sb.append(&quot;-xml delim              : XML input with associated delimiter.&quot;).append(nl);</span>
+<span class="nc" id="L462">    sb.append(&quot;-encoding type          : Input encoding (default: UTF-8).&quot;).append(nl);</span>
+<span class="nc" id="L463">    sb.append(&quot;-printSentenceLengths   : &quot;).append(nl);</span>
+<span class="nc" id="L464">    sb.append(&quot;-noTokenization         : Split on newline delimiters only.&quot;).append(nl);</span>
+<span class="nc" id="L465">    sb.append(&quot;-printOriginalText      : Print the original, not normalized form of tokens.&quot;).append(nl);</span>
+<span class="nc" id="L466">    sb.append(&quot;-suppressEscaping       : Suppress PTB escaping.&quot;).append(nl);</span>
+<span class="nc" id="L467">    sb.append(&quot;-tokenizerOptions opts  : Specify custom tokenizer options.&quot;).append(nl);</span>
+<span class="nc" id="L468">    sb.append(&quot;-tag delim              : Input tokens are tagged. Split tags.&quot;).append(nl);</span>
+<span class="nc" id="L469">    sb.append(&quot;-whitespaceTokenization : Whitespace tokenization only.&quot;).append(nl);</span>
+<span class="nc" id="L470">    return sb.toString();</span>
+  }
+
+  private static Map&lt;String,Integer&gt; argOptionDefs() {
+<span class="nc" id="L474">    Map&lt;String,Integer&gt; argOptionDefs = Generics.newHashMap();</span>
+<span class="nc" id="L475">    argOptionDefs.put(&quot;help&quot;, 0);</span>
+<span class="nc" id="L476">    argOptionDefs.put(&quot;xml&quot;, 1);</span>
+<span class="nc" id="L477">    argOptionDefs.put(&quot;encoding&quot;, 1);</span>
+<span class="nc" id="L478">    argOptionDefs.put(&quot;printSentenceLengths&quot;, 0);</span>
+<span class="nc" id="L479">    argOptionDefs.put(&quot;noTokenization&quot;, 0);</span>
+<span class="nc" id="L480">    argOptionDefs.put(&quot;suppressEscaping&quot;, 0);</span>
+<span class="nc" id="L481">    argOptionDefs.put(&quot;tag&quot;, 1);</span>
+<span class="nc" id="L482">    argOptionDefs.put(&quot;tokenizerOptions&quot;, 1);</span>
+<span class="nc" id="L483">    argOptionDefs.put(&quot;whitespaceTokenization&quot;, 0);</span>
+<span class="nc" id="L484">    return argOptionDefs;</span>
+  }
+
+  /**
+   * A simple, deterministic sentence-splitter. This method only supports the English
+   * tokenizer, so for other languages you should run the tokenizer first and then
+   * run this sentence splitter with the &quot;-whitespaceTokenization&quot; option.
+   *
+   * @param args Command-line arguments
+   */
+  public static void main(String[] args) throws IOException {
+<span class="nc" id="L495">    final Properties options = StringUtils.argsToProperties(args, argOptionDefs());</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">    if (options.containsKey(&quot;help&quot;)) {</span>
+<span class="nc" id="L497">      log.info(usage());</span>
+<span class="nc" id="L498">      return;</span>
+    }
+
+    // Command-line flags
+<span class="nc" id="L502">    String encoding = options.getProperty(&quot;encoding&quot;, &quot;utf-8&quot;);</span>
+<span class="nc" id="L503">    boolean printSentenceLengths = PropertiesUtils.getBool(options,&quot;printSentenceLengths&quot;, false);</span>
+<span class="nc" id="L504">    String xmlElementDelimiter = options.getProperty(&quot;xml&quot;, null);</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    DocType docType = xmlElementDelimiter == null ? DocType.Plain : DocType.XML;</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    String sentenceDelimiter = options.containsKey(&quot;noTokenization&quot;) ? System.getProperty(&quot;line.separator&quot;) : null;</span>
+<span class="nc" id="L507">    String tagDelimiter = options.getProperty(&quot;tag&quot;, null);</span>
+<span class="nc" id="L508">    String[] sentenceDelims = null;</span>
+
+    // Setup the TokenizerFactory
+<span class="nc" id="L511">    int numFactoryFlags = 0;</span>
+<span class="nc" id="L512">    boolean suppressEscaping = options.containsKey(&quot;suppressEscaping&quot;);</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">    if (suppressEscaping) numFactoryFlags += 1;</span>
+<span class="nc" id="L514">    boolean customTokenizer = options.containsKey(&quot;tokenizerOptions&quot;);</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">    if (customTokenizer) numFactoryFlags += 1;</span>
+<span class="nc" id="L516">    boolean printOriginalText = options.containsKey(&quot;printOriginalText&quot;);</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">    if (printOriginalText) numFactoryFlags += 1;</span>
+<span class="nc" id="L518">    boolean whitespaceTokenization = options.containsKey(&quot;whitespaceTokenization&quot;);</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">    if (whitespaceTokenization) numFactoryFlags += 1;</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">    if (numFactoryFlags &gt; 1) {</span>
+<span class="nc" id="L521">      log.info(&quot;Only one tokenizer flag allowed at a time: &quot;);</span>
+<span class="nc" id="L522">      log.info(&quot;  -suppressEscaping, -tokenizerOptions, -printOriginalText, -whitespaceTokenization&quot;);</span>
+<span class="nc" id="L523">      return;</span>
+    }
+
+<span class="nc" id="L526">    TokenizerFactory&lt;? extends HasWord&gt; tf = null;</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">    if (suppressEscaping) {</span>
+<span class="nc" id="L528">      tf = PTBTokenizer.factory(new CoreLabelTokenFactory(), &quot;ptb3Escaping=false&quot;);</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">    } else if (customTokenizer) {</span>
+<span class="nc" id="L530">      tf = PTBTokenizer.factory(new CoreLabelTokenFactory(), options.getProperty(&quot;tokenizerOptions&quot;));</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">    } else if (printOriginalText) {</span>
+<span class="nc" id="L532">      tf = PTBTokenizer.factory(new CoreLabelTokenFactory(), &quot;invertible=true&quot;);</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">    } else if (whitespaceTokenization) {</span>
+<span class="nc" id="L534">      List&lt;String&gt; whitespaceDelims =</span>
+<span class="nc" id="L535">          new ArrayList&lt;&gt;(Arrays.asList(DocumentPreprocessor.DEFAULT_SENTENCE_DELIMS));</span>
+<span class="nc" id="L536">      whitespaceDelims.add(WhitespaceLexer.NEWLINE);</span>
+<span class="nc" id="L537">      sentenceDelims = whitespaceDelims.toArray(new String[whitespaceDelims.size()]);</span>
+<span class="nc" id="L538">    } else {</span>
+<span class="nc" id="L539">      tf = PTBTokenizer.factory(new CoreLabelTokenFactory(), &quot;&quot;);</span>
+    }
+
+<span class="nc" id="L542">    String fileList = options.getProperty(&quot;&quot;, null);</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">    String[] files = fileList == null ? new String[1] : fileList.split(&quot;\\s+&quot;);</span>
+
+<span class="nc" id="L545">    int numSents = 0;</span>
+<span class="nc" id="L546">    PrintWriter pw = new PrintWriter(new OutputStreamWriter(System.out, encoding), true);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    for (String file : files) {</span>
+      DocumentPreprocessor docPreprocessor;
+<span class="nc bnc" id="L549" title="All 4 branches missed.">      if (file == null || file.isEmpty()) {</span>
+<span class="nc" id="L550">        docPreprocessor = new DocumentPreprocessor(new InputStreamReader(System.in, encoding));</span>
+      } else {
+<span class="nc" id="L552">        docPreprocessor = new DocumentPreprocessor(file, docType, encoding);</span>
+      }
+<span class="nc bnc" id="L554" title="All 2 branches missed.">      if (docType == DocType.XML) {</span>
+<span class="nc" id="L555">        docPreprocessor.setElementDelimiter(xmlElementDelimiter);</span>
+      }
+<span class="nc" id="L557">      docPreprocessor.setTokenizerFactory(tf);</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">      if (sentenceDelimiter != null) {</span>
+<span class="nc" id="L559">        docPreprocessor.setSentenceDelimiter(sentenceDelimiter);</span>
+      }
+<span class="nc bnc" id="L561" title="All 2 branches missed.">      if (tagDelimiter != null) {</span>
+<span class="nc" id="L562">        docPreprocessor.setTagDelimiter(tagDelimiter);</span>
+      }
+<span class="nc bnc" id="L564" title="All 2 branches missed.">      if (sentenceDelims != null) {</span>
+<span class="nc" id="L565">        docPreprocessor.setSentenceFinalPuncWords(sentenceDelims);</span>
+      }
+
+<span class="nc bnc" id="L568" title="All 2 branches missed.">      for (List&lt;HasWord&gt; sentence : docPreprocessor) {</span>
+<span class="nc" id="L569">        numSents++;</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        if (printSentenceLengths) {</span>
+<span class="nc" id="L571">          System.err.printf(&quot;Length: %d%n&quot;, sentence.size());</span>
+        }
+<span class="nc" id="L573">        boolean printSpace = false;</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">        for (HasWord word : sentence) {</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">          if (printOriginalText) {</span>
+<span class="nc" id="L576">            CoreLabel cl = (CoreLabel) word;</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">            if ( ! printSpace) {</span>
+<span class="nc" id="L578">              pw.print(cl.get(CoreAnnotations.BeforeAnnotation.class));</span>
+<span class="nc" id="L579">              printSpace = true;</span>
+            }
+<span class="nc" id="L581">            pw.print(cl.get(CoreAnnotations.OriginalTextAnnotation.class));</span>
+<span class="nc" id="L582">            pw.print(cl.get(CoreAnnotations.AfterAnnotation.class));</span>
+<span class="nc" id="L583">          } else {</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            if (printSpace) pw.print(&quot; &quot;);</span>
+<span class="nc" id="L585">            printSpace = true;</span>
+<span class="nc" id="L586">            pw.print(word.word());</span>
+          }
+<span class="nc" id="L588">        }</span>
+<span class="nc" id="L589">        pw.println();</span>
+<span class="nc" id="L590">      }</span>
+    }
+<span class="nc" id="L592">    pw.close();</span>
+<span class="nc" id="L593">    System.err.printf(&quot;Read in %d sentences.%n&quot;, numSents);</span>
+<span class="nc" id="L594">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

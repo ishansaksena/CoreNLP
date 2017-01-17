@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClauseSplitter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.naturalli</a> &gt; <span class="el_source">ClauseSplitter.java</span></div><h1>ClauseSplitter.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.naturalli;
+
+import edu.stanford.nlp.classify.*;
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.ie.util.RelationTriple;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.util.*;
+
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
+import java.util.stream.Stream;
+import java.util.zip.GZIPOutputStream;
+
+import edu.stanford.nlp.naturalli.ClauseSplitterSearchProblem.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+/**
+ * Just a convenience alias for a clause splitting search problem factory.
+ * Mostly here to form a nice parallel with {@link edu.stanford.nlp.naturalli.ForwardEntailer}.
+ *
+ * @author Gabor Angeli
+ */
+public interface ClauseSplitter extends BiFunction&lt;SemanticGraph, Boolean, ClauseSplitterSearchProblem&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L38">  Redwood.RedwoodChannels log = Redwood.channels(ClauseSplitter.class);</span>
+
+<span class="pc" id="L40">  enum ClauseClassifierLabel {</span>
+<span class="fc" id="L41">    CLAUSE_SPLIT(2),</span>
+<span class="fc" id="L42">    CLAUSE_INTERM(1),</span>
+<span class="fc" id="L43">    NOT_A_CLAUSE(0);</span>
+    public final byte index;
+<span class="fc" id="L45">    ClauseClassifierLabel(int val) {</span>
+<span class="fc" id="L46">      this.index = (byte) val;</span>
+<span class="fc" id="L47">    }</span>
+    /** Seriously, why would Java not have this by default? */
+    @Override
+    public String toString() {
+<span class="nc" id="L51">      return this.name();</span>
+    }
+    @SuppressWarnings(&quot;unused&quot;)
+    public static ClauseClassifierLabel fromIndex(int index) {
+<span class="nc bnc" id="L55" title="All 4 branches missed.">      switch (index) {</span>
+        case 0:
+<span class="nc" id="L57">          return NOT_A_CLAUSE;</span>
+        case 1:
+<span class="nc" id="L59">          return CLAUSE_INTERM;</span>
+        case 2:
+<span class="nc" id="L61">          return CLAUSE_SPLIT;</span>
+        default:
+<span class="nc" id="L63">          throw new IllegalArgumentException(&quot;Not a valid index: &quot; + index);</span>
+      }
+    }
+  }
+
+
+  /**
+   * Train a clause searcher factory. That is, train a classifier for which arcs should be
+   * new clauses.
+   *
+   * @param trainingData The training data. This is a stream of triples of:
+   *                     &lt;ol&gt;
+   *                       &lt;li&gt;The sentence containing a known extraction.&lt;/li&gt;
+   *                       &lt;li&gt;The span of the subject in the sentence, as a token span.&lt;/li&gt;
+   *                       &lt;li&gt;The span of the object in the sentence, as a token span.&lt;/li&gt;
+   *                     &lt;/ol&gt;
+   * @param modelPath The path to save the model to. This is useful for {@link ClauseSplitter#load(String)}.
+   * @param trainingDataDump The path to save the training data, as a set of labeled featurized datums.
+   * @param featurizer The featurizer to use for this classifier.
+   *
+   * @return A factory for creating searchers from a given dependency tree.
+   */
+  static ClauseSplitter train(
+      Stream&lt;Pair&lt;CoreMap, Collection&lt;Pair&lt;Span, Span&gt;&gt;&gt;&gt; trainingData,
+      Optional&lt;File&gt; modelPath,
+      Optional&lt;File&gt; trainingDataDump,
+      Featurizer featurizer) {
+
+    // Parse options
+<span class="nc" id="L92">    LinearClassifierFactory&lt;ClauseClassifierLabel, String&gt; factory = new LinearClassifierFactory&lt;&gt;();</span>
+    // Generally useful objects
+<span class="nc" id="L94">    OpenIE openie = new OpenIE(PropertiesUtils.asProperties(</span>
+        &quot;splitter.nomodel&quot;, &quot;true&quot;,
+        &quot;optimizefor&quot;, &quot;GENERAL&quot;
+    ));
+<span class="nc" id="L98">    WeightedDataset&lt;ClauseClassifierLabel, String&gt; dataset = new WeightedDataset&lt;&gt;();</span>
+<span class="nc" id="L99">    AtomicInteger numExamplesProcessed = new AtomicInteger(0);</span>
+<span class="nc" id="L100">    final Optional&lt;PrintWriter&gt; datasetDumpWriter = trainingDataDump.map(file -&gt; {</span>
+      try {
+<span class="nc" id="L102">        return new PrintWriter(new OutputStreamWriter(new GZIPOutputStream(new FileOutputStream(trainingDataDump.get()))));</span>
+<span class="nc" id="L103">      } catch (IOException e) {</span>
+<span class="nc" id="L104">        throw new RuntimeIOException(e);</span>
+      }
+    });
+
+
+    // Step 1: Loop over data
+<span class="nc" id="L110">    forceTrack(&quot;Training inference&quot;);</span>
+<span class="nc" id="L111">    trainingData.forEach(rawExample -&gt; {</span>
+      // Parse training datum
+<span class="nc" id="L113">      CoreMap sentence = rawExample.first;</span>
+<span class="nc" id="L114">      Collection&lt;Pair&lt;Span, Span&gt;&gt; spans = rawExample.second;</span>
+<span class="nc" id="L115">      List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L116">      SemanticGraph tree = sentence.get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class);</span>
+      // Create raw clause searcher (no classifier)
+<span class="nc" id="L118">      ClauseSplitterSearchProblem problem = new ClauseSplitterSearchProblem(tree, true);</span>
+
+      // Run search
+<span class="nc" id="L121">      problem.search(fragmentAndScore -&gt; {</span>
+        // Parse the search callback
+<span class="nc" id="L123">        List&lt;Counter&lt;String&gt;&gt; features = fragmentAndScore.second;</span>
+<span class="nc" id="L124">        SentenceFragment fragment = fragmentAndScore.third.get();</span>
+
+        // Search for extractions
+<span class="nc" id="L127">        Set&lt;RelationTriple&gt; extractions = new HashSet&lt;&gt;(openie.relationsInFragments(openie.entailmentsFromClause(fragment)));</span>
+<span class="nc" id="L128">        Trilean correct = Trilean.FALSE;</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        RELATION_TRIPLE_LOOP: for (RelationTriple extraction : extractions) {</span>
+          // Clean up the guesses
+<span class="nc" id="L131">          Span subjectGuess = Span.fromValues(extraction.subject.get(0).index() - 1, extraction.subject.get(extraction.subject.size() - 1).index());</span>
+<span class="nc" id="L132">          Span objectGuess = Span.fromValues(extraction.object.get(0).index() - 1, extraction.object.get(extraction.object.size() - 1).index());</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">          for (Pair&lt;Span, Span&gt; candidateGold : spans) {</span>
+<span class="nc" id="L134">            Span subjectSpan = candidateGold.first;</span>
+<span class="nc" id="L135">            Span objectSpan = candidateGold.second;</span>
+            // Check if it matches
+<span class="nc bnc" id="L137" title="All 4 branches missed.">            if ((subjectGuess.equals(subjectSpan) &amp;&amp; objectGuess.equals(objectSpan)) ||</span>
+<span class="nc bnc" id="L138" title="All 4 branches missed.">                (subjectGuess.equals(objectSpan) &amp;&amp; objectGuess.equals(subjectSpan))</span>
+                ) {
+<span class="nc" id="L140">              correct = Trilean.TRUE;</span>
+<span class="nc" id="L141">              break RELATION_TRIPLE_LOOP;</span>
+<span class="nc bnc" id="L142" title="All 4 branches missed.">            } else if (Util.nerOverlap(tokens, subjectSpan, subjectGuess) &amp;&amp; Util.nerOverlap(tokens, objectSpan, objectGuess) ||</span>
+<span class="nc bnc" id="L143" title="All 4 branches missed.">                Util.nerOverlap(tokens, subjectSpan, objectGuess) &amp;&amp; Util.nerOverlap(tokens, objectSpan, subjectGuess)) {</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">              if (!correct.isTrue()) {</span>
+<span class="nc" id="L145">                correct = Trilean.TRUE;</span>
+<span class="nc" id="L146">                break RELATION_TRIPLE_LOOP;</span>
+              }
+            } else {
+<span class="nc bnc" id="L149" title="All 2 branches missed.">              if (!correct.isTrue()) {</span>
+<span class="nc" id="L150">                correct = Trilean.UNKNOWN;</span>
+<span class="nc" id="L151">                break RELATION_TRIPLE_LOOP;</span>
+              }
+            }
+<span class="nc" id="L154">          }</span>
+<span class="nc" id="L155">        }</span>
+
+        // Process the datum
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (!features.isEmpty()) {</span>
+
+          // Convert the path to datums
+<span class="nc" id="L161">          List&lt;Pair&lt;Counter&lt;String&gt;, ClauseClassifierLabel&gt;&gt; decisionsToAddAsDatums = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">          if (correct.isTrue()) {</span>
+            // If this is a &quot;true&quot; path, add the k-1 decisions as INTERM and the last decision as a SPLIT
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            for (int i = 0; i &lt; features.size(); ++i) {</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">              if (i == features.size() - 1) {</span>
+<span class="nc" id="L166">                decisionsToAddAsDatums.add(Pair.makePair(features.get(i), ClauseClassifierLabel.CLAUSE_SPLIT));</span>
+              } else {
+<span class="nc" id="L168">                decisionsToAddAsDatums.add(Pair.makePair(features.get(i), ClauseClassifierLabel.CLAUSE_INTERM));</span>
+              }
+            }
+<span class="nc bnc" id="L171" title="All 2 branches missed.">          } else if (correct.isFalse()) {</span>
+            // If this is a &quot;false&quot; path, then we know at least the last decision was bad.
+<span class="nc" id="L173">            decisionsToAddAsDatums.add(Pair.makePair(features.get(features.size() - 1), ClauseClassifierLabel.NOT_A_CLAUSE));</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">          } else if (correct.isUnknown()) {</span>
+            // If this is an &quot;unknown&quot; path, only add it if it was the result of vanilla splits
+            // (check if it is a sequence of simple splits)
+<span class="nc" id="L177">            boolean isSimpleSplit = false;</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            for (Counter&lt;String&gt; feats : features) {</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">              if (featurizer.isSimpleSplit(feats)) {</span>
+<span class="nc" id="L180">                isSimpleSplit = true;</span>
+<span class="nc" id="L181">                break;</span>
+              }
+<span class="nc" id="L183">            }</span>
+            // (if so, add it as if it were a True example)
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            if (isSimpleSplit) {</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">              for (int i = 0; i &lt; features.size(); ++i) {</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">                if (i == features.size() - 1) {</span>
+<span class="nc" id="L188">                  decisionsToAddAsDatums.add(Pair.makePair(features.get(i), ClauseClassifierLabel.CLAUSE_SPLIT));</span>
+                } else {
+<span class="nc" id="L190">                  decisionsToAddAsDatums.add(Pair.makePair(features.get(i), ClauseClassifierLabel.CLAUSE_INTERM));</span>
+                }
+              }
+            }
+          }
+
+          // Add the datums
+<span class="nc bnc" id="L197" title="All 2 branches missed.">          for (Pair&lt;Counter&lt;String&gt;, ClauseClassifierLabel&gt; decision : decisionsToAddAsDatums) {</span>
+            // (create datum)
+<span class="nc" id="L199">            RVFDatum&lt;ClauseClassifierLabel, String&gt; datum = new RVFDatum&lt;&gt;(decision.first);</span>
+<span class="nc" id="L200">            datum.setLabel(decision.second);</span>
+            // (dump datum to debug log)
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            if (datasetDumpWriter.isPresent()) {</span>
+<span class="nc" id="L203">              datasetDumpWriter.get().println(decision.second + &quot;\t&quot; +</span>
+<span class="nc" id="L204">                  StringUtils.join(decision.first.entrySet().stream().map(entry -&gt; entry.getKey() + &quot;-&gt;&quot; + entry.getValue()), &quot;;&quot;));</span>
+            }
+            // (add datum to dataset)
+<span class="nc" id="L207">            dataset.add(datum);</span>
+<span class="nc" id="L208">          }</span>
+        }
+<span class="nc" id="L210">        return true;</span>
+<span class="nc" id="L211">      }, new LinearClassifier&lt;&gt;(new ClassicCounter&lt;&gt;()), Collections.emptyMap(), featurizer, 10000);</span>
+
+      // Debug info
+<span class="nc bnc" id="L214" title="All 2 branches missed.">      if (numExamplesProcessed.incrementAndGet() % 100 == 0) {</span>
+<span class="nc" id="L215">        log(&quot;processed &quot; + numExamplesProcessed + &quot; training sentences: &quot; + dataset.size() + &quot; datums&quot;);</span>
+      }
+<span class="nc" id="L217">    });</span>
+<span class="nc" id="L218">    endTrack(&quot;Training inference&quot;);</span>
+
+    // Close the file
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    if (datasetDumpWriter.isPresent()) {</span>
+<span class="nc" id="L222">      datasetDumpWriter.get().close();</span>
+    }
+
+    // Step 2: Train classifier
+<span class="nc" id="L226">    forceTrack(&quot;Training&quot;);</span>
+<span class="nc" id="L227">    Classifier&lt;ClauseClassifierLabel,String&gt; fullClassifier = factory.trainClassifier(dataset);</span>
+<span class="nc" id="L228">    endTrack(&quot;Training&quot;);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">    if (modelPath.isPresent()) {</span>
+<span class="nc" id="L230">      Pair&lt;Classifier&lt;ClauseClassifierLabel,String&gt;, Featurizer&gt; toSave = Pair.makePair(fullClassifier, featurizer);</span>
+      try {
+<span class="nc" id="L232">        IOUtils.writeObjectToFile(toSave, modelPath.get());</span>
+<span class="nc" id="L233">        log(&quot;SUCCESS: wrote model to &quot; + modelPath.get().getPath());</span>
+<span class="nc" id="L234">      } catch (IOException e) {</span>
+<span class="nc" id="L235">        log(&quot;ERROR: failed to save model to path: &quot; + modelPath.get().getPath());</span>
+<span class="nc" id="L236">        err(e);</span>
+<span class="nc" id="L237">      }</span>
+    }
+
+    // Step 3: Check accuracy of classifier
+<span class="nc" id="L241">    forceTrack(&quot;Training accuracy&quot;);</span>
+<span class="nc" id="L242">    dataset.randomize(42L);</span>
+<span class="nc" id="L243">    Util.dumpAccuracy(fullClassifier, dataset);</span>
+<span class="nc" id="L244">    endTrack(&quot;Training accuracy&quot;);</span>
+
+<span class="nc" id="L246">    int numFolds = 5;</span>
+<span class="nc" id="L247">    forceTrack(numFolds + &quot; fold cross-validation&quot;);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">    for (int fold = 0; fold &lt; numFolds; ++fold) {</span>
+<span class="nc" id="L249">      forceTrack(&quot;Fold &quot; + (fold + 1));</span>
+<span class="nc" id="L250">      forceTrack(&quot;Training&quot;);</span>
+<span class="nc" id="L251">      Pair&lt;GeneralDataset&lt;ClauseClassifierLabel, String&gt;, GeneralDataset&lt;ClauseClassifierLabel, String&gt;&gt; foldData = dataset.splitOutFold(fold, numFolds);</span>
+<span class="nc" id="L252">      Classifier&lt;ClauseClassifierLabel, String&gt; classifier = factory.trainClassifier(foldData.first);</span>
+<span class="nc" id="L253">      endTrack(&quot;Training&quot;);</span>
+<span class="nc" id="L254">      forceTrack(&quot;Test&quot;);</span>
+<span class="nc" id="L255">      Util.dumpAccuracy(classifier, foldData.second);</span>
+<span class="nc" id="L256">      endTrack(&quot;Test&quot;);</span>
+<span class="nc" id="L257">      endTrack(&quot;Fold &quot; + (fold + 1));</span>
+    }
+<span class="nc" id="L259">    endTrack(numFolds + &quot; fold cross-validation&quot;);</span>
+
+
+    // Step 5: return factory
+<span class="nc" id="L263">    return (tree, truth) -&gt; new ClauseSplitterSearchProblem(tree, truth, Optional.of(fullClassifier), Optional.of(featurizer));</span>
+  }
+
+  static ClauseSplitter train(
+      Stream&lt;Pair&lt;CoreMap, Collection&lt;Pair&lt;Span, Span&gt;&gt;&gt;&gt; trainingData,
+      File modelPath,
+      File trainingDataDump) {
+<span class="nc" id="L270">    return train(trainingData, Optional.of(modelPath), Optional.of(trainingDataDump), ClauseSplitterSearchProblem.DEFAULT_FEATURIZER);</span>
+  }
+
+
+  /**
+   * Load a factory model from a given path. This can be trained with
+   * {@link ClauseSplitter#train(Stream, Optional, Optional, Featurizer)}.
+   *
+   * @return A function taking a dependency tree, and returning a clause searcher.
+   */
+  static ClauseSplitter load(String serializedModel) throws IOException {
+    try {
+<span class="nc" id="L282">      long start = System.currentTimeMillis();</span>
+<span class="nc" id="L283">      Pair&lt;Classifier&lt;ClauseClassifierLabel,String&gt;, Featurizer&gt; data = IOUtils.readObjectFromURLOrClasspathOrFileSystem(serializedModel);</span>
+<span class="nc" id="L284">      ClauseSplitter rtn =  (tree, truth) -&gt; new ClauseSplitterSearchProblem(tree, truth, Optional.of(data.first), Optional.of(data.second));</span>
+<span class="nc" id="L285">      log.info(&quot;Loading clause splitter from &quot; + serializedModel + &quot; ... done [&quot; +</span>
+<span class="nc" id="L286">              Redwood.formatTimeDifference(System.currentTimeMillis() - start) + &quot;]&quot;);</span>
+<span class="nc" id="L287">      return rtn;</span>
+<span class="nc" id="L288">    } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L289">      throw new IllegalStateException(&quot;Invalid model at path: &quot; + serializedModel, e);</span>
+    }
+  }
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

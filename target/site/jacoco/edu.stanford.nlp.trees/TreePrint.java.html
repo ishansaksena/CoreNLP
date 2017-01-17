@@ -1,0 +1,1041 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TreePrint.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees</a> &gt; <span class="el_source">TreePrint.java</span></div><h1>TreePrint.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.trees;
+
+import edu.stanford.nlp.ling.*;
+import edu.stanford.nlp.process.PTBTokenizer;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseEnglishWordMap;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.XMLUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+
+/**
+ * A class for customizing the print method(s) for a
+ * {@code edu.stanford.nlp.trees.Tree} as the output of the
+ * parser.  This class supports printing in multiple ways and altering
+ * behavior via properties specified at construction.
+ *
+ * @author Roger Levy
+ * @author Christopher Manning
+ * @author Galen Andrew
+ */
+public class TreePrint  {
+
+  /** A logger for this class */
+<span class="fc" id="L29">  private static Redwood.RedwoodChannels log = Redwood.channels(TreePrint.class);</span>
+
+  // TODO: Add support for makeCopulaHead as an outputFormatOption here.
+
+  public static final String rootLabelOnlyFormat = &quot;rootSymbolOnly&quot;;
+  public static final String headMark = &quot;=H&quot;;
+
+  /** The legal output tree formats. */
+<span class="fc" id="L37">  public static final String[] outputTreeFormats = {</span>
+    &quot;penn&quot;,
+    &quot;oneline&quot;,
+    rootLabelOnlyFormat,
+    &quot;words&quot;,
+    &quot;wordsAndTags&quot;,
+    &quot;dependencies&quot;,
+    &quot;typedDependencies&quot;,
+    &quot;typedDependenciesCollapsed&quot;,
+    &quot;latexTree&quot;,
+    &quot;xmlTree&quot;,
+    &quot;collocations&quot;,
+    &quot;semanticGraph&quot;,
+    &quot;conllStyleDependencies&quot;,
+    &quot;conll2007&quot;
+  };
+
+  private final Properties formats;
+  private final Properties options;
+
+  private final boolean markHeadNodes; // = false;
+  private final boolean lexicalize; // = false;
+  private final boolean removeEmpty;
+  private final boolean ptb2text;
+  private final boolean transChinese; // = false;
+  private final boolean basicDependencies;
+  private final boolean collapsedDependencies;
+  private final boolean nonCollapsedDependencies;
+  private final boolean nonCollapsedDependenciesSeparated;
+  private final boolean CCPropagatedDependencies;
+  private final boolean treeDependencies;
+
+  private final boolean includeTags;
+
+  private final HeadFinder hf;
+  private final TreebankLanguagePack tlp;
+  private final WordStemmer stemmer;
+  private final Predicate&lt;Dependency&lt;Label, Label, Object&gt;&gt; dependencyFilter;
+  private final Predicate&lt;Dependency&lt;Label, Label, Object&gt;&gt; dependencyWordFilter;
+  private final GrammaticalStructureFactory gsf;
+
+  /** Pool use of one WordNetConnection.  I don't really know if
+   *  Dan Bikel's WordNet code is thread safe, but it definitely doesn't
+   *  close its files, and too much of our code makes TreePrint objects and
+   *  then drops them on the floor, and so we run out of file handles.
+   *  That is, if this variable isn't static, code crashes.
+   *  Maybe we should change this code to use jwnl(x)?
+   *  CDM July 2006.
+   */
+  private static WordNetConnection wnc;
+
+
+  /** This PrintWriter is used iff the user doesn't pass one in to a
+   *  call to printTree().  It prints to System.out.
+   */
+<span class="fc" id="L92">  private final PrintWriter pw = new PrintWriter(System.out, true);</span>
+
+
+  /** Construct a new TreePrint that will print the given formats.
+   *  Warning! This is the anglocentric constructor.
+   *  It will work correctly only for English.
+   *
+   *  @param formats The formats to print the tree in.
+   */
+  public TreePrint(String formats) {
+<span class="fc" id="L102">    this(formats, &quot;&quot;, new PennTreebankLanguagePack());</span>
+<span class="fc" id="L103">  }</span>
+
+  /** Make a TreePrint instance with no options specified. */
+  public TreePrint(String formats, TreebankLanguagePack tlp) {
+<span class="nc" id="L107">    this(formats, &quot;&quot;, tlp);</span>
+<span class="nc" id="L108">  }</span>
+
+  /** Make a TreePrint instance. This one uses the default tlp headFinder. */
+  public TreePrint(String formats, String options, TreebankLanguagePack tlp) {
+<span class="fc" id="L112">    this(formats, options, tlp, tlp.headFinder(), tlp.typedDependencyHeadFinder());</span>
+<span class="fc" id="L113">  }</span>
+
+  /**
+   * Make a TreePrint instance.
+   *
+   * @param formatString A comma separated list of ways to print each Tree.
+   *                For instance, &quot;penn&quot; or &quot;words,typedDependencies&quot;.
+   *                Known formats are: oneline, penn, latexTree, xmlTree, words,
+   *                wordsAndTags, rootSymbolOnly, dependencies,
+   *                typedDependencies, typedDependenciesCollapsed,
+   *                collocations, semanticGraph, conllStyleDependencies,
+   *                conll2007.  The last two are both tab-separated values
+   *                formats.  The latter has a lot more columns filled with
+   *                underscores. All of them print a blank line after
+   *                the output except for oneline.  oneline is also not
+   *                meaningful in XML output (it is ignored: use penn instead).
+   *                (Use of typedDependenciesCollapsed is deprecated.  It
+   *                works but we recommend instead selecting a type of
+   *                dependencies using the optionsString argument.  Note in
+   *                particular that typedDependenciesCollapsed does not do
+   *                CC propagation, which we generally recommend.)
+   * @param optionsString Options that additionally specify how trees are to
+   *                be printed (for instance, whether stemming should be done).
+   *                Known options are: {@code stem, lexicalize, markHeadNodes,
+   *                xml, removeTopBracket, transChinese,
+   *                includePunctuationDependencies, basicDependencies, treeDependencies,
+   *                CCPropagatedDependencies, collapsedDependencies, nonCollapsedDependencies,
+   *                nonCollapsedDependenciesSeparated, includeTags}.
+   * @param tlp     The TreebankLanguagePack used to do things like delete
+   *                or ignore punctuation in output
+   * @param hf      The HeadFinder used in printing output
+   */
+<span class="fc" id="L145">  public TreePrint(String formatString, String optionsString, TreebankLanguagePack tlp, HeadFinder hf, HeadFinder typedDependencyHF) {</span>
+<span class="fc" id="L146">    formats = StringUtils.stringToProperties(formatString);</span>
+<span class="fc" id="L147">    options = StringUtils.stringToProperties(optionsString);</span>
+<span class="fc" id="L148">    List&lt;String&gt; okOutputs = Arrays.asList(outputTreeFormats);</span>
+<span class="fc bfc" id="L149" title="All 2 branches covered.">    for (Object formObj : formats.keySet()) {</span>
+<span class="fc" id="L150">      String format = (String) formObj;</span>
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">      if ( ! okOutputs.contains(format)) {</span>
+<span class="nc" id="L152">        throw new RuntimeException(&quot;Error: output tree format &quot; + format + &quot; not supported. Known formats are: &quot; + okOutputs);</span>
+      }
+<span class="fc" id="L154">    }</span>
+
+<span class="fc" id="L156">    this.hf = hf;</span>
+<span class="fc" id="L157">    this.tlp = tlp;</span>
+    boolean includePunctuationDependencies;
+<span class="fc" id="L159">    includePunctuationDependencies = propertyToBoolean(this.options,</span>
+                                                       &quot;includePunctuationDependencies&quot;);
+
+<span class="fc" id="L162">    boolean generateOriginalDependencies = tlp.generateOriginalDependencies();</span>
+
+    Predicate&lt;String&gt; puncFilter;
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">    if (includePunctuationDependencies) {</span>
+<span class="nc" id="L166">      dependencyFilter = Filters.acceptFilter();</span>
+<span class="nc" id="L167">      dependencyWordFilter = Filters.acceptFilter();</span>
+<span class="nc" id="L168">      puncFilter = Filters.acceptFilter();</span>
+    } else {
+<span class="fc" id="L170">      dependencyFilter = new Dependencies.DependentPuncTagRejectFilter&lt;&gt;(tlp.punctuationTagRejectFilter());</span>
+<span class="fc" id="L171">      dependencyWordFilter = new Dependencies.DependentPuncWordRejectFilter&lt;&gt;(tlp.punctuationWordRejectFilter());</span>
+      //Universal dependencies filter punction by tags
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">      puncFilter = generateOriginalDependencies ? tlp.punctuationWordRejectFilter() : tlp.punctuationTagRejectFilter();</span>
+    }
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">    if (propertyToBoolean(this.options, &quot;stem&quot;)) {</span>
+<span class="nc" id="L176">      stemmer = new WordStemmer();</span>
+    } else {
+<span class="fc" id="L178">      stemmer = null;</span>
+    }
+<span class="fc bfc" id="L180" title="All 2 branches covered.">    if (formats.containsKey(&quot;typedDependenciesCollapsed&quot;) ||</span>
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">        formats.containsKey(&quot;typedDependencies&quot;) ||</span>
+<span class="pc bpc" id="L182" title="1 of 4 branches missed.">        (formats.containsKey(&quot;conll2007&quot;) &amp;&amp; tlp.supportsGrammaticalStructures())) {</span>
+<span class="fc" id="L183">      gsf = tlp.grammaticalStructureFactory(puncFilter, typedDependencyHF);</span>
+    } else {
+<span class="fc" id="L185">      gsf = null;</span>
+    }
+
+<span class="fc" id="L188">    lexicalize = propertyToBoolean(this.options, &quot;lexicalize&quot;);</span>
+<span class="fc" id="L189">    markHeadNodes = propertyToBoolean(this.options, &quot;markHeadNodes&quot;);</span>
+<span class="fc" id="L190">    transChinese = propertyToBoolean(this.options, &quot;transChinese&quot;);</span>
+<span class="fc" id="L191">    ptb2text = propertyToBoolean(this.options, &quot;ptb2text&quot;);</span>
+<span class="pc bpc" id="L192" title="2 of 4 branches missed.">    removeEmpty = propertyToBoolean(this.options, &quot;noempty&quot;) || ptb2text;</span>
+
+<span class="fc" id="L194">    basicDependencies =  propertyToBoolean(this.options, &quot;basicDependencies&quot;);</span>
+<span class="fc" id="L195">    collapsedDependencies = propertyToBoolean(this.options, &quot;collapsedDependencies&quot;);</span>
+<span class="fc" id="L196">    nonCollapsedDependencies = propertyToBoolean(this.options, &quot;nonCollapsedDependencies&quot;);</span>
+<span class="fc" id="L197">    nonCollapsedDependenciesSeparated = propertyToBoolean(this.options, &quot;nonCollapsedDependenciesSeparated&quot;);</span>
+<span class="fc" id="L198">    treeDependencies = propertyToBoolean(this.options, &quot;treeDependencies&quot;);</span>
+
+<span class="fc" id="L200">    includeTags = propertyToBoolean(this.options, &quot;includeTags&quot;);</span>
+
+    // if no option format for the dependencies is specified, CCPropagated is the default
+<span class="pc bpc" id="L203" title="5 of 10 branches missed.">    if ( ! basicDependencies &amp;&amp; ! collapsedDependencies &amp;&amp; ! nonCollapsedDependencies &amp;&amp; ! nonCollapsedDependenciesSeparated &amp;&amp; ! treeDependencies) {</span>
+<span class="fc" id="L204">      CCPropagatedDependencies = true;</span>
+    } else {
+<span class="nc" id="L206">      CCPropagatedDependencies = propertyToBoolean(this.options, &quot;CCPropagatedDependencies&quot;);</span>
+    }
+<span class="fc" id="L208">  }</span>
+
+
+  private static boolean propertyToBoolean(Properties prop, String key) {
+<span class="fc" id="L212">    return Boolean.parseBoolean(prop.getProperty(key));</span>
+  }
+
+  /**
+   * Prints the tree to the default PrintWriter.
+   * @param t The tree to display
+   */
+  public void printTree(Tree t) {
+<span class="nc" id="L220">    printTree(t, pw);</span>
+<span class="nc" id="L221">  }</span>
+
+  /**
+   * Prints the tree, with an empty ID.
+   * @param t The tree to display
+   * @param pw The PrintWriter to print it to
+   */
+  public void printTree(final Tree t, PrintWriter pw) {
+<span class="fc" id="L229">    printTree(t, &quot;&quot;, pw);</span>
+<span class="fc" id="L230">  }</span>
+
+
+  /**
+   * Prints the tree according to the options specified for this instance.
+   * If the tree {@code t} is {@code null}, then the code prints
+   * a line indicating a skipped tree.  Under the XML option this is
+   * an {@code s} element with the {@code skipped} attribute having
+   * value {@code true}, and, otherwise, it is the token
+   * {@code SENTENCE_SKIPPED_OR_UNPARSABLE}.
+   *
+   * @param t The tree to display
+   * @param id A name for this sentence
+   * @param pw Where to display the tree
+   */
+  public void printTree(final Tree t, final String id, final PrintWriter pw) {
+<span class="fc" id="L246">    final boolean inXml = propertyToBoolean(options, &quot;xml&quot;);</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">    if (t == null) {</span>
+      // Parsing didn't succeed.
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">      if (inXml) {</span>
+<span class="nc" id="L250">        pw.print(&quot;&lt;s&quot;);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if ( ! StringUtils.isNullOrEmpty(id)) {</span>
+<span class="nc" id="L252">          pw.print(&quot; id=\&quot;&quot; + XMLUtils.escapeXML(id) + '\&quot;');</span>
+        }
+<span class="nc" id="L254">        pw.println(&quot; skipped=\&quot;true\&quot;/&gt;&quot;);</span>
+<span class="nc" id="L255">        pw.println();</span>
+      } else {
+<span class="fc" id="L257">        pw.println(&quot;SENTENCE_SKIPPED_OR_UNPARSABLE&quot;);</span>
+      }
+    } else {
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">      if (inXml) {</span>
+<span class="nc" id="L261">        pw.print(&quot;&lt;s&quot;);</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        if ( ! StringUtils.isNullOrEmpty(id)) {</span>
+<span class="nc" id="L263">          pw.print(&quot; id=\&quot;&quot; + XMLUtils.escapeXML(id) + '\&quot;');</span>
+        }
+<span class="nc" id="L265">        pw.println(&quot;&gt;&quot;);</span>
+      }
+<span class="fc" id="L267">      printTreeInternal(t, pw, inXml);</span>
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">      if (inXml) {</span>
+<span class="nc" id="L269">        pw.println(&quot;&lt;/s&gt;&quot;);</span>
+<span class="nc" id="L270">        pw.println();</span>
+      }
+    }
+<span class="fc" id="L273">  }</span>
+
+
+  /**
+   * Prints the trees according to the options specified for this instance.
+   * If the tree {@code t} is {@code null}, then the code prints
+   * a line indicating a skipped tree.  Under the XML option this is
+   * an {@code s} element with the {@code skipped} attribute having
+   * value {@code true}, and, otherwise, it is the token
+   * {@code SENTENCE_SKIPPED_OR_UNPARSABLE}.
+   *
+   * @param trees The list of trees to display
+   * @param id A name for this sentence
+   * @param pw Where to dislay the tree
+   */
+  public void printTrees(final List&lt;ScoredObject&lt;Tree&gt;&gt; trees, final String id, final PrintWriter pw) {
+<span class="nc" id="L289">    final boolean inXml = propertyToBoolean(options, &quot;xml&quot;);</span>
+<span class="nc" id="L290">    int ii = 0;  // incremented before used, so first tree is numbered 1</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">    for (ScoredObject&lt;Tree&gt; tp : trees) {</span>
+<span class="nc" id="L292">      ii++;</span>
+<span class="nc" id="L293">      Tree t = tp.object();</span>
+<span class="nc" id="L294">      double score = tp.score();</span>
+
+<span class="nc bnc" id="L296" title="All 2 branches missed.">      if (t == null) {</span>
+        // Parsing didn't succeed.
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (inXml) {</span>
+<span class="nc" id="L299">          pw.print(&quot;&lt;s&quot;);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">          if ( ! StringUtils.isNullOrEmpty(id)) {</span>
+<span class="nc" id="L301">            pw.print(&quot; id=\&quot;&quot; + XMLUtils.escapeXML(id) + '\&quot;');</span>
+          }
+<span class="nc" id="L303">          pw.print(&quot; n=\&quot;&quot;);</span>
+<span class="nc" id="L304">          pw.print(ii);</span>
+<span class="nc" id="L305">          pw.print('\&quot;');</span>
+<span class="nc" id="L306">          pw.print(&quot; score=\&quot;&quot; + score + '\&quot;');</span>
+<span class="nc" id="L307">          pw.println(&quot; skipped=\&quot;true\&quot;/&gt;&quot;);</span>
+<span class="nc" id="L308">          pw.println();</span>
+        } else {
+<span class="nc" id="L310">          pw.println(&quot;SENTENCE_SKIPPED_OR_UNPARSABLE Parse #&quot; + ii + &quot; with score &quot; + score);</span>
+        }
+      } else {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (inXml) {</span>
+<span class="nc" id="L314">          pw.print(&quot;&lt;s&quot;);</span>
+<span class="nc bnc" id="L315" title="All 4 branches missed.">          if (id != null &amp;&amp; ! &quot;&quot;.equals(id)) {</span>
+<span class="nc" id="L316">            pw.print(&quot; id=\&quot;&quot;);</span>
+<span class="nc" id="L317">            pw.print(XMLUtils.escapeXML(id));</span>
+<span class="nc" id="L318">            pw.print('\&quot;');</span>
+          }
+<span class="nc" id="L320">          pw.print(&quot; n=\&quot;&quot;);</span>
+<span class="nc" id="L321">          pw.print(ii);</span>
+<span class="nc" id="L322">          pw.print('\&quot;');</span>
+<span class="nc" id="L323">          pw.print(&quot; score=\&quot;&quot;);</span>
+<span class="nc" id="L324">          pw.print(score);</span>
+<span class="nc" id="L325">          pw.print('\&quot;');</span>
+<span class="nc" id="L326">          pw.println(&quot;&gt;&quot;);</span>
+        } else {
+<span class="nc" id="L328">          pw.print(&quot;# Parse &quot;);</span>
+<span class="nc" id="L329">          pw.print(ii);</span>
+<span class="nc" id="L330">          pw.print(&quot; with score &quot;);</span>
+<span class="nc" id="L331">          pw.println(score);</span>
+        }
+<span class="nc" id="L333">        printTreeInternal(t, pw, inXml);</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (inXml) {</span>
+<span class="nc" id="L335">          pw.println(&quot;&lt;/s&gt;&quot;);</span>
+<span class="nc" id="L336">          pw.println();</span>
+        }
+      }
+<span class="nc" id="L339">    }</span>
+<span class="nc" id="L340">  }</span>
+
+
+  /** Print the internal part of a tree having already identified it.
+   *  The ID and outer XML element is printed wrapping this method, but none
+   *  of the internal content.
+   *
+   * @param t The tree to print. Now known to be non-null
+   * @param pw Where to print it to
+   * @param inXml Whether to use XML style printing
+   */
+  private void printTreeInternal(final Tree t, final PrintWriter pw, final boolean inXml) {
+<span class="fc" id="L352">    Tree outputTree = t;</span>
+
+<span class="pc bpc" id="L354" title="3 of 4 branches missed.">    if (formats.containsKey(&quot;conll2007&quot;) || removeEmpty) {</span>
+<span class="fc" id="L355">      outputTree = outputTree.prune(new BobChrisTreeNormalizer.EmptyFilter());</span>
+    }
+
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">    if (formats.containsKey(&quot;words&quot;)) {</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">      if (inXml) {</span>
+<span class="nc" id="L360">        ArrayList&lt;Label&gt; sentUnstemmed = outputTree.yield();</span>
+<span class="nc" id="L361">        pw.println(&quot;  &lt;words&gt;&quot;);</span>
+<span class="nc" id="L362">        int i = 1;</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        for (Label w : sentUnstemmed) {</span>
+<span class="nc" id="L364">          pw.println(&quot;    &lt;word ind=\&quot;&quot; + i + &quot;\&quot;&gt;&quot; + XMLUtils.escapeXML(w.value()) + &quot;&lt;/word&gt;&quot;);</span>
+<span class="nc" id="L365">          i++;</span>
+<span class="nc" id="L366">        }</span>
+<span class="nc" id="L367">        pw.println(&quot;  &lt;/words&gt;&quot;);</span>
+<span class="nc" id="L368">      } else {</span>
+<span class="nc" id="L369">        String sent = SentenceUtils.listToString(outputTree.yield(), false);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if(ptb2text) {</span>
+<span class="nc" id="L371">          pw.println(PTBTokenizer.ptb2Text(sent));</span>
+        } else {
+<span class="nc" id="L373">          pw.println(sent);</span>
+<span class="nc" id="L374">          pw.println();</span>
+        }
+      }
+    }
+
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">    if (propertyToBoolean(options, &quot;removeTopBracket&quot;)) {</span>
+<span class="nc" id="L380">      String s = outputTree.label().value();</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      if (tlp.isStartSymbol(s)) {</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if (outputTree.isUnaryRewrite()) {</span>
+<span class="nc" id="L383">          outputTree = outputTree.firstChild();</span>
+        } else {
+          // It's not quite clear what to do if the tree isn't unary at the top
+          // but we then don't strip the ROOT symbol, since that seems closer
+          // than losing part of the tree altogether....
+<span class="nc" id="L388">          log.info(&quot;TreePrint: can't remove top bracket: not unary&quot;);</span>
+        }
+      }
+      // Note that TreePrint is also called on dependency trees that have
+      // a word as the root node, and so we don't error if there isn't
+      // the root symbol at the top; rather we silently assume that this
+      // is a dependency tree!!
+    }
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">    if (stemmer != null) {</span>
+<span class="nc" id="L397">      stemmer.visitTree(outputTree);</span>
+    }
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">    if (lexicalize) {</span>
+<span class="nc" id="L400">      outputTree = Trees.lexicalize(outputTree, hf);</span>
+      Function&lt;Tree, Tree&gt; a =
+<span class="nc" id="L402">        TreeFunctions.getLabeledToDescriptiveCoreLabelTreeFunction();</span>
+<span class="nc" id="L403">      outputTree = a.apply(outputTree);</span>
+    }
+
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">    if (formats.containsKey(&quot;collocations&quot;)) {</span>
+<span class="nc" id="L407">      outputTree = getCollocationProcessedTree(outputTree, hf);</span>
+    }
+
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">    if (!lexicalize) { // delexicalize the output tree</span>
+      Function&lt;Tree, Tree&gt; a =
+<span class="fc" id="L412">        TreeFunctions.getLabeledTreeToStringLabeledTreeFunction();</span>
+<span class="fc" id="L413">      outputTree = a.apply(outputTree);</span>
+    }
+
+<span class="fc" id="L416">    Tree outputPSTree = outputTree;  // variant with head-marking, translations</span>
+
+<span class="pc bpc" id="L418" title="1 of 2 branches missed.">    if (markHeadNodes) {</span>
+<span class="nc" id="L419">      outputPSTree = markHeadNodes(outputPSTree);</span>
+    }
+
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">    if (transChinese) {</span>
+<span class="nc" id="L423">      TreeTransformer tt = t1 -&gt; {</span>
+<span class="nc" id="L424">        t1 = t1.treeSkeletonCopy();</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        for (Tree subtree : t1) {</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">          if (subtree.isLeaf()) {</span>
+<span class="nc" id="L427">            Label oldLabel = subtree.label();</span>
+<span class="nc" id="L428">            String translation = ChineseEnglishWordMap.getInstance().getFirstTranslation(oldLabel.value());</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (translation == null) translation = &quot;[UNK]&quot;;</span>
+<span class="nc" id="L430">            Label newLabel = new StringLabel(oldLabel.value() + ':' + translation);</span>
+<span class="nc" id="L431">            subtree.setLabel(newLabel);</span>
+          }
+<span class="nc" id="L433">        }</span>
+<span class="nc" id="L434">        return t1;</span>
+      };
+<span class="nc" id="L436">      outputPSTree = tt.transformTree(outputPSTree);</span>
+    }
+
+<span class="pc bpc" id="L439" title="1 of 2 branches missed.">    if (propertyToBoolean(options, &quot;xml&quot;)) {</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">      if (formats.containsKey(&quot;wordsAndTags&quot;)) {</span>
+<span class="nc" id="L441">        ArrayList&lt;TaggedWord&gt; sent = outputTree.taggedYield();</span>
+<span class="nc" id="L442">        pw.println(&quot;  &lt;words pos=\&quot;true\&quot;&gt;&quot;);</span>
+<span class="nc" id="L443">        int i = 1;</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        for (TaggedWord tw : sent) {</span>
+<span class="nc" id="L445">          pw.println(&quot;    &lt;word ind=\&quot;&quot; + i + &quot;\&quot; pos=\&quot;&quot; + XMLUtils.escapeXML(tw.tag()) + &quot;\&quot;&gt;&quot; + XMLUtils.escapeXML(tw.word()) + &quot;&lt;/word&gt;&quot;);</span>
+<span class="nc" id="L446">          i++;</span>
+<span class="nc" id="L447">        }</span>
+<span class="nc" id="L448">        pw.println(&quot;  &lt;/words&gt;&quot;);</span>
+      }
+<span class="nc bnc" id="L450" title="All 2 branches missed.">      if (formats.containsKey(&quot;penn&quot;)) {</span>
+<span class="nc" id="L451">        pw.println(&quot;  &lt;tree style=\&quot;penn\&quot;&gt;&quot;);</span>
+<span class="nc" id="L452">        StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L453">        PrintWriter psw = new PrintWriter(sw);</span>
+<span class="nc" id="L454">        outputPSTree.pennPrint(psw);</span>
+<span class="nc" id="L455">        pw.print(XMLUtils.escapeXML(sw.toString()));</span>
+<span class="nc" id="L456">        pw.println(&quot;  &lt;/tree&gt;&quot;);</span>
+      }
+<span class="nc bnc" id="L458" title="All 2 branches missed.">      if (formats.containsKey(&quot;latexTree&quot;)) {</span>
+<span class="nc" id="L459">        pw.println(&quot;    &lt;tree style=\&quot;latexTrees\&quot;&gt;&quot;);</span>
+<span class="nc" id="L460">        pw.println(&quot;.[&quot;);</span>
+<span class="nc" id="L461">        StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L462">        PrintWriter psw = new PrintWriter(sw);</span>
+<span class="nc" id="L463">        outputTree.indentedListPrint(psw,false);</span>
+<span class="nc" id="L464">        pw.print(XMLUtils.escapeXML(sw.toString()));</span>
+<span class="nc" id="L465">        pw.println(&quot;.]&quot;);</span>
+<span class="nc" id="L466">        pw.println(&quot;  &lt;/tree&gt;&quot;);</span>
+      }
+<span class="nc bnc" id="L468" title="All 2 branches missed.">      if (formats.containsKey(&quot;xmlTree&quot;)) {</span>
+<span class="nc" id="L469">        pw.println(&quot;&lt;tree style=\&quot;xml\&quot;&gt;&quot;);</span>
+<span class="nc" id="L470">        outputTree.indentedXMLPrint(pw,false);</span>
+<span class="nc" id="L471">        pw.println(&quot;&lt;/tree&gt;&quot;);</span>
+      }
+<span class="nc bnc" id="L473" title="All 2 branches missed.">      if (formats.containsKey(&quot;dependencies&quot;)) {</span>
+<span class="nc" id="L474">        Tree indexedTree = outputTree.deepCopy(outputTree.treeFactory(),</span>
+<span class="nc" id="L475">                                                 CoreLabel.factory());</span>
+<span class="nc" id="L476">        indexedTree.indexLeaves();</span>
+<span class="nc" id="L477">        Set&lt;Dependency&lt;Label, Label, Object&gt;&gt; depsSet = indexedTree.mapDependencies(dependencyWordFilter, hf);</span>
+<span class="nc" id="L478">        List&lt;Dependency&lt;Label, Label, Object&gt;&gt; sortedDeps = new ArrayList&lt;&gt;(depsSet);</span>
+<span class="nc" id="L479">        Collections.sort(sortedDeps, Dependencies.dependencyIndexComparator());</span>
+<span class="nc" id="L480">        pw.println(&quot;&lt;dependencies style=\&quot;untyped\&quot;&gt;&quot;);</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        for (Dependency&lt;Label, Label, Object&gt; d : sortedDeps) {</span>
+<span class="nc" id="L482">          pw.println(d.toString(&quot;xml&quot;));</span>
+<span class="nc" id="L483">        }</span>
+<span class="nc" id="L484">        pw.println(&quot;&lt;/dependencies&gt;&quot;);</span>
+      }
+<span class="nc bnc" id="L486" title="All 4 branches missed.">      if (formats.containsKey(&quot;conll2007&quot;) || formats.containsKey(&quot;conllStyleDependencies&quot;)) {</span>
+<span class="nc" id="L487">        log.info(&quot;The \&quot;conll2007\&quot; and \&quot;conllStyleDependencies\&quot; formats are ignored in xml.&quot;);</span>
+      }
+<span class="nc bnc" id="L489" title="All 2 branches missed.">      if (formats.containsKey(&quot;typedDependencies&quot;)) {</span>
+<span class="nc" id="L490">        GrammaticalStructure gs = gsf.newGrammaticalStructure(outputTree);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">        if (basicDependencies) {</span>
+<span class="nc" id="L492">          print(gs.typedDependencies(), &quot;xml&quot;, includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L494" title="All 4 branches missed.">        if (nonCollapsedDependencies || nonCollapsedDependenciesSeparated) {</span>
+<span class="nc" id="L495">          print(gs.allTypedDependencies(), &quot;xml&quot;, includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        if (collapsedDependencies) {</span>
+<span class="nc" id="L498">          print(gs.typedDependenciesCollapsed(GrammaticalStructure.Extras.MAXIMAL), &quot;xml&quot;, includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        if (CCPropagatedDependencies) {</span>
+<span class="nc" id="L501">          print(gs.typedDependenciesCCprocessed(), &quot;xml&quot;, includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if(treeDependencies) {</span>
+<span class="nc" id="L504">          print(gs.typedDependenciesCollapsedTree(), &quot;xml&quot;, includeTags, pw);</span>
+        }
+      }
+<span class="nc bnc" id="L507" title="All 2 branches missed.">      if (formats.containsKey(&quot;typedDependenciesCollapsed&quot;)) {</span>
+<span class="nc" id="L508">        GrammaticalStructure gs = gsf.newGrammaticalStructure(outputTree);</span>
+<span class="nc" id="L509">        print(gs.typedDependenciesCCprocessed(), &quot;xml&quot;, includeTags, pw);</span>
+<span class="nc" id="L510">      }</span>
+
+      // This makes parser require jgrapht.  Bad.
+      // if (formats.containsKey(&quot;semanticGraph&quot;)) {
+      //  SemanticGraph sg = SemanticGraph.makeFromTree(outputTree, true, false, false, null);
+      //  pw.println(sg.toFormattedString());
+      // }
+    } else {
+      // non-XML printing
+<span class="pc bpc" id="L519" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;wordsAndTags&quot;)) {</span>
+<span class="nc" id="L520">        pw.println(SentenceUtils.listToString(outputTree.taggedYield(), false));</span>
+<span class="nc" id="L521">        pw.println();</span>
+      }
+<span class="pc bpc" id="L523" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;oneline&quot;)) {</span>
+<span class="nc" id="L524">        pw.println(outputPSTree);</span>
+      }
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;penn&quot;)) {</span>
+<span class="nc" id="L527">        outputPSTree.pennPrint(pw);</span>
+<span class="nc" id="L528">        pw.println();</span>
+      }
+<span class="pc bpc" id="L530" title="1 of 2 branches missed.">      if (formats.containsKey(rootLabelOnlyFormat)) {</span>
+<span class="nc" id="L531">        pw.println(outputTree.label().value());</span>
+      }
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;latexTree&quot;)) {</span>
+<span class="nc" id="L534">        pw.println(&quot;.[&quot;);</span>
+<span class="nc" id="L535">        outputTree.indentedListPrint(pw,false);</span>
+<span class="nc" id="L536">        pw.println(&quot;.]&quot;);</span>
+      }
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;xmlTree&quot;)) {</span>
+<span class="nc" id="L539">        outputTree.indentedXMLPrint(pw,false);</span>
+      }
+<span class="pc bpc" id="L541" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;dependencies&quot;)) {</span>
+<span class="nc" id="L542">        Tree indexedTree = outputTree.deepCopy(outputTree.treeFactory());</span>
+<span class="nc" id="L543">        indexedTree.indexLeaves();</span>
+<span class="nc" id="L544">        List&lt;Dependency&lt;Label, Label, Object&gt;&gt; sortedDeps = getSortedDeps(indexedTree, dependencyWordFilter);</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        for (Dependency&lt;Label, Label, Object&gt; d : sortedDeps) {</span>
+<span class="nc" id="L546">          pw.println(d.toString(&quot;predicate&quot;));</span>
+<span class="nc" id="L547">        }</span>
+<span class="nc" id="L548">        pw.println();</span>
+      }
+<span class="pc bpc" id="L550" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;conll2007&quot;)) {</span>
+        // CoNLL-X 2007 format: http://ilk.uvt.nl/conll/#dataformat
+        // wsg: This code should be retained (and not subsumed into EnglishGrammaticalStructure) so
+        //      that dependencies for other languages can be printed.
+        // wsg2011: This code currently ignores the dependency label since the present implementation
+        //          of mapDependencies() returns UnnamedDependency objects.
+        // TODO: if there is a GrammaticalStructureFactory available, use that instead of mapDependencies
+<span class="fc" id="L557">        Tree it = outputTree.deepCopy(outputTree.treeFactory(), CoreLabel.factory());</span>
+<span class="fc" id="L558">        it.indexLeaves();</span>
+
+<span class="fc" id="L560">        List&lt;CoreLabel&gt; tagged = it.taggedLabeledYield();</span>
+<span class="fc" id="L561">        List&lt;Dependency&lt;Label, Label, Object&gt;&gt; sortedDeps = getSortedDeps(it, Filters.acceptFilter());</span>
+
+<span class="fc bfc" id="L563" title="All 2 branches covered.">        for (Dependency&lt;Label, Label, Object&gt; d : sortedDeps) {</span>
+<span class="pc bpc" id="L564" title="1 of 2 branches missed.">          if (!dependencyFilter.test(d)) {</span>
+<span class="nc" id="L565">            continue;</span>
+          }
+<span class="pc bpc" id="L567" title="2 of 4 branches missed.">          if (!(d.dependent() instanceof HasIndex) || !(d.governor() instanceof HasIndex)) {</span>
+<span class="nc" id="L568">            throw new IllegalArgumentException(&quot;Expected labels to have indices&quot;);</span>
+          }
+<span class="fc" id="L570">          HasIndex dep = (HasIndex) d.dependent();</span>
+<span class="fc" id="L571">          HasIndex gov = (HasIndex) d.governor();</span>
+
+<span class="fc" id="L573">          int depi = dep.index();</span>
+<span class="fc" id="L574">          int govi = gov.index();</span>
+
+<span class="fc" id="L576">          CoreLabel w = tagged.get(depi - 1);</span>
+
+          // Used for both course and fine POS tag fields
+<span class="fc" id="L579">          String tag = PTBTokenizer.ptbToken2Text(w.tag());</span>
+
+<span class="fc" id="L581">          String word = PTBTokenizer.ptbToken2Text(w.word());</span>
+<span class="fc" id="L582">          String lemma = &quot;_&quot;;</span>
+<span class="fc" id="L583">          String feats = &quot;_&quot;;</span>
+<span class="fc" id="L584">          String pHead = &quot;_&quot;;</span>
+<span class="fc" id="L585">          String pDepRel = &quot;_&quot;;</span>
+          String depRel;
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">          if (d.name() != null) {</span>
+<span class="fc" id="L588">            depRel = d.name().toString();</span>
+          } else {
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            depRel = (govi == 0) ? &quot;ROOT&quot; : &quot;NULL&quot;;</span>
+          }
+
+          // The 2007 format has 10 fields
+<span class="fc" id="L594">          pw.printf(&quot;%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s%n&quot;, depi, word, lemma, tag, tag, feats, govi, depRel, pHead, pDepRel);</span>
+<span class="fc" id="L595">        }</span>
+<span class="fc" id="L596">        pw.println();</span>
+      }
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;conllStyleDependencies&quot;)) {</span>
+        // TODO: Rewrite this to output StanfordDependencies using EnglishGrammaticalStructure code
+<span class="nc" id="L600">        BobChrisTreeNormalizer tn = new BobChrisTreeNormalizer();</span>
+<span class="nc" id="L601">        Tree indexedTree = outputTree.deepCopy(outputTree.treeFactory(),</span>
+<span class="nc" id="L602">                                                 CoreLabel.factory());</span>
+        // TODO: Can the below for-loop be deleted now?  (Now that the HeadFinder knows about NML.)
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        for (Tree node : indexedTree) {</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">          if (node.label().value().startsWith(&quot;NML&quot;)) {</span>
+<span class="nc" id="L606">            node.label().setValue(&quot;NP&quot;);</span>
+          }
+<span class="nc" id="L608">        }</span>
+
+<span class="nc" id="L610">        indexedTree = tn.normalizeWholeTree(indexedTree, outputTree.treeFactory());</span>
+<span class="nc" id="L611">        indexedTree.indexLeaves();</span>
+<span class="nc" id="L612">        Set&lt;Dependency&lt;Label, Label, Object&gt;&gt; depsSet = null;</span>
+<span class="nc" id="L613">        boolean failed = false;</span>
+        try {
+<span class="nc" id="L615">          depsSet = indexedTree.mapDependencies(dependencyFilter, hf);</span>
+<span class="nc" id="L616">        } catch (Exception e) {</span>
+<span class="nc" id="L617">          failed = true;</span>
+<span class="nc" id="L618">        }</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        if (failed) {</span>
+<span class="nc" id="L620">          log.info(&quot;failed: &quot;);</span>
+<span class="nc" id="L621">          log.info(t);</span>
+<span class="nc" id="L622">          log.info();</span>
+        } else {
+<span class="nc" id="L624">          Map&lt;Integer,Integer&gt; deps = Generics.newHashMap();</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">          for (Dependency&lt;Label, Label, Object&gt; dep : depsSet) {</span>
+<span class="nc" id="L626">            CoreLabel child = (CoreLabel)dep.dependent();</span>
+<span class="nc" id="L627">            CoreLabel parent = (CoreLabel)dep.governor();</span>
+<span class="nc" id="L628">            Integer childIndex =</span>
+<span class="nc" id="L629">              child.get(CoreAnnotations.IndexAnnotation.class);</span>
+<span class="nc" id="L630">            Integer parentIndex =</span>
+<span class="nc" id="L631">              parent.get(CoreAnnotations.IndexAnnotation.class);</span>
+//            log.info(childIndex+&quot;\t&quot;+parentIndex);
+<span class="nc" id="L633">            deps.put(childIndex, parentIndex);</span>
+<span class="nc" id="L634">          }</span>
+<span class="nc" id="L635">          boolean foundRoot = false;</span>
+<span class="nc" id="L636">          int index = 1;</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">          for (Tree node : indexedTree.getLeaves()) {</span>
+<span class="nc" id="L638">            String word = node.label().value();</span>
+<span class="nc" id="L639">            String tag = node.parent(indexedTree).label().value();</span>
+<span class="nc" id="L640">            int parent = 0;</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">            if (deps.containsKey(index)) {</span>
+<span class="nc" id="L642">              parent = deps.get(index);</span>
+            } else {
+<span class="nc bnc" id="L644" title="All 2 branches missed.">              if (foundRoot) { throw new RuntimeException(); }</span>
+<span class="nc" id="L645">              foundRoot = true;</span>
+            }
+<span class="nc" id="L647">            pw.println(index + '\t' + word + '\t' + tag + '\t' + parent);</span>
+<span class="nc" id="L648">            index++;</span>
+<span class="nc" id="L649">          }</span>
+<span class="nc" id="L650">          pw.println();</span>
+        }
+      }
+<span class="pc bpc" id="L653" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;typedDependencies&quot;)) {</span>
+<span class="nc" id="L654">        GrammaticalStructure gs = gsf.newGrammaticalStructure(outputTree);</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (basicDependencies) {</span>
+<span class="nc" id="L656">          print(gs.typedDependencies(), includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L658" title="All 2 branches missed.">        if (nonCollapsedDependencies) {</span>
+<span class="nc" id="L659">          print(gs.allTypedDependencies(), includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L661" title="All 2 branches missed.">        if (nonCollapsedDependenciesSeparated) {</span>
+<span class="nc" id="L662">          print(gs.allTypedDependencies(), &quot;separator&quot;, includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L664" title="All 2 branches missed.">        if (collapsedDependencies) {</span>
+<span class="nc" id="L665">          print(gs.typedDependenciesCollapsed(GrammaticalStructure.Extras.MAXIMAL), includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        if (CCPropagatedDependencies) {</span>
+<span class="nc" id="L668">          print(gs.typedDependenciesCCprocessed(), includeTags, pw);</span>
+        }
+<span class="nc bnc" id="L670" title="All 2 branches missed.">        if (treeDependencies) {</span>
+<span class="nc" id="L671">          print(gs.typedDependenciesCollapsedTree(), includeTags, pw);</span>
+        }
+      }
+<span class="pc bpc" id="L674" title="1 of 2 branches missed.">      if (formats.containsKey(&quot;typedDependenciesCollapsed&quot;)) {</span>
+<span class="nc" id="L675">        GrammaticalStructure gs = gsf.newGrammaticalStructure(outputTree);</span>
+<span class="nc" id="L676">        print(gs.typedDependenciesCCprocessed(), includeTags, pw);</span>
+      }
+      // This makes parser require jgrapht.  Bad
+      // if (formats.containsKey(&quot;semanticGraph&quot;)) {
+      //  SemanticGraph sg = SemanticGraph.makeFromTree(outputTree, true, false, false, null);
+      //  pw.println(sg.toFormattedString());
+      // }
+    }
+
+    // flush to make sure we see all output
+<span class="fc" id="L686">    pw.flush();</span>
+<span class="fc" id="L687">  }</span>
+
+  private List&lt;Dependency&lt;Label, Label, Object&gt;&gt; getSortedDeps(Tree tree, Predicate&lt;Dependency&lt;Label, Label, Object&gt;&gt; filter) {
+<span class="pc bpc" id="L690" title="1 of 2 branches missed.">    if (gsf != null) {</span>
+<span class="fc" id="L691">      GrammaticalStructure gs = gsf.newGrammaticalStructure(tree);</span>
+<span class="fc" id="L692">      Collection&lt;TypedDependency&gt; deps = gs.typedDependencies(GrammaticalStructure.Extras.NONE);</span>
+<span class="fc" id="L693">      List&lt;Dependency&lt;Label, Label, Object&gt;&gt; sortedDeps = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L694" title="All 2 branches covered.">      for (TypedDependency dep : deps) {</span>
+<span class="fc" id="L695">        sortedDeps.add(new NamedDependency(dep.gov(), dep.dep(), dep.reln().toString()));</span>
+<span class="fc" id="L696">      }</span>
+<span class="fc" id="L697">      Collections.sort(sortedDeps, Dependencies.dependencyIndexComparator());</span>
+<span class="fc" id="L698">      return sortedDeps;</span>
+    } else {
+<span class="nc" id="L700">      Set&lt;Dependency&lt;Label, Label, Object&gt;&gt; depsSet = tree.mapDependencies(filter, hf, &quot;root&quot;);</span>
+<span class="nc" id="L701">      List&lt;Dependency&lt;Label, Label, Object&gt;&gt; sortedDeps = new ArrayList&lt;&gt;(depsSet);</span>
+<span class="nc" id="L702">      Collections.sort(sortedDeps, Dependencies.dependencyIndexComparator());</span>
+<span class="nc" id="L703">      return sortedDeps;</span>
+    }
+  }
+
+
+  /** For the input tree, collapse any collocations in it that exist in
+   *  WordNet and are contiguous in the tree into a single node.
+   *  A single static Wordnet connection is used by all instances of this
+   *  class.  Reflection to check that a Wordnet connection exists.  Otherwise
+   *  we print an error and do nothing.
+   *
+   *  @param tree The input tree.  NOTE: This tree is mangled by this method
+   *  @param hf The head finder to use
+   *  @return The collocation collapsed tree
+   */
+  private static synchronized Tree getCollocationProcessedTree(Tree tree,
+                                                               HeadFinder hf) {
+<span class="nc bnc" id="L720" title="All 2 branches missed.">    if (wnc == null) {</span>
+      try {
+<span class="nc" id="L722">        Class&lt;?&gt; cl = Class.forName(&quot;edu.stanford.nlp.trees.WordNetInstance&quot;);</span>
+<span class="nc" id="L723">        wnc = (WordNetConnection) cl.newInstance();</span>
+<span class="nc" id="L724">      } catch (Exception e) {</span>
+<span class="nc" id="L725">        log.info(&quot;Couldn't open WordNet Connection.  Aborting collocation detection.&quot;);</span>
+<span class="nc" id="L726">        log.info(e);</span>
+<span class="nc" id="L727">        wnc = null;</span>
+<span class="nc" id="L728">      }</span>
+    }
+<span class="nc bnc" id="L730" title="All 2 branches missed.">    if (wnc != null) {</span>
+<span class="nc" id="L731">      CollocationFinder cf = new CollocationFinder(tree, wnc, hf);</span>
+<span class="nc" id="L732">      tree = cf.getMangledTree();</span>
+<span class="nc" id="L733">    } else {</span>
+<span class="nc" id="L734">      log.error(&quot;WordNetConnection unavailable for collocations.&quot;);</span>
+    }
+<span class="nc" id="L736">    return tree;</span>
+  }
+
+
+  public void printHeader(PrintWriter pw, String charset) {
+<span class="nc bnc" id="L741" title="All 2 branches missed.">    if (propertyToBoolean(options, &quot;xml&quot;)) {</span>
+<span class="nc" id="L742">      pw.println(&quot;&lt;?xml version=\&quot;1.0\&quot; encoding=\&quot;&quot; + charset + &quot;\&quot;?&gt;&quot;);</span>
+<span class="nc" id="L743">      pw.println(&quot;&lt;corpus&gt;&quot;);</span>
+    }
+<span class="nc" id="L745">  }</span>
+
+
+  public void printFooter(PrintWriter pw) {
+<span class="nc bnc" id="L749" title="All 2 branches missed.">    if (propertyToBoolean(options, &quot;xml&quot;)) {</span>
+<span class="nc" id="L750">      pw.println(&quot;&lt;/corpus&gt;&quot;);</span>
+    }
+<span class="nc" id="L752">  }</span>
+
+
+  public Tree markHeadNodes(Tree t) {
+<span class="nc" id="L756">    return markHeadNodes(t, null);</span>
+  }
+
+  private Tree markHeadNodes(Tree t, Tree head) {
+<span class="nc bnc" id="L760" title="All 2 branches missed.">    if (t.isLeaf()) {</span>
+<span class="nc" id="L761">      return t; // don't worry about head-marking leaves</span>
+    }
+    Label newLabel;
+<span class="nc bnc" id="L764" title="All 2 branches missed.">    if (t == head) {</span>
+<span class="nc" id="L765">      newLabel = headMark(t.label());</span>
+    } else {
+<span class="nc" id="L767">      newLabel = t.label();</span>
+    }
+<span class="nc" id="L769">    Tree newHead = hf.determineHead(t);</span>
+<span class="nc" id="L770">    return t.treeFactory().newTreeNode(newLabel, Arrays.asList(headMarkChildren(t, newHead)));</span>
+  }
+
+  private static Label headMark(Label l) {
+<span class="nc" id="L774">    Label l1 = l.labelFactory().newLabel(l);</span>
+<span class="nc" id="L775">    l1.setValue(l1.value() + headMark);</span>
+<span class="nc" id="L776">    return l1;</span>
+  }
+
+  private Tree[] headMarkChildren(Tree t, Tree head) {
+<span class="nc" id="L780">    Tree[] kids = t.children();</span>
+<span class="nc" id="L781">    Tree[] newKids = new Tree[kids.length];</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">    for (int i = 0, n = kids.length; i &lt; n; i++) {</span>
+<span class="nc" id="L783">      newKids[i] = markHeadNodes(kids[i], head);</span>
+    }
+<span class="nc" id="L785">    return newKids;</span>
+  }
+
+  /** This provides a simple main method for calling TreePrint.
+   *  Flags supported are:
+   *  &lt;ol&gt;
+   *  &lt;li&gt; -format format (like -outputFormat of parser, default &quot;penn&quot;)
+   *  &lt;li&gt; -options options (like -outputFormatOptions of parser, default &quot;&quot;)
+   *  &lt;li&gt; -tLP class (the TreebankLanguagePack, default &quot;edu.stanford.nlp.tree.PennTreebankLanguagePack&quot;)
+   *  &lt;li&gt; -hf class (the HeadFinder, default, the one in the class specified by -tLP)
+   *  &lt;li&gt; -useTLPTreeReader (use the treeReaderFactory() inside
+   *       the -tLP class; otherwise a PennTreeReader with no normalization is used)
+   *  &lt;/ol&gt;
+   *  The single argument should be a file containing Trees in the format that is either
+   *  Penn Treebank s-expressions or as specified by -useTLPTreeReader and the -tLP class,
+   *  or if there is no such argument, trees are read from stdin and the program runs as a
+   *  filter.
+   *
+   *  @param args Command line arguments, as above.
+   */
+  public static void main(String[] args) {
+<span class="nc" id="L806">    String format = &quot;penn&quot;;</span>
+<span class="nc" id="L807">    String options = &quot;&quot;;</span>
+<span class="nc" id="L808">    String tlpName = &quot;edu.stanford.nlp.trees.PennTreebankLanguagePack&quot;;</span>
+<span class="nc" id="L809">    String hfName = null;</span>
+<span class="nc" id="L810">    Map&lt;String,Integer&gt; flagMap = Generics.newHashMap();</span>
+<span class="nc" id="L811">    flagMap.put(&quot;-format&quot;, 1);</span>
+<span class="nc" id="L812">    flagMap.put(&quot;-options&quot;, 1);</span>
+<span class="nc" id="L813">    flagMap.put(&quot;-tLP&quot;, 1);</span>
+<span class="nc" id="L814">    flagMap.put(&quot;-hf&quot;, 1);</span>
+<span class="nc" id="L815">    Map&lt;String,String[]&gt; argsMap = StringUtils.argsToMap(args,flagMap);</span>
+<span class="nc" id="L816">    args = argsMap.get(null);</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">    if(argsMap.keySet().contains(&quot;-format&quot;)) {</span>
+<span class="nc" id="L818">      format = argsMap.get(&quot;-format&quot;)[0];</span>
+    }
+<span class="nc bnc" id="L820" title="All 2 branches missed.">    if(argsMap.keySet().contains(&quot;-options&quot;)) {</span>
+<span class="nc" id="L821">      options = argsMap.get(&quot;-options&quot;)[0];</span>
+    }
+<span class="nc bnc" id="L823" title="All 2 branches missed.">    if (argsMap.keySet().contains(&quot;-tLP&quot;)) {</span>
+<span class="nc" id="L824">      tlpName = argsMap.get(&quot;-tLP&quot;)[0];</span>
+    }
+<span class="nc bnc" id="L826" title="All 2 branches missed.">    if (argsMap.keySet().contains(&quot;-hf&quot;)) {</span>
+<span class="nc" id="L827">      hfName = argsMap.get(&quot;-hf&quot;)[0];</span>
+    }
+    TreebankLanguagePack tlp;
+    try {
+<span class="nc" id="L831">      tlp = (TreebankLanguagePack) Class.forName(tlpName).newInstance();</span>
+<span class="nc" id="L832">    } catch (Exception e) {</span>
+<span class="nc" id="L833">      log.warning(e);</span>
+<span class="nc" id="L834">      return;</span>
+<span class="nc" id="L835">    }</span>
+    HeadFinder hf;
+<span class="nc bnc" id="L837" title="All 2 branches missed.">    if (hfName != null) {</span>
+      try {
+<span class="nc" id="L839">        hf = (HeadFinder) Class.forName(hfName).newInstance();</span>
+<span class="nc" id="L840">      } catch (Exception e) {</span>
+<span class="nc" id="L841">        log.warning(e);</span>
+<span class="nc" id="L842">        return;</span>
+<span class="nc" id="L843">      }</span>
+    } else {
+<span class="nc" id="L845">      hf = tlp.headFinder();</span>
+    }
+<span class="nc bnc" id="L847" title="All 2 branches missed.">    TreePrint print = new TreePrint(format, options, tlp, (hf == null) ? tlp.headFinder(): hf, tlp.typedDependencyHeadFinder());</span>
+    Iterator&lt;Tree&gt; i; // initialized below
+<span class="nc bnc" id="L849" title="All 2 branches missed.">    if (args.length &gt; 0) {</span>
+      Treebank trees; // initialized below
+      TreeReaderFactory trf;
+<span class="nc bnc" id="L852" title="All 2 branches missed.">      if (argsMap.keySet().contains(&quot;-useTLPTreeReader&quot;)) {</span>
+<span class="nc" id="L853">        trf = tlp.treeReaderFactory();</span>
+      } else {
+<span class="nc" id="L855">        trf = in -&gt; new PennTreeReader(in, new LabeledScoredTreeFactory(new StringLabelFactory()), new TreeNormalizer());</span>
+      }
+<span class="nc" id="L857">      trees = new DiskTreebank(trf);</span>
+<span class="nc" id="L858">      trees.loadPath(args[0]);</span>
+<span class="nc" id="L859">      i = trees.iterator();</span>
+<span class="nc" id="L860">    } else {</span>
+<span class="nc" id="L861">      i = tlp.treeTokenizerFactory().getTokenizer(new BufferedReader(new InputStreamReader(System.in)));</span>
+    }
+<span class="nc bnc" id="L863" title="All 2 branches missed.">    while(i.hasNext()) {</span>
+<span class="nc" id="L864">      print.printTree(i.next());</span>
+    }
+<span class="nc" id="L866">  }</span>
+
+  /**
+   * NO OUTSIDE USE
+   * Returns a String representation of the result of this set of
+   * typed dependencies in a user-specified format.
+   * Currently, three formats are supported:
+   * &lt;dl&gt;
+   * &lt;dt&gt;&quot;plain&quot;&lt;/dt&gt;
+   * &lt;dd&gt;(Default.)  Formats the dependencies as logical relations,
+   * as exemplified by the following:
+   * &lt;pre&gt;
+   *  nsubj(died-1, Sam-0)
+   *  tmod(died-1, today-2)
+   *  &lt;/pre&gt;
+   * &lt;/dd&gt;
+   * &lt;dt&gt;&quot;readable&quot;&lt;/dt&gt;
+   * &lt;dd&gt;Formats the dependencies as a table with columns
+   * {@code dependent}, {@code relation}, and
+   * {@code governor}, as exemplified by the following:
+   * &lt;pre&gt;
+   *  Sam-0               nsubj               died-1
+   *  today-2             tmod                died-1
+   *  &lt;/pre&gt;
+   * &lt;/dd&gt;
+   * &lt;dt&gt;&quot;xml&quot;&lt;/dt&gt;
+   * &lt;dd&gt;Formats the dependencies as XML, as exemplified by the following:
+   * &lt;pre&gt;
+   *  &amp;lt;dependencies&amp;gt;
+   *    &amp;lt;dep type=&quot;nsubj&quot;&amp;gt;
+   *      &amp;lt;governor idx=&quot;1&quot;&amp;gt;died&amp;lt;/governor&amp;gt;
+   *      &amp;lt;dependent idx=&quot;0&quot;&amp;gt;Sam&amp;lt;/dependent&amp;gt;
+   *    &amp;lt;/dep&amp;gt;
+   *    &amp;lt;dep type=&quot;tmod&quot;&amp;gt;
+   *      &amp;lt;governor idx=&quot;1&quot;&amp;gt;died&amp;lt;/governor&amp;gt;
+   *      &amp;lt;dependent idx=&quot;2&quot;&amp;gt;today&amp;lt;/dependent&amp;gt;
+   *    &amp;lt;/dep&amp;gt;
+   *  &amp;lt;/dependencies&amp;gt;
+   *  &lt;/pre&gt;
+   * &lt;/dd&gt;
+   * &lt;/dl&gt;
+   *
+   * @param dependencies The TypedDependencies to print
+   * @param format a {@code String} specifying the desired format
+   * @return a {@code String} representation of the typed
+   *         dependencies in this {@code GrammaticalStructure}
+   */
+  private static String toString(Collection&lt;TypedDependency&gt; dependencies, String format, boolean includeTags) {
+<span class="nc bnc" id="L914" title="All 4 branches missed.">    if (format != null &amp;&amp; format.equals(&quot;xml&quot;)) {</span>
+<span class="nc" id="L915">      return toXMLString(dependencies, includeTags);</span>
+<span class="nc bnc" id="L916" title="All 4 branches missed.">    } else if (format != null &amp;&amp; format.equals(&quot;readable&quot;)) {</span>
+<span class="nc" id="L917">      return toReadableString(dependencies);</span>
+<span class="nc bnc" id="L918" title="All 4 branches missed.">    } else if (format != null &amp;&amp; format.equals(&quot;separator&quot;)) {</span>
+<span class="nc" id="L919">      return toString(dependencies, true, includeTags);</span>
+    } else {
+<span class="nc" id="L921">      return toString(dependencies, false, includeTags);</span>
+    }
+  }
+
+  /**
+   * NO OUTSIDE USE
+   * Returns a String representation of this set of typed dependencies
+   * as exemplified by the following:
+   * &lt;pre&gt;
+   *  tmod(died-6, today-9)
+   *  nsubj(died-6, Sam-3)
+   *  &lt;/pre&gt;
+   *
+   * @param dependencies The TypedDependencies to print
+   * @param extraSep boolean indicating whether the extra dependencies have to be printed separately, after the basic ones
+   * @return a {@code String} representation of this set of
+   *         typed dependencies
+   */
+  private static String toString(Collection&lt;TypedDependency&gt; dependencies, boolean extraSep, boolean includeTags) {
+<span class="nc bnc" id="L940" title="All 2 branches missed.">    CoreLabel.OutputFormat labelFormat = (includeTags) ? CoreLabel.OutputFormat.VALUE_TAG_INDEX : CoreLabel.OutputFormat.VALUE_INDEX;</span>
+<span class="nc" id="L941">    StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">    if (extraSep) {</span>
+<span class="nc" id="L943">      List&lt;TypedDependency&gt; extraDeps = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">      for (TypedDependency td : dependencies) {</span>
+<span class="nc bnc" id="L945" title="All 2 branches missed.">        if (td.extra()) {</span>
+<span class="nc" id="L946">          extraDeps.add(td);</span>
+        } else {
+<span class="nc" id="L948">          buf.append(td.toString(labelFormat)).append('\n');</span>
+        }
+<span class="nc" id="L950">      }</span>
+      // now we print the separator for extra dependencies, and print these if there are some
+<span class="nc bnc" id="L952" title="All 2 branches missed.">      if (!extraDeps.isEmpty()) {</span>
+<span class="nc" id="L953">        buf.append(&quot;======\n&quot;);</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        for (TypedDependency td : extraDeps) {</span>
+<span class="nc" id="L955">          buf.append(td.toString(labelFormat)).append('\n');</span>
+<span class="nc" id="L956">        }</span>
+      }
+<span class="nc" id="L958">    } else {</span>
+<span class="nc bnc" id="L959" title="All 2 branches missed.">      for (TypedDependency td : dependencies) {</span>
+<span class="nc" id="L960">        buf.append(td.toString(labelFormat)).append('\n');</span>
+<span class="nc" id="L961">      }</span>
+    }
+<span class="nc" id="L963">    return buf.toString();</span>
+  }
+
+  // NO OUTSIDE USE
+  private static String toReadableString(Collection&lt;TypedDependency&gt; dependencies) {
+<span class="nc" id="L968">    StringBuilder buf = new StringBuilder();</span>
+<span class="nc" id="L969">    buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;, &quot;dep&quot;, &quot;reln&quot;, &quot;gov&quot;));</span>
+<span class="nc" id="L970">    buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;, &quot;---&quot;, &quot;----&quot;, &quot;---&quot;));</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">    for (TypedDependency td : dependencies) {</span>
+<span class="nc" id="L972">      buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;, td.dep(), td.reln(), td.gov()));</span>
+<span class="nc" id="L973">    }</span>
+<span class="nc" id="L974">    return buf.toString();</span>
+  }
+
+  // NO OUTSIDE USE
+  private static String toXMLString(Collection&lt;TypedDependency&gt; dependencies, boolean includeTags) {
+<span class="nc" id="L979">    StringBuilder buf = new StringBuilder(&quot;&lt;dependencies style=\&quot;typed\&quot;&gt;\n&quot;);</span>
+<span class="nc bnc" id="L980" title="All 2 branches missed.">    for (TypedDependency td : dependencies) {</span>
+<span class="nc" id="L981">      String reln = td.reln().toString();</span>
+<span class="nc" id="L982">      String gov = td.gov().value();</span>
+<span class="nc" id="L983">      String govTag = td.gov().tag();</span>
+<span class="nc" id="L984">      int govIdx = td.gov().index();</span>
+<span class="nc" id="L985">      String dep = td.dep().value();</span>
+<span class="nc" id="L986">      String depTag = td.dep().tag();</span>
+<span class="nc" id="L987">      int depIdx = td.dep().index();</span>
+<span class="nc" id="L988">      boolean extra = td.extra();</span>
+      // add an attribute if the node is a copy
+      // (this happens in collapsing when different prepositions are conjuncts)
+<span class="nc" id="L991">      String govCopy = &quot;&quot;;</span>
+<span class="nc" id="L992">      int copyGov = td.gov().copyCount();</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">      if (copyGov &gt; 0) {</span>
+<span class="nc" id="L994">        govCopy = &quot; copy=\&quot;&quot; + copyGov + '\&quot;';</span>
+      }
+<span class="nc" id="L996">      String depCopy = &quot;&quot;;</span>
+<span class="nc" id="L997">      int copyDep = td.dep().copyCount();</span>
+<span class="nc bnc" id="L998" title="All 2 branches missed.">      if (copyDep &gt; 0) {</span>
+<span class="nc" id="L999">        depCopy = &quot; copy=\&quot;&quot; + copyDep + '\&quot;';</span>
+      }
+<span class="nc bnc" id="L1001" title="All 4 branches missed.">      String govTagAttribute = (includeTags &amp;&amp; govTag != null) ? &quot; tag=\&quot;&quot; + govTag + &quot;\&quot;&quot; : &quot;&quot;;</span>
+<span class="nc bnc" id="L1002" title="All 4 branches missed.">      String depTagAttribute = (includeTags &amp;&amp; depTag != null) ? &quot; tag=\&quot;&quot; + depTag + &quot;\&quot;&quot; : &quot;&quot;;</span>
+      // add an attribute if the typed dependency is an extra relation (do not preserve the tree structure)
+<span class="nc" id="L1004">      String extraAttr = &quot;&quot;;</span>
+<span class="nc bnc" id="L1005" title="All 2 branches missed.">      if (extra) {</span>
+<span class="nc" id="L1006">        extraAttr = &quot; extra=\&quot;yes\&quot;&quot;;</span>
+      }
+<span class="nc" id="L1008">      buf.append(&quot;  &lt;dep type=\&quot;&quot;).append(XMLUtils.escapeXML(reln)).append('\&quot;').append(extraAttr).append(&quot;&gt;\n&quot;);</span>
+<span class="nc" id="L1009">      buf.append(&quot;    &lt;governor idx=\&quot;&quot;).append(govIdx).append('\&quot;').append(govCopy).append(govTagAttribute).append('&gt;').append(XMLUtils.escapeXML(gov)).append(&quot;&lt;/governor&gt;\n&quot;);</span>
+<span class="nc" id="L1010">      buf.append(&quot;    &lt;dependent idx=\&quot;&quot;).append(depIdx).append('\&quot;').append(depCopy).append(depTagAttribute).append('&gt;').append(XMLUtils.escapeXML(dep)).append(&quot;&lt;/dependent&gt;\n&quot;);</span>
+<span class="nc" id="L1011">      buf.append(&quot;  &lt;/dep&gt;\n&quot;);</span>
+<span class="nc" id="L1012">    }</span>
+<span class="nc" id="L1013">    buf.append(&quot;&lt;/dependencies&gt;&quot;);</span>
+<span class="nc" id="L1014">    return buf.toString();</span>
+  }
+
+  /**
+   * USED BY TREEPRINT AND WSD.SUPWSD.PREPROCESS
+   * Prints this set of typed dependencies to the specified
+   * {@code PrintWriter}.
+   * @param dependencies The collection of TypedDependency to print
+   * @param pw Where to print them
+   */
+  public static void print(Collection&lt;TypedDependency&gt; dependencies, boolean includeTags, PrintWriter pw) {
+<span class="nc" id="L1025">    pw.println(toString(dependencies, false, includeTags));</span>
+<span class="nc" id="L1026">  }</span>
+
+  /**
+   * USED BY TREEPRINT
+   * Prints this set of typed dependencies to the specified
+   * {@code PrintWriter} in the specified format.
+   * @param dependencies The collection of TypedDependency to print
+   * @param format &quot;xml&quot; or &quot;readable&quot; or other
+   * @param pw Where to print them
+   */
+  public static void print(Collection&lt;TypedDependency&gt; dependencies, String format, boolean includeTags, PrintWriter pw) {
+<span class="nc" id="L1037">    pw.println(toString(dependencies, format, includeTags));</span>
+<span class="nc" id="L1038">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

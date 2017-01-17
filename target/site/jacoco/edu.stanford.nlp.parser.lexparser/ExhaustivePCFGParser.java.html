@@ -1,0 +1,2267 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ExhaustivePCFGParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">ExhaustivePCFGParser.java</span></div><h1>ExhaustivePCFGParser.java</h1><pre class="source lang-java linenums">// Stanford Parser -- a probabilistic lexicalized NL CFG parser
+// Copyright (c) 2002, 2003, 2004, 2005 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    parser-support@lists.stanford.edu
+//    http://nlp.stanford.edu/downloads/lex-parser.shtml
+
+package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.io.EncodingPrintWriter;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasContext;
+import edu.stanford.nlp.ling.HasOffset;
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.math.SloppyMath;
+import edu.stanford.nlp.parser.KBestViterbiParser;
+import edu.stanford.nlp.parser.common.ParserAnnotations;
+import edu.stanford.nlp.parser.common.ParserConstraint;
+import edu.stanford.nlp.trees.TreeFactory;
+import edu.stanford.nlp.trees.TreebankLanguagePack;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.LabeledScoredTreeFactory;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.PriorityQueue;
+
+import java.util.*;
+import java.util.regex.Matcher;
+
+/** An exhaustive generalized CKY PCFG parser.
+ *  Fairly carefully optimized to be fast.
+ *  &lt;br&gt;
+ *  If reusing this object for multiple parses, remember to correctly
+ *  set any options such as the constraints field.
+ *
+ *  @author Dan Klein
+ *  @author Christopher Manning (I seem to maintain it....)
+ *  @author Jenny Finkel (N-best and sampling code, former from Liang/Chiang)
+ */
+<span class="nc bnc" id="L60" title="All 2 branches missed.">public class ExhaustivePCFGParser implements Scorer, KBestViterbiParser  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L63">  private static Redwood.RedwoodChannels log = Redwood.channels(ExhaustivePCFGParser.class);</span>
+
+  // public static long insideTime = 0;  // for profiling
+  // public static long outsideTime = 0;
+
+  protected final String goalStr;
+  protected final Index&lt;String&gt; stateIndex;
+  protected final Index&lt;String&gt; wordIndex;
+  protected final Index&lt;String&gt; tagIndex;
+
+  protected final TreeFactory tf;
+
+  protected final BinaryGrammar bg;
+  protected final UnaryGrammar ug;
+  protected final Lexicon lex;
+  protected final Options op;
+  protected final TreebankLanguagePack tlp;
+
+  protected OutsideRuleFilter orf;
+
+  // inside scores
+  protected float[][][] iScore;  // start idx, end idx, state -&gt; logProb (ragged; null for end &lt;= start)
+  // outside scores
+  protected float[][][] oScore;  // start idx, end idx, state -&gt; logProb
+  protected float bestScore;
+
+  protected int[][][] wordsInSpan; // number of words in span with this state
+
+  protected boolean[][] oFilteredStart; // [start][state]; only used by unused outsideRuleFilter
+  protected boolean[][] oFilteredEnd; // [end][state]; only used by unused outsideRuleFilter
+
+  protected boolean[][] iPossibleByL; // [start][state]
+  protected boolean[][] iPossibleByR; // [end][state]
+  protected boolean[][] oPossibleByL; // [start][state]
+  protected boolean[][] oPossibleByR; // [end][state]
+
+  protected int[] words;  // words of sentence being parsed as word Numberer ints
+  private int[] beginOffsets;
+  private int[] endOffsets;
+  private CoreLabel[] originalCoreLabels;
+  private HasTag[] originalTags;
+  protected int length; // one larger than true length of sentence; includes boundary symbol in count
+  protected boolean[][] tags;
+<span class="nc" id="L106">  protected int myMaxLength = -0xDEADBEEF;</span>
+
+  protected final int numStates;
+<span class="nc" id="L109">  protected int arraySize = 0;</span>
+
+  /**
+   * When you want to force the parser to parse a particular
+   * subsequence into a particular state.  Parses will only be made
+   * where there is a constituent over the given span which matches
+   * (as regular expression) the state Pattern given.  See the
+   * documentation of the ParserConstraint class for information on
+   * specifying a ParserConstraint.
+   * &lt;br&gt;
+   * Implementation note: It would be cleaner to make this a
+   * Collections.emptyList, but that actually significantly slows down
+   * the processing in the case of empty lists.  Checking for null
+   * saves quite a bit of time.
+   */
+<span class="nc" id="L124">  protected List&lt;ParserConstraint&gt; constraints = null;</span>
+
+  private CoreLabel getCoreLabel(int labelIndex) {
+<span class="nc bnc" id="L127" title="All 2 branches missed.">    if (originalCoreLabels[labelIndex] != null) {</span>
+<span class="nc" id="L128">      CoreLabel terminalLabel = originalCoreLabels[labelIndex];</span>
+<span class="nc bnc" id="L129" title="All 4 branches missed.">      if (terminalLabel.value() == null &amp;&amp; terminalLabel.word() != null) {</span>
+<span class="nc" id="L130">        terminalLabel.setValue(terminalLabel.word());</span>
+      }
+<span class="nc" id="L132">      return terminalLabel;</span>
+    }
+
+<span class="nc" id="L135">    String wordStr = wordIndex.get(words[labelIndex]);</span>
+<span class="nc" id="L136">    CoreLabel terminalLabel = new CoreLabel();</span>
+<span class="nc" id="L137">    terminalLabel.setValue(wordStr);</span>
+<span class="nc" id="L138">    terminalLabel.setWord(wordStr);</span>
+<span class="nc" id="L139">    terminalLabel.setBeginPosition(beginOffsets[labelIndex]);</span>
+<span class="nc" id="L140">    terminalLabel.setEndPosition(endOffsets[labelIndex]);</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">    if (originalTags[labelIndex] != null) {</span>
+<span class="nc" id="L142">      terminalLabel.setTag(originalTags[labelIndex].tag());</span>
+    }
+<span class="nc" id="L144">    return terminalLabel;</span>
+  }
+
+  @Override
+  public double oScore(Edge edge) {
+<span class="nc" id="L149">    double oS = oScore[edge.start][edge.end][edge.state];</span>
+<span class="nc" id="L150">    if (op.testOptions.pcfgThreshold) {</span>
+      double iS = iScore[edge.start][edge.end][edge.state];
+      if (iS + oS - bestScore &lt; op.testOptions.pcfgThresholdValue) {
+        return Double.NEGATIVE_INFINITY;
+      }
+    }
+<span class="nc" id="L156">    return oS;</span>
+  }
+
+  @Override
+  public double iScore(Edge edge) {
+<span class="nc" id="L161">    return iScore[edge.start][edge.end][edge.state];</span>
+  }
+
+  @Override
+  public boolean oPossible(Hook hook) {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">    return (hook.isPreHook() ? oPossibleByR[hook.end][hook.state] : oPossibleByL[hook.start][hook.state]);</span>
+  }
+
+  @Override
+  public boolean iPossible(Hook hook) {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    return (hook.isPreHook() ? iPossibleByR[hook.start][hook.subState] : iPossibleByL[hook.end][hook.subState]);</span>
+  }
+
+
+  public boolean oPossibleL(int state, int start) {
+<span class="nc" id="L176">    return oPossibleByL[start][state];</span>
+  }
+
+  public boolean oPossibleR(int state, int end) {
+<span class="nc" id="L180">    return oPossibleByR[end][state];</span>
+  }
+
+  public boolean iPossibleL(int state, int start) {
+<span class="nc" id="L184">    return iPossibleByL[start][state];</span>
+  }
+
+  public boolean iPossibleR(int state, int end) {
+<span class="nc" id="L188">    return iPossibleByR[end][state];</span>
+  }
+
+  protected void buildOFilter() {
+<span class="nc" id="L192">    oFilteredStart = new boolean[length][numStates];</span>
+<span class="nc" id="L193">    oFilteredEnd = new boolean[length + 1][numStates];</span>
+<span class="nc" id="L194">    orf.init();</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">    for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc" id="L196">      orf.leftAccepting(oFilteredStart[start]);</span>
+<span class="nc" id="L197">      orf.advanceRight(tags[start]);</span>
+    }
+<span class="nc bnc" id="L199" title="All 2 branches missed.">    for (int end = length; end &gt; 0; end--) {</span>
+<span class="nc" id="L200">      orf.rightAccepting(oFilteredEnd[end]);</span>
+<span class="nc" id="L201">      orf.advanceLeft(tags[end - 1]);</span>
+    }
+<span class="nc" id="L203">  }</span>
+
+
+  public double validateBinarizedTree(Tree tree, int start) {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">    if (tree.isLeaf()) {</span>
+<span class="nc" id="L208">      return 0.0;</span>
+    }
+<span class="nc" id="L210">    float epsilon = 0.0001f;</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">    if (tree.isPreTerminal()) {</span>
+<span class="nc" id="L212">      String wordStr = tree.children()[0].label().value();</span>
+<span class="nc" id="L213">      int tag = tagIndex.indexOf(tree.label().value());</span>
+<span class="nc" id="L214">      int word = wordIndex.indexOf(wordStr);</span>
+<span class="nc" id="L215">      IntTaggedWord iTW = new IntTaggedWord(word, tag);</span>
+<span class="nc" id="L216">      float score = lex.score(iTW, start, wordStr, null);</span>
+<span class="nc" id="L217">      float bound = iScore[start][start + 1][stateIndex.indexOf(tree.label().value())];</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">      if (score &gt; bound + epsilon) {</span>
+<span class="nc" id="L219">        System.out.println(&quot;Invalid tagging:&quot;);</span>
+<span class="nc" id="L220">        System.out.println(&quot;  Tag: &quot; + tree.label().value());</span>
+<span class="nc" id="L221">        System.out.println(&quot;  Word: &quot; + tree.children()[0].label().value());</span>
+<span class="nc" id="L222">        System.out.println(&quot;  Score: &quot; + score);</span>
+<span class="nc" id="L223">        System.out.println(&quot;  Bound: &quot; + bound);</span>
+      }
+<span class="nc" id="L225">      return score;</span>
+    }
+<span class="nc" id="L227">    int parent = stateIndex.indexOf(tree.label().value());</span>
+<span class="nc" id="L228">    int firstChild = stateIndex.indexOf(tree.children()[0].label().value());</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">    if (tree.numChildren() == 1) {</span>
+<span class="nc" id="L230">      UnaryRule ur = new UnaryRule(parent, firstChild);</span>
+<span class="nc" id="L231">      double score = SloppyMath.max(ug.scoreRule(ur), -10000.0) + validateBinarizedTree(tree.children()[0], start);</span>
+<span class="nc" id="L232">      double bound = iScore[start][start + tree.yield().size()][parent];</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">      if (score &gt; bound + epsilon) {</span>
+<span class="nc" id="L234">        System.out.println(&quot;Invalid unary:&quot;);</span>
+<span class="nc" id="L235">        System.out.println(&quot;  Parent: &quot; + tree.label().value());</span>
+<span class="nc" id="L236">        System.out.println(&quot;  Child: &quot; + tree.children()[0].label().value());</span>
+<span class="nc" id="L237">        System.out.println(&quot;  Start: &quot; + start);</span>
+<span class="nc" id="L238">        System.out.println(&quot;  End: &quot; + (start + tree.yield().size()));</span>
+<span class="nc" id="L239">        System.out.println(&quot;  Score: &quot; + score);</span>
+<span class="nc" id="L240">        System.out.println(&quot;  Bound: &quot; + bound);</span>
+      }
+<span class="nc" id="L242">      return score;</span>
+    }
+<span class="nc" id="L244">    int secondChild = stateIndex.indexOf(tree.children()[1].label().value());</span>
+<span class="nc" id="L245">    BinaryRule br = new BinaryRule(parent, firstChild, secondChild);</span>
+<span class="nc" id="L246">    double score = SloppyMath.max(bg.scoreRule(br), -10000.0) + validateBinarizedTree(tree.children()[0], start) + validateBinarizedTree(tree.children()[1], start + tree.children()[0].yield().size());</span>
+<span class="nc" id="L247">    double bound = iScore[start][start + tree.yield().size()][parent];</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">    if (score &gt; bound + epsilon) {</span>
+<span class="nc" id="L249">      System.out.println(&quot;Invalid binary:&quot;);</span>
+<span class="nc" id="L250">      System.out.println(&quot;  Parent: &quot; + tree.label().value());</span>
+<span class="nc" id="L251">      System.out.println(&quot;  LChild: &quot; + tree.children()[0].label().value());</span>
+<span class="nc" id="L252">      System.out.println(&quot;  RChild: &quot; + tree.children()[1].label().value());</span>
+<span class="nc" id="L253">      System.out.println(&quot;  Start: &quot; + start);</span>
+<span class="nc" id="L254">      System.out.println(&quot;  End: &quot; + (start + tree.yield().size()));</span>
+<span class="nc" id="L255">      System.out.println(&quot;  Score: &quot; + score);</span>
+<span class="nc" id="L256">      System.out.println(&quot;  Bound: &quot; + bound);</span>
+    }
+<span class="nc" id="L258">    return score;</span>
+  }
+
+  // needs to be set up so that uses same Train options...
+  public Tree scoreNonBinarizedTree(Tree tree) {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    TreeAnnotatorAndBinarizer binarizer = new TreeAnnotatorAndBinarizer(op.tlpParams, op.forceCNF, !op.trainOptions.outsideFactor(), true, op);</span>
+<span class="nc" id="L264">    tree = binarizer.transformTree(tree);</span>
+<span class="nc" id="L265">    scoreBinarizedTree(tree, 0);</span>
+<span class="nc" id="L266">    return op.tlpParams.subcategoryStripper().transformTree(new Debinarizer(op.forceCNF).transformTree(tree));</span>
+    //    return debinarizer.transformTree(t);
+  }
+
+  //
+  public double scoreBinarizedTree(Tree tree, int start) {
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    if (tree.isLeaf()) {</span>
+<span class="nc" id="L273">      return 0.0;</span>
+    }
+<span class="nc bnc" id="L275" title="All 2 branches missed.">    if (tree.isPreTerminal()) {</span>
+<span class="nc" id="L276">      String wordStr = tree.children()[0].label().value();</span>
+<span class="nc" id="L277">      int tag = tagIndex.indexOf(tree.label().value());</span>
+<span class="nc" id="L278">      int word = wordIndex.indexOf(wordStr);</span>
+<span class="nc" id="L279">      IntTaggedWord iTW = new IntTaggedWord(word, tag);</span>
+      // if (lex.score(iTW,(leftmost ? 0 : 1)) == Double.NEGATIVE_INFINITY) {
+      //   System.out.println(&quot;NO SCORE FOR: &quot;+iTW);
+      // }
+<span class="nc" id="L283">      float score = lex.score(iTW, start, wordStr, null);</span>
+<span class="nc" id="L284">      tree.setScore(score);</span>
+<span class="nc" id="L285">      return score;</span>
+    }
+<span class="nc" id="L287">    int parent = stateIndex.indexOf(tree.label().value());</span>
+<span class="nc" id="L288">    int firstChild = stateIndex.indexOf(tree.children()[0].label().value());</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    if (tree.numChildren() == 1) {</span>
+<span class="nc" id="L290">      UnaryRule ur = new UnaryRule(parent, firstChild);</span>
+      //+ DEBUG
+      // if (ug.scoreRule(ur) &lt; -10000) {
+      //        System.out.println(&quot;Grammar doesn't have rule: &quot; + ur);
+      // }
+      //      return SloppyMath.max(ug.scoreRule(ur), -10000.0) + scoreBinarizedTree(tree.children()[0], leftmost);
+<span class="nc" id="L296">      double score = ug.scoreRule(ur) + scoreBinarizedTree(tree.children()[0], start);</span>
+<span class="nc" id="L297">      tree.setScore(score);</span>
+<span class="nc" id="L298">      return score;</span>
+    }
+<span class="nc" id="L300">    int secondChild = stateIndex.indexOf(tree.children()[1].label().value());</span>
+<span class="nc" id="L301">    BinaryRule br = new BinaryRule(parent, firstChild, secondChild);</span>
+    //+ DEBUG
+    // if (bg.scoreRule(br) &lt; -10000) {
+    //  System.out.println(&quot;Grammar doesn't have rule: &quot; + br);
+    // }
+    //    return SloppyMath.max(bg.scoreRule(br), -10000.0) +
+    //            scoreBinarizedTree(tree.children()[0], leftmost) +
+    //            scoreBinarizedTree(tree.children()[1], false);
+<span class="nc" id="L309">    double score = bg.scoreRule(br) + scoreBinarizedTree(tree.children()[0], start) + scoreBinarizedTree(tree.children()[1], start + tree.children()[0].yield().size());</span>
+<span class="nc" id="L310">    tree.setScore(score);</span>
+<span class="nc" id="L311">    return score;</span>
+  }
+
+
+  static final boolean spillGuts = false;
+  static final boolean dumpTagging = false;
+<span class="nc" id="L317">  private long time = System.currentTimeMillis();</span>
+
+  protected void tick(String str) {
+<span class="nc" id="L320">    long time2 = System.currentTimeMillis();</span>
+<span class="nc" id="L321">    long diff = time2 - time;</span>
+<span class="nc" id="L322">    time = time2;</span>
+<span class="nc" id="L323">    log.info(&quot;done.  &quot; + diff + &quot;\n&quot; + str);</span>
+<span class="nc" id="L324">  }</span>
+
+<span class="nc" id="L326">  protected boolean floodTags = false;</span>
+<span class="nc" id="L327">  protected List sentence = null;</span>
+<span class="nc" id="L328">  protected Lattice lr = null;</span>
+
+  protected int[][] narrowLExtent; // = null; // [end][state]: the rightmost left extent of state s ending at position i
+  protected int[][] wideLExtent; // = null; // [end][state] the leftmost left extent of state s ending at position i
+  protected int[][] narrowRExtent; // = null; // [start][state]: the leftmost right extent of state s starting at position i
+  protected int[][] wideRExtent; // = null; // [start][state] the rightmost right extent of state s starting at position i
+
+  protected final boolean[] isTag; // this records whether grammar states (stateIndex) correspond to POS tags
+
+
+  public boolean parse(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L339">    lr = null; // better nullPointer exception than silent error</span>
+    //System.out.println(&quot;is it a taggedword?&quot; + (sentence.get(0) instanceof TaggedWord)); //debugging
+<span class="nc bnc" id="L341" title="All 2 branches missed.">    if (sentence != this.sentence) {</span>
+<span class="nc" id="L342">      this.sentence = sentence;</span>
+<span class="nc" id="L343">      floodTags = false;</span>
+    }
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L346">      Timing.tick(&quot;Starting pcfg parse.&quot;);</span>
+    }
+    if (spillGuts) {
+      tick(&quot;Starting PCFG parse...&quot;);
+    }
+<span class="nc" id="L351">    length = sentence.size();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">    if (length &gt; arraySize) {</span>
+<span class="nc" id="L353">      considerCreatingArrays(length);</span>
+    }
+<span class="nc" id="L355">    int goal = stateIndex.indexOf(goalStr);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+      // System.out.println(numStates + &quot; states, &quot; + goal + &quot; is the goal state.&quot;);
+      // log.info(new ArrayList(ug.coreRules.keySet()));
+<span class="nc" id="L359">      log.info(&quot;Initializing PCFG...&quot;);</span>
+    }
+    // map input words to words array (wordIndex ints)
+<span class="nc" id="L362">    words = new int[length];</span>
+<span class="nc" id="L363">    beginOffsets = new int[length];</span>
+<span class="nc" id="L364">    endOffsets = new int[length];</span>
+<span class="nc" id="L365">    originalCoreLabels = new CoreLabel[length];</span>
+<span class="nc" id="L366">    originalTags = new HasTag[length];</span>
+<span class="nc" id="L367">    int unk = 0;</span>
+<span class="nc" id="L368">    StringBuilder unkWords = new StringBuilder(&quot;[&quot;);</span>
+    // int unkIndex = wordIndex.size();
+
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    for (int i = 0; i &lt; length; i++) {</span>
+<span class="nc" id="L372">      String s = sentence.get(i).word();</span>
+
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      if (sentence.get(i) instanceof HasOffset) {</span>
+<span class="nc" id="L375">        HasOffset word = (HasOffset) sentence.get(i);</span>
+<span class="nc" id="L376">        beginOffsets[i] = word.beginPosition();</span>
+<span class="nc" id="L377">        endOffsets[i] = word.endPosition();</span>
+<span class="nc" id="L378">      } else {</span>
+        //Storing the positions of the word interstices
+        //Account for single space between words
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        beginOffsets[i] = ((i == 0) ? 0 : endOffsets[i - 1] + 1);</span>
+<span class="nc" id="L382">        endOffsets[i] = beginOffsets[i] + s.length();</span>
+      }
+
+<span class="nc bnc" id="L385" title="All 2 branches missed.">      if (sentence.get(i) instanceof CoreLabel) {</span>
+<span class="nc" id="L386">        originalCoreLabels[i] = (CoreLabel) sentence.get(i);</span>
+      }
+<span class="nc bnc" id="L388" title="All 2 branches missed.">      if (sentence.get(i) instanceof HasTag) {</span>
+<span class="nc" id="L389">        HasTag tag = (HasTag) sentence.get(i);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (tag.tag() != null) {</span>
+<span class="nc" id="L391">          originalTags[i] = tag;</span>
+        }
+      }
+
+<span class="nc bnc" id="L395" title="All 6 branches missed.">      if (op.testOptions.verbose &amp;&amp; (!wordIndex.contains(s) || !lex.isKnown(wordIndex.indexOf(s)))) {</span>
+<span class="nc" id="L396">        unk++;</span>
+<span class="nc" id="L397">        unkWords.append(' ');</span>
+<span class="nc" id="L398">        unkWords.append(s);</span>
+<span class="nc" id="L399">        unkWords.append(&quot; { &quot;);</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        for (int jj = 0; jj &lt; s.length(); jj++) {</span>
+<span class="nc" id="L401">          char ch = s.charAt(jj);</span>
+<span class="nc" id="L402">          unkWords.append(Character.getType(ch)).append(&quot; &quot;);</span>
+        }
+<span class="nc" id="L404">        unkWords.append(&quot;}&quot;);</span>
+      }
+      // TODO: really, add a new word?
+      //words[i] = wordIndex.indexOf(s, unkIndex);
+      //if (words[i] == unkIndex) {
+      //  ++unkIndex;
+      //}
+<span class="nc" id="L411">      words[i] = wordIndex.addToIndex(s);</span>
+      //if (wordIndex.contains(s)) {
+      //  words[i] = wordIndex.indexOf(s);
+      //} else {
+      //  words[i] = wordIndex.indexOf(Lexicon.UNKNOWN_WORD);
+      //}
+    }
+
+    // initialize inside and outside score arrays
+    if (spillGuts) {
+      tick(&quot;Wiping arrays...&quot;);
+    }
+<span class="nc bnc" id="L423" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L424">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc bnc" id="L426" title="All 2 branches missed.">    for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">      for (int end = start + 1; end &lt;= length; end++) {</span>
+<span class="nc" id="L428">        Arrays.fill(iScore[start][end], Float.NEGATIVE_INFINITY);</span>
+<span class="nc bnc" id="L429" title="All 4 branches missed.">        if (op.doDep &amp;&amp; ! op.testOptions.useFastFactored) {</span>
+<span class="nc" id="L430">          Arrays.fill(oScore[start][end], Float.NEGATIVE_INFINITY);</span>
+        }
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        if (op.testOptions.lengthNormalization) {</span>
+<span class="nc" id="L433">          Arrays.fill(wordsInSpan[start][end], 1);</span>
+        }
+      }
+    }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L438">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc bnc" id="L440" title="All 2 branches missed.">    for (int loc = 0; loc &lt;= length; loc++) {</span>
+<span class="nc" id="L441">      Arrays.fill(narrowLExtent[loc], -1); // the rightmost left with state s ending at i that we can get is the beginning</span>
+<span class="nc" id="L442">      Arrays.fill(wideLExtent[loc], length + 1); // the leftmost left with state s ending at i that we can get is the end</span>
+    }
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    for (int loc = 0; loc &lt; length; loc++) {</span>
+<span class="nc" id="L445">      Arrays.fill(narrowRExtent[loc], length + 1); // the leftmost right with state s starting at i that we can get is the end</span>
+<span class="nc" id="L446">      Arrays.fill(wideRExtent[loc], -1); // the rightmost right with state s starting at i that we can get is the beginning</span>
+    }
+    // int puncTag = stateIndex.indexOf(&quot;.&quot;);
+    // boolean lastIsPunc = false;
+<span class="nc bnc" id="L450" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L451">      Timing.tick(&quot;done.&quot;);</span>
+<span class="nc" id="L452">      unkWords.append(&quot; ]&quot;);</span>
+<span class="nc" id="L453">      op.tlpParams.pw(System.err).println(&quot;Unknown words: &quot; + unk + &quot; &quot; + unkWords);</span>
+<span class="nc" id="L454">      log.info(&quot;Starting filters...&quot;);</span>
+    }
+<span class="nc bnc" id="L456" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L457">      throw new RuntimeInterruptedException();</span>
+    }
+    // do tags
+    if (spillGuts) {
+      tick(&quot;Tagging...&quot;);
+    }
+<span class="nc" id="L463">    initializeChart(sentence);</span>
+    //if (op.testOptions.outsideFilter)
+    // buildOFilter();
+<span class="nc bnc" id="L466" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L467">      Timing.tick(&quot;done.&quot;);</span>
+<span class="nc" id="L468">      log.info(&quot;Starting insides...&quot;);</span>
+    }
+    // do the inside probabilities
+<span class="nc" id="L471">    doInsideScores();</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+      // insideTime += Timing.tick(&quot;done.&quot;);
+<span class="nc" id="L474">      Timing.tick(&quot;done.&quot;);</span>
+<span class="nc" id="L475">      System.out.println(&quot;PCFG parsing &quot; + length + &quot; words (incl. stop): insideScore = &quot; + iScore[0][length][goal]);</span>
+    }
+<span class="nc" id="L477">    bestScore = iScore[0][length][goal];</span>
+<span class="nc" id="L478">    boolean succeeded = hasParse();</span>
+<span class="nc bnc" id="L479" title="All 6 branches missed.">    if (op.testOptions.doRecovery &amp;&amp; !succeeded &amp;&amp; !floodTags) {</span>
+<span class="nc" id="L480">      floodTags = true; // sentence will try to reparse</span>
+      // ms: disabled message. this is annoying and it doesn't really provide much information
+      //log.info(&quot;Trying recovery parse...&quot;);
+<span class="nc" id="L483">      return parse(sentence);</span>
+    }
+<span class="nc bnc" id="L485" title="All 4 branches missed.">    if ( ! op.doDep || op.testOptions.useFastFactored) {</span>
+<span class="nc" id="L486">      return succeeded;</span>
+    }
+<span class="nc bnc" id="L488" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L489">      log.info(&quot;Starting outsides...&quot;);</span>
+    }
+    // outside scores
+<span class="nc" id="L492">    oScore[0][length][goal] = 0.0f;</span>
+<span class="nc" id="L493">    doOutsideScores();</span>
+    //System.out.println(&quot;State rate: &quot;+((int)(1000*ohits/otries))/10.0);
+    //System.out.println(&quot;Traversals: &quot;+ohits);
+<span class="nc bnc" id="L496" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+      // outsideTime += Timing.tick(&quot;Done.&quot;);
+<span class="nc" id="L498">      Timing.tick(&quot;done.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L501" title="All 2 branches missed.">    if (op.doDep) {</span>
+<span class="nc" id="L502">      initializePossibles();</span>
+    }
+
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L506">      throw new RuntimeInterruptedException();</span>
+    }
+
+<span class="nc" id="L509">    return succeeded;</span>
+  }
+
+  public boolean parse(HTKLatticeReader lr) {
+    //TODO wsg 20-jan-2010
+    // There are presently 2 issues with HTK lattice parsing:
+    //   (1) The initializeChart() method present in rev. 19820 did not properly initialize
+    //         lattices (or sub-lattices) like this (where A,B,C are nodes, and NN is the POS tag arc label):
+    //
+    //              --NN--&gt; B --NN--
+    //             /                \
+    //            A ------NN-------&gt; C
+    //
+    //   (2) extractBestParse() was not implemented properly.
+    //
+    //   To re-implement support for HTKLatticeReader it is necessary to create an interface
+    //   for the two different lattice implementations and then modify initializeChart() and
+    //   extractBestParse() as appropriate. Another solution would be to duplicate these two
+    //   methods and make the necessary changes for HTKLatticeReader. In both cases, the
+    //   acoustic model score provided by the HTK lattices should be included in the weighting.
+    //
+    //   Note that I never actually tested HTKLatticeReader, so I am uncertain if this facility
+    //   actually worked in the first place.
+    //
+<span class="nc" id="L533">    System.err.printf(&quot;%s: HTK lattice parsing presently disabled.\n&quot;, this.getClass().getName());</span>
+<span class="nc" id="L534">    return false;</span>
+  }
+
+  public boolean parse(Lattice lr) {
+<span class="nc" id="L538">    sentence = null; // better nullPointer exception than silent error</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">    if (lr != this.lr) {</span>
+<span class="nc" id="L540">      this.lr = lr;</span>
+<span class="nc" id="L541">      floodTags = false;</span>
+    }
+
+<span class="nc bnc" id="L544" title="All 2 branches missed.">    if (op.testOptions.verbose)</span>
+<span class="nc" id="L545">      Timing.tick(&quot;Doing lattice PCFG parse...&quot;);</span>
+
+
+    // The number of whitespace nodes in the lattice
+<span class="nc" id="L549">    length = lr.getNumNodes() - 1; //Subtract 1 since considerCreatingArrays will add the final interstice</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">    if (length &gt; arraySize)</span>
+<span class="nc" id="L551">      considerCreatingArrays(length);</span>
+
+
+<span class="nc" id="L554">    int goal = stateIndex.indexOf(goalStr);</span>
+//    if (op.testOptions.verbose) {
+//      log.info(&quot;Unaries: &quot; + ug.rules());
+//      log.info(&quot;Binaries: &quot; + bg.rules());
+//      log.info(&quot;Initializing PCFG...&quot;);
+//      log.info(&quot;   &quot; + numStates + &quot; states, &quot; + goal + &quot; is the goal state.&quot;);
+//    }
+
+//    log.info(&quot;Tagging states&quot;);
+//    for(int i = 0; i &lt; numStates; i++) {
+//      if(isTag[i]) {
+//        int tagId = Numberer.translate(stateSpace, &quot;tags&quot;, i);
+//        String tag = (String) tagNumberer.object(tagId);
+//        System.err.printf(&quot; %d: %s\n&quot;,i,tag);
+//      }
+//    }
+
+    // Create a map of all words in the lattice
+    //
+//    int numEdges = lr.getNumEdges();
+//    words = new int[numEdges];
+//    offsets = new IntPair[numEdges];
+//
+//    int unk = 0;
+//    int i = 0;
+//    StringBuilder unkWords = new StringBuilder(&quot;[&quot;);
+//    for (LatticeEdge edge : lr) {
+//      String s = edge.word;
+//      if (op.testOptions.verbose &amp;&amp; !lex.isKnown(wordNumberer.number(s))) {
+//        unk++;
+//        unkWords.append(&quot; &quot; + s);
+//      }
+//      words[i++] = wordNumberer.number(s);
+//    }
+
+<span class="nc bnc" id="L589" title="All 2 branches missed.">    for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">    	for (int end = start + 1; end &lt;= length; end++) {</span>
+<span class="nc" id="L591">    		Arrays.fill(iScore[start][end], Float.NEGATIVE_INFINITY);</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">    		if (op.doDep) Arrays.fill(oScore[start][end], Float.NEGATIVE_INFINITY);</span>
+    	}
+    }
+
+<span class="nc bnc" id="L596" title="All 2 branches missed.">    for (int loc = 0; loc &lt;= length; loc++) {</span>
+<span class="nc" id="L597">      Arrays.fill(narrowLExtent[loc], -1); // the rightmost left with state s ending at i that we can get is the beginning</span>
+<span class="nc" id="L598">      Arrays.fill(wideLExtent[loc], length + 1); // the leftmost left with state s ending at i that we can get is the end</span>
+    }
+<span class="nc bnc" id="L600" title="All 2 branches missed.">    for (int loc = 0; loc &lt; length; loc++) {</span>
+<span class="nc" id="L601">      Arrays.fill(narrowRExtent[loc], length + 1); // the leftmost right with state s starting at i that we can get is the end</span>
+<span class="nc" id="L602">      Arrays.fill(wideRExtent[loc], -1); // the rightmost right with state s starting at i that we can get is the beginning</span>
+    }
+
+<span class="nc" id="L605">    initializeChart(lr);</span>
+
+<span class="nc" id="L607">    doInsideScores();</span>
+<span class="nc" id="L608">    bestScore = iScore[0][length][goal];</span>
+
+<span class="nc bnc" id="L610" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L611">      Timing.tick(&quot;done.&quot;);</span>
+<span class="nc" id="L612">      log.info(&quot;PCFG &quot; + length + &quot; words (incl. stop) iScore &quot; + bestScore);</span>
+    }
+
+<span class="nc" id="L615">    boolean succeeded = hasParse();</span>
+
+    // Try a recovery parse
+<span class="nc bnc" id="L618" title="All 6 branches missed.">    if (!succeeded &amp;&amp; op.testOptions.doRecovery &amp;&amp; !floodTags) {</span>
+<span class="nc" id="L619">      floodTags = true;</span>
+<span class="nc" id="L620">      System.err.printf(this.getClass().getName() + &quot;: Parse failed. Trying recovery parse...&quot;);</span>
+<span class="nc" id="L621">      succeeded = parse(lr);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">      if(!succeeded) return false;</span>
+    }
+
+<span class="nc" id="L625">    oScore[0][length][goal] = 0.0f;</span>
+<span class="nc" id="L626">    doOutsideScores();</span>
+
+<span class="nc bnc" id="L628" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L629">      Timing.tick(&quot;done.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L632" title="All 2 branches missed.">    if (op.doDep) {</span>
+<span class="nc" id="L633">      initializePossibles();</span>
+    }
+
+<span class="nc" id="L636">    return succeeded;</span>
+  }
+
+  /** These arrays are used by the factored parser (only) during edge combination.
+   *  The method assumes that the iScore and oScore arrays have been initialized.
+   */
+  protected void initializePossibles() {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">    for (int loc = 0; loc &lt; length; loc++) {</span>
+<span class="nc" id="L644">      Arrays.fill(iPossibleByL[loc], false);</span>
+<span class="nc" id="L645">      Arrays.fill(oPossibleByL[loc], false);</span>
+    }
+<span class="nc bnc" id="L647" title="All 2 branches missed.">    for (int loc = 0; loc &lt;= length; loc++) {</span>
+<span class="nc" id="L648">      Arrays.fill(iPossibleByR[loc], false);</span>
+<span class="nc" id="L649">      Arrays.fill(oPossibleByR[loc], false);</span>
+    }
+<span class="nc bnc" id="L651" title="All 2 branches missed.">    for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">      for (int end = start + 1; end &lt;= length; end++) {</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc bnc" id="L654" title="All 4 branches missed.">          if (iScore[start][end][state] &gt; Float.NEGATIVE_INFINITY &amp;&amp; oScore[start][end][state] &gt; Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L655">            iPossibleByL[start][state] = true;</span>
+<span class="nc" id="L656">            iPossibleByR[end][state] = true;</span>
+<span class="nc" id="L657">            oPossibleByL[start][state] = true;</span>
+<span class="nc" id="L658">            oPossibleByR[end][state] = true;</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L663">  }</span>
+
+  private void doOutsideScores() {
+<span class="nc bnc" id="L666" title="All 2 branches missed.">    for (int diff = length; diff &gt;= 1; diff--) {</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">      if (Thread.interrupted()) {</span>
+<span class="nc" id="L668">        throw new RuntimeInterruptedException();</span>
+      }
+
+<span class="nc bnc" id="L671" title="All 2 branches missed.">      for (int start = 0; start + diff &lt;= length; start++) {</span>
+<span class="nc" id="L672">        int end = start + diff;</span>
+        // do unaries
+<span class="nc bnc" id="L674" title="All 2 branches missed.">        for (int s = 0; s &lt; numStates; s++) {</span>
+<span class="nc" id="L675">          float oS = oScore[start][end][s];</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">          if (oS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L677">            continue;</span>
+          }
+<span class="nc" id="L679">          UnaryRule[] rules = ug.closedRulesByParent(s);</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">          for (UnaryRule ur : rules) {</span>
+<span class="nc" id="L681">            float pS = ur.score;</span>
+<span class="nc" id="L682">            float tot = oS + pS;</span>
+<span class="nc bnc" id="L683" title="All 4 branches missed.">            if (tot &gt; oScore[start][end][ur.child] &amp;&amp; iScore[start][end][ur.child] &gt; Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L684">              oScore[start][end][ur.child] = tot;</span>
+            }
+          }
+        }
+        // do binaries
+<span class="nc bnc" id="L689" title="All 2 branches missed.">        for (int s = 0; s &lt; numStates; s++) {</span>
+<span class="nc" id="L690">          int min1 = narrowRExtent[start][s];</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">          if (end &lt; min1) {</span>
+<span class="nc" id="L692">            continue;</span>
+          }
+<span class="nc" id="L694">          BinaryRule[] rules = bg.splitRulesWithLC(s);</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">          for (BinaryRule br  : rules) {</span>
+<span class="nc" id="L696">            float oS = oScore[start][end][br.parent];</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">            if (oS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L698">              continue;</span>
+            }
+<span class="nc" id="L700">            int max1 = narrowLExtent[end][br.rightChild];</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">            if (max1 &lt; min1) {</span>
+<span class="nc" id="L702">              continue;</span>
+            }
+<span class="nc" id="L704">            int min = min1;</span>
+<span class="nc" id="L705">            int max = max1;</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">            if (max - min &gt; 2) {</span>
+<span class="nc" id="L707">              int min2 = wideLExtent[end][br.rightChild];</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">              min = (min1 &gt; min2 ? min1 : min2);</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">              if (max1 &lt; min) {</span>
+<span class="nc" id="L710">                continue;</span>
+              }
+<span class="nc" id="L712">              int max2 = wideRExtent[start][br.leftChild];</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">              max = (max1 &lt; max2 ? max1 : max2);</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">              if (max &lt; min) {</span>
+<span class="nc" id="L715">                continue;</span>
+              }
+            }
+<span class="nc" id="L718">            float pS = br.score;</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            for (int split = min; split &lt;= max; split++) {</span>
+<span class="nc" id="L720">              float lS = iScore[start][split][br.leftChild];</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">              if (lS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L722">                continue;</span>
+              }
+<span class="nc" id="L724">              float rS = iScore[split][end][br.rightChild];</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">              if (rS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L726">                continue;</span>
+              }
+<span class="nc" id="L728">              float totL = pS + rS + oS;</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">              if (totL &gt; oScore[start][split][br.leftChild]) {</span>
+<span class="nc" id="L730">                oScore[start][split][br.leftChild] = totL;</span>
+              }
+<span class="nc" id="L732">              float totR = pS + lS + oS;</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">              if (totR &gt; oScore[split][end][br.rightChild]) {</span>
+<span class="nc" id="L734">                oScore[split][end][br.rightChild] = totR;</span>
+              }
+            }
+          }
+        }
+<span class="nc bnc" id="L739" title="All 2 branches missed.">        for (int s = 0; s &lt; numStates; s++) {</span>
+<span class="nc" id="L740">          int max1 = narrowLExtent[end][s];</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">          if (max1 &lt; start) {</span>
+<span class="nc" id="L742">            continue;</span>
+          }
+<span class="nc" id="L744">          BinaryRule[] rules = bg.splitRulesWithRC(s);</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">          for (BinaryRule br : rules) {</span>
+<span class="nc" id="L746">            float oS = oScore[start][end][br.parent];</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">            if (oS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L748">              continue;</span>
+            }
+<span class="nc" id="L750">            int min1 = narrowRExtent[start][br.leftChild];</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">            if (max1 &lt; min1) {</span>
+<span class="nc" id="L752">              continue;</span>
+            }
+<span class="nc" id="L754">            int min = min1;</span>
+<span class="nc" id="L755">            int max = max1;</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">            if (max - min &gt; 2) {</span>
+<span class="nc" id="L757">              int min2 = wideLExtent[end][br.rightChild];</span>
+<span class="nc bnc" id="L758" title="All 2 branches missed.">              min = (min1 &gt; min2 ? min1 : min2);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">              if (max1 &lt; min) {</span>
+<span class="nc" id="L760">                continue;</span>
+              }
+<span class="nc" id="L762">              int max2 = wideRExtent[start][br.leftChild];</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">              max = (max1 &lt; max2 ? max1 : max2);</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">              if (max &lt; min) {</span>
+<span class="nc" id="L765">                continue;</span>
+              }
+            }
+<span class="nc" id="L768">            float pS = br.score;</span>
+<span class="nc bnc" id="L769" title="All 2 branches missed.">            for (int split = min; split &lt;= max; split++) {</span>
+<span class="nc" id="L770">              float lS = iScore[start][split][br.leftChild];</span>
+<span class="nc bnc" id="L771" title="All 2 branches missed.">              if (lS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L772">                continue;</span>
+              }
+<span class="nc" id="L774">              float rS = iScore[split][end][br.rightChild];</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">              if (rS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L776">                continue;</span>
+              }
+<span class="nc" id="L778">              float totL = pS + rS + oS;</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">              if (totL &gt; oScore[start][split][br.leftChild]) {</span>
+<span class="nc" id="L780">                oScore[start][split][br.leftChild] = totL;</span>
+              }
+<span class="nc" id="L782">              float totR = pS + lS + oS;</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">              if (totR &gt; oScore[split][end][br.rightChild]) {</span>
+<span class="nc" id="L784">                oScore[split][end][br.rightChild] = totR;</span>
+              }
+            }
+          }
+        }
+        /*
+          for (int s = 0; s &lt; numStates; s++) {
+          float oS = oScore[start][end][s];
+          //if (iScore[start][end][s] == Float.NEGATIVE_INFINITY ||
+          //             oS == Float.NEGATIVE_INFINITY)
+          if (oS == Float.NEGATIVE_INFINITY)
+          continue;
+          BinaryRule[] rules = bg.splitRulesWithParent(s);
+          for (int r=0; r&lt;rules.length; r++) {
+            BinaryRule br = rules[r];
+            int min1 = narrowRExtent[start][br.leftChild];
+            if (end &lt; min1)
+              continue;
+            int max1 = narrowLExtent[end][br.rightChild];
+            if (max1 &lt; min1)
+              continue;
+            int min2 = wideLExtent[end][br.rightChild];
+            int min = (min1 &gt; min2 ? min1 : min2);
+            if (max1 &lt; min)
+              continue;
+            int max2 = wideRExtent[start][br.leftChild];
+            int max = (max1 &lt; max2 ? max1 : max2);
+            if (max &lt; min)
+              continue;
+float pS = (float) br.score;
+for (int split = min; split &lt;= max; split++) {
+float lS = iScore[start][split][br.leftChild];
+if (lS == Float.NEGATIVE_INFINITY)
+          continue;
+float rS = iScore[split][end][br.rightChild];
+              if (rS == Float.NEGATIVE_INFINITY)
+continue;
+float totL = pS+rS+oS;
+if (totL &gt; oScore[start][split][br.leftChild]) {
+oScore[start][split][br.leftChild] = totL;
+}
+float totR = pS+lS+oS;
+if (totR &gt; oScore[split][end][br.rightChild]) {
+oScore[split][end][br.rightChild] = totR;
+}
+}
+}
+}
+        */
+      }
+    }
+<span class="nc" id="L835">  }</span>
+
+  /** Fills in the iScore array of each category over each span
+   *  of length 2 or more.
+   */
+  void doInsideScores() {
+<span class="nc bnc" id="L841" title="All 2 branches missed.">    for (int diff = 2; diff &lt;= length; diff++) {</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">      if (Thread.interrupted()) {</span>
+<span class="nc" id="L843">        throw new RuntimeInterruptedException();</span>
+      }
+
+      // usually stop one short because boundary symbol only combines
+      // with whole sentence span. So for 3 word sentence + boundary = 4,
+      // length == 4, and do [0,2], [1,3]; [0,3]; [0,4]
+<span class="nc bnc" id="L849" title="All 4 branches missed.">      for (int start = 0; start &lt; ((diff == length) ? 1: length - diff); start++) {</span>
+<span class="nc" id="L850">        doInsideChartCell(diff, start);</span>
+      } // for start
+    } // for diff (i.e., span)
+<span class="nc" id="L853">  } // end doInsideScores()</span>
+
+
+  private void doInsideChartCell(final int diff, final int start) {
+<span class="nc" id="L857">    final boolean lengthNormalization = op.testOptions.lengthNormalization;</span>
+    if (spillGuts) {
+      tick(&quot;Binaries for span &quot; + diff + &quot; start &quot; + start + &quot; ...&quot;);
+    }
+<span class="nc" id="L861">    int end = start + diff;</span>
+
+<span class="nc" id="L863">    final List&lt;ParserConstraint&gt; constraints = getConstraints();</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">    if (constraints != null) {</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">      for (ParserConstraint c : constraints) {</span>
+<span class="nc bnc" id="L866" title="All 12 branches missed.">        if ((start &gt; c.start &amp;&amp; start &lt; c.end &amp;&amp; end &gt; c.end) || (end &gt; c.start &amp;&amp; end &lt; c.end &amp;&amp; start &lt; c.start)) {</span>
+<span class="nc" id="L867">          return;</span>
+        }
+<span class="nc" id="L869">      }</span>
+    }
+
+    // 2011-11-26 jdk1.6: caching/hoisting a bunch of variables gives you about 15% speed up!
+    // caching this saves a bit of time in the inner loop, maybe 1.8%
+<span class="nc" id="L874">    int[] narrowRExtent_start = narrowRExtent[start];</span>
+    // caching this saved 2% in the inner loop
+<span class="nc" id="L876">    int[] wideRExtent_start = wideRExtent[start];</span>
+<span class="nc" id="L877">    int[] narrowLExtent_end = narrowLExtent[end];</span>
+<span class="nc" id="L878">    int[] wideLExtent_end = wideLExtent[end];</span>
+<span class="nc" id="L879">    float[][] iScore_start = iScore[start];</span>
+<span class="nc" id="L880">    float[] iScore_start_end = iScore_start[end];</span>
+
+<span class="nc bnc" id="L882" title="All 2 branches missed.">    for (int leftState = 0; leftState &lt; numStates; leftState++) {</span>
+<span class="nc" id="L883">      int narrowR = narrowRExtent_start[leftState];</span>
+<span class="nc bnc" id="L884" title="All 2 branches missed.">      if (narrowR &gt;= end) {  // can this left constituent leave space for a right constituent?</span>
+<span class="nc" id="L885">        continue;</span>
+      }
+<span class="nc" id="L887">      BinaryRule[] leftRules = bg.splitRulesWithLC(leftState);</span>
+      //      if (spillGuts) System.out.println(&quot;Found &quot; + leftRules.length + &quot; left rules for state &quot; + stateIndex.get(leftState));
+<span class="nc bnc" id="L889" title="All 2 branches missed.">      for (BinaryRule rule : leftRules) {</span>
+<span class="nc" id="L890">        int rightChild = rule.rightChild;</span>
+<span class="nc" id="L891">        int narrowL = narrowLExtent_end[rightChild];</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">        if (narrowL &lt; narrowR) { // can this right constituent fit next to the left constituent?</span>
+<span class="nc" id="L893">          continue;</span>
+        }
+<span class="nc" id="L895">        int min2 = wideLExtent_end[rightChild];</span>
+<span class="nc bnc" id="L896" title="All 2 branches missed.">        int min = (narrowR &gt; min2 ? narrowR : min2);</span>
+        // Erik Frey 2009-12-17: This is unnecessary: narrowR is &lt;= narrowL (established in previous check) and wideLExtent[e][r] is always &lt;= narrowLExtent[e][r] by design, so the check will never evaluate true.
+        // if (min &gt; narrowL) { // can this right constituent stretch far enough to reach the left constituent?
+        //   continue;
+        // }
+<span class="nc" id="L901">        int max1 = wideRExtent_start[leftState];</span>
+<span class="nc bnc" id="L902" title="All 2 branches missed.">        int max = (max1 &lt; narrowL ? max1 : narrowL);</span>
+<span class="nc bnc" id="L903" title="All 2 branches missed.">        if (min &gt; max) { // can this left constituent stretch far enough to reach the right constituent?</span>
+<span class="nc" id="L904">          continue;</span>
+        }
+<span class="nc" id="L906">        float pS = rule.score;</span>
+<span class="nc" id="L907">        int parentState = rule.parent;</span>
+<span class="nc" id="L908">        float oldIScore = iScore_start_end[parentState];</span>
+<span class="nc" id="L909">        float bestIScore = oldIScore;</span>
+        boolean foundBetter;  // always set below for this rule
+        //System.out.println(&quot;Min &quot;+min+&quot; max &quot;+max+&quot; start &quot;+start+&quot; end &quot;+end);
+
+<span class="nc bnc" id="L913" title="All 2 branches missed.">        if ( ! lengthNormalization) {</span>
+          // find the split that can use this rule to make the max score
+<span class="nc bnc" id="L915" title="All 2 branches missed.">          for (int split = min; split &lt;= max; split++) {</span>
+
+<span class="nc bnc" id="L917" title="All 2 branches missed.">            if (constraints != null) {</span>
+<span class="nc" id="L918">              boolean skip = false;</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">              for (ParserConstraint c : constraints) {</span>
+<span class="nc bnc" id="L920" title="All 12 branches missed.">                if (((start &lt; c.start &amp;&amp; end &gt;= c.end) || (start &lt;= c.start &amp;&amp; end &gt; c.end)) &amp;&amp; split &gt; c.start &amp;&amp; split &lt; c.end) {</span>
+<span class="nc" id="L921">                  skip = true;</span>
+<span class="nc" id="L922">                  break;</span>
+                }
+<span class="nc bnc" id="L924" title="All 4 branches missed.">                if ((start == c.start &amp;&amp; split == c.end)) {</span>
+<span class="nc" id="L925">                  String tag = stateIndex.get(leftState);</span>
+<span class="nc" id="L926">                  Matcher m = c.state.matcher(tag);</span>
+<span class="nc bnc" id="L927" title="All 2 branches missed.">                  if (!m.matches()) {</span>
+<span class="nc" id="L928">                    skip = true;</span>
+<span class="nc" id="L929">                    break;</span>
+                  }
+                }
+<span class="nc bnc" id="L932" title="All 4 branches missed.">                if ((split == c.start &amp;&amp; end == c.end)) {</span>
+<span class="nc" id="L933">                  String tag = stateIndex.get(rightChild);</span>
+<span class="nc" id="L934">                  Matcher m = c.state.matcher(tag);</span>
+<span class="nc bnc" id="L935" title="All 2 branches missed.">                  if (!m.matches()) {</span>
+<span class="nc" id="L936">                    skip = true;</span>
+<span class="nc" id="L937">                    break;</span>
+                  }
+                }
+<span class="nc" id="L940">              }</span>
+<span class="nc bnc" id="L941" title="All 2 branches missed.">              if (skip) {</span>
+<span class="nc" id="L942">                continue;</span>
+              }
+            }
+
+<span class="nc" id="L946">            float lS = iScore_start[split][leftState];</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">            if (lS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L948">              continue;</span>
+            }
+<span class="nc" id="L950">            float rS = iScore[split][end][rightChild];</span>
+<span class="nc bnc" id="L951" title="All 2 branches missed.">            if (rS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L952">              continue;</span>
+            }
+<span class="nc" id="L954">            float tot = pS + lS + rS;</span>
+            if (spillGuts) { log.info(&quot;Rule &quot; + rule + &quot; over [&quot; + start + &quot;,&quot; + end + &quot;) has log score &quot; + tot + &quot; from L[&quot; + stateIndex.get(leftState) + &quot;=&quot; + leftState + &quot;] = &quot;+ lS  + &quot; R[&quot; + stateIndex.get(rightChild) + &quot;=&quot; + rightChild + &quot;] =  &quot; + rS); }
+<span class="nc bnc" id="L956" title="All 2 branches missed.">            if (tot &gt; bestIScore) {</span>
+<span class="nc" id="L957">              bestIScore = tot;</span>
+            }
+          } // for split point
+<span class="nc bnc" id="L960" title="All 2 branches missed.">          foundBetter = bestIScore &gt; oldIScore;</span>
+        } else {
+          // find split that uses this rule to make the max *length normalized* score
+<span class="nc" id="L963">          int bestWordsInSpan = wordsInSpan[start][end][parentState];</span>
+<span class="nc" id="L964">          float oldNormIScore = oldIScore / bestWordsInSpan;</span>
+<span class="nc" id="L965">          float bestNormIScore = oldNormIScore;</span>
+
+<span class="nc bnc" id="L967" title="All 2 branches missed.">          for (int split = min; split &lt;= max; split++) {</span>
+<span class="nc" id="L968">            float lS = iScore_start[split][leftState];</span>
+<span class="nc bnc" id="L969" title="All 2 branches missed.">            if (lS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L970">              continue;</span>
+            }
+<span class="nc" id="L972">            float rS = iScore[split][end][rightChild];</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">            if (rS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L974">              continue;</span>
+            }
+<span class="nc" id="L976">            float tot = pS + lS + rS;</span>
+<span class="nc" id="L977">            int newWordsInSpan = wordsInSpan[start][split][leftState] + wordsInSpan[split][end][rightChild];</span>
+<span class="nc" id="L978">            float normTot = tot / newWordsInSpan;</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">            if (normTot &gt; bestNormIScore) {</span>
+<span class="nc" id="L980">              bestIScore = tot;</span>
+<span class="nc" id="L981">              bestNormIScore = normTot;</span>
+<span class="nc" id="L982">              bestWordsInSpan = newWordsInSpan;</span>
+            }
+          } // for split point
+<span class="nc bnc" id="L985" title="All 2 branches missed.">          foundBetter = bestNormIScore &gt; oldNormIScore;</span>
+<span class="nc bnc" id="L986" title="All 2 branches missed.">          if (foundBetter) {</span>
+<span class="nc" id="L987">            wordsInSpan[start][end][parentState] = bestWordsInSpan;</span>
+          }
+        } // fi op.testOptions.lengthNormalization
+<span class="nc bnc" id="L990" title="All 2 branches missed.">        if (foundBetter) { // this way of making &quot;parentState&quot; is better than previous</span>
+<span class="nc" id="L991">          iScore_start_end[parentState] = bestIScore;</span>
+
+          if (spillGuts) log.info(&quot;Could build &quot; + stateIndex.get(parentState) + &quot; from &quot; + start + &quot; to &quot; + end + &quot; score &quot; + bestIScore);
+<span class="nc bnc" id="L994" title="All 2 branches missed.">          if (oldIScore == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">            if (start &gt; narrowLExtent_end[parentState]) {</span>
+<span class="nc" id="L996">              narrowLExtent_end[parentState] = wideLExtent_end[parentState] = start;</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">            } else if (start &lt; wideLExtent_end[parentState]) {</span>
+<span class="nc" id="L998">              wideLExtent_end[parentState] = start;</span>
+            }
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">            if (end &lt; narrowRExtent_start[parentState]) {</span>
+<span class="nc" id="L1001">              narrowRExtent_start[parentState] = wideRExtent_start[parentState] = end;</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">            } else if (end &gt; wideRExtent_start[parentState]) {</span>
+<span class="nc" id="L1003">              wideRExtent_start[parentState] = end;</span>
+            }
+          }
+        } // end if foundBetter
+      } // end for leftRules
+    } // end for leftState
+    // do right restricted rules
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">    for (int rightState = 0; rightState &lt; numStates; rightState++) {</span>
+<span class="nc" id="L1011">      int narrowL = narrowLExtent_end[rightState];</span>
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">      if (narrowL &lt;= start) {</span>
+<span class="nc" id="L1013">        continue;</span>
+      }
+<span class="nc" id="L1015">      BinaryRule[] rightRules = bg.splitRulesWithRC(rightState);</span>
+      //      if (spillGuts) System.out.println(&quot;Found &quot; + rightRules.length + &quot; right rules for state &quot; + stateIndex.get(rightState));
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">      for (BinaryRule rule : rightRules) {</span>
+        //      if (spillGuts) System.out.println(&quot;Considering rule for &quot; + start + &quot; to &quot; + end + &quot;: &quot; + rightRules[i]);
+
+<span class="nc" id="L1020">        int leftChild = rule.leftChild;</span>
+<span class="nc" id="L1021">        int narrowR = narrowRExtent_start[leftChild];</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">        if (narrowR &gt; narrowL) {</span>
+<span class="nc" id="L1023">          continue;</span>
+        }
+<span class="nc" id="L1025">        int min2 = wideLExtent_end[rightState];</span>
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">        int min = (narrowR &gt; min2 ? narrowR : min2);</span>
+        // Erik Frey 2009-12-17: This is unnecessary: narrowR is &lt;= narrowL (established in previous check) and wideLExtent[e][r] is always &lt;= narrowLExtent[e][r] by design, so the check will never evaluate true.
+        // if (min &gt; narrowL) {
+        //   continue;
+        // }
+<span class="nc" id="L1031">        int max1 = wideRExtent_start[leftChild];</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">        int max = (max1 &lt; narrowL ? max1 : narrowL);</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        if (min &gt; max) {</span>
+<span class="nc" id="L1034">          continue;</span>
+        }
+<span class="nc" id="L1036">        float pS = rule.score;</span>
+<span class="nc" id="L1037">        int parentState = rule.parent;</span>
+<span class="nc" id="L1038">        float oldIScore = iScore_start_end[parentState];</span>
+<span class="nc" id="L1039">        float bestIScore = oldIScore;</span>
+        boolean foundBetter; // always initialized below
+        //System.out.println(&quot;Start &quot;+start+&quot; end &quot;+end+&quot; min &quot;+min+&quot; max &quot;+max);
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">        if ( ! lengthNormalization) {</span>
+          // find the split that can use this rule to make the max score
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">          for (int split = min; split &lt;= max; split++) {</span>
+
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">            if (constraints != null) {</span>
+<span class="nc" id="L1047">              boolean skip = false;</span>
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">              for (ParserConstraint c : constraints) {</span>
+<span class="nc bnc" id="L1049" title="All 12 branches missed.">                if (((start &lt; c.start &amp;&amp; end &gt;= c.end) || (start &lt;= c.start &amp;&amp; end &gt; c.end)) &amp;&amp; split &gt; c.start &amp;&amp; split &lt; c.end) {</span>
+<span class="nc" id="L1050">                  skip = true;</span>
+<span class="nc" id="L1051">                  break;</span>
+                }
+<span class="nc bnc" id="L1053" title="All 4 branches missed.">                if ((start == c.start &amp;&amp; split == c.end)) {</span>
+<span class="nc" id="L1054">                  String tag = stateIndex.get(leftChild);</span>
+<span class="nc" id="L1055">                  Matcher m = c.state.matcher(tag);</span>
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">                  if (!m.matches()) {</span>
+                    //if (!tag.startsWith(c.state+&quot;^&quot;)) {
+<span class="nc" id="L1058">                    skip = true;</span>
+<span class="nc" id="L1059">                    break;</span>
+                  }
+                }
+<span class="nc bnc" id="L1062" title="All 4 branches missed.">                if ((split == c.start &amp;&amp; end == c.end)) {</span>
+<span class="nc" id="L1063">                  String tag = stateIndex.get(rightState);</span>
+<span class="nc" id="L1064">                  Matcher m = c.state.matcher(tag);</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">                  if (!m.matches()) {</span>
+                    //if (!tag.startsWith(c.state+&quot;^&quot;)) {
+<span class="nc" id="L1067">                    skip = true;</span>
+<span class="nc" id="L1068">                    break;</span>
+                  }
+                }
+<span class="nc" id="L1071">              }</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">              if (skip) {</span>
+<span class="nc" id="L1073">                continue;</span>
+              }
+            }
+
+<span class="nc" id="L1077">            float lS = iScore_start[split][leftChild];</span>
+            // cdm [2012]: Test whether removing these 2 tests might speed things up because less branching?
+            // jab [2014]: oddly enough, removing these tests helps the chinese parser but not the english parser.
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">            if (lS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1081">              continue;</span>
+            }
+<span class="nc" id="L1083">            float rS = iScore[split][end][rightState];</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">            if (rS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1085">              continue;</span>
+            }
+<span class="nc" id="L1087">            float tot = pS + lS + rS;</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">            if (tot &gt; bestIScore) {</span>
+<span class="nc" id="L1089">              bestIScore = tot;</span>
+            }
+          } // end for split
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">          foundBetter = bestIScore &gt; oldIScore;</span>
+        } else {
+          // find split that uses this rule to make the max *length normalized* score
+<span class="nc" id="L1095">          int bestWordsInSpan = wordsInSpan[start][end][parentState];</span>
+<span class="nc" id="L1096">          float oldNormIScore = oldIScore / bestWordsInSpan;</span>
+<span class="nc" id="L1097">          float bestNormIScore = oldNormIScore;</span>
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">          for (int split = min; split &lt;= max; split++) {</span>
+<span class="nc" id="L1099">            float lS = iScore_start[split][leftChild];</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">            if (lS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1101">              continue;</span>
+            }
+<span class="nc" id="L1103">            float rS = iScore[split][end][rightState];</span>
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">            if (rS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1105">              continue;</span>
+            }
+<span class="nc" id="L1107">            float tot = pS + lS + rS;</span>
+<span class="nc" id="L1108">            int newWordsInSpan = wordsInSpan[start][split][leftChild] + wordsInSpan[split][end][rightState];</span>
+<span class="nc" id="L1109">            float normTot = tot / newWordsInSpan;</span>
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">            if (normTot &gt; bestNormIScore) {</span>
+<span class="nc" id="L1111">              bestIScore = tot;</span>
+<span class="nc" id="L1112">              bestNormIScore = normTot;</span>
+<span class="nc" id="L1113">              bestWordsInSpan = newWordsInSpan;</span>
+            }
+          } // end for split
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">          foundBetter = bestNormIScore &gt; oldNormIScore;</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">          if (foundBetter) {</span>
+<span class="nc" id="L1118">            wordsInSpan[start][end][parentState] = bestWordsInSpan;</span>
+          }
+        } // end if lengthNormalization
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">        if (foundBetter) { // this way of making &quot;parentState&quot; is better than previous</span>
+<span class="nc" id="L1122">          iScore_start_end[parentState] = bestIScore;</span>
+          if (spillGuts) log.info(&quot;Could build &quot; + stateIndex.get(parentState) + &quot; from &quot; + start + &quot; to &quot; + end + &quot; with score &quot; + bestIScore);
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">          if (oldIScore == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">            if (start &gt; narrowLExtent_end[parentState]) {</span>
+<span class="nc" id="L1126">              narrowLExtent_end[parentState] = wideLExtent_end[parentState] = start;</span>
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">            } else if (start &lt; wideLExtent_end[parentState]) {</span>
+<span class="nc" id="L1128">              wideLExtent_end[parentState] = start;</span>
+            }
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">            if (end &lt; narrowRExtent_start[parentState]) {</span>
+<span class="nc" id="L1131">              narrowRExtent_start[parentState] = wideRExtent_start[parentState] = end;</span>
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">            } else if (end &gt; wideRExtent_start[parentState]) {</span>
+<span class="nc" id="L1133">              wideRExtent_start[parentState] = end;</span>
+            }
+          }
+        } // end if foundBetter
+      } // for rightRules
+    } // for rightState
+    if (spillGuts) {
+      tick(&quot;Unaries for span &quot; + diff + &quot;...&quot;);
+    }
+    // do unary rules -- one could promote this loop and put start inside
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">    for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc" id="L1144">      float iS = iScore_start_end[state];</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">      if (iS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1146">        continue;</span>
+      }
+
+<span class="nc" id="L1149">      UnaryRule[] unaries = ug.closedRulesByChild(state);</span>
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">      for (UnaryRule ur : unaries) {</span>
+
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">        if (constraints != null) {</span>
+<span class="nc" id="L1153">          boolean skip = false;</span>
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">          for (ParserConstraint c : constraints) {</span>
+<span class="nc bnc" id="L1155" title="All 4 branches missed.">            if ((start == c.start &amp;&amp; end == c.end)) {</span>
+<span class="nc" id="L1156">              String tag = stateIndex.get(ur.parent);</span>
+<span class="nc" id="L1157">              Matcher m = c.state.matcher(tag);</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">              if (!m.matches()) {</span>
+                //if (!tag.startsWith(c.state+&quot;^&quot;)) {
+<span class="nc" id="L1160">                skip = true;</span>
+<span class="nc" id="L1161">                break;</span>
+              }
+            }
+<span class="nc" id="L1164">          }</span>
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">          if (skip) {</span>
+<span class="nc" id="L1166">            continue;</span>
+          }
+        }
+
+<span class="nc" id="L1170">        int parentState = ur.parent;</span>
+<span class="nc" id="L1171">        float pS = ur.score;</span>
+<span class="nc" id="L1172">        float tot = iS + pS;</span>
+<span class="nc" id="L1173">        float cur = iScore_start_end[parentState];</span>
+        boolean foundBetter;  // always set below
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">        if (lengthNormalization) {</span>
+<span class="nc" id="L1176">          int totWordsInSpan = wordsInSpan[start][end][state];</span>
+<span class="nc" id="L1177">          float normTot = tot / totWordsInSpan;</span>
+<span class="nc" id="L1178">          int curWordsInSpan = wordsInSpan[start][end][parentState];</span>
+<span class="nc" id="L1179">          float normCur = cur / curWordsInSpan;</span>
+<span class="nc bnc" id="L1180" title="All 2 branches missed.">          foundBetter = normTot &gt; normCur;</span>
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">          if (foundBetter) {</span>
+<span class="nc" id="L1182">            wordsInSpan[start][end][parentState] = wordsInSpan[start][end][state];</span>
+          }
+<span class="nc" id="L1184">        } else {</span>
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">          foundBetter = (tot &gt; cur);</span>
+        }
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">        if (foundBetter) {</span>
+          if (spillGuts) log.info(&quot;Could build &quot; + stateIndex.get(parentState) + &quot; from &quot; + start + &quot; to &quot; + end + &quot; with score &quot; + tot);
+<span class="nc" id="L1189">          iScore_start_end[parentState] = tot;</span>
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">          if (cur == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">            if (start &gt; narrowLExtent_end[parentState]) {</span>
+<span class="nc" id="L1192">              narrowLExtent_end[parentState] = wideLExtent_end[parentState] = start;</span>
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">            } else if (start &lt; wideLExtent_end[parentState]) {</span>
+<span class="nc" id="L1194">              wideLExtent_end[parentState] = start;</span>
+            }
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">            if (end &lt; narrowRExtent_start[parentState]) {</span>
+<span class="nc" id="L1197">              narrowRExtent_start[parentState] = wideRExtent_start[parentState] = end;</span>
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">            } else if (end &gt; wideRExtent_start[parentState]) {</span>
+<span class="nc" id="L1199">              wideRExtent_start[parentState] = end;</span>
+            }
+          }
+        } // end if foundBetter
+      } // for UnaryRule r
+    } // for unary rules
+<span class="nc" id="L1205">  }</span>
+
+
+  private void initializeChart(Lattice lr) {
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">    for (LatticeEdge edge : lr) {</span>
+<span class="nc" id="L1210">      int start = edge.start;</span>
+<span class="nc" id="L1211">      int end = edge.end;</span>
+<span class="nc" id="L1212">      String word = edge.word;</span>
+
+      // Add pre-terminals, augmented with edge weights
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">      for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc bnc" id="L1216" title="All 2 branches missed.">        if (isTag[state]) {</span>
+<span class="nc" id="L1217">          IntTaggedWord itw = new IntTaggedWord(word, stateIndex.get(state), wordIndex, tagIndex);</span>
+
+<span class="nc" id="L1219">          float newScore = lex.score(itw, start, word, null) + (float) edge.weight;</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">          if (newScore &gt; iScore[start][end][state]) {</span>
+<span class="nc" id="L1221">            iScore[start][end][state] = newScore;</span>
+<span class="nc" id="L1222">            narrowRExtent[start][state] = Math.min(end, narrowRExtent[start][state]);</span>
+<span class="nc" id="L1223">            narrowLExtent[end][state] = Math.max(start, narrowLExtent[end][state]);</span>
+<span class="nc" id="L1224">            wideRExtent[start][state] = Math.max(end, wideRExtent[start][state]);</span>
+<span class="nc" id="L1225">            wideLExtent[end][state] = Math.min(start, wideLExtent[end][state]);</span>
+          }
+        }
+      }
+
+      // Give scores to all tags if the parse fails (more flexible tagging)
+<span class="nc bnc" id="L1231" title="All 4 branches missed.">      if (floodTags &amp;&amp; (!op.testOptions.noRecoveryTagging)) {</span>
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">        for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc" id="L1233">          float iS = iScore[start][end][state];</span>
+<span class="nc bnc" id="L1234" title="All 4 branches missed.">          if (isTag[state] &amp;&amp; iS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1235">            iScore[start][end][state] = -1000.0f + (float) edge.weight;</span>
+<span class="nc" id="L1236">            narrowRExtent[start][state] = end;</span>
+<span class="nc" id="L1237">            narrowLExtent[end][state] = start;</span>
+<span class="nc" id="L1238">            wideRExtent[start][state] = end;</span>
+<span class="nc" id="L1239">            wideLExtent[end][state] = start;</span>
+          }
+        }
+      }
+
+      // Add unary rules (possibly chains) that terminate in POS tags
+<span class="nc bnc" id="L1245" title="All 2 branches missed.">      for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc" id="L1246">        float iS = iScore[start][end][state];</span>
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">        if (iS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1248">          continue;</span>
+        }
+<span class="nc" id="L1250">        UnaryRule[] unaries = ug.closedRulesByChild(state);</span>
+<span class="nc bnc" id="L1251" title="All 2 branches missed.">        for (UnaryRule ur : unaries) {</span>
+<span class="nc" id="L1252">          int parentState = ur.parent;</span>
+<span class="nc" id="L1253">          float pS = ur.score;</span>
+<span class="nc" id="L1254">          float tot = iS + pS;</span>
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">          if (tot &gt; iScore[start][end][parentState]) {</span>
+<span class="nc" id="L1256">            iScore[start][end][parentState] = tot;</span>
+<span class="nc" id="L1257">            narrowRExtent[start][parentState] = Math.min(end, narrowRExtent[start][parentState]);</span>
+<span class="nc" id="L1258">            narrowLExtent[end][parentState] = Math.max(start, narrowLExtent[end][parentState]);</span>
+<span class="nc" id="L1259">            wideRExtent[start][parentState] = Math.max(end, wideRExtent[start][parentState]);</span>
+<span class="nc" id="L1260">            wideLExtent[end][parentState] = Math.min(start, wideLExtent[end][parentState]);</span>
+//            narrowRExtent[start][parentState] = start + 1; //end
+//            narrowLExtent[end][parentState] = end - 1; //start
+//            wideRExtent[start][parentState] = start + 1; //end
+//            wideLExtent[end][parentState] = end - 1; //start
+          }
+        }
+      }
+<span class="nc" id="L1268">    }</span>
+<span class="nc" id="L1269">  }</span>
+
+
+  private void initializeChart(List&lt;? extends HasWord&gt;  sentence) {
+<span class="nc" id="L1273">    int boundary = wordIndex.indexOf(Lexicon.BOUNDARY);</span>
+
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">    for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L1276" title="All 2 branches missed.">      if (op.testOptions.maxSpanForTags &gt; 1) { // only relevant for parsing single words as multiple input tokens.</span>
+        // todo [cdm 2012]: This case seems buggy in never doing unaries over span 1 items
+        // note we don't look for &quot;words&quot; including the end symbol!
+<span class="nc bnc" id="L1279" title="All 6 branches missed.">        for (int end = start + 1; (end &lt; length - 1 &amp;&amp; end - start &lt;= op.testOptions.maxSpanForTags) || (start + 1 == end); end++) {</span>
+<span class="nc" id="L1280">          StringBuilder word = new StringBuilder();</span>
+          //wsg: Feb 2010 - Appears to support character-level parsing
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">          for (int i = start; i &lt; end; i++) {</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">            if (sentence.get(i) instanceof HasWord) {</span>
+<span class="nc" id="L1284">              HasWord cl = sentence.get(i);</span>
+<span class="nc" id="L1285">              word.append(cl.word());</span>
+<span class="nc" id="L1286">            } else {</span>
+<span class="nc" id="L1287">              word.append(sentence.get(i).toString());</span>
+            }
+          }
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">          for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc" id="L1291">            float iS = iScore[start][end][state];</span>
+<span class="nc bnc" id="L1292" title="All 4 branches missed.">            if (iS == Float.NEGATIVE_INFINITY &amp;&amp; isTag[state]) {</span>
+<span class="nc" id="L1293">              IntTaggedWord itw = new IntTaggedWord(word.toString(), stateIndex.get(state), wordIndex, tagIndex);</span>
+<span class="nc" id="L1294">              iScore[start][end][state] = lex.score(itw, start, word.toString(), null);</span>
+<span class="nc bnc" id="L1295" title="All 2 branches missed.">              if (iScore[start][end][state] &gt; Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1296">                narrowRExtent[start][state] = start + 1;</span>
+<span class="nc" id="L1297">                narrowLExtent[end][state] = end - 1;</span>
+<span class="nc" id="L1298">                wideRExtent[start][state] = start + 1;</span>
+<span class="nc" id="L1299">                wideLExtent[end][state] = end - 1;</span>
+              }
+            }
+          }
+        }
+
+      } else { // &quot;normal&quot; chart initialization of the [start,start+1] cell
+
+<span class="nc" id="L1307">        int word = words[start];</span>
+<span class="nc" id="L1308">        int end = start + 1;</span>
+<span class="nc" id="L1309">        Arrays.fill(tags[start], false);</span>
+
+<span class="nc" id="L1311">        float[] iScore_start_end = iScore[start][end];</span>
+<span class="nc" id="L1312">        int[] narrowRExtent_start = narrowRExtent[start];</span>
+<span class="nc" id="L1313">        int[] narrowLExtent_end = narrowLExtent[end];</span>
+<span class="nc" id="L1314">        int[] wideRExtent_start = wideRExtent[start];</span>
+<span class="nc" id="L1315">        int[] wideLExtent_end = wideLExtent[end];</span>
+
+        //Force tags
+<span class="nc" id="L1318">        String trueTagStr = null;</span>
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">        if (sentence.get(start) instanceof HasTag) {</span>
+<span class="nc" id="L1320">          trueTagStr = ((HasTag) sentence.get(start)).tag();</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">          if (&quot;&quot;.equals(trueTagStr)) {</span>
+<span class="nc" id="L1322">            trueTagStr = null;</span>
+          }
+        }
+
+        // Another option for forcing tags: supply a regex
+<span class="nc" id="L1327">        String candidateTagRegex = null;</span>
+<span class="nc bnc" id="L1328" title="All 2 branches missed.">        if (sentence.get(start) instanceof CoreLabel) {</span>
+<span class="nc" id="L1329">          candidateTagRegex = ((CoreLabel) sentence.get(start)).get(ParserAnnotations.CandidatePartOfSpeechAnnotation.class);</span>
+<span class="nc bnc" id="L1330" title="All 2 branches missed.">          if (&quot;&quot;.equals(candidateTagRegex)) {</span>
+<span class="nc" id="L1331">            candidateTagRegex = null;</span>
+          }
+        }
+
+        //Word context (e.g., morphosyntactic info)
+<span class="nc" id="L1336">        String wordContextStr = null;</span>
+<span class="nc bnc" id="L1337" title="All 2 branches missed.">        if(sentence.get(start) instanceof HasContext) {</span>
+<span class="nc" id="L1338">          wordContextStr = ((HasContext) sentence.get(start)).originalText();</span>
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">          if(&quot;&quot;.equals(wordContextStr))</span>
+<span class="nc" id="L1340">            wordContextStr = null;</span>
+        }
+
+<span class="nc" id="L1343">        boolean assignedSomeTag = false;</span>
+
+<span class="nc bnc" id="L1345" title="All 4 branches missed.">        if ( ! floodTags || word == boundary) {</span>
+          // in this case we generate the taggings in the lexicon,
+          // which may itself be tagging flexibly or using a strict lexicon.
+          if (dumpTagging) {
+            EncodingPrintWriter.err.println(&quot;Normal tagging &quot; + wordIndex.get(word) + &quot; [&quot; + word + &quot;]&quot;, &quot;UTF-8&quot;);
+          }
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">          for (Iterator&lt;IntTaggedWord&gt; taggingI = lex.ruleIteratorByWord(word, start, wordContextStr); taggingI.hasNext(); ) {</span>
+<span class="nc" id="L1352">            IntTaggedWord tagging = taggingI.next();</span>
+<span class="nc" id="L1353">            int state = stateIndex.indexOf(tagIndex.get(tagging.tag));</span>
+            // if word was supplied with a POS tag, skip all taggings
+            // not basicCategory() compatible with supplied tag.
+<span class="nc bnc" id="L1356" title="All 2 branches missed.">            if (trueTagStr != null) {</span>
+<span class="nc bnc" id="L1357" title="All 6 branches missed.">              if ((!op.testOptions.forceTagBeginnings &amp;&amp; !tlp.basicCategory(tagging.tagString(tagIndex)).equals(trueTagStr)) ||</span>
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">                  (op.testOptions.forceTagBeginnings &amp;&amp;  !tagging.tagString(tagIndex).startsWith(trueTagStr))) {</span>
+                if (dumpTagging) {
+                  EncodingPrintWriter.err.println(&quot;  Skipping &quot; + tagging + &quot; as it doesn't match trueTagStr: &quot; + trueTagStr, &quot;UTF-8&quot;);
+                }
+<span class="nc" id="L1362">                continue;</span>
+              }
+            }
+<span class="nc bnc" id="L1365" title="All 2 branches missed.">            if (candidateTagRegex != null) {</span>
+<span class="nc bnc" id="L1366" title="All 6 branches missed.">              if ((!op.testOptions.forceTagBeginnings &amp;&amp; !tlp.basicCategory(tagging.tagString(tagIndex)).matches(candidateTagRegex)) ||</span>
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">                  (op.testOptions.forceTagBeginnings &amp;&amp;  !tagging.tagString(tagIndex).matches(candidateTagRegex))) {</span>
+                if (dumpTagging) {
+                  EncodingPrintWriter.err.println(&quot;  Skipping &quot; + tagging + &quot; as it doesn't match candidateTagRegex: &quot; + candidateTagRegex, &quot;UTF-8&quot;);
+                }
+<span class="nc" id="L1371">                continue;</span>
+              }
+            }
+            // try {
+<span class="nc" id="L1375">            float lexScore = lex.score(tagging, start, wordIndex.get(tagging.word), wordContextStr); // score the cell according to P(word|tag) in the lexicon</span>
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">            if (lexScore &gt; Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1377">              assignedSomeTag = true;</span>
+<span class="nc" id="L1378">              iScore_start_end[state] = lexScore;</span>
+<span class="nc" id="L1379">              narrowRExtent_start[state] = end;</span>
+<span class="nc" id="L1380">              narrowLExtent_end[state] = start;</span>
+<span class="nc" id="L1381">              wideRExtent_start[state] = end;</span>
+<span class="nc" id="L1382">              wideLExtent_end[state] = start;</span>
+            }
+            // } catch (Exception e) {
+            // e.printStackTrace();
+            // System.out.println(&quot;State: &quot; + state + &quot; tags &quot; + Numberer.getGlobalNumberer(&quot;tags&quot;).object(tagging.tag));
+            // }
+<span class="nc" id="L1388">            int tag = tagging.tag;</span>
+<span class="nc" id="L1389">            tags[start][tag] = true;</span>
+            if (dumpTagging) {
+              EncodingPrintWriter.err.println(&quot;Word pos &quot; + start + &quot; tagging &quot; + tagging + &quot; score &quot; + iScore_start_end[state] + &quot; [state &quot; + stateIndex.get(state) + &quot; = &quot; + state + &quot;]&quot;, &quot;UTF-8&quot;);
+            }
+            //if (start == length-2 &amp;&amp; tagging.parent == puncTag)
+            //  lastIsPunc = true;
+<span class="nc" id="L1395">          }</span>
+        } // end if ( ! floodTags || word == boundary)
+
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">        if ( ! assignedSomeTag) {</span>
+          // If you got here, either you were using forceTags (gold tags)
+          // and the gold tag was not seen with that word in the training data
+          // or we are in floodTags=true (recovery parse) mode
+          // Here, we give words all tags for
+          // which the lexicon score is not -Inf, not just seen or
+          // specified taggings
+          if (dumpTagging) {
+            EncodingPrintWriter.err.println(&quot;Forced FlexiTagging &quot; + wordIndex.get(word), &quot;UTF-8&quot;);
+          }
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">          for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc bnc" id="L1409" title="All 4 branches missed.">            if (isTag[state] &amp;&amp; iScore_start_end[state] == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">              if (trueTagStr != null) {</span>
+<span class="nc" id="L1411">                String tagString = stateIndex.get(state);</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">                if ( ! tlp.basicCategory(tagString).equals(trueTagStr)) {</span>
+<span class="nc" id="L1413">                  continue;</span>
+                }
+              }
+
+<span class="nc" id="L1417">              float lexScore = lex.score(new IntTaggedWord(word, tagIndex.indexOf(stateIndex.get(state))), start, wordIndex.get(word), wordContextStr);</span>
+<span class="nc bnc" id="L1418" title="All 2 branches missed.">              if (candidateTagRegex != null) {</span>
+<span class="nc" id="L1419">                String tagString = stateIndex.get(state);</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">                if (!tlp.basicCategory(tagString).matches(candidateTagRegex)) {</span>
+<span class="nc" id="L1421">                  continue;</span>
+                }
+              }
+
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">              if (lexScore &gt; Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1426">                iScore_start_end[state] = lexScore;</span>
+<span class="nc" id="L1427">                narrowRExtent_start[state] = end;</span>
+<span class="nc" id="L1428">                narrowLExtent_end[state] = start;</span>
+<span class="nc" id="L1429">                wideRExtent_start[state] = end;</span>
+<span class="nc" id="L1430">                wideLExtent_end[state] = start;</span>
+              }
+              if (dumpTagging) {
+                EncodingPrintWriter.err.println(&quot;Word pos &quot; + start + &quot; tagging &quot; + (new IntTaggedWord(word, tagIndex.indexOf(stateIndex.get(state)))) + &quot; score &quot; + iScore_start_end[state]  + &quot; [state &quot; + stateIndex.get(state) + &quot; = &quot; + state + &quot;]&quot;, &quot;UTF-8&quot;);
+              }
+            }
+          }
+        } // end if ! assignedSomeTag
+
+        // tag multi-counting
+<span class="nc bnc" id="L1440" title="All 2 branches missed.">        if (op.dcTags) {</span>
+<span class="nc bnc" id="L1441" title="All 2 branches missed.">          for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc bnc" id="L1442" title="All 2 branches missed.">            if (isTag[state]) {</span>
+<span class="nc" id="L1443">              iScore_start_end[state] *= (1.0 + op.testOptions.depWeight);</span>
+            }
+          }
+        }
+
+<span class="nc bnc" id="L1448" title="All 6 branches missed.">        if (floodTags &amp;&amp; (!op.testOptions.noRecoveryTagging) &amp;&amp; ! (word == boundary)) {</span>
+          // if parse failed because of tag coverage, we put in all tags with
+          // a score of -1000, by fiat.  You get here from the invocation of
+          // parse(ls) inside parse(ls) *after* floodTags has been turned on.
+          // Search above for &quot;floodTags = true&quot;.
+          if (dumpTagging) {
+            EncodingPrintWriter.err.println(&quot;Flooding tags for &quot; + wordIndex.get(word), &quot;UTF-8&quot;);
+          }
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">          for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc bnc" id="L1457" title="All 4 branches missed.">            if (isTag[state] &amp;&amp; iScore_start_end[state] == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1458">              iScore_start_end[state] = -1000.0f;</span>
+<span class="nc" id="L1459">              narrowRExtent_start[state] = end;</span>
+<span class="nc" id="L1460">              narrowLExtent_end[state] = start;</span>
+<span class="nc" id="L1461">              wideRExtent_start[state] = end;</span>
+<span class="nc" id="L1462">              wideLExtent_end[state] = start;</span>
+            }
+          }
+        }
+
+        // Apply unary rules in diagonal cells of chart
+        if (spillGuts) {
+          tick(&quot;Terminal Unary...&quot;);
+        }
+<span class="nc bnc" id="L1471" title="All 2 branches missed.">        for (int state = 0; state &lt; numStates; state++) {</span>
+<span class="nc" id="L1472">          float iS = iScore_start_end[state];</span>
+<span class="nc bnc" id="L1473" title="All 2 branches missed.">          if (iS == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1474">            continue;</span>
+          }
+<span class="nc" id="L1476">          UnaryRule[] unaries = ug.closedRulesByChild(state);</span>
+<span class="nc bnc" id="L1477" title="All 2 branches missed.">          for (UnaryRule ur : unaries) {</span>
+<span class="nc" id="L1478">            int parentState = ur.parent;</span>
+<span class="nc" id="L1479">            float pS = ur.score;</span>
+<span class="nc" id="L1480">            float tot = iS + pS;</span>
+<span class="nc bnc" id="L1481" title="All 2 branches missed.">            if (tot &gt; iScore_start_end[parentState]) {</span>
+<span class="nc" id="L1482">              iScore_start_end[parentState] = tot;</span>
+<span class="nc" id="L1483">              narrowRExtent_start[parentState] = end;</span>
+<span class="nc" id="L1484">              narrowLExtent_end[parentState] = start;</span>
+<span class="nc" id="L1485">              wideRExtent_start[parentState] = end;</span>
+<span class="nc" id="L1486">              wideLExtent_end[parentState] = start;</span>
+            }
+          }
+        }
+        if (spillGuts) {
+          tick(&quot;Next word...&quot;);
+        }
+      }
+    } // end for start
+<span class="nc" id="L1495">  } // end initializeChart(List sentence)</span>
+
+
+  @Override
+  public boolean hasParse() {
+<span class="nc bnc" id="L1500" title="All 2 branches missed.">    return getBestScore() &gt; Double.NEGATIVE_INFINITY;</span>
+  }
+
+
+  private static final double TOL = 1e-5;
+
+  protected static boolean matches(double x, double y) {
+<span class="nc bnc" id="L1507" title="All 2 branches missed.">    return (Math.abs(x - y) / (Math.abs(x) + Math.abs(y) + 1e-10) &lt; TOL);</span>
+  }
+
+
+  @Override
+  public double getBestScore() {
+<span class="nc" id="L1513">    return getBestScore(goalStr);</span>
+  }
+
+  public double getBestScore(String stateName) {
+<span class="nc bnc" id="L1517" title="All 2 branches missed.">    if (length &gt; arraySize) {</span>
+<span class="nc" id="L1518">      return Double.NEGATIVE_INFINITY;</span>
+    }
+<span class="nc bnc" id="L1520" title="All 2 branches missed.">    if (!stateIndex.contains(stateName)) {</span>
+<span class="nc" id="L1521">      return Double.NEGATIVE_INFINITY;</span>
+    }
+<span class="nc" id="L1523">    int goal = stateIndex.indexOf(stateName);</span>
+<span class="nc bnc" id="L1524" title="All 8 branches missed.">    if (iScore == null || iScore.length == 0 || iScore[0].length &lt;= length || iScore[0][length].length &lt;= goal) {</span>
+<span class="nc" id="L1525">      return Double.NEGATIVE_INFINITY;</span>
+    }
+<span class="nc" id="L1527">    return iScore[0][length][goal];</span>
+  }
+
+
+  @Override
+  public Tree getBestParse() {
+<span class="nc" id="L1533">    Tree internalTree = extractBestParse(goalStr, 0, length);</span>
+    //System.out.println(&quot;Got internal best parse...&quot;);
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">    if (internalTree == null) {</span>
+<span class="nc" id="L1536">      log.info(&quot;Warning: no parse found in ExhaustivePCFGParser.extractBestParse&quot;);</span>
+    } // else {
+      // restoreUnaries(internalTree);
+    // }
+    // System.out.println(&quot;Restored unaries...&quot;);
+<span class="nc" id="L1541">    return internalTree;</span>
+    //TreeTransformer debinarizer = BinarizerFactory.getDebinarizer();
+    //return debinarizer.transformTree(internalTree);
+  }
+
+  /** Return the best parse of some category/state over a certain span. */
+  protected Tree extractBestParse(String goalStr, int start, int end) {
+<span class="nc" id="L1548">    return extractBestParse(stateIndex.indexOf(goalStr), start, end);</span>
+  }
+
+  private Tree extractBestParse(int goal, int start, int end) {
+    // find source of inside score
+    // no backtraces so we can speed up the parsing for its primary use
+<span class="nc" id="L1554">    double bestScore = iScore[start][end][goal];</span>
+<span class="nc bnc" id="L1555" title="All 2 branches missed.">    double normBestScore = op.testOptions.lengthNormalization ? (bestScore / wordsInSpan[start][end][goal]) : bestScore;</span>
+<span class="nc" id="L1556">    String goalStr = stateIndex.get(goal);</span>
+
+    // check tags
+<span class="nc bnc" id="L1559" title="All 4 branches missed.">    if (end - start &lt;= op.testOptions.maxSpanForTags &amp;&amp; tagIndex.contains(goalStr)) {</span>
+<span class="nc bnc" id="L1560" title="All 2 branches missed.">      if (op.testOptions.maxSpanForTags &gt; 1) {</span>
+<span class="nc" id="L1561">        Tree wordNode = null;</span>
+<span class="nc bnc" id="L1562" title="All 2 branches missed.">        if (sentence != null) {</span>
+<span class="nc" id="L1563">          StringBuilder word = new StringBuilder();</span>
+<span class="nc bnc" id="L1564" title="All 2 branches missed.">          for (int i = start; i &lt; end; i++) {</span>
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">            if (sentence.get(i) instanceof HasWord) {</span>
+<span class="nc" id="L1566">              HasWord cl = (HasWord) sentence.get(i);</span>
+<span class="nc" id="L1567">              word.append(cl.word());</span>
+<span class="nc" id="L1568">            } else {</span>
+<span class="nc" id="L1569">              word.append(sentence.get(i).toString());</span>
+            }
+          }
+<span class="nc" id="L1572">          wordNode = tf.newLeaf(word.toString());</span>
+
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">        } else if (lr != null) {</span>
+<span class="nc" id="L1575">          List&lt;LatticeEdge&gt; latticeEdges = lr.getEdgesOverSpan(start, end);</span>
+<span class="nc bnc" id="L1576" title="All 2 branches missed.">          for (LatticeEdge edge : latticeEdges) {</span>
+<span class="nc" id="L1577">            IntTaggedWord itw = new IntTaggedWord(edge.word, stateIndex.get(goal), wordIndex, tagIndex);</span>
+
+<span class="nc bnc" id="L1579" title="All 2 branches missed.">            float tagScore = (floodTags) ? -1000.0f : lex.score(itw, start, edge.word, null);</span>
+<span class="nc bnc" id="L1580" title="All 2 branches missed.">            if (matches(bestScore, tagScore + (float) edge.weight)) {</span>
+<span class="nc" id="L1581">              wordNode = tf.newLeaf(edge.word);</span>
+<span class="nc bnc" id="L1582" title="All 2 branches missed.">              if(wordNode.label() instanceof CoreLabel) {</span>
+<span class="nc" id="L1583">              	CoreLabel cl = (CoreLabel) wordNode.label();</span>
+<span class="nc" id="L1584">              	cl.setBeginPosition(start);</span>
+<span class="nc" id="L1585">              	cl.setEndPosition(end);</span>
+<span class="nc" id="L1586">              }</span>
+              break;
+            }
+<span class="nc" id="L1589">          }</span>
+<span class="nc bnc" id="L1590" title="All 2 branches missed.">          if (wordNode == null) {</span>
+<span class="nc" id="L1591">            throw new RuntimeException(&quot;could not find matching word from lattice in parse reconstruction&quot;);</span>
+          }
+
+<span class="nc" id="L1594">        } else {</span>
+<span class="nc" id="L1595">          throw new RuntimeException(&quot;attempt to get word when sentence and lattice are null!&quot;);</span>
+        }
+<span class="nc" id="L1597">        Tree tagNode = tf.newTreeNode(goalStr, Collections.singletonList(wordNode));</span>
+<span class="nc" id="L1598">        tagNode.setScore(bestScore);</span>
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">        if (originalTags[start] != null) {</span>
+<span class="nc" id="L1600">          tagNode.label().setValue(originalTags[start].tag());</span>
+        }
+<span class="nc" id="L1602">        return tagNode;</span>
+      } else {  // normal lexicon is single words case
+<span class="nc" id="L1604">        IntTaggedWord tagging = new IntTaggedWord(words[start], tagIndex.indexOf(goalStr));</span>
+<span class="nc" id="L1605">        String contextStr = getCoreLabel(start).originalText();</span>
+<span class="nc" id="L1606">        float tagScore = lex.score(tagging, start, wordIndex.get(words[start]), contextStr);</span>
+<span class="nc bnc" id="L1607" title="All 4 branches missed.">        if (tagScore &gt; Float.NEGATIVE_INFINITY || floodTags) {</span>
+          // return a pre-terminal tree
+<span class="nc" id="L1609">          CoreLabel terminalLabel = getCoreLabel(start);</span>
+
+<span class="nc" id="L1611">          Tree wordNode = tf.newLeaf(terminalLabel);</span>
+<span class="nc" id="L1612">          Tree tagNode = tf.newTreeNode(goalStr, Collections.singletonList(wordNode));</span>
+<span class="nc" id="L1613">          tagNode.setScore(bestScore);</span>
+<span class="nc bnc" id="L1614" title="All 2 branches missed.">          if (terminalLabel.tag() != null) {</span>
+<span class="nc" id="L1615">            tagNode.label().setValue(terminalLabel.tag());</span>
+          }
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">          if (tagNode.label() instanceof HasTag) {</span>
+<span class="nc" id="L1618">            ((HasTag) tagNode.label()).setTag(tagNode.label().value());</span>
+          }
+<span class="nc" id="L1620">          return tagNode;</span>
+        }
+      }
+    }
+    // check binaries first
+<span class="nc bnc" id="L1625" title="All 2 branches missed.">    for (int split = start + 1; split &lt; end; split++) {</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">      for (Iterator&lt;BinaryRule&gt; binaryI = bg.ruleIteratorByParent(goal); binaryI.hasNext(); ) {</span>
+<span class="nc" id="L1627">        BinaryRule br = binaryI.next();</span>
+<span class="nc" id="L1628">        double score = br.score + iScore[start][split][br.leftChild] + iScore[split][end][br.rightChild];</span>
+        boolean matches;
+<span class="nc bnc" id="L1630" title="All 2 branches missed.">        if (op.testOptions.lengthNormalization) {</span>
+<span class="nc" id="L1631">          double normScore = score / (wordsInSpan[start][split][br.leftChild] + wordsInSpan[split][end][br.rightChild]);</span>
+<span class="nc" id="L1632">          matches = matches(normScore, normBestScore);</span>
+<span class="nc" id="L1633">        } else {</span>
+<span class="nc" id="L1634">          matches = matches(score, bestScore);</span>
+        }
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">        if (matches) {</span>
+          // build binary split
+<span class="nc" id="L1638">          Tree leftChildTree = extractBestParse(br.leftChild, start, split);</span>
+<span class="nc" id="L1639">          Tree rightChildTree = extractBestParse(br.rightChild, split, end);</span>
+<span class="nc" id="L1640">          List&lt;Tree&gt; children = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1641">          children.add(leftChildTree);</span>
+<span class="nc" id="L1642">          children.add(rightChildTree);</span>
+<span class="nc" id="L1643">          Tree result = tf.newTreeNode(goalStr, children);</span>
+<span class="nc" id="L1644">          result.setScore(score);</span>
+          // log.info(&quot;    Found Binary node: &quot;+result);
+<span class="nc" id="L1646">          return result;</span>
+        }
+<span class="nc" id="L1648">      }</span>
+    }
+    // check unaries
+    // note that even though we parse with the unary-closed grammar, we can
+    // extract the best parse with the non-unary-closed grammar, since all
+    // the intermediate states in the chain must have been built, and hence
+    // we can exploit the sparser space and reconstruct the full tree as we go.
+    // for (Iterator&lt;UnaryRule&gt; unaryI = ug.closedRuleIteratorByParent(goal); unaryI.hasNext(); ) {
+<span class="nc bnc" id="L1656" title="All 2 branches missed.">    for (Iterator&lt;UnaryRule&gt; unaryI = ug.ruleIteratorByParent(goal); unaryI.hasNext(); ) {</span>
+<span class="nc" id="L1657">      UnaryRule ur = unaryI.next();</span>
+      // log.info(&quot;  Trying &quot; + ur + &quot; dtr score: &quot; + iScore[start][end][ur.child]);
+<span class="nc" id="L1659">      double score = ur.score + iScore[start][end][ur.child];</span>
+      boolean matches;
+<span class="nc bnc" id="L1661" title="All 2 branches missed.">      if (op.testOptions.lengthNormalization) {</span>
+<span class="nc" id="L1662">        double normScore = score / wordsInSpan[start][end][ur.child];</span>
+<span class="nc" id="L1663">        matches = matches(normScore, normBestScore);</span>
+<span class="nc" id="L1664">      } else {</span>
+<span class="nc" id="L1665">        matches = matches(score, bestScore);</span>
+      }
+<span class="nc bnc" id="L1667" title="All 4 branches missed.">      if (ur.child != ur.parent &amp;&amp; matches) {</span>
+        // build unary
+<span class="nc" id="L1669">        Tree childTree = extractBestParse(ur.child, start, end);</span>
+<span class="nc" id="L1670">        Tree result = tf.newTreeNode(goalStr, Collections.singletonList(childTree));</span>
+        // log.info(&quot;    Matched!  Unary node: &quot;+result);
+<span class="nc" id="L1672">        result.setScore(score);</span>
+<span class="nc" id="L1673">        return result;</span>
+      }
+<span class="nc" id="L1675">    }</span>
+<span class="nc" id="L1676">    log.info(&quot;Warning: no parse found in ExhaustivePCFGParser.extractBestParse: failing on: [&quot; + start + &quot;, &quot; + end + &quot;] looking for &quot; + goalStr);</span>
+<span class="nc" id="L1677">    return null;</span>
+  }
+
+
+  /* -----------------------
+  // No longer needed: extracBestParse restores unaries as it goes
+  protected void restoreUnaries(Tree t) {
+    //System.out.println(&quot;In restoreUnaries...&quot;);
+    for (Tree node : t) {
+      log.info(&quot;Doing node: &quot;+node.label());
+      if (node.isLeaf() || node.isPreTerminal() || node.numChildren() != 1) {
+        //System.out.println(&quot;Skipping node: &quot;+node.label());
+        continue;
+      }
+      //System.out.println(&quot;Not skipping node: &quot;+node.label());
+      Tree parent = node;
+      Tree child = node.children()[0];
+      List path = ug.getBestPath(stateIndex.indexOf(parent.label().value()), stateIndex.indexOf(child.label().value()));
+      log.info(&quot;Got path: &quot;+path);
+      int pos = 1;
+      while (pos &lt; path.size() - 1) {
+        int interState = ((Integer) path.get(pos)).intValue();
+        Tree intermediate = tf.newTreeNode(new StringLabel(stateIndex.get(interState)), parent.getChildrenAsList());
+        parent.setChildren(Collections.singletonList(intermediate));
+        pos++;
+      }
+      //System.out.println(&quot;Done with node: &quot;+node.label());
+    }
+  }
+  ---------------------- */
+
+
+  /**
+   * Return all best parses (except no ties allowed on POS tags?).
+   * Even though we parse with the unary-closed grammar, since all the
+   * intermediate states in a chain must have been built, we can
+   * reconstruct the unary chain as we go using the non-unary-closed grammar.
+   */
+  protected List&lt;Tree&gt; extractBestParses(int goal, int start, int end) {
+    // find sources of inside score
+    // no backtraces so we can speed up the parsing for its primary use
+<span class="nc" id="L1718">    double bestScore = iScore[start][end][goal];</span>
+<span class="nc" id="L1719">    String goalStr = stateIndex.get(goal);</span>
+    //System.out.println(&quot;Searching for &quot;+goalStr+&quot; from &quot;+start+&quot; to &quot;+end+&quot; scored &quot;+bestScore);
+    // check tags
+<span class="nc bnc" id="L1722" title="All 4 branches missed.">    if (end - start == 1 &amp;&amp; tagIndex.contains(goalStr)) {</span>
+<span class="nc" id="L1723">      IntTaggedWord tagging = new IntTaggedWord(words[start], tagIndex.indexOf(goalStr));</span>
+<span class="nc" id="L1724">      String contextStr = getCoreLabel(start).originalText();</span>
+<span class="nc" id="L1725">      float tagScore = lex.score(tagging, start, wordIndex.get(words[start]), contextStr);</span>
+<span class="nc bnc" id="L1726" title="All 4 branches missed.">      if (tagScore &gt; Float.NEGATIVE_INFINITY || floodTags) {</span>
+        // return a pre-terminal tree
+<span class="nc" id="L1728">        String wordStr = wordIndex.get(words[start]);</span>
+<span class="nc" id="L1729">        Tree wordNode = tf.newLeaf(wordStr);</span>
+<span class="nc" id="L1730">        Tree tagNode = tf.newTreeNode(goalStr, Collections.singletonList(wordNode));</span>
+<span class="nc bnc" id="L1731" title="All 2 branches missed.">        if (originalTags[start] != null) {</span>
+<span class="nc" id="L1732">          tagNode.label().setValue(originalTags[start].tag());</span>
+        }
+        //System.out.println(&quot;Tag node: &quot;+tagNode);
+<span class="nc" id="L1735">        return Collections.singletonList(tagNode);</span>
+      }
+    }
+    // check binaries first
+<span class="nc" id="L1739">    List&lt;Tree&gt; bestTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1740" title="All 2 branches missed.">    for (int split = start + 1; split &lt; end; split++) {</span>
+<span class="nc bnc" id="L1741" title="All 2 branches missed.">      for (Iterator&lt;BinaryRule&gt; binaryI = bg.ruleIteratorByParent(goal); binaryI.hasNext(); ) {</span>
+<span class="nc" id="L1742">        BinaryRule br = binaryI.next();</span>
+<span class="nc" id="L1743">        double score = br.score + iScore[start][split][br.leftChild] + iScore[split][end][br.rightChild];</span>
+<span class="nc bnc" id="L1744" title="All 2 branches missed.">        if (matches(score, bestScore)) {</span>
+          // build binary split
+<span class="nc" id="L1746">          List&lt;Tree&gt; leftChildTrees = extractBestParses(br.leftChild, start, split);</span>
+<span class="nc" id="L1747">          List&lt;Tree&gt; rightChildTrees = extractBestParses(br.rightChild, split, end);</span>
+          // System.out.println(&quot;Found a best way to build &quot; + goalStr + &quot;(&quot; +
+          //                 start + &quot;,&quot; + end + &quot;) with &quot; +
+          //                 leftChildTrees.size() + &quot;x&quot; +
+          //                 rightChildTrees.size() + &quot; ways to build.&quot;);
+<span class="nc bnc" id="L1752" title="All 2 branches missed.">          for (Tree leftChildTree : leftChildTrees) {</span>
+<span class="nc bnc" id="L1753" title="All 2 branches missed.">            for (Tree rightChildTree : rightChildTrees) {</span>
+<span class="nc" id="L1754">              List&lt;Tree&gt; children = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1755">              children.add(leftChildTree);</span>
+<span class="nc" id="L1756">              children.add(rightChildTree);</span>
+<span class="nc" id="L1757">              Tree result = tf.newTreeNode(goalStr, children);</span>
+              //System.out.println(&quot;Binary node: &quot;+result);
+<span class="nc" id="L1759">              bestTrees.add(result);</span>
+<span class="nc" id="L1760">            }</span>
+<span class="nc" id="L1761">          }</span>
+        }
+<span class="nc" id="L1763">      }</span>
+    }
+    // check unaries
+<span class="nc bnc" id="L1766" title="All 2 branches missed.">    for (Iterator&lt;UnaryRule&gt; unaryI = ug.ruleIteratorByParent(goal); unaryI.hasNext(); ) {</span>
+<span class="nc" id="L1767">      UnaryRule ur = unaryI.next();</span>
+<span class="nc" id="L1768">      double score = ur.score + iScore[start][end][ur.child];</span>
+<span class="nc bnc" id="L1769" title="All 4 branches missed.">      if (ur.child != ur.parent &amp;&amp; matches(score, bestScore)) {</span>
+        // build unary
+<span class="nc" id="L1771">        List&lt;Tree&gt; childTrees = extractBestParses(ur.child, start, end);</span>
+<span class="nc bnc" id="L1772" title="All 2 branches missed.">        for (Tree childTree : childTrees) {</span>
+<span class="nc" id="L1773">          Tree result = tf.newTreeNode(goalStr, Collections.singletonList(childTree));</span>
+          //System.out.println(&quot;Unary node: &quot;+result);
+<span class="nc" id="L1775">          bestTrees.add(result);</span>
+<span class="nc" id="L1776">        }</span>
+      }
+<span class="nc" id="L1778">    }</span>
+<span class="nc bnc" id="L1779" title="All 2 branches missed.">    if (bestTrees.isEmpty()) {</span>
+<span class="nc" id="L1780">      log.info(&quot;Warning: no parse found in ExhaustivePCFGParser.extractBestParse: failing on: [&quot; + start + &quot;, &quot; + end + &quot;] looking for &quot; + goalStr);</span>
+    }
+<span class="nc" id="L1782">    return bestTrees;</span>
+  }
+
+
+  /** Get k good parses for the sentence.  It is expected that the
+   *  parses returned approximate the k best parses, but without any
+   *  guarantee that the exact list of k best parses has been produced.
+   *
+   *  @param k The number of good parses to return
+   *  @return A list of k good parses for the sentence, with
+   *         each accompanied by its score
+   */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKGoodParses(int k) {
+<span class="nc" id="L1796">    return getKBestParses(k);</span>
+  }
+
+  /** Get k parse samples for the sentence.  It is expected that the
+   *  parses are sampled based on their relative probability.
+   *
+   *  @param k The number of sampled parses to return
+   *  @return A list of k parse samples for the sentence, with
+   *         each accompanied by its score
+   */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKSampledParses(int k) {
+<span class="nc" id="L1808">    throw new UnsupportedOperationException(&quot;ExhaustivePCFGParser doesn't sample.&quot;);</span>
+  }
+
+
+  //
+  // BEGIN K-BEST STUFF
+  // taken straight out of &quot;Better k-best Parsing&quot; by Liang Huang and David
+  // Chiang
+  //
+
+  /** Get the exact k best parses for the sentence.
+   *
+   *  @param k The number of best parses to return
+   *  @return The exact k best parses for the sentence, with
+   *         each accompanied by its score (typically a
+   *         negative log probability).
+   */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKBestParses(int k) {
+
+<span class="nc" id="L1828">    cand = Generics.newHashMap();</span>
+<span class="nc" id="L1829">    dHat = Generics.newHashMap();</span>
+
+<span class="nc" id="L1831">    int start = 0;</span>
+<span class="nc" id="L1832">    int end = length;</span>
+<span class="nc" id="L1833">    int goal = stateIndex.indexOf(goalStr);</span>
+
+<span class="nc" id="L1835">    Vertex v = new Vertex(goal, start, end);</span>
+<span class="nc" id="L1836">    List&lt;ScoredObject&lt;Tree&gt;&gt; kBestTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1837" title="All 2 branches missed.">    for (int i = 1; i &lt;= k; i++) {</span>
+<span class="nc" id="L1838">      Tree internalTree = getTree(v, i, k);</span>
+<span class="nc bnc" id="L1839" title="All 2 branches missed.">      if (internalTree == null) { break; }</span>
+      // restoreUnaries(internalTree);
+<span class="nc" id="L1841">      kBestTrees.add(new ScoredObject&lt;&gt;(internalTree, dHat.get(v).get(i - 1).score));</span>
+    }
+<span class="nc" id="L1843">    return kBestTrees;</span>
+  }
+
+  /** Get the kth best, when calculating kPrime best (e.g. 2nd best of 5). */
+  private Tree getTree(Vertex v, int k, int kPrime) {
+<span class="nc" id="L1848">    lazyKthBest(v, k, kPrime);</span>
+<span class="nc" id="L1849">    String goalStr = stateIndex.get(v.goal);</span>
+<span class="nc" id="L1850">    int start = v.start;</span>
+    // int end = v.end;
+
+<span class="nc" id="L1853">    List&lt;Derivation&gt; dHatV = dHat.get(v);</span>
+
+<span class="nc bnc" id="L1855" title="All 4 branches missed.">    if (isTag[v.goal] &amp;&amp; v.start + 1 == v.end) {</span>
+<span class="nc" id="L1856">      IntTaggedWord tagging = new IntTaggedWord(words[start], tagIndex.indexOf(goalStr));</span>
+<span class="nc" id="L1857">      String contextStr = getCoreLabel(start).originalText();</span>
+<span class="nc" id="L1858">      float tagScore = lex.score(tagging, start, wordIndex.get(words[start]), contextStr);</span>
+<span class="nc bnc" id="L1859" title="All 4 branches missed.">      if (tagScore &gt; Float.NEGATIVE_INFINITY || floodTags) {</span>
+        // return a pre-terminal tree
+<span class="nc" id="L1861">        CoreLabel terminalLabel = getCoreLabel(start);</span>
+
+<span class="nc" id="L1863">        Tree wordNode = tf.newLeaf(terminalLabel);</span>
+<span class="nc" id="L1864">        Tree tagNode = tf.newTreeNode(goalStr, Collections.singletonList(wordNode));</span>
+<span class="nc bnc" id="L1865" title="All 2 branches missed.">        if (originalTags[start] != null) {</span>
+<span class="nc" id="L1866">          tagNode.label().setValue(originalTags[start].tag());</span>
+        }
+<span class="nc bnc" id="L1868" title="All 2 branches missed.">        if (tagNode.label() instanceof HasTag) {</span>
+<span class="nc" id="L1869">          ((HasTag) tagNode.label()).setTag(tagNode.label().value());</span>
+        }
+<span class="nc" id="L1871">        return tagNode;</span>
+      } else {
+<span class="nc bnc" id="L1873" title="All 2 branches missed.">        assert false;</span>
+      }
+    }
+
+<span class="nc bnc" id="L1877" title="All 2 branches missed.">    if (k-1 &gt;= dHatV.size()) {</span>
+<span class="nc" id="L1878">      return null;</span>
+    }
+
+<span class="nc" id="L1881">    Derivation d = dHatV.get(k-1);</span>
+
+<span class="nc" id="L1883">    List&lt;Tree&gt; children = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1884" title="All 2 branches missed.">    for (int i = 0; i &lt; d.arc.size(); i++) {</span>
+<span class="nc" id="L1885">      Vertex child = d.arc.tails.get(i);</span>
+<span class="nc" id="L1886">      Tree t = getTree(child, d.j.get(i), kPrime);</span>
+<span class="nc bnc" id="L1887" title="All 4 branches missed.">      assert (t != null);</span>
+<span class="nc" id="L1888">      children.add(t);</span>
+    }
+
+<span class="nc" id="L1891">    return tf.newTreeNode(goalStr,children);</span>
+  }
+
+  private static class Vertex {
+    public final int goal;
+    public final int start;
+    public final int end;
+
+<span class="nc" id="L1899">    public Vertex(int goal, int start, int end) {</span>
+<span class="nc" id="L1900">      this.goal = goal;</span>
+<span class="nc" id="L1901">      this.start = start;</span>
+<span class="nc" id="L1902">      this.end = end;</span>
+<span class="nc" id="L1903">    }</span>
+
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L1906" title="All 2 branches missed.">      if (!(o instanceof Vertex)) { return false; }</span>
+<span class="nc" id="L1907">      Vertex v = (Vertex)o;</span>
+<span class="nc bnc" id="L1908" title="All 6 branches missed.">      return (v.goal == goal &amp;&amp; v.start == start &amp;&amp; v.end == end);</span>
+    }
+
+<span class="nc" id="L1911">    private int hc = -1;</span>
+
+    public int hashCode() {
+<span class="nc bnc" id="L1914" title="All 2 branches missed.">      if (hc == -1) {</span>
+<span class="nc" id="L1915">        hc = goal + (17 * (start + (17 * end)));</span>
+      }
+<span class="nc" id="L1917">      return hc;</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L1921">      return goal+&quot;[&quot;+start+&quot;,&quot;+end+&quot;]&quot;;</span>
+    }
+  }
+
+  private static class Arc {
+    public final List&lt;Vertex&gt; tails;
+    public final Vertex head;
+    public final double ruleScore; // for convenience
+
+<span class="nc" id="L1930">    public Arc(List&lt;Vertex&gt; tails, Vertex head, double ruleScore) {</span>
+<span class="nc" id="L1931">      this.tails = Collections.unmodifiableList(tails);</span>
+<span class="nc" id="L1932">      this.head = head;</span>
+<span class="nc" id="L1933">      this.ruleScore = ruleScore;</span>
+      // TODO: add check that rule is compatible with head and tails!
+<span class="nc" id="L1935">    }</span>
+
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L1938" title="All 2 branches missed.">      if (!(o instanceof Arc)) { return false; }</span>
+<span class="nc" id="L1939">      Arc a = (Arc) o;</span>
+<span class="nc bnc" id="L1940" title="All 4 branches missed.">      return a.head.equals(head) &amp;&amp; a.tails.equals(tails);</span>
+    }
+
+<span class="nc" id="L1943">    private int hc = -1;</span>
+
+    public int hashCode() {
+<span class="nc bnc" id="L1946" title="All 2 branches missed.">      if (hc == -1) {</span>
+<span class="nc" id="L1947">        hc = head.hashCode() + (17 * tails.hashCode());</span>
+      }
+<span class="nc" id="L1949">      return hc;</span>
+    }
+
+<span class="nc" id="L1952">    public int size() { return tails.size(); }</span>
+  }
+
+  private static class Derivation {
+    public final Arc arc;
+    public final List&lt;Integer&gt; j;
+    public final double score;  // score does not affect equality (?)
+    public final List&lt;Double&gt; childrenScores;
+
+<span class="nc" id="L1961">    public Derivation(Arc arc, List&lt;Integer&gt; j, double score, List&lt;Double&gt; childrenScores) {</span>
+<span class="nc" id="L1962">      this.arc = arc;</span>
+<span class="nc" id="L1963">      this.j = Collections.unmodifiableList(j);</span>
+<span class="nc" id="L1964">      this.score = score;</span>
+<span class="nc" id="L1965">      this.childrenScores = Collections.unmodifiableList(childrenScores);</span>
+<span class="nc" id="L1966">    }</span>
+
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L1969" title="All 2 branches missed.">      if (!(o instanceof Derivation)) { return false; }</span>
+<span class="nc" id="L1970">      Derivation d = (Derivation)o;</span>
+<span class="nc bnc" id="L1971" title="All 8 branches missed.">      if (arc == null &amp;&amp; d.arc != null || arc != null &amp;&amp; d.arc == null) { return false; }</span>
+<span class="nc bnc" id="L1972" title="All 8 branches missed.">      return ((arc == null &amp;&amp; d.arc == null || d.arc.equals(arc)) &amp;&amp; d.j.equals(j));</span>
+    }
+
+<span class="nc" id="L1975">    private int hc = -1;</span>
+
+    public int hashCode() {
+<span class="nc bnc" id="L1978" title="All 2 branches missed.">      if (hc == -1) {</span>
+<span class="nc bnc" id="L1979" title="All 2 branches missed.">        hc = (arc == null ? 0 : arc.hashCode()) + (17 * j.hashCode());</span>
+      }
+<span class="nc" id="L1981">      return hc;</span>
+    }
+  }
+
+  private List&lt;Arc&gt; getBackwardsStar(Vertex v) {
+
+<span class="nc" id="L1987">    List&lt;Arc&gt; bs = new ArrayList&lt;&gt;();</span>
+
+    // pre-terminal??
+<span class="nc bnc" id="L1990" title="All 4 branches missed.">    if (isTag[v.goal] &amp;&amp; v.start + 1 == v.end) {</span>
+<span class="nc" id="L1991">      List&lt;Vertex&gt; tails = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1992">      double score = iScore[v.start][v.end][v.goal];</span>
+<span class="nc" id="L1993">      Arc arc = new Arc(tails, v, score);</span>
+<span class="nc" id="L1994">      bs.add(arc);</span>
+    }
+
+    // check binaries
+<span class="nc bnc" id="L1998" title="All 2 branches missed.">    for (int split = v.start + 1; split &lt; v.end; split++) {</span>
+<span class="nc bnc" id="L1999" title="All 2 branches missed.">      for (BinaryRule br : bg.ruleListByParent(v.goal)) {</span>
+<span class="nc" id="L2000">        Vertex lChild = new Vertex(br.leftChild, v.start, split);</span>
+<span class="nc" id="L2001">        Vertex rChild = new Vertex(br.rightChild, split, v.end);</span>
+<span class="nc" id="L2002">        List&lt;Vertex&gt; tails = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2003">        tails.add(lChild);</span>
+<span class="nc" id="L2004">        tails.add(rChild);</span>
+<span class="nc" id="L2005">        Arc arc = new Arc(tails, v, br.score);</span>
+<span class="nc" id="L2006">        bs.add(arc);</span>
+<span class="nc" id="L2007">      }</span>
+    }
+
+    // check unaries
+<span class="nc bnc" id="L2011" title="All 2 branches missed.">    for (UnaryRule ur : ug.rulesByParent(v.goal)) {</span>
+<span class="nc" id="L2012">      Vertex child = new Vertex(ur.child, v.start, v.end);</span>
+<span class="nc" id="L2013">      List&lt;Vertex&gt; tails = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2014">      tails.add(child);</span>
+<span class="nc" id="L2015">      Arc arc = new Arc(tails, v, ur.score);</span>
+<span class="nc" id="L2016">      bs.add(arc);</span>
+<span class="nc" id="L2017">    }</span>
+
+<span class="nc" id="L2019">    return bs;</span>
+  }
+
+<span class="nc" id="L2022">  private Map&lt;Vertex,PriorityQueue&lt;Derivation&gt;&gt; cand = Generics.newHashMap();</span>
+<span class="nc" id="L2023">  private Map&lt;Vertex,LinkedList&lt;Derivation&gt;&gt; dHat = Generics.newHashMap();</span>
+
+  private PriorityQueue&lt;Derivation&gt; getCandidates(Vertex v, int k) {
+<span class="nc" id="L2026">    PriorityQueue&lt;Derivation&gt; candV = cand.get(v);</span>
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">    if (candV == null) {</span>
+<span class="nc" id="L2028">      candV = new BinaryHeapPriorityQueue&lt;&gt;();</span>
+<span class="nc" id="L2029">      List&lt;Arc&gt; bsV = getBackwardsStar(v);</span>
+
+<span class="nc bnc" id="L2031" title="All 2 branches missed.">      for (Arc arc : bsV) {</span>
+<span class="nc" id="L2032">        int size = arc.size();</span>
+<span class="nc" id="L2033">        double score = arc.ruleScore;</span>
+<span class="nc" id="L2034">        List&lt;Double&gt; childrenScores = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L2035" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L2036">          Vertex child = arc.tails.get(i);</span>
+<span class="nc" id="L2037">          double s = iScore[child.start][child.end][child.goal];</span>
+<span class="nc" id="L2038">          childrenScores.add(s);</span>
+<span class="nc" id="L2039">          score += s;</span>
+        }
+<span class="nc bnc" id="L2041" title="All 2 branches missed.">        if (score == Double.NEGATIVE_INFINITY) { continue; }</span>
+<span class="nc" id="L2042">        List&lt;Integer&gt; j = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L2043" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L2044">          j.add(1);</span>
+        }
+<span class="nc" id="L2046">        Derivation d = new Derivation(arc, j, score, childrenScores);</span>
+<span class="nc" id="L2047">        candV.add(d, score);</span>
+<span class="nc" id="L2048">      }</span>
+<span class="nc" id="L2049">      PriorityQueue&lt;Derivation&gt; tmp = new BinaryHeapPriorityQueue&lt;&gt;();</span>
+<span class="nc bnc" id="L2050" title="All 2 branches missed.">      for (int i = 0; i &lt; k; i++) {</span>
+<span class="nc bnc" id="L2051" title="All 2 branches missed.">        if (candV.isEmpty()) { break; }</span>
+<span class="nc" id="L2052">        Derivation d = candV.removeFirst();</span>
+<span class="nc" id="L2053">        tmp.add(d, d.score);</span>
+      }
+<span class="nc" id="L2055">      candV = tmp;</span>
+<span class="nc" id="L2056">      cand.put(v, candV);</span>
+    }
+<span class="nc" id="L2058">    return candV;</span>
+  }
+
+  // note: kPrime is the original k
+  private void lazyKthBest(Vertex v, int k, int kPrime) {
+<span class="nc" id="L2063">    PriorityQueue&lt;Derivation&gt; candV = getCandidates(v, kPrime);</span>
+
+<span class="nc" id="L2065">    LinkedList&lt;Derivation&gt; dHatV = dHat.get(v);</span>
+<span class="nc bnc" id="L2066" title="All 2 branches missed.">    if (dHatV == null) {</span>
+<span class="nc" id="L2067">      dHatV = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L2068">      dHat.put(v,dHatV);</span>
+    }
+<span class="nc bnc" id="L2070" title="All 2 branches missed.">    while (dHatV.size() &lt; k) {</span>
+<span class="nc bnc" id="L2071" title="All 2 branches missed.">      if (!dHatV.isEmpty()) {</span>
+<span class="nc" id="L2072">        Derivation derivation = dHatV.getLast();</span>
+<span class="nc" id="L2073">        lazyNext(candV, derivation, kPrime);</span>
+      }
+<span class="nc bnc" id="L2075" title="All 2 branches missed.">      if (!candV.isEmpty()) {</span>
+<span class="nc" id="L2076">        Derivation d = candV.removeFirst();</span>
+<span class="nc" id="L2077">        dHatV.add(d);</span>
+<span class="nc" id="L2078">      } else {</span>
+        break;
+      }
+    }
+<span class="nc" id="L2082">  }</span>
+
+  private void lazyNext(PriorityQueue&lt;Derivation&gt; candV, Derivation derivation, int kPrime) {
+<span class="nc" id="L2085">    List&lt;Vertex&gt; tails = derivation.arc.tails;</span>
+<span class="nc bnc" id="L2086" title="All 2 branches missed.">    for  (int i = 0, sz = derivation.arc.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L2087">      List&lt;Integer&gt; j = new ArrayList&lt;&gt;(derivation.j);</span>
+<span class="nc" id="L2088">      j.set(i, j.get(i)+1);</span>
+<span class="nc" id="L2089">      Vertex Ti = tails.get(i);</span>
+<span class="nc" id="L2090">      lazyKthBest(Ti, j.get(i), kPrime);</span>
+<span class="nc" id="L2091">      LinkedList&lt;Derivation&gt; dHatTi = dHat.get(Ti);</span>
+      // compute score for this derivation
+<span class="nc bnc" id="L2093" title="All 2 branches missed.">      if (j.get(i)-1 &gt;= dHatTi.size()) { continue; }</span>
+<span class="nc" id="L2094">      Derivation d = dHatTi.get(j.get(i)-1);</span>
+<span class="nc" id="L2095">      double newScore = derivation.score - derivation.childrenScores.get(i) + d.score;</span>
+<span class="nc" id="L2096">      List&lt;Double&gt; childrenScores = new ArrayList&lt;&gt;(derivation.childrenScores);</span>
+<span class="nc" id="L2097">      childrenScores.set(i, d.score);</span>
+<span class="nc" id="L2098">      Derivation newDerivation = new Derivation(derivation.arc, j, newScore, childrenScores);</span>
+<span class="nc bnc" id="L2099" title="All 4 branches missed.">      if (!candV.contains(newDerivation) &amp;&amp; newScore &gt; Double.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L2100">        candV.add(newDerivation, newScore);</span>
+      }
+    }
+<span class="nc" id="L2103">  }</span>
+
+  //
+  // END K-BEST STUFF
+  //
+
+
+  /** Get a complete set of the maximally scoring parses for a sentence,
+   *  rather than one chosen at random.  This set may be of size 1 or larger.
+   *
+   *  @return All the equal best parses for a sentence, with each
+   *         accompanied by its score
+   */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getBestParses() {
+<span class="nc" id="L2118">    int start = 0;</span>
+<span class="nc" id="L2119">    int end = length;</span>
+<span class="nc" id="L2120">    int goal = stateIndex.indexOf(goalStr);</span>
+<span class="nc" id="L2121">    double bestScore = iScore[start][end][goal];</span>
+<span class="nc" id="L2122">    List&lt;Tree&gt; internalTrees = extractBestParses(goal, start, end);</span>
+    //System.out.println(&quot;Got internal best parse...&quot;);
+    // for (Tree internalTree : internalTrees) {
+    //   restoreUnaries(internalTree);
+    // }
+    //System.out.println(&quot;Restored unaries...&quot;);
+<span class="nc" id="L2128">    List&lt;ScoredObject&lt;Tree&gt;&gt; scoredTrees = new ArrayList&lt;&gt;(internalTrees.size());</span>
+<span class="nc bnc" id="L2129" title="All 2 branches missed.">    for (Tree tr : internalTrees) {</span>
+<span class="nc" id="L2130">      scoredTrees.add(new ScoredObject&lt;&gt;(tr, bestScore));</span>
+<span class="nc" id="L2131">    }</span>
+<span class="nc" id="L2132">    return scoredTrees;</span>
+    //TreeTransformer debinarizer = BinarizerFactory.getDebinarizer();
+    //return debinarizer.transformTree(internalTree);
+  }
+
+  protected List&lt;ParserConstraint&gt; getConstraints() {
+<span class="nc" id="L2138">    return constraints;</span>
+  }
+
+  void setConstraints(List&lt;ParserConstraint&gt; constraints) {
+<span class="nc bnc" id="L2142" title="All 2 branches missed.">    if (constraints == null) {</span>
+<span class="nc" id="L2143">      this.constraints = Collections.emptyList();</span>
+    } else {
+<span class="nc" id="L2145">      this.constraints = constraints;</span>
+    }
+<span class="nc" id="L2147">  }</span>
+
+<span class="nc" id="L2149">  public ExhaustivePCFGParser(BinaryGrammar bg, UnaryGrammar ug, Lexicon lex, Options op, Index&lt;String&gt; stateIndex, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {</span>
+    //    System.out.println(&quot;ExhaustivePCFGParser constructor called.&quot;);
+<span class="nc" id="L2151">    this.bg = bg;</span>
+<span class="nc" id="L2152">    this.ug = ug;</span>
+<span class="nc" id="L2153">    this.lex = lex;</span>
+<span class="nc" id="L2154">    this.op = op;</span>
+<span class="nc" id="L2155">    this.tlp = op.langpack();</span>
+<span class="nc" id="L2156">    goalStr = tlp.startSymbol();</span>
+<span class="nc" id="L2157">    this.stateIndex = stateIndex;</span>
+<span class="nc" id="L2158">    this.wordIndex = wordIndex;</span>
+<span class="nc" id="L2159">    this.tagIndex = tagIndex;</span>
+<span class="nc" id="L2160">    tf = new LabeledScoredTreeFactory();</span>
+
+<span class="nc" id="L2162">    numStates = stateIndex.size();</span>
+<span class="nc" id="L2163">    isTag = new boolean[numStates];</span>
+    // tag index is smaller, so we fill by iterating over the tag index
+    // rather than over the state index
+<span class="nc bnc" id="L2166" title="All 2 branches missed.">    for (String tag : tagIndex.objectsList()) {</span>
+<span class="nc" id="L2167">      int state = stateIndex.indexOf(tag);</span>
+<span class="nc bnc" id="L2168" title="All 2 branches missed.">      if (state &lt; 0) {</span>
+<span class="nc" id="L2169">        continue;</span>
+      }
+<span class="nc" id="L2171">      isTag[state] = true;</span>
+<span class="nc" id="L2172">    }</span>
+<span class="nc" id="L2173">  }</span>
+
+
+  public void nudgeDownArraySize() {
+    try {
+<span class="nc bnc" id="L2178" title="All 2 branches missed.">      if (arraySize &gt; 2) {</span>
+<span class="nc" id="L2179">        considerCreatingArrays(arraySize - 2);</span>
+      }
+<span class="nc" id="L2181">    } catch (OutOfMemoryError oome) {</span>
+<span class="nc" id="L2182">      oome.printStackTrace();</span>
+<span class="nc" id="L2183">    }</span>
+<span class="nc" id="L2184">  }</span>
+
+  private void considerCreatingArrays(int length) {
+<span class="nc bnc" id="L2187" title="All 4 branches missed.">    if (length &gt; op.testOptions.maxLength + 1 || length &gt;= myMaxLength) {</span>
+<span class="nc" id="L2188">      throw new OutOfMemoryError(&quot;Refusal to create such large arrays.&quot;);</span>
+    } else {
+      try {
+<span class="nc" id="L2191">        createArrays(length + 1);</span>
+<span class="nc" id="L2192">      } catch (OutOfMemoryError e) {</span>
+<span class="nc" id="L2193">        myMaxLength = length;</span>
+<span class="nc bnc" id="L2194" title="All 2 branches missed.">        if (arraySize &gt; 0) {</span>
+          try {
+<span class="nc" id="L2196">            createArrays(arraySize);</span>
+<span class="nc" id="L2197">          } catch (OutOfMemoryError e2) {</span>
+<span class="nc" id="L2198">            throw new RuntimeException(&quot;CANNOT EVEN CREATE ARRAYS OF ORIGINAL SIZE!!&quot;);</span>
+<span class="nc" id="L2199">          }</span>
+        }
+<span class="nc" id="L2201">        throw e;</span>
+<span class="nc" id="L2202">      }</span>
+<span class="nc" id="L2203">      arraySize = length + 1;</span>
+<span class="nc bnc" id="L2204" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L2205">        log.info(&quot;Created PCFG parser arrays of size &quot; + arraySize);</span>
+      }
+    }
+<span class="nc" id="L2208">  }</span>
+
+  protected void createArrays(int length) {
+    // zero out some stuff first in case we recently ran out of memory and are reallocating
+<span class="nc" id="L2212">    clearArrays();</span>
+
+<span class="nc" id="L2214">    int numTags = tagIndex.size();</span>
+    // allocate just the parts of iScore and oScore used (end &gt; start, etc.)
+    // todo: with some modifications to doInsideScores, we wouldn't need to allocate iScore[i,length] for i != 0 and i != length
+    //    System.out.println(&quot;initializing iScore arrays with length &quot; + length + &quot; and numStates &quot; + numStates);
+<span class="nc" id="L2218">    iScore = new float[length][length + 1][];</span>
+<span class="nc bnc" id="L2219" title="All 2 branches missed.">    for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L2220" title="All 2 branches missed.">      for (int end = start + 1; end &lt;= length; end++) {</span>
+<span class="nc" id="L2221">        iScore[start][end] = new float[numStates];</span>
+      }
+    }
+    //    System.out.println(&quot;finished initializing iScore arrays&quot;);
+<span class="nc bnc" id="L2225" title="All 4 branches missed.">    if (op.doDep &amp;&amp; !op.testOptions.useFastFactored) {</span>
+      //      System.out.println(&quot;initializing oScore arrays with length &quot; + length + &quot; and numStates &quot; + numStates);
+<span class="nc" id="L2227">      oScore = new float[length][length + 1][];</span>
+<span class="nc bnc" id="L2228" title="All 2 branches missed.">      for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L2229" title="All 2 branches missed.">        for (int end = start + 1; end &lt;= length; end++) {</span>
+<span class="nc" id="L2230">          oScore[start][end] = new float[numStates];</span>
+        }
+      }
+      // System.out.println(&quot;finished initializing oScore arrays&quot;);
+    }
+<span class="nc" id="L2235">    narrowRExtent = new int[length][numStates];</span>
+<span class="nc" id="L2236">    wideRExtent = new int[length][numStates];</span>
+<span class="nc" id="L2237">    narrowLExtent = new int[length + 1][numStates];</span>
+<span class="nc" id="L2238">    wideLExtent = new int[length + 1][numStates];</span>
+<span class="nc bnc" id="L2239" title="All 4 branches missed.">    if (op.doDep &amp;&amp; !op.testOptions.useFastFactored) {</span>
+<span class="nc" id="L2240">      iPossibleByL = new boolean[length][numStates];</span>
+<span class="nc" id="L2241">      iPossibleByR = new boolean[length + 1][numStates];</span>
+<span class="nc" id="L2242">      oPossibleByL = new boolean[length][numStates];</span>
+<span class="nc" id="L2243">      oPossibleByR = new boolean[length + 1][numStates];</span>
+    }
+<span class="nc" id="L2245">    tags = new boolean[length][numTags];</span>
+
+<span class="nc bnc" id="L2247" title="All 2 branches missed.">    if (op.testOptions.lengthNormalization) {</span>
+<span class="nc" id="L2248">      wordsInSpan = new int[length][length + 1][];</span>
+<span class="nc bnc" id="L2249" title="All 2 branches missed.">      for (int start = 0; start &lt; length; start++) {</span>
+<span class="nc bnc" id="L2250" title="All 2 branches missed.">        for (int end = start + 1; end &lt;= length; end++) {</span>
+<span class="nc" id="L2251">          wordsInSpan[start][end] = new int[numStates];</span>
+        }
+      }
+    }
+    //    System.out.println(&quot;ExhaustivePCFGParser constructor finished.&quot;);
+<span class="nc" id="L2256">  }</span>
+
+  private void clearArrays() {
+<span class="nc" id="L2259">    iScore = oScore = null;</span>
+<span class="nc" id="L2260">    iPossibleByL = iPossibleByR = oPossibleByL = oPossibleByR = null;</span>
+<span class="nc" id="L2261">    oFilteredEnd = oFilteredStart = null;</span>
+<span class="nc" id="L2262">    tags = null;</span>
+<span class="nc" id="L2263">    narrowRExtent = wideRExtent = narrowLExtent = wideLExtent = null;</span>
+<span class="nc" id="L2264">  }</span>
+
+} // end class ExhaustivePCFGParser
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,2134 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ProtobufAnnotationSerializer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">ProtobufAnnotationSerializer.java</span></div><h1>ProtobufAnnotationSerializer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline;
+
+import edu.stanford.nlp.ie.NumberNormalizer;
+import edu.stanford.nlp.ie.machinereading.structure.EntityMention;
+import edu.stanford.nlp.ie.machinereading.structure.ExtractionObject;
+import edu.stanford.nlp.ie.machinereading.structure.MachineReadingAnnotations.*;
+import edu.stanford.nlp.ie.machinereading.structure.RelationMention;
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.ie.util.RelationTriple;
+import edu.stanford.nlp.international.Language;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.SegmenterCoreAnnotations;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.naturalli.*;
+import edu.stanford.nlp.neural.rnn.RNNCoreAnnotations;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.sentiment.SentimentCoreAnnotations;
+import edu.stanford.nlp.time.Timex;
+import edu.stanford.nlp.trees.GrammaticalRelation;
+import edu.stanford.nlp.trees.LabeledScoredTreeNode;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.ling.CoreAnnotations.*;
+import edu.stanford.nlp.trees.TreeCoreAnnotations.*;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations.*;
+import edu.stanford.nlp.time.TimeAnnotations.*;
+
+import java.io.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import edu.stanford.nlp.coref.CorefCoreAnnotations.*;
+
+import edu.stanford.nlp.coref.data.CorefChain;
+import edu.stanford.nlp.coref.data.Dictionaries;
+import edu.stanford.nlp.coref.data.Mention;
+import edu.stanford.nlp.coref.data.SpeakerInfo;
+
+/**
+ * &lt;p&gt;
+ *   A serializer using Google's protocol buffer format.
+ *   The files produced by this serializer, in addition to being language-independent,
+ *   are a little over 10% the size and 4x faster to read+write versus the default Java serialization
+ *   (see GenericAnnotationSerializer), when both files are compressed with gzip.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   Note that this handles only a subset of the possible annotations
+ *   that can be attached to a sentence. Nonetheless, it is guaranteed to be
+ *   lossless with the default set of named annotators you can create from a
+ *   {@link StanfordCoreNLP} pipeline, with default properties defined for each annotator.
+ *   Note that the serializer does not gzip automatically -- this must be done by passing in a GZipOutputStream
+ *   and calling a GZipInputStream manually. For most Annotations, gzipping provides a notable decrease in size (~2.5x)
+ *   due to most of the data being raw Strings.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   To allow lossy serialization, use {@link ProtobufAnnotationSerializer#ProtobufAnnotationSerializer(boolean)}.
+ *   Otherwise, an exception is thrown if an unknown key appears in the annotation which would not be saved to th
+ *   protocol buffer.
+ *   If such keys exist, and are a part of the standard CoreNLP pipeline, please let us know!
+ *   If you would like to serialize keys in addition to those serialized by default (e.g., you are attaching
+ *   your own annotations), then you should do the following:
+ * &lt;/p&gt;
+ *
+ * &lt;ol&gt;
+ *   &lt;li&gt;
+ *     Create a .proto file which extends one or more of Document, Sentence, or Token. Each of these have fields
+ *     100-255 left open for user extensions. An example of such an extension is:
+ *     &lt;pre&gt;
+ *       package edu.stanford.nlp.pipeline;
+ *
+ *       option java_package = &quot;com.example.my.awesome.nlp.app&quot;;
+ *       option java_outer_classname = &quot;MyAppProtos&quot;;
+ *
+ *       import &quot;CoreNLP.proto&quot;;
+ *
+ *       extend Sentence {
+ *         optional uint32 myNewField    = 101;
+ *       }
+ *     &lt;/pre&gt;
+ *   &lt;/li&gt;
+ *
+ *   &lt;li&gt;
+ *     Compile your .proto file with protoc. For example (from CORENLP_HOME):
+ *     &lt;pre&gt;
+ *        protoc -I=src/edu/stanford/nlp/pipeline/:/path/to/folder/contining/your/proto/file --java_out=/path/to/output/src/folder/  /path/to/proto/file
+ *     &lt;/pre&gt;
+ *   &lt;/li&gt;
+ *
+ *   &lt;li&gt;
+ *     &lt;p&gt;
+ *     Extend {@link ProtobufAnnotationSerializer} to serialize and deserialize your field.
+ *     Generally, this entail overriding two functions -- one to write the proto and one to read it.
+ *     In both cases, you usually want to call the superclass' implementation of the function, and add on to it
+ *     from there.
+ *     In our running example, adding a field to the {@link CoreNLPProtos.Sentence} proto, you would overwrite:
+ *     &lt;/p&gt;
+ *
+ *     &lt;ul&gt;
+ *       &lt;li&gt;{@link ProtobufAnnotationSerializer#toProtoBuilder(edu.stanford.nlp.util.CoreMap, java.util.Set)}&lt;/li&gt;
+ *       &lt;li&gt;{@link ProtobufAnnotationSerializer#fromProtoNoTokens(edu.stanford.nlp.pipeline.CoreNLPProtos.Sentence)}&lt;/li&gt;
+ *     &lt;/ul&gt;
+ *
+ *     &lt;p&gt;
+ *     Note, importantly, that for the serializer to be able to check for lossless serialization, all annotations added
+ *     to the proto must be registered as added by being removed from the set passed to
+ *     {@link ProtobufAnnotationSerializer#toProtoBuilder(edu.stanford.nlp.util.CoreMap, java.util.Set)} (and the analogous
+ *     functions for documents and tokens).
+ *     &lt;/p&gt;
+ *
+ *     &lt;p&gt;
+ *       Lastly, the new annotations must be registered in the original .proto file; this can be achieved by including
+ *       a static block in the overwritten class:
+ *     &lt;/p&gt;
+ *     &lt;pre&gt;
+ *       static {
+ *         ExtensionRegistry registry = ExtensionRegistry.newInstance();
+ *         registry.add(MyAppProtos.myNewField);
+ *         CoreNLPProtos.registerAllExtensions(registry);
+ *       }
+ *     &lt;/pre&gt;
+ *   &lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ *
+ * TODOs
+ * &lt;ul&gt;
+ *   &lt;li&gt;In CoreNLP, the leaves of a tree are == to the tokens in a sentence. This is not the case for a deserialized proto.&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * @author Gabor Angeli
+ */
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">public class ProtobufAnnotationSerializer extends AnnotationSerializer {</span>
+
+  /** A global lock; necessary since dependency tree creation is not threadsafe */
+<span class="fc" id="L140">  private static final Object globalLock = &quot;I'm a lock :)&quot;;</span>
+
+  /**
+   * An exception to denote that the serialization would be lossy.
+   * This exception is thrown at serialization time.
+   *
+   * @see ProtobufAnnotationSerializer#enforceLosslessSerialization
+   * @see ProtobufAnnotationSerializer#ProtobufAnnotationSerializer(boolean)
+   */
+  public static class LossySerializationException extends RuntimeException {
+<span class="nc" id="L150">    private LossySerializationException(String msg) { super(msg); }</span>
+  }
+
+  /**
+   * If true, serialization is guaranteed to be lossless or else a runtime exception is thrown
+   * at serialization time.
+   */
+  public final boolean enforceLosslessSerialization;
+
+  /**
+   * Create a new Annotation serializer outputting to a protocol buffer format.
+   * This is guaranteed to either be a lossless compression, or throw an exception at
+   * serialization time.
+   */
+<span class="nc" id="L164">  public ProtobufAnnotationSerializer() { this(true); }</span>
+
+  /**
+   * Create a new Annotation serializer outputting to a protocol buffer format.
+   *
+   * @param enforceLosslessSerialization If set to true, a {@link ProtobufAnnotationSerializer.LossySerializationException}
+   *                                     is thrown at serialization
+   *                                     time if the serialization would be lossy. If set to false,
+   *                                     these exceptions are ignored.
+   *
+   */
+<span class="fc" id="L175">  public ProtobufAnnotationSerializer(boolean enforceLosslessSerialization) { this.enforceLosslessSerialization = enforceLosslessSerialization; }</span>
+
+  /** {@inheritDoc} */
+  @Override
+  public OutputStream write(Annotation corpus, OutputStream os) throws IOException {
+<span class="nc" id="L180">    CoreNLPProtos.Document serialized = toProto(corpus);</span>
+<span class="nc" id="L181">    serialized.writeDelimitedTo(os);</span>
+<span class="nc" id="L182">    os.flush();</span>
+<span class="nc" id="L183">    return os;</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Pair&lt;Annotation, InputStream&gt; read(InputStream is) throws IOException, ClassNotFoundException, ClassCastException {
+<span class="nc" id="L189">    CoreNLPProtos.Document doc = CoreNLPProtos.Document.parseDelimitedFrom(is);</span>
+<span class="nc" id="L190">    return Pair.makePair(fromProto(doc), is);</span>
+  }
+
+  /**
+   * Read a single protocol buffer, which constitutes the entire stream.
+   * This is in contrast to the default, where mutliple buffers may come out of the stream,
+   * and therefore each one is prepended by the length of the buffer to follow.
+   *
+   * @param in The file to read.
+   * @return A parsed Annotation.
+   * @throws IOException In case the stream cannot be read from.
+   */
+  @SuppressWarnings({&quot;UnusedDeclaration&quot;, &quot;ThrowFromFinallyBlock&quot;})
+  public Annotation readUndelimited(File in) throws IOException {
+<span class="nc" id="L204">    FileInputStream undelimited = new FileInputStream(in);</span>
+    CoreNLPProtos.Document doc;
+<span class="nc" id="L206">    try (FileInputStream delimited = new FileInputStream(in)) {</span>
+<span class="nc" id="L207">      doc = CoreNLPProtos.Document.parseFrom(delimited);</span>
+<span class="nc bnc" id="L208" title="All 8 branches missed.">    } catch (Exception e) {</span>
+<span class="nc" id="L209">      doc = CoreNLPProtos.Document.parseDelimitedFrom(undelimited);</span>
+    } finally {
+<span class="nc" id="L211">      undelimited.close();</span>
+<span class="nc" id="L212">    }</span>
+<span class="nc" id="L213">    return fromProto(doc);</span>
+  }
+
+  /**
+   * Get a particular key from a CoreMap, registering it as being retrieved.
+   * @param map The CoreMap to retrieve the key from.
+   * @param keysToRegister A set of keys to remove this key from, representing to keys which should be retrieved by the serializer.
+   * @param key The key key to retrieve.
+   * @param &lt;E&gt; The class of the item which is being retrieved.
+   * @return CoreMap.get(key)
+   */
+  private static &lt;E&gt; E getAndRegister(CoreMap map, Set&lt;Class&lt;?&gt;&gt; keysToRegister, Class&lt;? extends CoreAnnotation&lt;E&gt;&gt; key) {
+<span class="fc" id="L225">    keysToRegister.remove(key);</span>
+<span class="fc" id="L226">    return map.get(key);</span>
+  }
+
+  /**
+   * Create a CoreLabel proto from a CoreLabel instance.
+   * This is not static, as it optionally throws an exception if the serialization is lossy.
+   * @param coreLabel The CoreLabel to convert
+   * @return A protocol buffer message corresponding to this CoreLabel
+   */
+  public CoreNLPProtos.Token toProto(CoreLabel coreLabel) {
+<span class="fc" id="L236">    Set&lt;Class&lt;?&gt;&gt; keysToSerialize = new HashSet&lt;&gt;(coreLabel.keySetNotNull());</span>
+<span class="fc" id="L237">    CoreNLPProtos.Token.Builder builder = toProtoBuilder(coreLabel, keysToSerialize);</span>
+    // Completeness check
+<span class="pc bpc" id="L239" title="3 of 4 branches missed.">    if (enforceLosslessSerialization &amp;&amp; !keysToSerialize.isEmpty()) {</span>
+<span class="nc" id="L240">      throw new LossySerializationException(&quot;Keys are not being serialized: &quot; + StringUtils.join(keysToSerialize));</span>
+    }
+<span class="fc" id="L242">    return builder.build();</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   *   The method to extend by subclasses of the Protobuf Annotator if custom additions are added to Tokens.
+   *   In contrast to {@link ProtobufAnnotationSerializer#toProto(edu.stanford.nlp.ling.CoreLabel)}, this function
+   *   returns a builder that can be extended.
+   * &lt;/p&gt;
+   *
+   * @param coreLabel The sentence to save to a protocol buffer
+   * @param keysToSerialize A set tracking which keys have been saved. It's important to remove any keys added to the proto
+   *                        from this set, as the code tracks annotations to ensure lossless serialization
+   */
+  protected CoreNLPProtos.Token.Builder toProtoBuilder(CoreLabel coreLabel, Set&lt;Class&lt;?&gt;&gt; keysToSerialize) {
+<span class="fc" id="L257">    CoreNLPProtos.Token.Builder builder = CoreNLPProtos.Token.newBuilder();</span>
+<span class="fc" id="L258">    Set&lt;Class&lt;?&gt;&gt; keySet = coreLabel.keySetNotNull();</span>
+    // Remove items serialized elsewhere from the required list
+<span class="fc" id="L260">    keysToSerialize.remove(TextAnnotation.class);</span>
+<span class="fc" id="L261">    keysToSerialize.remove(SentenceIndexAnnotation.class);</span>
+<span class="fc" id="L262">    keysToSerialize.remove(DocIDAnnotation.class);</span>
+<span class="fc" id="L263">    keysToSerialize.remove(IndexAnnotation.class);</span>
+<span class="fc" id="L264">    keysToSerialize.remove(ParagraphAnnotation.class);</span>
+    // Remove items populated by number normalizer
+<span class="fc" id="L266">    keysToSerialize.remove(NumericCompositeObjectAnnotation.class);</span>
+<span class="fc" id="L267">    keysToSerialize.remove(NumericCompositeTypeAnnotation.class);</span>
+<span class="fc" id="L268">    keysToSerialize.remove(NumericCompositeValueAnnotation.class);</span>
+<span class="fc" id="L269">    keysToSerialize.remove(NumericTypeAnnotation.class);</span>
+<span class="fc" id="L270">    keysToSerialize.remove(NumericValueAnnotation.class);</span>
+    // Remove items which were never supposed to be there in the first place
+<span class="fc" id="L272">    keysToSerialize.remove(ForcedSentenceUntilEndAnnotation.class);</span>
+<span class="fc" id="L273">    keysToSerialize.remove(ForcedSentenceEndAnnotation.class);</span>
+<span class="fc" id="L274">    keysToSerialize.remove(HeadWordLabelAnnotation.class);</span>
+<span class="fc" id="L275">    keysToSerialize.remove(HeadTagLabelAnnotation.class);</span>
+    // Set the word (this may be null if the CoreLabel is storing a character (as in case of segmenter)
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">    if (coreLabel.word() != null)</span>
+<span class="fc" id="L278">      builder.setWord(coreLabel.word());</span>
+    // Optional fields
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">    if (keySet.contains(PartOfSpeechAnnotation.class)) { builder.setPos(coreLabel.tag()); keysToSerialize.remove(PartOfSpeechAnnotation.class); }</span>
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">    if (keySet.contains(ValueAnnotation.class)) { builder.setValue(coreLabel.value()); keysToSerialize.remove(ValueAnnotation.class); }</span>
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">    if (keySet.contains(CategoryAnnotation.class)) { builder.setCategory(coreLabel.category()); keysToSerialize.remove(CategoryAnnotation.class); }</span>
+<span class="fc bfc" id="L283" title="All 2 branches covered.">    if (keySet.contains(BeforeAnnotation.class)) { builder.setBefore(coreLabel.before()); keysToSerialize.remove(BeforeAnnotation.class); }</span>
+<span class="fc bfc" id="L284" title="All 2 branches covered.">    if (keySet.contains(AfterAnnotation.class)) { builder.setAfter(coreLabel.after()); keysToSerialize.remove(AfterAnnotation.class); }</span>
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">    if (keySet.contains(OriginalTextAnnotation.class)) { builder.setOriginalText(coreLabel.originalText()); keysToSerialize.remove(OriginalTextAnnotation.class); }</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">    if (keySet.contains(NamedEntityTagAnnotation.class)) { builder.setNer(coreLabel.ner()); keysToSerialize.remove(NamedEntityTagAnnotation.class); }</span>
+<span class="pc bpc" id="L287" title="1 of 2 branches missed.">    if (keySet.contains(CharacterOffsetBeginAnnotation.class)) { builder.setBeginChar(coreLabel.beginPosition()); keysToSerialize.remove(CharacterOffsetBeginAnnotation.class); }</span>
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">    if (keySet.contains(CharacterOffsetEndAnnotation.class)) { builder.setEndChar(coreLabel.endPosition()); keysToSerialize.remove(CharacterOffsetEndAnnotation.class); }</span>
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">    if (keySet.contains(LemmaAnnotation.class)) { builder.setLemma(coreLabel.lemma()); keysToSerialize.remove(LemmaAnnotation.class); }</span>
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">    if (keySet.contains(UtteranceAnnotation.class)) { builder.setUtterance(getAndRegister(coreLabel, keysToSerialize, UtteranceAnnotation.class)); }</span>
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">    if (keySet.contains(SpeakerAnnotation.class)) { builder.setSpeaker(getAndRegister(coreLabel, keysToSerialize, SpeakerAnnotation.class)); }</span>
+<span class="pc bpc" id="L292" title="1 of 2 branches missed.">    if (keySet.contains(BeginIndexAnnotation.class)) { builder.setBeginIndex(getAndRegister(coreLabel, keysToSerialize, BeginIndexAnnotation.class)); }</span>
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">    if (keySet.contains(EndIndexAnnotation.class)) { builder.setEndIndex(getAndRegister(coreLabel, keysToSerialize, EndIndexAnnotation.class)); }</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">    if (keySet.contains(TokenBeginAnnotation.class)) { builder.setTokenBeginIndex(getAndRegister(coreLabel, keysToSerialize, TokenBeginAnnotation.class)); }</span>
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">    if (keySet.contains(TokenEndAnnotation.class)) { builder.setTokenEndIndex(getAndRegister(coreLabel, keysToSerialize, TokenEndAnnotation.class)); }</span>
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">    if (keySet.contains(NormalizedNamedEntityTagAnnotation.class)) { builder.setNormalizedNER(getAndRegister(coreLabel, keysToSerialize, NormalizedNamedEntityTagAnnotation.class)); }</span>
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">    if (keySet.contains(TimexAnnotation.class)) { builder.setTimexValue(toProto(getAndRegister(coreLabel, keysToSerialize, TimexAnnotation.class))); }</span>
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">    if (keySet.contains(AnswerAnnotation.class)) { builder.setAnswer(getAndRegister(coreLabel, keysToSerialize, AnswerAnnotation.class)); }</span>
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">    if (keySet.contains(WikipediaEntityAnnotation.class)) { builder.setWikipediaEntity(getAndRegister(coreLabel, keysToSerialize, WikipediaEntityAnnotation.class)); }</span>
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">    if (keySet.contains(XmlContextAnnotation.class)) {</span>
+<span class="nc" id="L301">      builder.setHasXmlContext(true);</span>
+<span class="nc" id="L302">      builder.addAllXmlContext(getAndRegister(coreLabel, keysToSerialize, XmlContextAnnotation.class));</span>
+    } else {
+<span class="fc" id="L304">      builder.setHasXmlContext(false);</span>
+    }
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">    if (keySet.contains(CorefClusterIdAnnotation.class)) { builder.setCorefClusterID(getAndRegister(coreLabel, keysToSerialize, CorefClusterIdAnnotation.class)); }</span>
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">    if (keySet.contains(NaturalLogicAnnotations.OperatorAnnotation.class)) { builder.setOperator(toProto(getAndRegister(coreLabel, keysToSerialize, NaturalLogicAnnotations.OperatorAnnotation.class))); }</span>
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">    if (keySet.contains(NaturalLogicAnnotations.PolarityAnnotation.class)) { builder.setPolarity(toProto(getAndRegister(coreLabel, keysToSerialize, NaturalLogicAnnotations.PolarityAnnotation.class))); }</span>
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">    if (keySet.contains(SpanAnnotation.class)) {</span>
+<span class="nc" id="L310">      IntPair span = getAndRegister(coreLabel, keysToSerialize, SpanAnnotation.class);</span>
+<span class="nc" id="L311">      builder.setSpan(CoreNLPProtos.Span.newBuilder().setBegin(span.getSource()).setEnd(span.getTarget()).build());</span>
+    }
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">    if (keySet.contains(SentimentCoreAnnotations.SentimentClass.class)) { builder.setSentiment(getAndRegister(coreLabel, keysToSerialize, SentimentCoreAnnotations.SentimentClass.class)); }</span>
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">    if (keySet.contains(QuotationIndexAnnotation.class)) { builder.setQuotationIndex(getAndRegister(coreLabel, keysToSerialize, QuotationIndexAnnotation.class)); }</span>
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">    if (keySet.contains(CoNLLUFeats.class)) { builder.setConllUFeatures(toMapStringStringProto(getAndRegister(coreLabel, keysToSerialize, CoNLLUFeats.class))); }</span>
+<span class="pc bpc" id="L316" title="1 of 2 branches missed.">    if (keySet.contains(CoNLLUTokenSpanAnnotation.class)) {</span>
+<span class="nc" id="L317">      IntPair span = getAndRegister(coreLabel, keysToSerialize, CoNLLUTokenSpanAnnotation.class);</span>
+<span class="nc" id="L318">      builder.setConllUTokenSpan(CoreNLPProtos.Span.newBuilder().setBegin(span.getSource()).setEnd(span.getTarget()).build());</span>
+    }
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">    if (keySet.contains(CoNLLUMisc.class)) { builder.setConllUMisc(getAndRegister(coreLabel, keysToSerialize, CoNLLUMisc.class));}</span>
+<span class="pc bpc" id="L321" title="1 of 2 branches missed.">    if (keySet.contains(CoarseTagAnnotation.class)) { builder.setCoarseTag(getAndRegister(coreLabel, keysToSerialize, CoarseTagAnnotation.class));}</span>
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">    if (keySet.contains(CoNLLUSecondaryDepsAnnotation.class)) { builder.setConllUSecondaryDeps(toMapIntStringProto(getAndRegister(coreLabel, keysToSerialize, CoNLLUSecondaryDepsAnnotation.class)));}</span>
+
+        // Non-default annotators
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">    if (keySet.contains(GenderAnnotation.class)) { builder.setGender(getAndRegister(coreLabel, keysToSerialize, GenderAnnotation.class)); }</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">    if (keySet.contains(TrueCaseAnnotation.class)) { builder.setTrueCase(getAndRegister(coreLabel, keysToSerialize, TrueCaseAnnotation.class)); }</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">    if (keySet.contains(TrueCaseTextAnnotation.class)) { builder.setTrueCaseText(getAndRegister(coreLabel, keysToSerialize, TrueCaseTextAnnotation.class)); }</span>
+
+    // Chinese character related stuff
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">    if (keySet.contains(ChineseCharAnnotation.class)) { builder.setChineseChar(getAndRegister(coreLabel, keysToSerialize, ChineseCharAnnotation.class)); }</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">    if (keySet.contains(ChineseSegAnnotation.class)) { builder.setChineseSeg(getAndRegister(coreLabel, keysToSerialize, ChineseSegAnnotation.class)); }</span>
+
+    // Return
+<span class="fc" id="L334">    return builder;</span>
+  }
+
+  /**
+   * Create a protobuf builder, rather than a compiled protobuf.
+   * Useful for, e.g., the simple CoreNLP interface.
+   * @param sentence The sentence to serialize.
+   * @return A Sentence builder.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public CoreNLPProtos.Sentence.Builder toProtoBuilder(CoreMap sentence) {
+<span class="fc" id="L345">    return toProtoBuilder(sentence, Collections.EMPTY_SET);</span>
+  }
+
+  /**
+   * Create a Sentence proto from a CoreMap instance.
+   * This is not static, as it optionally throws an exception if the serialization is lossy.
+   * @param sentence The CoreMap to convert. Note that it should not be a CoreLabel or an Annotation,
+   *                 and should represent a sentence.
+   * @return A protocol buffer message corresponding to this sentence
+   * @throws IllegalArgumentException If the sentence is not a valid sentence (e.g., is a document or a word).
+   */
+  public CoreNLPProtos.Sentence toProto(CoreMap sentence) {
+<span class="fc" id="L357">    Set&lt;Class&lt;?&gt;&gt; keysToSerialize = new HashSet&lt;&gt;(sentence.keySet());</span>
+<span class="fc" id="L358">    CoreNLPProtos.Sentence.Builder builder = toProtoBuilder(sentence, keysToSerialize);</span>
+    // Completeness check
+<span class="pc bpc" id="L360" title="3 of 4 branches missed.">    if (enforceLosslessSerialization &amp;&amp; !keysToSerialize.isEmpty()) {</span>
+<span class="nc" id="L361">      throw new LossySerializationException(&quot;Keys are not being serialized: &quot; + StringUtils.join(keysToSerialize));</span>
+    }
+<span class="fc" id="L363">    return builder.build();</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   *   The method to extend by subclasses of the Protobuf Annotator if custom additions are added to Tokens.
+   *   In contrast to {@link ProtobufAnnotationSerializer#toProto(edu.stanford.nlp.ling.CoreLabel)}, this function
+   *   returns a builder that can be extended.
+   * &lt;/p&gt;
+   *
+   * @param sentence The sentence to save to a protocol buffer
+   * @param keysToSerialize A set tracking which keys have been saved. It's important to remove any keys added to the proto
+   *                        from this set, as the code tracks annotations to ensure lossless serialization.
+   */
+  @SuppressWarnings(&quot;deprecation&quot;)
+  protected CoreNLPProtos.Sentence.Builder toProtoBuilder(CoreMap sentence, Set&lt;Class&lt;?&gt;&gt; keysToSerialize) {
+    // Error checks
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">    if (sentence instanceof CoreLabel) { throw new IllegalArgumentException(&quot;CoreMap is actually a CoreLabel&quot;); }</span>
+<span class="fc" id="L381">    CoreNLPProtos.Sentence.Builder builder = CoreNLPProtos.Sentence.newBuilder();</span>
+    // Remove items serialized elsewhere from the required list
+<span class="fc" id="L383">    keysToSerialize.remove(TextAnnotation.class);</span>
+<span class="fc" id="L384">    keysToSerialize.remove(NumerizedTokensAnnotation.class);</span>
+    // Required fields
+<span class="fc" id="L386">    builder.setTokenOffsetBegin(getAndRegister(sentence, keysToSerialize, TokenBeginAnnotation.class));</span>
+<span class="fc" id="L387">    builder.setTokenOffsetEnd(getAndRegister(sentence, keysToSerialize, TokenEndAnnotation.class));</span>
+    // Get key set of CoreMap
+    Set&lt;Class&lt;?&gt;&gt; keySet;
+<span class="pc bpc" id="L390" title="1 of 2 branches missed.">    if (sentence instanceof ArrayCoreMap) {</span>
+<span class="fc" id="L391">       keySet = ((ArrayCoreMap) sentence).keySetNotNull();</span>
+    } else {
+<span class="nc" id="L393">      keySet = new IdentityHashSet&lt;&gt;(sentence.keySet());</span>
+    }
+    // Tokens
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">    if (sentence.containsKey(TokensAnnotation.class)) {</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">      for (CoreLabel tok : sentence.get(TokensAnnotation.class)) { builder.addToken(toProto(tok)); }</span>
+<span class="fc" id="L398">      keysToSerialize.remove(TokensAnnotation.class);</span>
+    }
+    // Characters
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">    if (sentence.containsKey(SegmenterCoreAnnotations.CharactersAnnotation.class)) {</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">      for (CoreLabel c : sentence.get(SegmenterCoreAnnotations.CharactersAnnotation.class)) {</span>
+<span class="nc" id="L403">        builder.addCharacter(toProto(c));</span>
+<span class="nc" id="L404">      }</span>
+<span class="nc" id="L405">      keysToSerialize.remove(SegmenterCoreAnnotations.CharactersAnnotation.class);</span>
+    }
+    // Optional fields
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">    if (keySet.contains(SentenceIndexAnnotation.class)) { builder.setSentenceIndex(getAndRegister(sentence, keysToSerialize, SentenceIndexAnnotation.class)); }</span>
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">    if (keySet.contains(CharacterOffsetBeginAnnotation.class)) { builder.setCharacterOffsetBegin(getAndRegister(sentence, keysToSerialize, CharacterOffsetBeginAnnotation.class)); }</span>
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">    if (keySet.contains(CharacterOffsetEndAnnotation.class)) { builder.setCharacterOffsetEnd(getAndRegister(sentence, keysToSerialize, CharacterOffsetEndAnnotation.class)); }</span>
+<span class="pc bpc" id="L411" title="1 of 2 branches missed.">    if (keySet.contains(TreeAnnotation.class)) { builder.setParseTree(toProto(getAndRegister(sentence, keysToSerialize, TreeAnnotation.class))); }</span>
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">    if (keySet.contains(BinarizedTreeAnnotation.class)) { builder.setBinarizedParseTree(toProto(getAndRegister(sentence, keysToSerialize, BinarizedTreeAnnotation.class))); }</span>
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">    if (keySet.contains(KBestTreesAnnotation.class)) {</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">      for (Tree tree : sentence.get(KBestTreesAnnotation.class)) {</span>
+<span class="nc" id="L415">        builder.addKBestParseTrees(toProto(tree));</span>
+<span class="nc" id="L416">        keysToSerialize.remove(KBestTreesAnnotation.class);</span>
+<span class="nc" id="L417">      }</span>
+    }
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">    if (keySet.contains(SentimentCoreAnnotations.SentimentAnnotatedTree.class)) { builder.setAnnotatedParseTree(toProto(getAndRegister(sentence, keysToSerialize, SentimentCoreAnnotations.SentimentAnnotatedTree.class))); }</span>
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">    if (keySet.contains(SentimentCoreAnnotations.SentimentClass.class)) { builder.setSentiment(getAndRegister(sentence, keysToSerialize, SentimentCoreAnnotations.SentimentClass.class)); }</span>
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">    if (keySet.contains(BasicDependenciesAnnotation.class)) { builder.setBasicDependencies(toProto(getAndRegister(sentence, keysToSerialize, BasicDependenciesAnnotation.class))); }</span>
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">    if (keySet.contains(CollapsedDependenciesAnnotation.class)) { builder.setCollapsedDependencies(toProto(getAndRegister(sentence, keysToSerialize, CollapsedDependenciesAnnotation.class))); }</span>
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">    if (keySet.contains(CollapsedCCProcessedDependenciesAnnotation.class)) { builder.setCollapsedCCProcessedDependencies(toProto(getAndRegister(sentence, keysToSerialize, CollapsedCCProcessedDependenciesAnnotation.class))); }</span>
+<span class="pc bpc" id="L424" title="1 of 2 branches missed.">    if (keySet.contains(AlternativeDependenciesAnnotation.class)) { builder.setAlternativeDependencies(toProto(getAndRegister(sentence, keysToSerialize, AlternativeDependenciesAnnotation.class))); }</span>
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">    if (keySet.contains(EnhancedDependenciesAnnotation.class)) { builder.setEnhancedDependencies(toProto(getAndRegister(sentence, keysToSerialize, EnhancedDependenciesAnnotation.class))); }</span>
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">    if (keySet.contains(EnhancedPlusPlusDependenciesAnnotation.class)) { builder.setEnhancedPlusPlusDependencies(toProto(getAndRegister(sentence, keysToSerialize, EnhancedPlusPlusDependenciesAnnotation.class))); }</span>
+<span class="pc bpc" id="L427" title="2 of 4 branches missed.">    if (keySet.contains(TokensAnnotation.class) &amp;&amp; getAndRegister(sentence, keysToSerialize, TokensAnnotation.class).size() &gt; 0 &amp;&amp;</span>
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">        getAndRegister(sentence, keysToSerialize, TokensAnnotation.class).get(0).containsKey(ParagraphAnnotation.class)) {</span>
+<span class="nc" id="L429">      builder.setParagraph(getAndRegister(sentence, keysToSerialize, TokensAnnotation.class).get(0).get(ParagraphAnnotation.class));</span>
+    }
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">    if (keySet.contains(NumerizedTokensAnnotation.class)) { builder.setHasNumerizedTokensAnnotation(true); } else { builder.setHasNumerizedTokensAnnotation(false); }</span>
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">    if (keySet.contains(NaturalLogicAnnotations.EntailedSentencesAnnotation.class)) {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">      for (SentenceFragment entailedSentence : getAndRegister(sentence, keysToSerialize, NaturalLogicAnnotations.EntailedSentencesAnnotation.class)) {</span>
+<span class="nc" id="L434">        builder.addEntailedSentence(toProto(entailedSentence));</span>
+<span class="nc" id="L435">      }</span>
+    }
+<span class="pc bpc" id="L437" title="1 of 2 branches missed.">    if (keySet.contains(NaturalLogicAnnotations.RelationTriplesAnnotation.class)) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      for (RelationTriple triple : getAndRegister(sentence, keysToSerialize, NaturalLogicAnnotations.RelationTriplesAnnotation.class)) {</span>
+<span class="nc" id="L439">        builder.addOpenieTriple(toProto(triple));</span>
+<span class="nc" id="L440">      }</span>
+    }
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">    if (keySet.contains(KBPTriplesAnnotation.class)) {</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">      for (RelationTriple triple : getAndRegister(sentence, keysToSerialize, KBPTriplesAnnotation.class)) {</span>
+<span class="nc" id="L444">        builder.addKbpTriple(toProto(triple));</span>
+<span class="nc" id="L445">      }</span>
+    }
+    // Non-default annotators
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">    if (keySet.contains(EntityMentionsAnnotation.class)) {</span>
+<span class="nc" id="L449">      builder.setHasRelationAnnotations(true);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">      for (EntityMention entity : getAndRegister(sentence, keysToSerialize, EntityMentionsAnnotation.class)) {</span>
+<span class="nc" id="L451">        builder.addEntity(toProto(entity));</span>
+<span class="nc" id="L452">      }</span>
+    } else {
+<span class="fc" id="L454">      builder.setHasRelationAnnotations(false);</span>
+    }
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">    if (keySet.contains(RelationMentionsAnnotation.class)) {</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">      if (!builder.getHasRelationAnnotations()) { throw new IllegalStateException(&quot;Registered entity mentions without relation mentions&quot;); }</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">      for (RelationMention relation : getAndRegister(sentence, keysToSerialize, RelationMentionsAnnotation.class)) {</span>
+<span class="nc" id="L459">        builder.addRelation(toProto(relation));</span>
+<span class="nc" id="L460">      }</span>
+    }
+    // add each of the mentions in the List&lt;Mentions&gt; for this sentence
+<span class="pc bpc" id="L463" title="1 of 2 branches missed.">    if (keySet.contains(CorefMentionsAnnotation.class)) {</span>
+<span class="nc" id="L464">      builder.setHasCorefMentionsAnnotation(true);</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">      for (Mention m : sentence.get(CorefMentionsAnnotation.class)) {</span>
+<span class="nc" id="L466">        builder.addMentionsForCoref(toProto(m));</span>
+<span class="nc" id="L467">      }</span>
+<span class="nc" id="L468">      keysToSerialize.remove(CorefMentionsAnnotation.class);</span>
+    }
+    // Entity mentions
+<span class="pc bpc" id="L471" title="1 of 2 branches missed.">    if (keySet.contains(MentionsAnnotation.class)) {</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">      for (CoreMap mention : sentence.get(MentionsAnnotation.class)) {</span>
+<span class="nc" id="L473">        builder.addMentions(toProtoMention(mention));</span>
+<span class="nc" id="L474">      }</span>
+<span class="nc" id="L475">      keysToSerialize.remove(MentionsAnnotation.class);</span>
+    }
+    // add a sentence id if it exists
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">    if (keySet.contains(SentenceIDAnnotation.class)) builder.setSentenceID(getAndRegister(sentence, keysToSerialize, SentenceIDAnnotation.class));</span>
+    // Return
+<span class="fc" id="L480">    return builder;</span>
+  }
+
+  /**
+   * Create a Document proto from a CoreMap instance.
+   * This is not static, as it optionally throws an exception if the serialization is lossy.
+   * @param doc The Annotation to convert.
+   * @return A protocol buffer message corresponding to this document
+   */
+  public CoreNLPProtos.Document toProto(Annotation doc) {
+<span class="nc" id="L490">    Set&lt;Class&lt;?&gt;&gt; keysToSerialize = new HashSet&lt;&gt;(doc.keySet());</span>
+<span class="nc" id="L491">    keysToSerialize.remove(TokensAnnotation.class);  // note(gabor): tokens are saved in the sentence</span>
+<span class="nc" id="L492">    CoreNLPProtos.Document.Builder builder = toProtoBuilder(doc, keysToSerialize);</span>
+    // Completeness Check
+<span class="nc bnc" id="L494" title="All 4 branches missed.">    if (enforceLosslessSerialization &amp;&amp; !keysToSerialize.isEmpty()) {</span>
+<span class="nc" id="L495">      throw new LossySerializationException(&quot;Keys are not being serialized: &quot; + StringUtils.join(keysToSerialize));</span>
+    }
+<span class="nc" id="L497">    return builder.build();</span>
+  }
+
+  /**
+   * Create a protobuf builder, rather than a compiled protobuf.
+   * Useful for, e.g., the simple CoreNLP interface.
+   * @param doc The document to serialize.
+   * @return A Document builder.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public CoreNLPProtos.Document.Builder toProtoBuilder(Annotation doc) {
+<span class="fc" id="L508">    return toProtoBuilder(doc, Collections.EMPTY_SET);</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   *   The method to extend by subclasses of the Protobuf Annotator if custom additions are added to Tokens.
+   *   In contrast to {@link ProtobufAnnotationSerializer#toProto(edu.stanford.nlp.ling.CoreLabel)}, this function
+   *   returns a builder that can be extended.
+   * &lt;/p&gt;
+   *
+   * @param doc The sentence to save to a protocol buffer
+   * @param keysToSerialize A set tracking which keys have been saved. It's important to remove any keys added to the proto
+   *                        from this set, as the code tracks annotations to ensure lossless serializationA set tracking which keys have been saved. It's important to remove any keys added to the proto*
+   *                        from this set, as the code tracks annotations to ensure lossless serialization.
+   */
+  protected CoreNLPProtos.Document.Builder toProtoBuilder(Annotation doc, Set&lt;Class&lt;?&gt;&gt; keysToSerialize) {
+<span class="fc" id="L524">    CoreNLPProtos.Document.Builder builder = CoreNLPProtos.Document.newBuilder();</span>
+    // Required fields
+<span class="fc" id="L526">    builder.setText(doc.get(TextAnnotation.class));</span>
+<span class="fc" id="L527">    keysToSerialize.remove(TextAnnotation.class);</span>
+    // Optional fields
+<span class="pc bpc" id="L529" title="1 of 2 branches missed.">    if (doc.containsKey(SentencesAnnotation.class)) {</span>
+<span class="fc bfc" id="L530" title="All 2 branches covered.">      for (CoreMap sentence : doc.get(SentencesAnnotation.class)) { builder.addSentence(toProto(sentence)); }</span>
+<span class="fc" id="L531">      keysToSerialize.remove(SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">    } else if (doc.containsKey(TokensAnnotation.class)) {</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">      for (CoreLabel token : doc.get(TokensAnnotation.class)) { builder.addSentencelessToken(toProto(token)); }</span>
+    }
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">    if (doc.containsKey(DocIDAnnotation.class)) {</span>
+<span class="nc" id="L536">      builder.setDocID(doc.get(DocIDAnnotation.class));</span>
+<span class="nc" id="L537">      keysToSerialize.remove(DocIDAnnotation.class);</span>
+    }
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">    if (doc.containsKey(DocDateAnnotation.class)) {</span>
+<span class="nc" id="L540">      builder.setDocDate(doc.get(DocDateAnnotation.class));</span>
+<span class="nc" id="L541">      keysToSerialize.remove(DocDateAnnotation.class);</span>
+    }
+<span class="pc bpc" id="L543" title="1 of 2 branches missed.">    if (doc.containsKey(CalendarAnnotation.class)) {</span>
+<span class="nc" id="L544">      builder.setCalendar(doc.get(CalendarAnnotation.class).toInstant().toEpochMilli());</span>
+<span class="nc" id="L545">      keysToSerialize.remove(CalendarAnnotation.class);</span>
+    }
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">    if (doc.containsKey(CorefChainAnnotation.class)) {</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      for (Map.Entry&lt;Integer, CorefChain&gt; chain : doc.get(CorefChainAnnotation.class).entrySet()) {</span>
+<span class="nc" id="L549">       builder.addCorefChain(toProto(chain.getValue()));</span>
+<span class="nc" id="L550">      }</span>
+<span class="nc" id="L551">      keysToSerialize.remove(CorefChainAnnotation.class);</span>
+    }
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">    if (doc.containsKey(QuotationsAnnotation.class)) {</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">      for (CoreMap quote : doc.get(QuotationsAnnotation.class)) {</span>
+<span class="nc" id="L555">        builder.addQuote(toProtoQuote(quote));</span>
+<span class="nc" id="L556">      }</span>
+<span class="nc" id="L557">      keysToSerialize.remove(QuotationsAnnotation.class);</span>
+    }
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">    if (doc.containsKey(MentionsAnnotation.class)) {</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">      for (CoreMap mention : doc.get(MentionsAnnotation.class)) {</span>
+<span class="nc" id="L561">        builder.addMentions(toProtoMention(mention));</span>
+<span class="nc" id="L562">      }</span>
+<span class="nc" id="L563">      keysToSerialize.remove(MentionsAnnotation.class);</span>
+    }
+    // add character info from segmenter
+<span class="pc bpc" id="L566" title="1 of 2 branches missed.">    if (doc.containsKey(SegmenterCoreAnnotations.CharactersAnnotation.class)) {</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">      for (CoreLabel c : doc.get(SegmenterCoreAnnotations.CharactersAnnotation.class)) {</span>
+<span class="nc" id="L568">        builder.addCharacter(toProto(c));</span>
+<span class="nc" id="L569">      }</span>
+<span class="nc" id="L570">      keysToSerialize.remove(SegmenterCoreAnnotations.CharactersAnnotation.class);</span>
+    }
+    // Return
+<span class="fc" id="L573">    return builder;</span>
+  }
+
+  /**
+   * Create a ParseTree proto from a Tree. If the Tree is a scored tree, the scores will
+   * be preserved.
+   * @param parseTree The parse tree to convert.
+   * @return A protocol buffer message corresponding to this tree.
+   */
+  public CoreNLPProtos.ParseTree toProto(Tree parseTree) {
+<span class="nc" id="L583">    CoreNLPProtos.ParseTree.Builder builder = CoreNLPProtos.ParseTree.newBuilder();</span>
+    // Required fields
+<span class="nc bnc" id="L585" title="All 2 branches missed.">    for (Tree child : parseTree.children()) { builder.addChild(toProto(child)); }</span>
+    // Optional fields
+<span class="nc" id="L587">    IntPair span = parseTree.getSpan();</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">    if (span != null) {</span>
+<span class="nc" id="L589">      builder.setYieldBeginIndex(span.getSource());</span>
+<span class="nc" id="L590">      builder.setYieldEndIndex(span.getTarget());</span>
+    }
+<span class="nc bnc" id="L592" title="All 2 branches missed.">    if (parseTree.label() != null) {</span>
+<span class="nc" id="L593">      builder.setValue(parseTree.label().value());</span>
+    }
+<span class="nc bnc" id="L595" title="All 2 branches missed.">    if (!Double.isNaN(parseTree.score())) {</span>
+<span class="nc" id="L596">      builder.setScore(parseTree.score());</span>
+    }
+    Integer sentiment;
+<span class="nc bnc" id="L599" title="All 4 branches missed.">    if (parseTree.label() instanceof CoreMap &amp;&amp; (sentiment = ((CoreMap) parseTree.label()).get(RNNCoreAnnotations.PredictedClass.class)) != null) {</span>
+<span class="nc" id="L600">      builder.setSentiment(CoreNLPProtos.Sentiment.valueOf(sentiment));</span>
+    }
+    // Return
+<span class="nc" id="L603">    return builder.build();</span>
+  }
+
+  /**
+   * Create a compact representation of the semantic graph for this dependency parse.
+   * @param graph The dependency graph to save.
+   * @return A protocol buffer message corresponding to this parse.
+   */
+  public static CoreNLPProtos.DependencyGraph toProto(SemanticGraph graph) {
+<span class="nc" id="L612">    CoreNLPProtos.DependencyGraph.Builder builder = CoreNLPProtos.DependencyGraph.newBuilder();</span>
+    // Roots
+<span class="nc" id="L614">    Set&lt;Integer&gt; rootSet = graph.getRoots().stream().map(IndexedWord::index).collect(Collectors.toCollection(IdentityHashSet::new));</span>
+    // Nodes
+<span class="nc bnc" id="L616" title="All 2 branches missed.">    for (IndexedWord node : graph.vertexSet()) {</span>
+      // Register node
+<span class="nc" id="L618">      CoreNLPProtos.DependencyGraph.Node.Builder nodeBuilder = CoreNLPProtos.DependencyGraph.Node.newBuilder()</span>
+<span class="nc" id="L619">          .setSentenceIndex(node.get(SentenceIndexAnnotation.class))</span>
+<span class="nc" id="L620">          .setIndex(node.index());</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">      if (node.copyCount() &gt; 0) {</span>
+<span class="nc" id="L622">        nodeBuilder.setCopyAnnotation(node.copyCount());</span>
+      }
+<span class="nc" id="L624">      builder.addNode(nodeBuilder.build());</span>
+      // Register root
+<span class="nc bnc" id="L626" title="All 2 branches missed.">      if (rootSet.contains(node.index())) {</span>
+<span class="nc" id="L627">        builder.addRoot(node.index());</span>
+      }
+<span class="nc" id="L629">    }</span>
+    // Edges
+<span class="nc bnc" id="L631" title="All 2 branches missed.">    for (SemanticGraphEdge edge : graph.edgeIterable()) {</span>
+      // Set edge
+<span class="nc" id="L633">      builder.addEdge(CoreNLPProtos.DependencyGraph.Edge.newBuilder()</span>
+<span class="nc" id="L634">          .setSource(edge.getSource().index())</span>
+<span class="nc" id="L635">          .setTarget(edge.getTarget().index())</span>
+<span class="nc" id="L636">          .setDep(edge.getRelation().toString())</span>
+<span class="nc" id="L637">          .setIsExtra(edge.isExtra())</span>
+<span class="nc" id="L638">          .setSourceCopy(edge.getSource().copyCount())</span>
+<span class="nc" id="L639">          .setTargetCopy(edge.getTarget().copyCount())</span>
+<span class="nc" id="L640">          .setLanguage(toProto(edge.getRelation().getLanguage())));</span>
+<span class="nc" id="L641">    }</span>
+    // Return
+<span class="nc" id="L643">    return builder.build();</span>
+  }
+  /**
+   * Create a CorefChain protocol buffer from the given coref chain.
+   * @param chain The coref chain to convert.
+   * @return A protocol buffer message corresponding to this chain.
+   */
+  public CoreNLPProtos.CorefChain toProto(CorefChain chain) {
+<span class="nc" id="L651">    CoreNLPProtos.CorefChain.Builder builder = CoreNLPProtos.CorefChain.newBuilder();</span>
+    // Set ID
+<span class="nc" id="L653">    builder.setChainID(chain.getChainID());</span>
+    // Set mentions
+<span class="nc" id="L655">    Map&lt;CorefChain.CorefMention, Integer&gt; mentionToIndex = new IdentityHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">    for (Map.Entry&lt;IntPair, Set&lt;CorefChain.CorefMention&gt;&gt; entry : chain.getMentionMap().entrySet()) {</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">      for (CorefChain.CorefMention mention : entry.getValue()) {</span>
+<span class="nc" id="L658">        mentionToIndex.put(mention, mentionToIndex.size());</span>
+<span class="nc" id="L659">        builder.addMention(CoreNLPProtos.CorefChain.CorefMention.newBuilder()</span>
+<span class="nc" id="L660">            .setMentionID(mention.mentionID)</span>
+<span class="nc" id="L661">            .setMentionType(mention.mentionType.name())</span>
+<span class="nc" id="L662">            .setNumber(mention.number.name())</span>
+<span class="nc" id="L663">            .setGender(mention.gender.name())</span>
+<span class="nc" id="L664">            .setAnimacy(mention.animacy.name())</span>
+<span class="nc" id="L665">            .setBeginIndex(mention.startIndex - 1)</span>
+<span class="nc" id="L666">            .setEndIndex(mention.endIndex - 1)</span>
+<span class="nc" id="L667">            .setHeadIndex(mention.headIndex - 1)</span>
+<span class="nc" id="L668">            .setSentenceIndex(mention.sentNum - 1)</span>
+<span class="nc" id="L669">            .setPosition(mention.position.get(1)) );</span>
+<span class="nc" id="L670">      }</span>
+<span class="nc" id="L671">    }</span>
+    // Set representative mention
+<span class="nc" id="L673">    builder.setRepresentative(mentionToIndex.get(chain.getRepresentativeMention()));</span>
+    // Return
+<span class="nc" id="L675">    return builder.build();</span>
+  }
+
+  public CoreNLPProtos.IndexedWord createIndexedWordProtoFromIW(IndexedWord iw) {
+<span class="nc" id="L679">    CoreNLPProtos.IndexedWord.Builder builder = CoreNLPProtos.IndexedWord.newBuilder();</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">    if (iw == null) {</span>
+<span class="nc" id="L681">      builder.setSentenceNum(-1);</span>
+<span class="nc" id="L682">      builder.setTokenIndex(-1);</span>
+    } else {
+<span class="nc" id="L684">      builder.setSentenceNum(iw.get(SentenceIndexAnnotation.class) - 1);</span>
+<span class="nc" id="L685">      builder.setTokenIndex(iw.get(IndexAnnotation.class) - 1);</span>
+<span class="nc" id="L686">      builder.setCopyCount(iw.copyCount());</span>
+    }
+<span class="nc" id="L688">    return builder.build();</span>
+
+  }
+
+  public CoreNLPProtos.IndexedWord createIndexedWordProtoFromCL(CoreLabel cl) {
+<span class="nc" id="L693">    CoreNLPProtos.IndexedWord.Builder builder = CoreNLPProtos.IndexedWord.newBuilder();</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">    if (cl == null) {</span>
+<span class="nc" id="L695">      builder.setSentenceNum(-1);</span>
+<span class="nc" id="L696">      builder.setTokenIndex(-1);</span>
+    } else {
+<span class="nc" id="L698">      builder.setSentenceNum(cl.get(SentenceIndexAnnotation.class) - 1);</span>
+<span class="nc" id="L699">      builder.setTokenIndex(cl.get(IndexAnnotation.class) - 1);</span>
+    }
+<span class="nc" id="L701">    return builder.build();</span>
+  }
+
+  public CoreNLPProtos.Mention toProto(Mention mention) {
+
+    // create the builder
+<span class="nc" id="L707">    CoreNLPProtos.Mention.Builder builder = CoreNLPProtos.Mention.newBuilder();</span>
+
+    // set enums
+<span class="nc bnc" id="L710" title="All 2 branches missed.">    if (mention.mentionType != null) { builder.setMentionType(mention.mentionType.name()); }</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">    if (mention.gender != null) { builder.setGender(mention.gender.name()); }</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">    if (mention.number != null) { builder.setNumber(mention.number.name()); }</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">    if (mention.animacy != null) { builder.setAnimacy(mention.animacy.name()); }</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">    if (mention.person != null) { builder.setPerson(mention.person.name()); }</span>
+
+<span class="nc bnc" id="L716" title="All 2 branches missed.">    if (mention.headString != null) {</span>
+<span class="nc" id="L717">      builder.setHeadString(mention.headString);</span>
+    }
+<span class="nc bnc" id="L719" title="All 2 branches missed.">    if (mention.nerString != null) {</span>
+<span class="nc" id="L720">      builder.setNerString(mention.nerString);</span>
+    }
+
+<span class="nc" id="L723">    builder.setStartIndex(mention.startIndex);</span>
+<span class="nc" id="L724">    builder.setEndIndex(mention.endIndex);</span>
+<span class="nc" id="L725">    builder.setHeadIndex(mention.headIndex);</span>
+<span class="nc" id="L726">    builder.setMentionID(mention.mentionID);</span>
+<span class="nc" id="L727">    builder.setOriginalRef(mention.originalRef);</span>
+<span class="nc" id="L728">    builder.setGoldCorefClusterID(mention.goldCorefClusterID);</span>
+<span class="nc" id="L729">    builder.setCorefClusterID(mention.corefClusterID);</span>
+<span class="nc" id="L730">    builder.setMentionNum(mention.mentionNum);</span>
+<span class="nc" id="L731">    builder.setSentNum(mention.sentNum);</span>
+<span class="nc" id="L732">    builder.setUtter(mention.utter);</span>
+<span class="nc" id="L733">    builder.setParagraph(mention.paragraph);</span>
+<span class="nc" id="L734">    builder.setIsSubject(mention.isSubject);</span>
+<span class="nc" id="L735">    builder.setIsDirectObject(mention.isDirectObject);</span>
+<span class="nc" id="L736">    builder.setIsIndirectObject(mention.isIndirectObject);</span>
+<span class="nc" id="L737">    builder.setIsPrepositionObject(mention.isPrepositionObject);</span>
+<span class="nc" id="L738">    builder.setHasTwin(mention.hasTwin);</span>
+<span class="nc" id="L739">    builder.setGeneric(mention.generic);</span>
+<span class="nc" id="L740">    builder.setIsSingleton(mention.isSingleton);</span>
+
+    // handle the two sets of Strings
+<span class="nc bnc" id="L743" title="All 2 branches missed.">    if (mention.dependents != null) {</span>
+<span class="nc" id="L744">      mention.dependents.forEach(builder::addDependents);</span>
+    }
+
+<span class="nc bnc" id="L747" title="All 2 branches missed.">    if (mention.preprocessedTerms != null) {</span>
+<span class="nc" id="L748">      mention.preprocessedTerms.forEach(builder::addPreprocessedTerms);</span>
+    }
+
+    // set IndexedWords by storing (sentence number, token index) pairs
+<span class="nc" id="L752">    builder.setDependingVerb(createIndexedWordProtoFromIW(mention.dependingVerb));</span>
+<span class="nc" id="L753">    builder.setHeadIndexedWord(createIndexedWordProtoFromIW(mention.headIndexedWord));</span>
+<span class="nc" id="L754">    builder.setHeadWord(createIndexedWordProtoFromCL(mention.headWord));</span>
+    //CoreLabel headWord = (mention.headWord != null) ? mention.headWord : null;
+    //builder.setHeadWord(createCoreLabelPositionProto(mention.headWord));
+
+    // add positions for each CoreLabel in sentence
+<span class="nc bnc" id="L759" title="All 2 branches missed.">    if (mention.sentenceWords != null) {</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">      for (CoreLabel cl : mention.sentenceWords) {</span>
+<span class="nc" id="L761">        builder.addSentenceWords(createIndexedWordProtoFromCL(cl));</span>
+<span class="nc" id="L762">      }</span>
+    }
+
+<span class="nc bnc" id="L765" title="All 2 branches missed.">    if (mention.originalSpan != null) {</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">      for (CoreLabel cl : mention.originalSpan) {</span>
+<span class="nc" id="L767">        builder.addOriginalSpan(createIndexedWordProtoFromCL(cl));</span>
+<span class="nc" id="L768">      }</span>
+    }
+
+    // flag if this Mention should get basicDependency, collapsedDependency, and contextParseTree or not
+<span class="nc bnc" id="L772" title="All 2 branches missed.">    builder.setHasBasicDependency((mention.basicDependency != null));</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">    builder.setHasEnhancedDepenedncy((mention.enhancedDependency != null));</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">    builder.setHasContextParseTree((mention.contextParseTree != null));</span>
+
+    // handle the sets of Mentions, just store mentionID
+<span class="nc bnc" id="L777" title="All 2 branches missed.">    if (mention.appositions != null) {</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">      for (Mention m : mention.appositions) {</span>
+<span class="nc" id="L779">        builder.addAppositions(m.mentionID);</span>
+<span class="nc" id="L780">      }</span>
+    }
+
+<span class="nc bnc" id="L783" title="All 2 branches missed.">    if (mention.predicateNominatives != null) {</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">      for (Mention m : mention.predicateNominatives) {</span>
+<span class="nc" id="L785">        builder.addPredicateNominatives(m.mentionID);</span>
+<span class="nc" id="L786">      }</span>
+    }
+
+<span class="nc bnc" id="L789" title="All 2 branches missed.">    if (mention.relativePronouns != null) {</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">      for (Mention m : mention.relativePronouns) {</span>
+<span class="nc" id="L791">        builder.addRelativePronouns(m.mentionID);</span>
+<span class="nc" id="L792">      }</span>
+    }
+
+<span class="nc bnc" id="L795" title="All 2 branches missed.">    if (mention.listMembers != null) {</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">      for (Mention m : mention.listMembers) {</span>
+<span class="nc" id="L797">        builder.addListMembers(m.mentionID);</span>
+<span class="nc" id="L798">      }</span>
+    }
+
+<span class="nc bnc" id="L801" title="All 2 branches missed.">    if (mention.belongToLists != null) {</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">      for (Mention m : mention.belongToLists) {</span>
+<span class="nc" id="L803">        builder.addBelongToLists(m.mentionID);</span>
+<span class="nc" id="L804">      }</span>
+    }
+
+<span class="nc bnc" id="L807" title="All 2 branches missed.">    if (mention.speakerInfo != null) {</span>
+<span class="nc" id="L808">      builder.setSpeakerInfo(toProto(mention.speakerInfo));</span>
+    }
+
+<span class="nc" id="L811">    return builder.build();</span>
+  }
+
+  public CoreNLPProtos.SpeakerInfo toProto(SpeakerInfo speakerInfo) {
+<span class="nc" id="L815">    CoreNLPProtos.SpeakerInfo.Builder builder = CoreNLPProtos.SpeakerInfo.newBuilder();</span>
+<span class="nc" id="L816">    builder.setSpeakerName(speakerInfo.getSpeakerName());</span>
+    // mentionID's should be set by MentionAnnotator
+<span class="nc bnc" id="L818" title="All 2 branches missed.">    for (Mention m : speakerInfo.getMentions()) {</span>
+<span class="nc" id="L819">      builder.addMentions(m.mentionID);</span>
+<span class="nc" id="L820">    }</span>
+<span class="nc" id="L821">    return builder.build();</span>
+  }
+
+
+  /**
+   * Convert the given Timex object to a protocol buffer.
+   * @param timex The timex to convert.
+   * @return A protocol buffer corresponding to this Timex object.
+   */
+  public CoreNLPProtos.Timex toProto(Timex timex) {
+<span class="nc" id="L831">    CoreNLPProtos.Timex.Builder builder = CoreNLPProtos.Timex.newBuilder();</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">    if (timex.value() != null) { builder.setValue(timex.value()); }</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">    if (timex.altVal() != null) { builder.setAltValue(timex.altVal()); }</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">    if (timex.text() != null) { builder.setText(timex.text()); }</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">    if (timex.timexType() != null) { builder.setType(timex.timexType()); }</span>
+<span class="nc bnc" id="L836" title="All 2 branches missed.">    if (timex.tid() != null) { builder.setTid(timex.tid()); }</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">    if (timex.beginPoint() &gt;= 0) { builder.setBeginPoint(timex.beginPoint()); }</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">    if (timex.endPoint() &gt;= 0) { builder.setEndPoint(timex.endPoint()); }</span>
+<span class="nc" id="L839">    return builder.build();</span>
+  }
+
+  /**
+   * Serialize the given entity mention to the corresponding protocol buffer.
+   * @param ent The entity mention to serialize.
+   * @return A protocol buffer corresponding to the serialized entity mention.
+   */
+  public CoreNLPProtos.Entity toProto(EntityMention ent) {
+<span class="nc" id="L848">    CoreNLPProtos.Entity.Builder builder = CoreNLPProtos.Entity.newBuilder();</span>
+    // From ExtractionObject
+<span class="nc bnc" id="L850" title="All 2 branches missed.">    if (ent.getObjectId() != null) { builder.setObjectID(ent.getObjectId()); }</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">    if (ent.getExtent() != null) { builder.setExtentStart(ent.getExtent().start()).setExtentEnd(ent.getExtent().end()); }</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">    if (ent.getType() != null) { builder.setType(ent.getType()); }</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">    if (ent.getSubType() != null) { builder.setSubtype(ent.getSubType()); }</span>
+    // From Entity
+<span class="nc bnc" id="L855" title="All 2 branches missed.">    if (ent.getHead() != null) { builder.setHeadStart(ent.getHead().start()); builder.setHeadEnd(ent.getHead().end()); }</span>
+<span class="nc bnc" id="L856" title="All 2 branches missed.">    if (ent.getMentionType() != null) { builder.setMentionType(ent.getMentionType()); }</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">    if (ent.getNormalizedName() != null) { builder.setNormalizedName(ent.getNormalizedName()); }</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">    if (ent.getSyntacticHeadTokenPosition() &gt;= 0) { builder.setHeadTokenIndex(ent.getSyntacticHeadTokenPosition()); }</span>
+<span class="nc bnc" id="L859" title="All 2 branches missed.">    if (ent.getCorefID() != null) { builder.setCorefID(ent.getCorefID()); }</span>
+    // Return
+<span class="nc" id="L861">    return builder.build();</span>
+
+  }
+
+  /**
+   * Serialize the given relation mention to the corresponding protocol buffer.
+   * @param rel The relation mention to serialize.
+   * @return A protocol buffer corresponding to the serialized relation mention.
+   */
+  public CoreNLPProtos.Relation toProto(RelationMention rel) {
+<span class="nc" id="L871">    CoreNLPProtos.Relation.Builder builder = CoreNLPProtos.Relation.newBuilder();</span>
+    // From ExtractionObject
+<span class="nc bnc" id="L873" title="All 2 branches missed.">    if (rel.getObjectId() != null) { builder.setObjectID(rel.getObjectId()); }</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">    if (rel.getExtent() != null) { builder.setExtentStart(rel.getExtent().start()).setExtentEnd(rel.getExtent().end()); }</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">    if (rel.getType() != null) { builder.setType(rel.getType()); }</span>
+<span class="nc bnc" id="L876" title="All 2 branches missed.">    if (rel.getSubType() != null) { builder.setSubtype(rel.getSubType()); }</span>
+    // From Relation
+<span class="nc bnc" id="L878" title="All 2 branches missed.">    if (rel.getArgNames() != null) {</span>
+<span class="nc" id="L879">      rel.getArgNames().forEach(builder::addArgName);</span>
+    }
+<span class="nc bnc" id="L881" title="All 4 branches missed.">    if (rel.getArgs() != null) { for (ExtractionObject arg : rel.getArgs()) { builder.addArg(toProto((EntityMention) arg)); } }</span>
+    // Return
+<span class="nc" id="L883">    return builder.build();</span>
+  }
+
+  /**
+   * Serialize a CoreNLP Language to a Protobuf Language.
+   * @param lang The language to serialize.
+   * @return The language in a Protobuf enum.
+   */
+  public static CoreNLPProtos.Language toProto(Language lang) {
+<span class="nc bnc" id="L892" title="All 12 branches missed.">    switch (lang) {</span>
+      case Arabic:
+<span class="nc" id="L894">        return CoreNLPProtos.Language.Arabic;</span>
+      case Chinese:
+<span class="nc" id="L896">        return CoreNLPProtos.Language.Chinese;</span>
+      case UniversalChinese:
+<span class="nc" id="L898">        return CoreNLPProtos.Language.UniversalChinese;</span>
+      case English:
+<span class="nc" id="L900">        return CoreNLPProtos.Language.English;</span>
+      case UniversalEnglish:
+<span class="nc" id="L902">        return CoreNLPProtos.Language.UniversalEnglish;</span>
+      case German:
+<span class="nc" id="L904">        return CoreNLPProtos.Language.German;</span>
+      case French:
+<span class="nc" id="L906">        return CoreNLPProtos.Language.French;</span>
+      case Hebrew:
+<span class="nc" id="L908">        return CoreNLPProtos.Language.Hebrew;</span>
+      case Spanish:
+<span class="nc" id="L910">        return CoreNLPProtos.Language.Spanish;</span>
+      case Unknown:
+<span class="nc" id="L912">        return CoreNLPProtos.Language.Unknown;</span>
+      case Any:
+<span class="nc" id="L914">        return CoreNLPProtos.Language.Any;</span>
+      default:
+<span class="nc" id="L916">        throw new IllegalStateException(&quot;Unknown language: &quot; + lang);</span>
+    }
+  }
+
+  /**
+   * Return a Protobuf operator from an OperatorSpec (Natural Logic).
+   */
+  public static CoreNLPProtos.Operator toProto(OperatorSpec op) {
+<span class="nc" id="L924">    return CoreNLPProtos.Operator.newBuilder()</span>
+<span class="nc" id="L925">        .setName(op.instance.name()).setQuantifierSpanBegin(op.quantifierBegin).setQuantifierSpanEnd(op.quantifierEnd)</span>
+<span class="nc" id="L926">        .setSubjectSpanBegin(op.subjectBegin).setSubjectSpanEnd(op.subjectEnd)</span>
+<span class="nc" id="L927">        .setObjectSpanBegin(op.objectBegin).setObjectSpanEnd(op.objectEnd).build();</span>
+  }
+
+  /**
+   * Return a Protobuf polarity from a CoreNLP Polarity (Natural Logic).
+   */
+  public static CoreNLPProtos.Polarity toProto(Polarity pol) {
+<span class="nc" id="L934">    return CoreNLPProtos.Polarity.newBuilder()</span>
+<span class="nc" id="L935">        .setProjectEquivalence(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.EQUIVALENT).fixedIndex))</span>
+<span class="nc" id="L936">        .setProjectForwardEntailment(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.FORWARD_ENTAILMENT).fixedIndex))</span>
+<span class="nc" id="L937">        .setProjectReverseEntailment(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.REVERSE_ENTAILMENT).fixedIndex))</span>
+<span class="nc" id="L938">        .setProjectNegation(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.NEGATION).fixedIndex))</span>
+<span class="nc" id="L939">        .setProjectAlternation(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.ALTERNATION).fixedIndex))</span>
+<span class="nc" id="L940">        .setProjectCover(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.COVER).fixedIndex))</span>
+<span class="nc" id="L941">        .setProjectIndependence(CoreNLPProtos.NaturalLogicRelation.valueOf(pol.projectLexicalRelation(NaturalLogicRelation.INDEPENDENCE).fixedIndex))</span>
+<span class="nc" id="L942">        .build();</span>
+  }
+
+  /**
+   * Return a Protobuf RelationTriple from a RelationTriple.
+   */
+  public static CoreNLPProtos.SentenceFragment toProto(SentenceFragment fragment) {
+<span class="nc" id="L949">    return CoreNLPProtos.SentenceFragment.newBuilder()</span>
+<span class="nc" id="L950">        .setAssumedTruth(fragment.assumedTruth)</span>
+<span class="nc" id="L951">        .setScore(fragment.score)</span>
+<span class="nc" id="L952">        .addAllTokenIndex(fragment.words.stream().map(x -&gt; x.index() - 1).collect(Collectors.toList()))</span>
+<span class="nc" id="L953">        .setRoot(fragment.parseTree.getFirstRoot().index() - 1)</span>
+<span class="nc" id="L954">        .build();</span>
+  }
+
+
+  /**
+   * Return a Protobuf RelationTriple from a RelationTriple.
+   */
+  public static CoreNLPProtos.RelationTriple toProto(RelationTriple triple) {
+<span class="nc" id="L962">    CoreNLPProtos.RelationTriple.Builder builder = CoreNLPProtos.RelationTriple.newBuilder()</span>
+<span class="nc" id="L963">        .setSubject(triple.subjectGloss())</span>
+<span class="nc" id="L964">        .setRelation(triple.relationGloss())</span>
+<span class="nc" id="L965">        .setObject(triple.objectGloss())</span>
+<span class="nc" id="L966">        .setConfidence(triple.confidence)</span>
+<span class="nc" id="L967">        .addAllSubjectTokens(triple.subject.stream().map(token -&gt;</span>
+<span class="nc" id="L968">            CoreNLPProtos.TokenLocation.newBuilder()</span>
+<span class="nc" id="L969">                .setSentenceIndex(token.sentIndex())</span>
+<span class="nc" id="L970">                .setTokenIndex(token.index() - 1)</span>
+<span class="nc" id="L971">                .build())</span>
+<span class="nc" id="L972">            .collect(Collectors.toList()))</span>
+<span class="nc" id="L973">        .addAllRelationTokens(</span>
+<span class="nc bnc" id="L974" title="All 4 branches missed.">            triple.relation.size() == 1 &amp;&amp; triple.relation.get(0).get(IndexAnnotation.class) == null</span>
+<span class="nc" id="L975">                ? Collections.emptyList()  // case: this is not a real relation token, but rather a placeholder relation</span>
+<span class="nc" id="L976">                : triple.relation.stream().map(token -&gt;</span>
+<span class="nc" id="L977">                CoreNLPProtos.TokenLocation.newBuilder()</span>
+<span class="nc" id="L978">                    .setSentenceIndex(token.sentIndex())</span>
+<span class="nc" id="L979">                    .setTokenIndex(token.index() - 1)</span>
+<span class="nc" id="L980">                    .build())</span>
+<span class="nc" id="L981">                .collect(Collectors.toList()))</span>
+<span class="nc" id="L982">        .addAllObjectTokens(triple.object.stream().map(token -&gt;</span>
+<span class="nc" id="L983">                CoreNLPProtos.TokenLocation.newBuilder()</span>
+<span class="nc" id="L984">                        .setSentenceIndex(token.sentIndex())</span>
+<span class="nc" id="L985">                        .setTokenIndex(token.index() - 1)</span>
+<span class="nc" id="L986">                        .build())</span>
+<span class="nc" id="L987">                .collect(Collectors.toList()));</span>
+<span class="nc" id="L988">    Optional&lt;SemanticGraph&gt; treeOptional = triple.asDependencyTree();</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">    if (treeOptional.isPresent()) {</span>
+<span class="nc" id="L990">      builder.setTree(toProto(treeOptional.get()));</span>
+    }
+<span class="nc" id="L992">    return builder.build();</span>
+  }
+
+  /**
+   * Serialize a Map (from Strings to Strings) to a proto.
+   *
+   * @param map The map to serialize.
+   *
+   * @return A proto representation of the map.
+   */
+  public static CoreNLPProtos.MapStringString toMapStringStringProto(Map&lt;String,String&gt; map) {
+<span class="nc" id="L1003">    CoreNLPProtos.MapStringString.Builder proto = CoreNLPProtos.MapStringString.newBuilder();</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">    for (Map.Entry&lt;String, String&gt; entry : map.entrySet()) {</span>
+<span class="nc" id="L1005">      proto.addKey(entry.getKey());</span>
+<span class="nc" id="L1006">      proto.addValue(entry.getValue());</span>
+<span class="nc" id="L1007">    }</span>
+<span class="nc" id="L1008">    return proto.build();</span>
+  }
+
+  /**
+   * Serialize a Map (from Integers to Strings) to a proto.
+   *
+   * @param map The map to serialize.
+   *
+   * @return A proto representation of the map.
+   */
+  public static CoreNLPProtos.MapIntString toMapIntStringProto(Map&lt;Integer,String&gt; map) {
+<span class="nc" id="L1019">      CoreNLPProtos.MapIntString.Builder proto = CoreNLPProtos.MapIntString.newBuilder();</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">      for (Map.Entry&lt;Integer, String&gt; entry : map.entrySet()) {</span>
+<span class="nc" id="L1021">          proto.addKey(entry.getKey());</span>
+<span class="nc" id="L1022">          proto.addValue(entry.getValue());</span>
+<span class="nc" id="L1023">      }</span>
+<span class="nc" id="L1024">      return proto.build();</span>
+  }
+
+
+  /**
+   * Convert a quote object to a protocol buffer.
+   */
+  public static CoreNLPProtos.Quote toProtoQuote(CoreMap quote) {
+<span class="nc" id="L1032">    CoreNLPProtos.Quote.Builder builder = CoreNLPProtos.Quote.newBuilder();</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">    if (quote.get(TextAnnotation.class) != null) { builder.setText(quote.get(TextAnnotation.class)); }</span>
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">    if (quote.get(DocIDAnnotation.class) != null) { builder.setDocid(quote.get(DocIDAnnotation.class)); }</span>
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">    if (quote.get(CharacterOffsetBeginAnnotation.class) != null) { builder.setBegin(quote.get(CharacterOffsetBeginAnnotation.class)); }</span>
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">    if (quote.get(CharacterOffsetEndAnnotation.class) != null) { builder.setEnd(quote.get(CharacterOffsetEndAnnotation.class)); }</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">    if (quote.get(SentenceBeginAnnotation.class) != null) { builder.setSentenceBegin(quote.get(SentenceBeginAnnotation.class)); }</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">    if (quote.get(SentenceEndAnnotation.class) != null) { builder.setSentenceEnd(quote.get(SentenceEndAnnotation.class)); }</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">    if (quote.get(TokenBeginAnnotation.class) != null) { builder.setTokenBegin(quote.get(TokenBeginAnnotation.class)); }</span>
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">    if (quote.get(TokenEndAnnotation.class) != null) { builder.setTokenEnd(quote.get(TokenEndAnnotation.class)); }</span>
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">    if (quote.get(QuotationIndexAnnotation.class) != null) { builder.setIndex(quote.get(QuotationIndexAnnotation.class)); }</span>
+<span class="nc" id="L1042">    return builder.build();</span>
+  }
+
+  /**
+   * Convert a mention object to a protocol buffer.
+   */
+  public CoreNLPProtos.NERMention toProtoMention(CoreMap mention) {
+<span class="nc" id="L1049">    CoreNLPProtos.NERMention.Builder builder = CoreNLPProtos.NERMention.newBuilder();</span>
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">    if (mention.get(SentenceIndexAnnotation.class) != null) { builder.setSentenceIndex(mention.get(SentenceIndexAnnotation.class)); }</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">    if (mention.get(TokenBeginAnnotation.class) != null) { builder.setTokenStartInSentenceInclusive(mention.get(TokenBeginAnnotation.class)); }</span>
+<span class="nc bnc" id="L1052" title="All 2 branches missed.">    if (mention.get(TokenEndAnnotation.class) != null) { builder.setTokenEndInSentenceExclusive(mention.get(TokenEndAnnotation.class)); }</span>
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">    if (mention.get(NamedEntityTagAnnotation.class) != null) { builder.setNer(mention.get(NamedEntityTagAnnotation.class)); }</span>
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">    if (mention.get(NormalizedNamedEntityTagAnnotation.class) != null) { builder.setNormalizedNER(mention.get(NormalizedNamedEntityTagAnnotation.class)); }</span>
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">    if (mention.get(EntityTypeAnnotation.class) != null) { builder.setEntityType(mention.get(EntityTypeAnnotation.class)); }</span>
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">    if (mention.get(TimexAnnotation.class) != null) { builder.setTimex(toProto(mention.get(TimexAnnotation.class))); }</span>
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">    if (mention.get(WikipediaEntityAnnotation.class) != null) { builder.setWikipediaEntity(mention.get(WikipediaEntityAnnotation.class)); }</span>
+
+<span class="nc" id="L1059">    return builder.build();</span>
+  }
+
+  /**
+   * Create a CoreLabel from its serialized counterpart.
+   * Note that this is, by itself, a lossy operation. Fields like the docid (sentence index, etc.) are only known
+   * from the enclosing document, and are not tracked in the protobuf.
+   * @param proto The serialized protobuf to read the CoreLabel from.
+   * @return A CoreLabel, missing the fields that are not stored in the CoreLabel protobuf.
+   */
+  public CoreLabel fromProto(CoreNLPProtos.Token proto) {
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1071">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc" id="L1073">    CoreLabel word = new CoreLabel();</span>
+    // Required fields
+<span class="nc" id="L1075">    word.setWord(proto.getWord());</span>
+    // Optional fields
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">    if (proto.hasPos()) { word.setTag(proto.getPos()); }</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">    if (proto.hasValue()) { word.setValue(proto.getValue()); }</span>
+<span class="nc bnc" id="L1079" title="All 2 branches missed.">    if (proto.hasCategory()) { word.setCategory(proto.getCategory()); }</span>
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">    if (proto.hasBefore()) { word.setBefore(proto.getBefore()); }</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">    if (proto.hasAfter()) { word.setAfter(proto.getAfter()); }</span>
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">    if (proto.hasOriginalText()) { word.setOriginalText(proto.getOriginalText()); }</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">    if (proto.hasNer()) { word.setNER(proto.getNer()); }</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">    if (proto.hasLemma()) { word.setLemma(proto.getLemma()); }</span>
+<span class="nc bnc" id="L1085" title="All 2 branches missed.">    if (proto.hasBeginChar()) { word.setBeginPosition(proto.getBeginChar()); }</span>
+<span class="nc bnc" id="L1086" title="All 2 branches missed.">    if (proto.hasEndChar()) { word.setEndPosition(proto.getEndChar()); }</span>
+<span class="nc bnc" id="L1087" title="All 2 branches missed.">    if (proto.hasSpeaker()) { word.set(SpeakerAnnotation.class, proto.getSpeaker()); }</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">    if (proto.hasUtterance()) { word.set(UtteranceAnnotation.class, proto.getUtterance()); }</span>
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">    if (proto.hasBeginIndex()) { word.set(BeginIndexAnnotation.class, proto.getBeginIndex()); }</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">    if (proto.hasEndIndex()) { word.set(EndIndexAnnotation.class, proto.getEndIndex()); }</span>
+<span class="nc bnc" id="L1091" title="All 2 branches missed.">    if (proto.hasTokenBeginIndex()) { word.set(TokenBeginAnnotation.class, proto.getTokenBeginIndex()); }</span>
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">    if (proto.hasTokenEndIndex()) { word.set(TokenEndAnnotation.class, proto.getTokenEndIndex()); }</span>
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">    if (proto.hasNormalizedNER()) { word.set(NormalizedNamedEntityTagAnnotation.class, proto.getNormalizedNER()); }</span>
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">    if (proto.hasTimexValue()) { word.set(TimexAnnotation.class, fromProto(proto.getTimexValue())); }</span>
+<span class="nc bnc" id="L1095" title="All 4 branches missed.">    if (proto.hasHasXmlContext() &amp;&amp; proto.getHasXmlContext()) { word.set(XmlContextAnnotation.class, proto.getXmlContextList()); }</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">    if (proto.hasCorefClusterID()) { word.set(CorefClusterIdAnnotation.class, proto.getCorefClusterID()); }</span>
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">    if (proto.hasAnswer()) { word.set(AnswerAnnotation.class, proto.getAnswer()); }</span>
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">    if (proto.hasOperator()) { word.set(NaturalLogicAnnotations.OperatorAnnotation.class, fromProto(proto.getOperator())); }</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">    if (proto.hasPolarity()) { word.set(NaturalLogicAnnotations.PolarityAnnotation.class, fromProto(proto.getPolarity())); }</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">    if (proto.hasSpan()) { word.set(SpanAnnotation.class, new IntPair(proto.getSpan().getBegin(), proto.getSpan().getEnd())); }</span>
+<span class="nc bnc" id="L1101" title="All 2 branches missed.">    if (proto.hasSentiment()) { word.set(SentimentCoreAnnotations.SentimentClass.class, proto.getSentiment()); }</span>
+<span class="nc bnc" id="L1102" title="All 2 branches missed.">    if (proto.hasQuotationIndex()) { word.set(QuotationIndexAnnotation.class, proto.getQuotationIndex()); }</span>
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">    if (proto.hasConllUFeatures()) { word.set(CoNLLUFeats.class, fromProto(proto.getConllUFeatures())); }</span>
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">    if (proto.hasConllUMisc()) { word.set(CoNLLUMisc.class, proto.getConllUMisc()); }</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">    if (proto.hasCoarseTag()) { word.set(CoarseTagAnnotation.class, proto.getCoarseTag()); }</span>
+<span class="nc bnc" id="L1106" title="All 2 branches missed.">    if (proto.hasConllUTokenSpan()) { word.set(CoNLLUTokenSpanAnnotation.class, new IntPair(proto.getConllUTokenSpan().getBegin(), proto.getSpan().getEnd())); }</span>
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">    if (proto.hasConllUSecondaryDeps()) { word.set(CoNLLUSecondaryDepsAnnotation.class, fromProto(proto.getConllUSecondaryDeps())); }</span>
+<span class="nc bnc" id="L1108" title="All 2 branches missed.">    if (proto.hasWikipediaEntity()) { word.set(WikipediaEntityAnnotation.class, proto.getWikipediaEntity()); }</span>
+    // Chinese char info
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">    if (proto.hasChineseChar()) { word.set(ChineseCharAnnotation.class, proto.getChineseChar()) ; }</span>
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">    if (proto.hasChineseSeg()) { word.set(ChineseSegAnnotation.class, proto.getChineseSeg()) ; }</span>
+
+    // Non-default annotators
+<span class="nc bnc" id="L1114" title="All 2 branches missed.">    if (proto.hasGender()) { word.set(GenderAnnotation.class, proto.getGender()); }</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">    if (proto.hasTrueCase()) { word.set(TrueCaseAnnotation.class, proto.getTrueCase()); }</span>
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">    if (proto.hasTrueCaseText()) { word.set(TrueCaseTextAnnotation.class, proto.getTrueCaseText()); }</span>
+
+    // Return
+<span class="nc" id="L1119">    return word;</span>
+  }
+
+  /**
+   * Create a CoreMap representing a sentence from this protocol buffer.
+   * This should not be used if you are reading a whole document, as it populates the tokens independent of the
+   * document tokens, which is not the behavior an {@link edu.stanford.nlp.pipeline.Annotation} expects.
+   *
+   * @param proto The protocol buffer to read from.
+   * @return A CoreMap representing the sentence.
+   */
+  @SuppressWarnings(&quot;deprecation&quot;)
+  @Deprecated
+  public CoreMap fromProto(CoreNLPProtos.Sentence proto) {
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1134">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc" id="L1136">    CoreMap lossySentence = fromProtoNoTokens(proto);</span>
+    // Add tokens -- missing by default as they're populated as sublists of the document tokens
+<span class="nc" id="L1138">    List&lt;CoreLabel&gt; tokens = proto.getTokenList().stream().map(this::fromProto).collect(Collectors.toList());</span>
+<span class="nc" id="L1139">    lossySentence.set(TokensAnnotation.class, tokens);</span>
+    // Add dependencies
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">    if (proto.hasBasicDependencies()) {</span>
+<span class="nc" id="L1142">      lossySentence.set(BasicDependenciesAnnotation.class, fromProto(proto.getBasicDependencies(), tokens, null));</span>
+    }
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">    if (proto.hasCollapsedDependencies()) {</span>
+<span class="nc" id="L1145">      lossySentence.set(CollapsedDependenciesAnnotation.class, fromProto(proto.getCollapsedDependencies(), tokens, null));</span>
+    }
+<span class="nc bnc" id="L1147" title="All 2 branches missed.">    if (proto.hasCollapsedCCProcessedDependencies()) {</span>
+<span class="nc" id="L1148">      lossySentence.set(CollapsedCCProcessedDependenciesAnnotation.class, fromProto(proto.getCollapsedCCProcessedDependencies(), tokens, null));</span>
+    }
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">    if (proto.hasAlternativeDependencies()) {</span>
+<span class="nc" id="L1151">      lossySentence.set(AlternativeDependenciesAnnotation.class, fromProto(proto.getAlternativeDependencies(), tokens, null));</span>
+    }
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">    if (proto.hasEnhancedDependencies()) {</span>
+<span class="nc" id="L1154">      lossySentence.set(EnhancedDependenciesAnnotation.class, fromProto(proto.getEnhancedDependencies(), tokens, null));</span>
+    }
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">    if (proto.hasEnhancedPlusPlusDependencies()) {</span>
+<span class="nc" id="L1157">      lossySentence.set(EnhancedPlusPlusDependenciesAnnotation.class, fromProto(proto.getEnhancedPlusPlusDependencies(), tokens, null));</span>
+    }
+    // Add entailed sentences
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">    if (proto.getEntailedSentenceCount() &gt; 0) {</span>
+<span class="nc" id="L1161">      List&lt;SentenceFragment&gt; entailedSentences = proto.getEntailedSentenceList().stream().map(frag -&gt; fromProto(frag, lossySentence.get(CollapsedDependenciesAnnotation.class))).collect(Collectors.toList());</span>
+<span class="nc" id="L1162">      lossySentence.set(NaturalLogicAnnotations.EntailedSentencesAnnotation.class, entailedSentences);</span>
+    }
+    // Add relation triples
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">    if (proto.getOpenieTripleCount() &gt; 0) {</span>
+<span class="nc" id="L1166">      throw new IllegalStateException(&quot;Cannot deserialize OpenIE triples with this method!&quot;);</span>
+    }
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">    if (proto.getKbpTripleCount() &gt; 0) {</span>
+<span class="nc" id="L1169">      throw new IllegalStateException(&quot;Cannot deserialize KBP triples with this method!&quot;);</span>
+    }
+    // Add chinese characters
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">    if (proto.getCharacterCount() &gt; 0) {</span>
+<span class="nc" id="L1173">      List&lt;CoreLabel&gt; sentenceCharacters =</span>
+<span class="nc" id="L1174">              proto.getCharacterList().stream().map(c -&gt; fromProto(c)).collect(Collectors.toList());</span>
+<span class="nc" id="L1175">      lossySentence.set(SegmenterCoreAnnotations.CharactersAnnotation.class, sentenceCharacters);</span>
+    }
+    // Add text -- missing by default as it's populated from the Document
+<span class="nc" id="L1178">    lossySentence.set(TextAnnotation.class, recoverOriginalText(tokens, proto));</span>
+
+    // Return
+<span class="nc" id="L1181">    return lossySentence;</span>
+  }
+
+  /**
+   * Create a CoreMap representing a sentence from this protocol buffer.
+   * Note that the sentence is very lossy -- most glaringly, the tokens are missing, awaiting a document
+   * to be filled in from.
+   * @param proto The serialized protobuf to read the sentence from.
+   * @return A CoreMap, representing a sentence as stored in the protocol buffer (and therefore missing some fields)
+   */
+  protected CoreMap fromProtoNoTokens(CoreNLPProtos.Sentence proto) {
+<span class="nc bnc" id="L1192" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1193">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc" id="L1195">    CoreMap sentence = new ArrayCoreMap();</span>
+    // Required fields
+<span class="nc" id="L1197">    sentence.set(TokenBeginAnnotation.class, proto.getTokenOffsetBegin());</span>
+<span class="nc" id="L1198">    sentence.set(TokenEndAnnotation.class, proto.getTokenOffsetEnd());</span>
+    // Optional fields
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">    if (proto.hasSentenceIndex()) { sentence.set(SentenceIndexAnnotation.class, proto.getSentenceIndex()); }</span>
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">    if (proto.hasCharacterOffsetBegin()) { sentence.set(CharacterOffsetBeginAnnotation.class, proto.getCharacterOffsetBegin()); }</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">    if (proto.hasCharacterOffsetEnd()) { sentence.set(CharacterOffsetEndAnnotation.class, proto.getCharacterOffsetEnd()); }</span>
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">    if (proto.hasParseTree()) { sentence.set(TreeAnnotation.class, fromProto(proto.getParseTree())); }</span>
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">    if (proto.hasBinarizedParseTree()) { sentence.set(BinarizedTreeAnnotation.class, fromProto(proto.getBinarizedParseTree())); }</span>
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">    if (proto.getKBestParseTreesCount() &gt; 0) {</span>
+<span class="nc" id="L1206">      List&lt;Tree&gt; trees = proto.getKBestParseTreesList().stream().map(this::fromProto).collect(Collectors.toCollection(LinkedList::new));</span>
+<span class="nc" id="L1207">      sentence.set(KBestTreesAnnotation.class, trees);</span>
+    }
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">    if (proto.hasAnnotatedParseTree()) { sentence.set(SentimentCoreAnnotations.SentimentAnnotatedTree.class, fromProto(proto.getAnnotatedParseTree())); }</span>
+<span class="nc bnc" id="L1210" title="All 2 branches missed.">    if (proto.hasSentiment()) { sentence.set(SentimentCoreAnnotations.SentimentClass.class, proto.getSentiment()); }</span>
+    // Non-default fields
+<span class="nc bnc" id="L1212" title="All 4 branches missed.">    if (proto.hasHasRelationAnnotations() &amp;&amp; proto.getHasRelationAnnotations()) {</span>
+      // set entities
+<span class="nc" id="L1214">      List&lt;EntityMention&gt; entities = proto.getEntityList().stream().map(entity -&gt; fromProto(entity, sentence)).collect(Collectors.toList());</span>
+<span class="nc" id="L1215">      sentence.set(EntityMentionsAnnotation.class, entities);</span>
+      // set relations
+<span class="nc" id="L1217">      List&lt;RelationMention&gt; relations = proto.getRelationList().stream().map(relation -&gt; fromProto(relation, sentence)).collect(Collectors.toList());</span>
+<span class="nc" id="L1218">      sentence.set(RelationMentionsAnnotation.class, relations);</span>
+    }
+
+    // if there are mentions for this sentence, add them to the annotation
+<span class="nc" id="L1222">    loadSentenceMentions(proto, sentence);</span>
+
+    // Return
+<span class="nc" id="L1225">    return sentence;</span>
+  }
+
+
+  protected void loadSentenceMentions(CoreNLPProtos.Sentence proto, CoreMap sentence) {
+    // add all Mentions for this sentence
+<span class="nc bnc" id="L1231" title="All 2 branches missed.">    if (proto.getHasCorefMentionsAnnotation()) {</span>
+<span class="nc" id="L1232">      sentence.set(CorefMentionsAnnotation.class, new ArrayList&lt;&gt;());</span>
+    }
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">    if (proto.getMentionsForCorefList().size() != 0) {</span>
+<span class="nc" id="L1235">      HashMap&lt;Integer, Mention&gt; idToMention = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1236">      List&lt;Mention&gt; sentenceMentions = sentence.get(CorefMentionsAnnotation.class);</span>
+      // initial set up of all mentions
+<span class="nc bnc" id="L1238" title="All 2 branches missed.">      for (CoreNLPProtos.Mention protoMention : proto.getMentionsForCorefList()) {</span>
+<span class="nc" id="L1239">        Mention m = fromProtoNoTokens(protoMention);</span>
+<span class="nc" id="L1240">        sentenceMentions.add(m);</span>
+<span class="nc" id="L1241">        idToMention.put(m.mentionID, m);</span>
+<span class="nc" id="L1242">      }</span>
+      // populate sets of Mentions for each Mention
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">      for (CoreNLPProtos.Mention protoMention : proto.getMentionsForCorefList()) {</span>
+<span class="nc" id="L1245">        Mention m = idToMention.get(protoMention.getMentionID());</span>
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">        if (protoMention.getAppositionsList().size() != 0) {</span>
+<span class="nc" id="L1247">          m.appositions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1248">          m.appositions.addAll(protoMention.getAppositionsList().stream()</span>
+<span class="nc" id="L1249">              .map(idToMention::get)</span>
+<span class="nc" id="L1250">              .collect(Collectors.toList()));</span>
+        }
+<span class="nc bnc" id="L1252" title="All 2 branches missed.">        if (protoMention.getPredicateNominativesList().size() != 0) {</span>
+<span class="nc" id="L1253">          m.predicateNominatives = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1254">          m.predicateNominatives.addAll(protoMention.getPredicateNominativesList().stream()</span>
+<span class="nc" id="L1255">              .map(idToMention::get)</span>
+<span class="nc" id="L1256">              .collect(Collectors.toList()));</span>
+        }
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">        if (protoMention.getRelativePronounsList().size() != 0) {</span>
+<span class="nc" id="L1259">          m.relativePronouns = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1260">          m.relativePronouns.addAll(protoMention.getRelativePronounsList().stream()</span>
+<span class="nc" id="L1261">              .map(idToMention::get)</span>
+<span class="nc" id="L1262">              .collect(Collectors.toList()));</span>
+        }
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">        if (protoMention.getListMembersList().size() != 0) {</span>
+<span class="nc" id="L1265">          m.listMembers = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1266">          m.listMembers.addAll(protoMention.getListMembersList().stream()</span>
+<span class="nc" id="L1267">              .map(idToMention::get)</span>
+<span class="nc" id="L1268">              .collect(Collectors.toList()));</span>
+        }
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">        if (protoMention.getBelongToListsList().size() != 0) {</span>
+<span class="nc" id="L1271">          m.belongToLists = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1272">          m.belongToLists.addAll(protoMention.getBelongToListsList().stream()</span>
+<span class="nc" id="L1273">              .map(idToMention::get)</span>
+<span class="nc" id="L1274">              .collect(Collectors.toList()));</span>
+        }
+<span class="nc" id="L1276">      }</span>
+    }
+<span class="nc" id="L1278">  }</span>
+
+  /**
+   * Returns a complete document, intended to mimic a document passes as input to
+   * {@link ProtobufAnnotationSerializer#toProto(Annotation)} as closely as possible.
+   * That is, most common fields are serialized, but there is not guarantee that custom additions
+   * will be saved and retrieved.
+   *
+   * @param proto The protocol buffer to read the document from.
+   * @return An Annotation corresponding to the read protobuf.
+   */
+  @SuppressWarnings(&quot;deprecation&quot;)
+  public Annotation fromProto(CoreNLPProtos.Document proto) {
+<span class="nc bnc" id="L1291" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1292">      throw new RuntimeInterruptedException();</span>
+    }
+    // Set text
+<span class="nc" id="L1295">    Annotation ann = new Annotation(proto.getText());</span>
+
+    // if there are characters, add characters
+<span class="nc bnc" id="L1298" title="All 2 branches missed.">    if (proto.getCharacterCount() &gt; 0) {</span>
+<span class="nc" id="L1299">      List&lt;CoreLabel&gt; docChars = new ArrayList&lt;CoreLabel&gt;();</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">      for (CoreNLPProtos.Token c : proto.getCharacterList()) {</span>
+<span class="nc" id="L1301">        docChars.add(fromProto(c));</span>
+<span class="nc" id="L1302">      }</span>
+<span class="nc" id="L1303">      ann.set(SegmenterCoreAnnotations.CharactersAnnotation.class, docChars);</span>
+    }
+
+    // Add tokens
+<span class="nc" id="L1307">    List&lt;CoreLabel&gt; tokens = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">    if (proto.getSentenceCount() &gt; 0) {</span>
+      // Populate the tokens from the sentence
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">      for (CoreNLPProtos.Sentence sentence : proto.getSentenceList()) {</span>
+        // It's conceivable that the sentences are not contiguous -- pad this with nulls
+<span class="nc bnc" id="L1312" title="All 4 branches missed.">        while (sentence.hasTokenOffsetBegin() &amp;&amp; tokens.size() &lt; sentence.getTokenOffsetBegin()) {</span>
+<span class="nc" id="L1313">          tokens.add(null);</span>
+        }
+        // Read the sentence
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">        for (CoreNLPProtos.Token token : sentence.getTokenList()) {</span>
+<span class="nc" id="L1317">          CoreLabel coreLabel = fromProto(token);</span>
+          // Set docid
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">          if (proto.hasDocID()) { coreLabel.setDocID(proto.getDocID()); }</span>
+<span class="nc bnc" id="L1320" title="All 4 branches missed.">          if (token.hasTokenBeginIndex() &amp;&amp; token.hasTokenEndIndex()) {</span>
+            // This is usually true, if enough annotators are defined
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">            while (tokens.size() &lt; sentence.getTokenOffsetEnd()) {</span>
+<span class="nc" id="L1323">              tokens.add(null);</span>
+            }
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">            for (int i = token.getTokenBeginIndex(); i &lt; token.getTokenEndIndex(); ++i) {</span>
+<span class="nc" id="L1326">              tokens.set(token.getTokenBeginIndex(), coreLabel);</span>
+            }
+          } else {
+            // Assume this token spans a single token, and just add it to the tokens list
+<span class="nc" id="L1330">            tokens.add(coreLabel);</span>
+          }
+<span class="nc" id="L1332">        }</span>
+<span class="nc" id="L1333">      }</span>
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">    } else if (proto.getSentencelessTokenCount() &gt; 0) {</span>
+      // Eek -- no sentences. Try to recover tokens directly
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">      if (proto.getSentencelessTokenCount() &gt; 0) {</span>
+<span class="nc bnc" id="L1337" title="All 2 branches missed.">        for (CoreNLPProtos.Token token : proto.getSentencelessTokenList()) {</span>
+<span class="nc" id="L1338">          CoreLabel coreLabel = fromProto(token);</span>
+          // Set docid
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">          if (proto.hasDocID()) { coreLabel.setDocID(proto.getDocID()); }</span>
+<span class="nc" id="L1341">          tokens.add(coreLabel);</span>
+<span class="nc" id="L1342">        }</span>
+      }
+    }
+<span class="nc bnc" id="L1345" title="All 2 branches missed.">    if (!tokens.isEmpty()) { ann.set(TokensAnnotation.class, tokens); }</span>
+
+    // Add sentences
+<span class="nc" id="L1348">    List&lt;CoreMap&gt; sentences = new ArrayList&lt;&gt;(proto.getSentenceCount());</span>
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">    for (int sentIndex = 0; sentIndex &lt; proto.getSentenceCount(); ++sentIndex) {</span>
+<span class="nc" id="L1350">      CoreNLPProtos.Sentence sentence = proto.getSentence(sentIndex);</span>
+<span class="nc" id="L1351">      CoreMap map = fromProtoNoTokens(sentence);</span>
+<span class="nc bnc" id="L1352" title="All 6 branches missed.">      if (!tokens.isEmpty() &amp;&amp; sentence.hasTokenOffsetBegin() &amp;&amp; sentence.hasTokenOffsetEnd() &amp;&amp;</span>
+<span class="nc bnc" id="L1353" title="All 2 branches missed.">          map.get(TokensAnnotation.class) == null) {</span>
+        // Set tokens for sentence
+<span class="nc" id="L1355">        int tokenBegin = sentence.getTokenOffsetBegin();</span>
+<span class="nc" id="L1356">        int tokenEnd = sentence.getTokenOffsetEnd();</span>
+<span class="nc bnc" id="L1357" title="All 6 branches missed.">        assert tokenBegin &lt;= tokens.size() &amp;&amp; tokenBegin &lt;= tokenEnd;</span>
+<span class="nc bnc" id="L1358" title="All 4 branches missed.">        assert tokenEnd &lt;= tokens.size();</span>
+<span class="nc" id="L1359">        map.set(TokensAnnotation.class, tokens.subList(tokenBegin, tokenEnd));</span>
+        // Set sentence index + token index + paragraph index
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">        for (int i = tokenBegin; i &lt; tokenEnd; ++i) {</span>
+<span class="nc" id="L1362">          tokens.get(i).setSentIndex(sentIndex);</span>
+<span class="nc" id="L1363">          tokens.get(i).setIndex(i - sentence.getTokenOffsetBegin() + 1);</span>
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">          if (sentence.hasParagraph()) { tokens.get(i).set(ParagraphAnnotation.class, sentence.getParagraph()); }</span>
+        }
+        // Set text
+<span class="nc" id="L1367">        int characterBegin = sentence.getCharacterOffsetBegin();</span>
+<span class="nc" id="L1368">        int characterEnd = sentence.getCharacterOffsetEnd();</span>
+<span class="nc bnc" id="L1369" title="All 2 branches missed.">        if (characterEnd &lt;= proto.getText().length()) {</span>
+          // The usual case -- get the text from the document text
+<span class="nc" id="L1371">          map.set(TextAnnotation.class, proto.getText().substring(characterBegin, characterEnd));</span>
+        } else {
+          // The document text is wrong -- guess the text from the tokens
+<span class="nc" id="L1374">          map.set(TextAnnotation.class, recoverOriginalText(tokens.subList(tokenBegin, tokenEnd), sentence));</span>
+        }
+      }
+      // End iteration
+<span class="nc" id="L1378">      sentences.add(map);</span>
+    }
+<span class="nc bnc" id="L1380" title="All 2 branches missed.">    if (!sentences.isEmpty()) { ann.set(SentencesAnnotation.class, sentences); }</span>
+
+    // Set DocID
+<span class="nc" id="L1383">    String docid = null;</span>
+<span class="nc bnc" id="L1384" title="All 2 branches missed.">    if (proto.hasDocID()) {</span>
+<span class="nc" id="L1385">      docid = proto.getDocID();</span>
+<span class="nc" id="L1386">      ann.set(DocIDAnnotation.class, docid);</span>
+    }
+    // Set reference time
+<span class="nc bnc" id="L1389" title="All 2 branches missed.">    if (proto.hasDocDate()) {</span>
+<span class="nc" id="L1390">      ann.set(DocDateAnnotation.class, proto.getDocDate());</span>
+    }
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">    if (proto.hasCalendar()) {</span>
+<span class="nc" id="L1393">      GregorianCalendar calendar = new GregorianCalendar();</span>
+<span class="nc" id="L1394">      calendar.setTimeInMillis(proto.getCalendar());</span>
+<span class="nc" id="L1395">      ann.set(CalendarAnnotation.class, calendar);</span>
+    }
+
+    // Set coref chain
+<span class="nc" id="L1399">    Map&lt;Integer, CorefChain&gt; corefChains = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">    for (CoreNLPProtos.CorefChain chainProto : proto.getCorefChainList()) {</span>
+<span class="nc" id="L1401">      CorefChain chain = fromProto(chainProto, ann);</span>
+<span class="nc" id="L1402">      corefChains.put(chain.getChainID(), chain);</span>
+<span class="nc" id="L1403">    }</span>
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">    if (!corefChains.isEmpty()) { ann.set(CorefChainAnnotation.class, corefChains); }</span>
+
+    // hashes to access Mentions , later in this method need to add speakerInfo to Mention
+    // so we need to create id -&gt; Mention, CoreNLPProtos.Mention maps to do this, since SpeakerInfo could reference
+    // any Mention in doc
+<span class="nc" id="L1409">    HashMap&lt;Integer, Mention&gt; idToMention = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1410">    HashMap&lt;Integer, CoreNLPProtos.Mention&gt; idToProtoMention = new HashMap&lt;&gt;();</span>
+
+    // Set things in the sentence that need a document context.
+<span class="nc bnc" id="L1413" title="All 2 branches missed.">    for (int sentenceIndex = 0; sentenceIndex &lt; proto.getSentenceCount(); ++sentenceIndex) {</span>
+<span class="nc" id="L1414">      CoreNLPProtos.Sentence sentence = proto.getSentenceList().get(sentenceIndex);</span>
+<span class="nc" id="L1415">      CoreMap map = sentences.get(sentenceIndex);</span>
+<span class="nc" id="L1416">      List&lt;CoreLabel&gt; sentenceTokens = map.get(TokensAnnotation.class);</span>
+      // Set dependency graphs
+<span class="nc bnc" id="L1418" title="All 2 branches missed.">      if (sentence.hasBasicDependencies()) {</span>
+<span class="nc" id="L1419">        map.set(BasicDependenciesAnnotation.class, fromProto(sentence.getBasicDependencies(), sentenceTokens, docid));</span>
+      }
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">      if (sentence.hasCollapsedDependencies()) {</span>
+<span class="nc" id="L1422">        map.set(CollapsedDependenciesAnnotation.class, fromProto(sentence.getCollapsedDependencies(), sentenceTokens, docid));</span>
+      }
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">      if (sentence.hasCollapsedCCProcessedDependencies()) {</span>
+<span class="nc" id="L1425">        map.set(CollapsedCCProcessedDependenciesAnnotation.class, fromProto(sentence.getCollapsedCCProcessedDependencies(), sentenceTokens, docid));</span>
+      }
+<span class="nc bnc" id="L1427" title="All 2 branches missed.">      if (sentence.hasAlternativeDependencies()) {</span>
+<span class="nc" id="L1428">        map.set(AlternativeDependenciesAnnotation.class, fromProto(sentence.getAlternativeDependencies(), sentenceTokens, docid));</span>
+      }
+<span class="nc bnc" id="L1430" title="All 2 branches missed.">      if (sentence.hasEnhancedDependencies()) {</span>
+<span class="nc" id="L1431">        map.set(EnhancedDependenciesAnnotation.class, fromProto(sentence.getEnhancedDependencies(), sentenceTokens, docid));</span>
+      }
+<span class="nc bnc" id="L1433" title="All 2 branches missed.">      if (sentence.hasEnhancedPlusPlusDependencies()) {</span>
+<span class="nc" id="L1434">        map.set(EnhancedPlusPlusDependenciesAnnotation.class, fromProto(sentence.getEnhancedPlusPlusDependencies(), sentenceTokens, docid));</span>
+      }
+      // Set entailed sentences
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">      if (sentence.getEntailedSentenceCount() &gt; 0) {</span>
+<span class="nc" id="L1438">        Set&lt;SentenceFragment&gt; entailedSentences = sentence.getEntailedSentenceList().stream().map(frag -&gt; fromProto(frag, map.get(EnhancedPlusPlusDependenciesAnnotation.class))).collect(Collectors.toSet());</span>
+<span class="nc" id="L1439">        map.set(NaturalLogicAnnotations.EntailedSentencesAnnotation.class, entailedSentences);</span>
+      }
+      // Set relation triples
+<span class="nc bnc" id="L1442" title="All 2 branches missed.">      if (sentence.getOpenieTripleCount() &gt; 0) {</span>
+<span class="nc" id="L1443">        List&lt;RelationTriple&gt; triples = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">        for (CoreNLPProtos.RelationTriple triple : sentence.getOpenieTripleList()) {</span>
+<span class="nc" id="L1445">          triples.add(fromProto(triple, ann, sentenceIndex));</span>
+<span class="nc" id="L1446">        }</span>
+<span class="nc" id="L1447">        map.set(NaturalLogicAnnotations.RelationTriplesAnnotation.class, triples);</span>
+      }
+      // Redo some light annotation
+<span class="nc bnc" id="L1450" title="All 2 branches missed.">      if ( map.containsKey(TokensAnnotation.class) &amp;&amp;</span>
+<span class="nc bnc" id="L1451" title="All 4 branches missed.">          (!sentence.hasHasNumerizedTokensAnnotation() || sentence.getHasNumerizedTokensAnnotation())) {</span>
+<span class="nc" id="L1452">        map.set(NumerizedTokensAnnotation.class, NumberNormalizer.findAndMergeNumbers(map));</span>
+      }
+      // add the CoreLabel and IndexedWord info to each mention
+      // when Mentions are serialized, just storing the index in the sentence for CoreLabels and IndexedWords
+      // this is the point where the de-serialized sentence has tokens
+<span class="nc" id="L1457">      int mentionInt = 0;</span>
+<span class="nc bnc" id="L1458" title="All 2 branches missed.">      for (CoreNLPProtos.Mention protoMention : sentence.getMentionsForCorefList()) {</span>
+        // get the mention
+<span class="nc" id="L1460">        Mention mentionToUpdate = map.get(CorefMentionsAnnotation.class).get(mentionInt);</span>
+        // store these in hash for more processing later in this method
+<span class="nc" id="L1462">        idToMention.put(mentionToUpdate.mentionID, mentionToUpdate);</span>
+<span class="nc" id="L1463">        idToProtoMention.put(mentionToUpdate.mentionID, protoMention);</span>
+        // update the values
+<span class="nc" id="L1465">        int headIndexedWordIndex = protoMention.getHeadIndexedWord().getTokenIndex();</span>
+<span class="nc bnc" id="L1466" title="All 2 branches missed.">        if (headIndexedWordIndex &gt;= 0) {</span>
+<span class="nc" id="L1467">          mentionToUpdate.headIndexedWord = new IndexedWord(sentenceTokens.get(protoMention.getHeadIndexedWord().getTokenIndex()));</span>
+<span class="nc" id="L1468">          mentionToUpdate.headIndexedWord.setCopyCount(protoMention.getHeadIndexedWord().getCopyCount());</span>
+        }
+<span class="nc" id="L1470">        int dependingVerbIndex = protoMention.getDependingVerb().getTokenIndex();</span>
+<span class="nc bnc" id="L1471" title="All 2 branches missed.">        if (dependingVerbIndex &gt;= 0) {</span>
+<span class="nc" id="L1472">          mentionToUpdate.dependingVerb = new IndexedWord(sentenceTokens.get(protoMention.getDependingVerb().getTokenIndex()));</span>
+<span class="nc" id="L1473">          mentionToUpdate.dependingVerb.setCopyCount(protoMention.getDependingVerb().getCopyCount());</span>
+        }
+<span class="nc" id="L1475">        int headWordIndex = protoMention.getHeadWord().getTokenIndex();</span>
+<span class="nc bnc" id="L1476" title="All 2 branches missed.">        if (headWordIndex &gt;= 0) {</span>
+<span class="nc" id="L1477">          mentionToUpdate.headWord = sentenceTokens.get(protoMention.getHeadWord().getTokenIndex());</span>
+        }
+<span class="nc" id="L1479">        mentionToUpdate.sentenceWords = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">        for (CoreNLPProtos.IndexedWord clp : protoMention.getSentenceWordsList()) {</span>
+<span class="nc" id="L1481">          int ti = clp.getTokenIndex();</span>
+<span class="nc" id="L1482">          mentionToUpdate.sentenceWords.add(sentenceTokens.get(ti));</span>
+<span class="nc" id="L1483">        }</span>
+<span class="nc" id="L1484">        mentionToUpdate.originalSpan = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1485" title="All 2 branches missed.">        for (CoreNLPProtos.IndexedWord clp : protoMention.getOriginalSpanList()) {</span>
+<span class="nc" id="L1486">          int ti = clp.getTokenIndex();</span>
+<span class="nc" id="L1487">          mentionToUpdate.originalSpan.add(sentenceTokens.get(ti));</span>
+<span class="nc" id="L1488">        }</span>
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">        if (protoMention.getHasBasicDependency()) {</span>
+<span class="nc" id="L1490">          mentionToUpdate.basicDependency = map.get(BasicDependenciesAnnotation.class);</span>
+        }
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">        if (protoMention.getHasEnhancedDepenedncy()) {</span>
+<span class="nc" id="L1493">          mentionToUpdate.enhancedDependency = map.get(EnhancedDependenciesAnnotation.class);</span>
+        }
+<span class="nc bnc" id="L1495" title="All 2 branches missed.">        if (protoMention.getHasContextParseTree()) {</span>
+<span class="nc" id="L1496">          mentionToUpdate.contextParseTree = map.get(TreeAnnotation.class);</span>
+        }
+        // move on to next mention
+<span class="nc" id="L1499">        mentionInt++;</span>
+<span class="nc" id="L1500">      }</span>
+
+    }
+
+    // Set quotes
+<span class="nc" id="L1505">    List&lt;CoreMap&gt; quotes = proto.getQuoteList().stream().map(quote -&gt; fromProto(quote, tokens)).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L1506" title="All 2 branches missed.">    if (!quotes.isEmpty()) {</span>
+<span class="nc" id="L1507">      ann.set(QuotationsAnnotation.class, quotes);</span>
+    }
+
+    // Set NERmention
+<span class="nc" id="L1511">    List&lt;CoreMap&gt; mentions = proto.getMentionsList().stream().map(this::fromProto).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L1512" title="All 2 branches missed.">    if (!mentions.isEmpty()) {</span>
+<span class="nc" id="L1513">      ann.set(MentionsAnnotation.class, mentions);</span>
+    }
+
+    // add SpeakerInfo stuff to Mentions, this requires knowing all mentions in the document
+    // also add all the Set&lt;Mention&gt;
+<span class="nc bnc" id="L1518" title="All 2 branches missed.">    for (int mentionID : idToMention.keySet()) {</span>
+      // this is the Mention message corresponding to this Mention
+<span class="nc" id="L1520">      Mention mentionToUpdate = idToMention.get(mentionID);</span>
+<span class="nc" id="L1521">      CoreNLPProtos.Mention correspondingProtoMention = idToProtoMention.get(mentionID);</span>
+<span class="nc bnc" id="L1522" title="All 2 branches missed.">      if (!correspondingProtoMention.hasSpeakerInfo()) {</span>
+        // keep speakerInfo null for this Mention if it didn't store a speakerInfo
+        // so just continue to next Mention
+<span class="nc" id="L1525">        continue;</span>
+      }
+      // if we're here we know a speakerInfo was stored
+<span class="nc" id="L1528">      SpeakerInfo speakerInfo = fromProto(correspondingProtoMention.getSpeakerInfo());</span>
+      // go through all ids stored for the speakerInfo in its mentions list, and get the Mention
+      // Mentions are stored by MentionID , MentionID should be set by MentionAnnotator
+      // MentionID is ID in document, 0, 1, 2, etc...
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">      for (int speakerInfoMentionID : correspondingProtoMention.getSpeakerInfo().getMentionsList()) {</span>
+<span class="nc" id="L1533">        speakerInfo.addMention(idToMention.get(speakerInfoMentionID));</span>
+<span class="nc" id="L1534">      }</span>
+      // now the SpeakerInfo for this Mention should be fully restored
+<span class="nc" id="L1536">      mentionToUpdate.speakerInfo = speakerInfo;</span>
+<span class="nc" id="L1537">    }</span>
+
+    // Return
+<span class="nc" id="L1540">    return ann;</span>
+  }
+
+  /**
+   * Retrieve a Tree object from a saved protobuf.
+   * This is not intended to be used on its own, but it is safe (lossless) to do so and therefore it is
+   * left visible.
+   *
+   * @param proto The serialized tree.
+   * @return A Tree object corresponding to the saved tree. This will always be a {@link LabeledScoredTreeNode}.
+   */
+  public Tree fromProto(CoreNLPProtos.ParseTree proto) {
+<span class="nc bnc" id="L1552" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1553">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc" id="L1555">    LabeledScoredTreeNode node = new LabeledScoredTreeNode();</span>
+    // Set label
+<span class="nc bnc" id="L1557" title="All 2 branches missed.">    if (proto.hasValue()) {</span>
+<span class="nc" id="L1558">      CoreLabel value = new CoreLabel();</span>
+<span class="nc" id="L1559">      value.setCategory(proto.getValue());</span>
+<span class="nc" id="L1560">      value.setValue(proto.getValue());</span>
+<span class="nc" id="L1561">      node.setLabel(value);</span>
+      // Set span
+<span class="nc bnc" id="L1563" title="All 4 branches missed.">      if (proto.hasYieldBeginIndex() &amp;&amp; proto.hasYieldEndIndex()) {</span>
+<span class="nc" id="L1564">        IntPair span = new IntPair(proto.getYieldBeginIndex(), proto.getYieldEndIndex());</span>
+<span class="nc" id="L1565">        value.set(SpanAnnotation.class, span);</span>
+      }
+      // Set sentiment
+<span class="nc bnc" id="L1568" title="All 2 branches missed.">      if (proto.hasSentiment()) {</span>
+<span class="nc" id="L1569">        value.set(RNNCoreAnnotations.PredictedClass.class, proto.getSentiment().getNumber());</span>
+      }
+    }
+    // Set score
+<span class="nc bnc" id="L1573" title="All 2 branches missed.">    if (proto.hasScore()) { node.setScore(proto.getScore()); }</span>
+    // Set children
+<span class="nc" id="L1575">    Tree[] children = new LabeledScoredTreeNode[proto.getChildCount()];</span>
+<span class="nc bnc" id="L1576" title="All 2 branches missed.">    for (int i = 0; i &lt; children.length; ++i) {</span>
+<span class="nc" id="L1577">      children[i] = fromProto(proto.getChild(i));</span>
+    }
+<span class="nc" id="L1579">    node.setChildren(children);</span>
+    // Return
+<span class="nc" id="L1581">    return node;</span>
+  }
+
+  /**
+   * Return a CoreNLP language from a Protobuf language
+   */
+  public static Language fromProto(CoreNLPProtos.Language lang) {
+<span class="nc bnc" id="L1588" title="All 12 branches missed.">    switch (lang) {</span>
+      case Arabic:
+<span class="nc" id="L1590">        return Language.Arabic;</span>
+      case Chinese:
+<span class="nc" id="L1592">        return Language.Chinese;</span>
+      case English:
+<span class="nc" id="L1594">        return Language.English;</span>
+      case German:
+<span class="nc" id="L1596">        return Language.German;</span>
+      case French:
+<span class="nc" id="L1598">        return Language.French;</span>
+      case Hebrew:
+<span class="nc" id="L1600">        return Language.Hebrew;</span>
+      case Spanish:
+<span class="nc" id="L1602">        return Language.Spanish;</span>
+      case UniversalChinese:
+<span class="nc" id="L1604">        return Language.UniversalChinese;</span>
+      case UniversalEnglish:
+<span class="nc" id="L1606">        return Language.UniversalEnglish;</span>
+      case Unknown:
+<span class="nc" id="L1608">        return Language.Unknown;</span>
+      case Any:
+<span class="nc" id="L1610">        return Language.Any;</span>
+      default:
+<span class="nc" id="L1612">        throw new IllegalStateException(&quot;Unknown language: &quot; + lang);</span>
+    }
+  }
+
+  /**
+   * Return a CoreNLP Operator (Natural Logic operator) from a Protobuf operator
+   */
+  public static OperatorSpec fromProto(CoreNLPProtos.Operator operator) {
+<span class="nc" id="L1620">    String opName = operator.getName().toLowerCase();</span>
+<span class="nc" id="L1621">    Operator op = null;</span>
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">    for (Operator candidate : Operator.values()) {</span>
+<span class="nc bnc" id="L1623" title="All 2 branches missed.">      if (candidate.name().toLowerCase().equals(opName)) {</span>
+<span class="nc" id="L1624">        op = candidate;</span>
+<span class="nc" id="L1625">        break;</span>
+      }
+    }
+<span class="nc" id="L1628">    return new OperatorSpec(op, operator.getQuantifierSpanBegin(), operator.getQuantifierSpanEnd(),</span>
+<span class="nc" id="L1629">        operator.getSubjectSpanBegin(), operator.getSubjectSpanEnd(),</span>
+<span class="nc" id="L1630">        operator.getObjectSpanBegin(), operator.getObjectSpanEnd());</span>
+  }
+
+  /**
+   * Return a CoreNLP Polarity (Natural Logic polarity) from a Protobuf operator
+   */
+  public static Polarity fromProto(CoreNLPProtos.Polarity polarity) {
+<span class="nc" id="L1637">    byte[] projectionFn = new byte[7];</span>
+<span class="nc" id="L1638">    projectionFn[0] = (byte) polarity.getProjectEquivalence().getNumber();</span>
+<span class="nc" id="L1639">    projectionFn[1] = (byte) polarity.getProjectForwardEntailment().getNumber();</span>
+<span class="nc" id="L1640">    projectionFn[2] = (byte) polarity.getProjectReverseEntailment().getNumber();</span>
+<span class="nc" id="L1641">    projectionFn[3] = (byte) polarity.getProjectNegation().getNumber();</span>
+<span class="nc" id="L1642">    projectionFn[4] = (byte) polarity.getProjectAlternation().getNumber();</span>
+<span class="nc" id="L1643">    projectionFn[5] = (byte) polarity.getProjectCover().getNumber();</span>
+<span class="nc" id="L1644">    projectionFn[6] = (byte) polarity.getProjectIndependence().getNumber();</span>
+<span class="nc" id="L1645">    return new Polarity(projectionFn);</span>
+  }
+
+
+  /**
+   * Deserialize a dependency tree, allowing for cross-sentence arcs.
+   * This is primarily here for deserializing OpenIE triples.
+   *
+   * @see ProtobufAnnotationSerializer#fromProto(CoreNLPProtos.DependencyGraph, List, String)
+   */
+  private static SemanticGraph fromProto(CoreNLPProtos.DependencyGraph proto, List&lt;CoreLabel&gt; sentence, String docid, Optional&lt;Annotation&gt; document) {
+<span class="nc" id="L1656">    SemanticGraph graph = new SemanticGraph();</span>
+
+    // first construct the actual nodes; keep them indexed by their index
+    // This block is optimized as one of the places which take noticeable time
+    // in datum caching
+<span class="nc" id="L1661">    int min = Integer.MAX_VALUE;</span>
+<span class="nc" id="L1662">    int max = Integer.MIN_VALUE;</span>
+<span class="nc bnc" id="L1663" title="All 2 branches missed.">    for(CoreNLPProtos.DependencyGraph.Node in: proto.getNodeList()){</span>
+<span class="nc bnc" id="L1664" title="All 2 branches missed.">      min = in.getIndex() &lt; min ? in.getIndex() : min;</span>
+<span class="nc bnc" id="L1665" title="All 2 branches missed.">      max = in.getIndex() &gt; max ? in.getIndex() : max;</span>
+<span class="nc" id="L1666">    }</span>
+<span class="nc" id="L1667">    TwoDimensionalMap&lt;Integer, Integer, IndexedWord&gt; nodes = TwoDimensionalMap.hashMap();</span>
+<span class="nc bnc" id="L1668" title="All 2 branches missed.">    for(CoreNLPProtos.DependencyGraph.Node in: proto.getNodeList()){</span>
+      CoreLabel token;
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">      if (document.isPresent()) {</span>
+<span class="nc" id="L1671">        token = document.get().get(SentencesAnnotation.class).get(in.getSentenceIndex()).get(TokensAnnotation.class).get(in.getIndex() - 1); // token index starts at 1!</span>
+      } else {
+<span class="nc" id="L1673">        token = sentence.get(in.getIndex() - 1); // index starts at 1!</span>
+      }
+      IndexedWord word;
+<span class="nc bnc" id="L1676" title="All 4 branches missed.">      if (in.hasCopyAnnotation() &amp;&amp; in.getCopyAnnotation() &gt; 0) {</span>
+        // TODO: if we make a copy wrapper CoreLabel, use it here instead
+<span class="nc" id="L1678">        word = new IndexedWord(new CoreLabel(token));</span>
+<span class="nc" id="L1679">        word.setCopyCount(in.getCopyAnnotation());</span>
+      } else {
+<span class="nc" id="L1681">        word = new IndexedWord(token);</span>
+      }
+
+      // for backwards compatibility - new annotations should have
+      // these fields set, but annotations older than August 2014 might not
+<span class="nc bnc" id="L1686" title="All 4 branches missed.">      if (word.docID() == null &amp;&amp; docid != null) {</span>
+<span class="nc" id="L1687">        word.setDocID(docid);</span>
+      }
+<span class="nc bnc" id="L1689" title="All 4 branches missed.">      if (word.sentIndex() &lt; 0 &amp;&amp; in.getSentenceIndex() &gt;= 0) {</span>
+<span class="nc" id="L1690">        word.setSentIndex(in.getSentenceIndex());</span>
+      }
+<span class="nc bnc" id="L1692" title="All 4 branches missed.">      if (word.index() &lt; 0 &amp;&amp; in.getIndex() &gt;= 0) {</span>
+<span class="nc" id="L1693">        word.setIndex(in.getIndex());</span>
+      }
+
+<span class="nc bnc" id="L1696" title="All 4 branches missed.">      assert in.getIndex() == word.index();</span>
+<span class="nc" id="L1697">      nodes.put(in.getIndex(), in.getCopyAnnotation(), word);</span>
+<span class="nc" id="L1698">      graph.addVertex(word);</span>
+<span class="nc" id="L1699">    }</span>
+
+    // add all edges to the actual graph
+<span class="nc bnc" id="L1702" title="All 2 branches missed.">    for(CoreNLPProtos.DependencyGraph.Edge ie: proto.getEdgeList()){</span>
+<span class="nc" id="L1703">      IndexedWord source = nodes.get(ie.getSource(), ie.getSourceCopy());</span>
+<span class="nc bnc" id="L1704" title="All 4 branches missed.">      assert(source != null);</span>
+<span class="nc" id="L1705">      IndexedWord target = nodes.get(ie.getTarget(), ie.getTargetCopy());</span>
+<span class="nc bnc" id="L1706" title="All 4 branches missed.">      assert(target != null);</span>
+<span class="nc" id="L1707">      synchronized (globalLock) {</span>
+        // this is not thread-safe: there are static fields in GrammaticalRelation
+<span class="nc bnc" id="L1709" title="All 4 branches missed.">        assert ie.hasDep();</span>
+<span class="nc" id="L1710">        GrammaticalRelation rel = GrammaticalRelation.valueOf(fromProto(ie.getLanguage()), ie.getDep());</span>
+<span class="nc bnc" id="L1711" title="All 4 branches missed.">        graph.addEdge(source, target, rel, 1.0, ie.hasIsExtra() &amp;&amp; ie.getIsExtra());</span>
+<span class="nc" id="L1712">      }</span>
+<span class="nc" id="L1713">    }</span>
+
+<span class="nc bnc" id="L1715" title="All 2 branches missed.">    if (proto.getRootCount() &gt; 0) {</span>
+<span class="nc" id="L1716">      Collection&lt;IndexedWord&gt; roots = proto.getRootList().stream().map(rootI -&gt; nodes.get(rootI, 0)).collect(Collectors.toList());</span>
+<span class="nc" id="L1717">      graph.setRoots(roots);</span>
+<span class="nc" id="L1718">    } else {</span>
+      // Roots were not saved away
+      // compute root nodes if non-empty
+<span class="nc bnc" id="L1721" title="All 2 branches missed.">      if(!graph.isEmpty()){</span>
+<span class="nc" id="L1722">        graph.resetRoots();</span>
+      }
+    }
+<span class="nc" id="L1725">    return graph;</span>
+
+  }
+
+
+  /**
+   * Voodoo magic to convert a serialized dependency graph into a {@link SemanticGraph}.
+   * This method is intended to be called only from the {@link ProtobufAnnotationSerializer#fromProto(CoreNLPProtos.Document)}
+   * method.
+   *
+   * @param proto The serialized representation of the graph. This relies heavily on indexing into the original document.
+   * @param sentence The raw sentence that this graph was saved from must be provided, as it is not saved in the serialized
+   *                 representation.
+   * @param docid A docid must be supplied, as it is not saved by the serialized representation.
+   * @return A semantic graph corresponding to the saved object, on the provided sentence.
+   */
+  public static SemanticGraph fromProto(CoreNLPProtos.DependencyGraph proto, List&lt;CoreLabel&gt; sentence, String docid) {
+<span class="nc" id="L1742">    return fromProto(proto, sentence, docid, Optional.empty());</span>
+  }
+
+
+  /**
+   * Return a  {@link RelationTriple} object from the serialized representation.
+   * This requires a sentence and a document so that
+   * (1) we have a docid for the dependency tree can be accurately rebuilt,
+   * and (2) we have references to the tokens to include in the relation triple.
+   *
+   * @param proto The serialized relation triples.
+   * @param doc The document we are deserializing. This document should already
+   *            have a docid annotation set, if there is one.
+   * @param sentenceIndex The index of the sentence this extraction should be attached to.
+   *
+   * @return A relation triple as a Java object, corresponding to the seriaized proto.
+   */
+  public static RelationTriple fromProto(CoreNLPProtos.RelationTriple proto, Annotation doc, int sentenceIndex) {
+<span class="nc bnc" id="L1760" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1761">      throw new RuntimeInterruptedException();</span>
+    }
+    // Get the spans for the extraction
+<span class="nc" id="L1764">    List&lt;CoreLabel&gt; subject = proto.getSubjectTokensList().stream().map(loc -&gt;</span>
+<span class="nc" id="L1765">        doc.get(SentencesAnnotation.class).get(loc.getSentenceIndex()).get(TokensAnnotation.class).get(loc.getTokenIndex())</span>
+<span class="nc" id="L1766">        ).collect(Collectors.toList());</span>
+    List&lt;CoreLabel&gt; relation;
+<span class="nc bnc" id="L1768" title="All 2 branches missed.">    if (proto.getRelationTokensCount() == 0) {  // If we don't have a real span for the relation, make a dummy word</span>
+<span class="nc" id="L1769">      relation = Collections.singletonList(new CoreLabel(new Word(proto.getRelation())));</span>
+    } else {
+<span class="nc" id="L1771">      relation = proto.getRelationTokensList().stream().map(loc -&gt;</span>
+<span class="nc" id="L1772">          doc.get(SentencesAnnotation.class).get(loc.getSentenceIndex()).get(TokensAnnotation.class).get(loc.getTokenIndex())</span>
+<span class="nc" id="L1773">      ).collect(Collectors.toList());</span>
+    }
+<span class="nc" id="L1775">    List&lt;CoreLabel&gt; object = proto.getObjectTokensList().stream().map(loc -&gt;</span>
+<span class="nc" id="L1776">        doc.get(SentencesAnnotation.class).get(loc.getSentenceIndex()).get(TokensAnnotation.class).get(loc.getTokenIndex())</span>
+<span class="nc" id="L1777">    ).collect(Collectors.toList());</span>
+
+    // Create the extraction
+    RelationTriple extraction;
+<span class="nc" id="L1781">    double confidence = proto.getConfidence();</span>
+<span class="nc bnc" id="L1782" title="All 2 branches missed.">    if (proto.hasTree()) {</span>
+<span class="nc" id="L1783">      SemanticGraph tree = fromProto(</span>
+<span class="nc" id="L1784">          proto.getTree(),</span>
+<span class="nc" id="L1785">          doc.get(SentencesAnnotation.class).get(sentenceIndex).get(TokensAnnotation.class),</span>
+<span class="nc" id="L1786">          doc.get(DocIDAnnotation.class),</span>
+<span class="nc" id="L1787">          Optional.of(doc));</span>
+<span class="nc" id="L1788">      extraction =  new RelationTriple.WithTree(subject, relation, object, tree, confidence);</span>
+<span class="nc" id="L1789">    } else {</span>
+<span class="nc" id="L1790">      extraction = new RelationTriple(subject, relation, object, confidence);</span>
+    }
+
+    // Tweak the extraction
+<span class="nc bnc" id="L1794" title="All 2 branches missed.">    if (proto.hasIstmod()) { extraction.istmod(proto.getIstmod()); }</span>
+<span class="nc bnc" id="L1795" title="All 2 branches missed.">    if (proto.hasPrefixBe()) { extraction.isPrefixBe(proto.getPrefixBe()); }</span>
+<span class="nc bnc" id="L1796" title="All 2 branches missed.">    if (proto.hasSuffixBe()) { extraction.isSuffixBe(proto.getSuffixBe()); }</span>
+<span class="nc bnc" id="L1797" title="All 2 branches missed.">    if (proto.hasSuffixOf()) { extraction.isSuffixOf(proto.getSuffixOf()); }</span>
+
+    // Return
+<span class="nc" id="L1800">    return extraction;</span>
+  }
+
+  /**
+   * Returns a sentence fragment from a given protocol buffer, and an associated parse tree.
+   *
+   * @param fragment The saved sentence fragment.
+   * @param tree The parse tree for the whole sentence.
+   *
+   * @return A {@link SentenceFragment} object corresponding to the saved proto.
+   */
+  public static SentenceFragment fromProto(CoreNLPProtos.SentenceFragment fragment, SemanticGraph tree) {
+<span class="nc bnc" id="L1812" title="All 2 branches missed.">    if (Thread.interrupted()) {</span>
+<span class="nc" id="L1813">      throw new RuntimeInterruptedException();</span>
+    }
+<span class="nc" id="L1815">    SemanticGraph fragmentTree = new SemanticGraph(tree);</span>
+    // Set the new root
+<span class="nc bnc" id="L1817" title="All 2 branches missed.">    if (fragment.hasRoot()) {</span>
+<span class="nc" id="L1818">      fragmentTree.resetRoots();</span>
+<span class="nc" id="L1819">      fragmentTree.vertexSet().stream()</span>
+<span class="nc bnc" id="L1820" title="All 2 branches missed.">          .filter(vertex -&gt; vertex.index() - 1 == fragment.getRoot())</span>
+<span class="nc" id="L1821">          .forEach(fragmentTree::setRoot);</span>
+    }
+    // Set the new vertices
+<span class="nc" id="L1824">    Set&lt;Integer&gt; keptIndices = new HashSet&lt;&gt;(fragment.getTokenIndexList());</span>
+<span class="nc" id="L1825">    tree.vertexSet().stream()</span>
+<span class="nc bnc" id="L1826" title="All 2 branches missed.">        .filter(vertex -&gt; !keptIndices.contains(vertex.index() - 1))</span>
+<span class="nc" id="L1827">        .forEach(fragmentTree::removeVertex);</span>
+    // Apparently this sometimes screws up the tree
+<span class="nc" id="L1829">    fragmentTree.vertexSet().stream()</span>
+<span class="nc bnc" id="L1830" title="All 2 branches missed.">        .filter(vertex -&gt; fragmentTree.getFirstRoot() != vertex &amp;&amp;</span>
+<span class="nc bnc" id="L1831" title="All 2 branches missed.">            tree.getFirstRoot() != vertex &amp;&amp;</span>
+<span class="nc bnc" id="L1832" title="All 2 branches missed.">            !fragmentTree.incomingEdgeIterable(vertex).iterator().hasNext())</span>
+<span class="nc" id="L1833">        .forEach(vertex -&gt; {</span>
+<span class="nc" id="L1834">          SemanticGraphEdge edge = tree.incomingEdgeIterable(vertex).iterator().next();</span>
+<span class="nc" id="L1835">          fragmentTree.addEdge(fragmentTree.getFirstRoot(), edge.getDependent(), edge.getRelation(),</span>
+<span class="nc" id="L1836">              edge.getWeight(), edge.isExtra());</span>
+<span class="nc" id="L1837">        });</span>
+    // Return the fragment
+    //noinspection SimplifiableConditionalExpression
+<span class="nc" id="L1840">    return new SentenceFragment(fragmentTree,</span>
+<span class="nc bnc" id="L1841" title="All 2 branches missed.">        fragment.hasAssumedTruth() ? fragment.getAssumedTruth() : true,</span>
+        false)
+<span class="nc bnc" id="L1843" title="All 2 branches missed.">        .changeScore(fragment.hasScore() ? fragment.getScore() : 1.0);</span>
+  }
+
+  /**
+   * Convert a serialized Map back into a Java Map.
+   *
+   * @param proto The serialized map.
+   *
+   * @return A Java Map corresponding to the serialized map.
+   */
+  public static HashMap&lt;String, String&gt; fromProto(CoreNLPProtos.MapStringString proto) {
+<span class="nc" id="L1854">    HashMap&lt;String, String&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1855" title="All 2 branches missed.">    for (int i = 0; i &lt; proto.getKeyCount(); ++i) {</span>
+<span class="nc" id="L1856">      map.put(proto.getKey(i), proto.getValue(i));</span>
+    }
+<span class="nc" id="L1858">    return map;</span>
+  }
+
+  /**
+   * Convert a serialized Map back into a Java Map.
+   *
+   * @param proto The serialized map.
+   *
+   * @return A Java Map corresponding to the serialized map.
+   */
+  public static HashMap&lt;Integer, String&gt; fromProto(CoreNLPProtos.MapIntString proto) {
+<span class="nc" id="L1869">      HashMap&lt;Integer, String&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1870" title="All 2 branches missed.">      for (int i = 0; i &lt; proto.getKeyCount(); ++i) {</span>
+<span class="nc" id="L1871">          map.put(proto.getKey(i), proto.getValue(i));</span>
+      }
+<span class="nc" id="L1873">      return map;</span>
+  }
+
+  /**
+   * Read a CorefChain from its serialized representation.
+   * This is private due to the need for an additional partial document. Also, why on Earth are you trying to use
+   * this on its own anyways?
+   * @param proto The serialized representation of the coref chain, missing information on its mention span string.
+   * @param partialDocument A partial document, which must contain {@link SentencesAnnotation} and {@link TokensAnnotation} in
+   *                        order to fill in the mention span strings.
+   * @return A coreference chain.
+   */
+  private CorefChain fromProto(CoreNLPProtos.CorefChain proto, Annotation partialDocument) {
+    // Get chain ID
+<span class="nc" id="L1887">    int cid = proto.getChainID();</span>
+    // Get mentions
+<span class="nc" id="L1889">    Map&lt;IntPair, Set&lt;CorefChain.CorefMention&gt;&gt; mentions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1890">    CorefChain.CorefMention representative = null;</span>
+<span class="nc bnc" id="L1891" title="All 2 branches missed.">    for (int i = 0; i &lt; proto.getMentionCount(); ++i) {</span>
+<span class="nc bnc" id="L1892" title="All 2 branches missed.">      if (Thread.interrupted()) {</span>
+<span class="nc" id="L1893">        throw new RuntimeInterruptedException();</span>
+      }
+<span class="nc" id="L1895">      CoreNLPProtos.CorefChain.CorefMention mentionProto = proto.getMention(i);</span>
+      // Create mention
+<span class="nc" id="L1897">      StringBuilder mentionSpan = new StringBuilder();</span>
+<span class="nc" id="L1898">      List&lt;CoreLabel&gt; sentenceTokens = partialDocument.get(SentencesAnnotation.class).get(mentionProto.getSentenceIndex()).get(TokensAnnotation.class);</span>
+<span class="nc bnc" id="L1899" title="All 2 branches missed.">      for (int k = mentionProto.getBeginIndex(); k &lt; mentionProto.getEndIndex(); ++k) {</span>
+<span class="nc" id="L1900">        mentionSpan.append(&quot; &quot;).append(sentenceTokens.get(k).word());</span>
+      }
+      // Set the coref cluster id for the token
+<span class="nc" id="L1903">      CorefChain.CorefMention mention = new CorefChain.CorefMention(</span>
+<span class="nc" id="L1904">          Dictionaries.MentionType.valueOf(mentionProto.getMentionType()),</span>
+<span class="nc" id="L1905">          Dictionaries.Number.valueOf(mentionProto.getNumber()),</span>
+<span class="nc" id="L1906">          Dictionaries.Gender.valueOf(mentionProto.getGender()),</span>
+<span class="nc" id="L1907">          Dictionaries.Animacy.valueOf(mentionProto.getAnimacy()),</span>
+<span class="nc" id="L1908">          mentionProto.getBeginIndex() + 1,</span>
+<span class="nc" id="L1909">          mentionProto.getEndIndex() + 1,</span>
+<span class="nc" id="L1910">          mentionProto.getHeadIndex() + 1,</span>
+          cid,
+<span class="nc" id="L1912">          mentionProto.getMentionID(),</span>
+<span class="nc" id="L1913">          mentionProto.getSentenceIndex() + 1,</span>
+<span class="nc" id="L1914">          new IntTuple(new int[]{ mentionProto.getSentenceIndex() + 1, mentionProto.getPosition() }),</span>
+<span class="nc bnc" id="L1915" title="All 2 branches missed.">          mentionSpan.substring(mentionSpan.length() &gt; 0 ? 1 : 0));</span>
+      // Register mention
+<span class="nc" id="L1917">      IntPair key = new IntPair(mentionProto.getSentenceIndex() - 1, mentionProto.getHeadIndex() - 1);</span>
+<span class="nc bnc" id="L1918" title="All 2 branches missed.">      if (!mentions.containsKey(key)) { mentions.put(key, new HashSet&lt;&gt;()); }</span>
+<span class="nc" id="L1919">      mentions.get(key).add(mention);</span>
+      // Check for representative
+<span class="nc bnc" id="L1921" title="All 4 branches missed.">      if (proto.hasRepresentative() &amp;&amp; i == proto.getRepresentative()) {</span>
+<span class="nc" id="L1922">        representative = mention;</span>
+      }
+    }
+    // Return
+<span class="nc" id="L1926">    return new CorefChain(cid, mentions, representative);</span>
+  }
+
+  private Mention fromProtoNoTokens(CoreNLPProtos.Mention protoMention) {
+<span class="nc" id="L1930">    Mention returnMention = new Mention();</span>
+    // set enums
+<span class="nc bnc" id="L1932" title="All 4 branches missed.">    if (protoMention.getMentionType() != null &amp;&amp; !protoMention.getMentionType().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1933">      returnMention.mentionType = Dictionaries.MentionType.valueOf(protoMention.getMentionType());</span>
+    }
+<span class="nc bnc" id="L1935" title="All 4 branches missed.">    if (protoMention.getNumber() != null &amp;&amp; !protoMention.getNumber().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1936">      returnMention.number = Dictionaries.Number.valueOf(protoMention.getNumber());</span>
+    }
+<span class="nc bnc" id="L1938" title="All 4 branches missed.">    if (protoMention.getGender() != null &amp;&amp; !protoMention.getGender().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1939">      returnMention.gender = Dictionaries.Gender.valueOf(protoMention.getGender());</span>
+    }
+<span class="nc bnc" id="L1941" title="All 4 branches missed.">    if (protoMention.getAnimacy() != null &amp;&amp; !protoMention.getAnimacy().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1942">      returnMention.animacy = Dictionaries.Animacy.valueOf(protoMention.getAnimacy());</span>
+    }
+<span class="nc bnc" id="L1944" title="All 4 branches missed.">    if (protoMention.getPerson() != null &amp;&amp; !protoMention.getPerson().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1945">      returnMention.person = Dictionaries.Person.valueOf(protoMention.getPerson());</span>
+    }
+
+    // TO DO: if the original Mention had &quot;&quot; for this field it will be lost, should deal with this problem
+<span class="nc bnc" id="L1949" title="All 2 branches missed.">    if (!protoMention.getHeadString().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1950">      returnMention.headString = protoMention.getHeadString();</span>
+    }
+    // TO DO: if the original Mention had &quot;&quot; for this field it will be lost, should deal with this problem
+<span class="nc bnc" id="L1953" title="All 2 branches missed.">    if (!protoMention.getNerString().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1954">      returnMention.nerString = protoMention.getNerString();</span>
+    }
+
+<span class="nc" id="L1957">    returnMention.startIndex = protoMention.getStartIndex();</span>
+<span class="nc" id="L1958">    returnMention.endIndex = protoMention.getEndIndex();</span>
+<span class="nc" id="L1959">    returnMention.headIndex = protoMention.getHeadIndex();</span>
+<span class="nc" id="L1960">    returnMention.mentionID = protoMention.getMentionID();</span>
+<span class="nc" id="L1961">    returnMention.originalRef = protoMention.getOriginalRef();</span>
+
+<span class="nc" id="L1963">    returnMention.goldCorefClusterID = protoMention.getGoldCorefClusterID();</span>
+<span class="nc" id="L1964">    returnMention.corefClusterID = protoMention.getCorefClusterID();</span>
+<span class="nc" id="L1965">    returnMention.mentionNum = protoMention.getMentionNum();</span>
+<span class="nc" id="L1966">    returnMention.sentNum = protoMention.getSentNum();</span>
+<span class="nc" id="L1967">    returnMention.utter = protoMention.getUtter();</span>
+<span class="nc" id="L1968">    returnMention.paragraph = protoMention.getParagraph();</span>
+<span class="nc" id="L1969">    returnMention.isSubject = protoMention.getIsSubject();</span>
+<span class="nc" id="L1970">    returnMention.isDirectObject = protoMention.getIsDirectObject();</span>
+<span class="nc" id="L1971">    returnMention.isIndirectObject = protoMention.getIsIndirectObject();</span>
+<span class="nc" id="L1972">    returnMention.isPrepositionObject = protoMention.getIsPrepositionObject();</span>
+<span class="nc" id="L1973">    returnMention.hasTwin = protoMention.getHasTwin();</span>
+<span class="nc" id="L1974">    returnMention.generic = protoMention.getGeneric();</span>
+<span class="nc" id="L1975">    returnMention.isSingleton = protoMention.getIsSingleton();</span>
+
+    // handle the sets of Strings
+<span class="nc bnc" id="L1978" title="All 2 branches missed.">    if (protoMention.getDependentsCount() != 0) {</span>
+<span class="nc" id="L1979">      returnMention.dependents = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1980">      returnMention.dependents.addAll(protoMention.getDependentsList());</span>
+    }
+
+<span class="nc bnc" id="L1983" title="All 2 branches missed.">    if (protoMention.getPreprocessedTermsCount() != 0) {</span>
+<span class="nc" id="L1984">      returnMention.preprocessedTerms = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1985">      returnMention.preprocessedTerms.addAll(protoMention.getPreprocessedTermsList());</span>
+    }
+
+<span class="nc" id="L1988">    return returnMention;</span>
+  }
+
+  private SpeakerInfo fromProto(CoreNLPProtos.SpeakerInfo speakerInfo) {
+<span class="nc" id="L1992">    String speakerName = speakerInfo.getSpeakerName();</span>
+<span class="nc" id="L1993">    return new SpeakerInfo(speakerName);</span>
+  }
+
+  /**
+   * Create an internal Timex object from the serialized protocol buffer.
+   * @param proto The serialized protocol buffer to read from.
+   * @return A timex, with as much information filled in as was gleaned from the protocol buffer.
+   */
+  private Timex fromProto(CoreNLPProtos.Timex proto) {
+<span class="nc" id="L2002">    return new Timex(</span>
+<span class="nc bnc" id="L2003" title="All 2 branches missed.">        proto.hasType() ? proto.getType() : null,</span>
+<span class="nc bnc" id="L2004" title="All 2 branches missed.">        proto.hasValue() ? proto.getValue() : null,</span>
+<span class="nc bnc" id="L2005" title="All 2 branches missed.">        proto.hasAltValue() ? proto.getAltValue() : null,</span>
+<span class="nc bnc" id="L2006" title="All 2 branches missed.">        proto.hasTid() ? proto.getTid() : null,</span>
+<span class="nc bnc" id="L2007" title="All 2 branches missed.">        proto.hasText() ? proto.getText() : null,</span>
+<span class="nc bnc" id="L2008" title="All 2 branches missed.">        proto.hasBeginPoint() ? proto.getBeginPoint() : -1,</span>
+<span class="nc bnc" id="L2009" title="All 2 branches missed.">        proto.hasEndPoint() ? proto.getEndPoint() : -1);</span>
+  }
+
+  /**
+   * Read a entity mention from its serialized form. Requires the containing sentence to be
+   * passed in along with the protocol buffer.
+   * @param proto The serialized entity mention.
+   * @param sentence The sentence this mention is attached to.
+   * @return The entity mention corresponding to the serialized object.
+   */
+  private EntityMention fromProto(CoreNLPProtos.Entity proto, CoreMap sentence) {
+<span class="nc" id="L2020">    EntityMention rtn = new EntityMention(</span>
+<span class="nc bnc" id="L2021" title="All 2 branches missed.">        proto.hasObjectID() ? proto.getObjectID() : null,</span>
+        sentence,
+<span class="nc bnc" id="L2023" title="All 2 branches missed.">        proto.hasHeadStart() ? new Span(proto.getHeadStart(), proto.getHeadEnd()) : null,</span>
+<span class="nc bnc" id="L2024" title="All 2 branches missed.">        proto.hasHeadEnd() ? new Span(proto.getExtentStart(), proto.getExtentEnd()) : null,</span>
+<span class="nc bnc" id="L2025" title="All 2 branches missed.">        proto.hasType() ? proto.getType() : null,</span>
+<span class="nc bnc" id="L2026" title="All 2 branches missed.">        proto.hasSubtype() ? proto.getSubtype() : null,</span>
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">        proto.hasMentionType() ? proto.getMentionType() : null );</span>
+<span class="nc bnc" id="L2028" title="All 2 branches missed.">    if (proto.hasNormalizedName()) { rtn.setNormalizedName(proto.getNormalizedName()); }</span>
+<span class="nc bnc" id="L2029" title="All 2 branches missed.">    if (proto.hasHeadTokenIndex()) { rtn.setHeadTokenPosition(proto.getHeadTokenIndex()); }</span>
+<span class="nc bnc" id="L2030" title="All 2 branches missed.">    if (proto.hasCorefID()) { rtn.setCorefID(proto.getCorefID()); }</span>
+<span class="nc" id="L2031">    return rtn;</span>
+  }
+
+  /**
+   * Read a relation mention from its serialized form. Requires the containing sentence to be
+   * passed in along with the protocol buffer.
+   * @param proto The serialized relation mention.
+   * @param sentence The sentence this mention is attached to.
+   * @return The relation mention corresponding to the serialized object.
+   */
+  private RelationMention fromProto(CoreNLPProtos.Relation proto, CoreMap sentence) {
+<span class="nc" id="L2042">    List&lt;ExtractionObject&gt; args = proto.getArgList().stream().map(arg -&gt; fromProto(arg, sentence)).collect(Collectors.toList());</span>
+<span class="nc" id="L2043">    RelationMention rtn = new RelationMention(</span>
+<span class="nc bnc" id="L2044" title="All 2 branches missed.">        proto.hasObjectID() ? proto.getObjectID() : null,</span>
+        sentence,
+<span class="nc bnc" id="L2046" title="All 2 branches missed.">        proto.hasExtentStart() ? new Span(proto.getExtentStart(), proto.getExtentEnd()) : null,</span>
+<span class="nc bnc" id="L2047" title="All 2 branches missed.">        proto.hasType() ? proto.getType() : null,</span>
+<span class="nc bnc" id="L2048" title="All 2 branches missed.">        proto.hasSubtype() ? proto.getSubtype() : null,</span>
+        args);
+<span class="nc bnc" id="L2050" title="All 2 branches missed.">    if (proto.hasSignature()) { rtn.setSignature(proto.getSignature()); }</span>
+<span class="nc bnc" id="L2051" title="All 4 branches missed.">    if (proto.getArgNameCount() &gt; 0 || proto.getArgCount() == 0) {</span>
+<span class="nc" id="L2052">      rtn.setArgNames(proto.getArgNameList());</span>
+    }
+<span class="nc" id="L2054">    return rtn;</span>
+  }
+
+  /**
+   * Convert a quote object to a protocol buffer.
+   */
+  @SuppressWarnings(&quot;UnusedParameters&quot;)
+  private static Annotation fromProto(CoreNLPProtos.Quote quote, List&lt;CoreLabel&gt; tokens) {
+<span class="nc" id="L2062">    List&lt;CoreLabel&gt; quotedTokens = null;</span>
+    // note[gabor]: This works, but apparently isn't the behavior of the quote annotator?
+//    if (quote.hasTokenBegin() &amp;&amp; quote.hasTokenEnd() &amp;&amp; quote.getTokenBegin() &gt;= 0 &amp;&amp; quote.getTokenEnd() &gt;= 0) {
+//      quotedTokens = tokens.subList(quote.getTokenBegin(), quote.getTokenEnd());
+//    }
+    @SuppressWarnings(&quot;ConstantConditions&quot;)
+<span class="nc" id="L2068">    Annotation ann = QuoteAnnotator.makeQuote(</span>
+<span class="nc bnc" id="L2069" title="All 2 branches missed.">        quote.hasText() ? quote.getText() : null,</span>
+<span class="nc bnc" id="L2070" title="All 2 branches missed.">        quote.hasBegin() ? quote.getBegin() : -1,</span>
+<span class="nc bnc" id="L2071" title="All 2 branches missed.">        quote.hasEnd() ? quote.getEnd() : -1,</span>
+        quotedTokens,
+<span class="nc bnc" id="L2073" title="All 2 branches missed.">        quote.hasTokenBegin() ? quote.getTokenBegin() : -1,</span>
+<span class="nc bnc" id="L2074" title="All 2 branches missed.">        quote.hasSentenceBegin() ? quote.getSentenceBegin() : -1,</span>
+<span class="nc bnc" id="L2075" title="All 2 branches missed.">        quote.hasSentenceEnd() ? quote.getSentenceEnd() : -1,</span>
+<span class="nc bnc" id="L2076" title="All 2 branches missed.">        quote.hasDocid() ? quote.getDocid() : null);</span>
+<span class="nc bnc" id="L2077" title="All 2 branches missed.">    if (quote.hasIndex()) { ann.set(QuotationIndexAnnotation.class, quote.getIndex()); }</span>
+<span class="nc bnc" id="L2078" title="All 2 branches missed.">    if (quote.hasTokenBegin()) { ann.set(TokenBeginAnnotation.class, quote.getTokenBegin()); }</span>
+<span class="nc bnc" id="L2079" title="All 2 branches missed.">    if (quote.hasTokenEnd()) { ann.set(TokenEndAnnotation.class, quote.getTokenEnd()); }</span>
+<span class="nc" id="L2080">    return ann;</span>
+  }
+
+  /**
+   * Convert a quote object to a protocol buffer.
+   */
+  @SuppressWarnings(&quot;UnusedParameters&quot;)
+  private CoreMap fromProto(CoreNLPProtos.NERMention mention) {
+<span class="nc" id="L2088">    CoreMap map = new ArrayCoreMap();</span>
+<span class="nc bnc" id="L2089" title="All 2 branches missed.">    if (mention.hasSentenceIndex()) map.set(SentenceIndexAnnotation.class, mention.getSentenceIndex());</span>
+<span class="nc bnc" id="L2090" title="All 2 branches missed.">    if (mention.hasTokenStartInSentenceInclusive()) map.set(TokenBeginAnnotation.class, mention.getTokenStartInSentenceInclusive());</span>
+<span class="nc bnc" id="L2091" title="All 2 branches missed.">    if (mention.hasTokenEndInSentenceExclusive()) map.set(TokenEndAnnotation.class, mention.getTokenEndInSentenceExclusive());</span>
+<span class="nc bnc" id="L2092" title="All 2 branches missed.">    if (mention.hasNer()) map.set(NamedEntityTagAnnotation.class, mention.getNer());</span>
+<span class="nc bnc" id="L2093" title="All 2 branches missed.">    if (mention.hasNormalizedNER()) map.set(NormalizedNamedEntityTagAnnotation.class, mention.getNormalizedNER());</span>
+<span class="nc bnc" id="L2094" title="All 2 branches missed.">    if (mention.hasEntityType()) map.set(EntityTypeAnnotation.class, mention.getEntityType());</span>
+<span class="nc bnc" id="L2095" title="All 2 branches missed.">    if (mention.hasTimex()) map.set(TimexAnnotation.class, fromProto(mention.getTimex()));</span>
+<span class="nc bnc" id="L2096" title="All 2 branches missed.">    if (mention.hasWikipediaEntity()) map.set(WikipediaEntityAnnotation.class, mention.getWikipediaEntity());</span>
+
+<span class="nc" id="L2098">    return map;</span>
+  }
+
+  /**
+   * Recover the {@link edu.stanford.nlp.ling.CoreAnnotations.TextAnnotation} field of a sentence
+   * from the tokens. This is useful if the text was not set in the protocol buffer, and therefore
+   * needs to be reconstructed from tokens.
+   *
+   * @param tokens The list of tokens representing this sentence.
+   * @return The original text of the sentence.
+   */
+  protected String recoverOriginalText(List&lt;CoreLabel&gt; tokens, CoreNLPProtos.Sentence sentence) {
+<span class="nc" id="L2110">    StringBuilder text = new StringBuilder();</span>
+<span class="nc" id="L2111">    CoreLabel last = null;</span>
+<span class="nc bnc" id="L2112" title="All 2 branches missed.">    if (tokens.size() &gt; 0) {</span>
+<span class="nc" id="L2113">      CoreLabel token = tokens.get(0);</span>
+<span class="nc bnc" id="L2114" title="All 2 branches missed.">      if (token.originalText() != null) { text.append(token.originalText()); } else { text.append(token.word()); }</span>
+<span class="nc" id="L2115">      last = tokens.get(0);</span>
+    }
+<span class="nc bnc" id="L2117" title="All 2 branches missed.">    for (int i = 1; i &lt; tokens.size(); ++i) {</span>
+<span class="nc" id="L2118">      CoreLabel token = tokens.get(i);</span>
+<span class="nc bnc" id="L2119" title="All 2 branches missed.">      if (token.before() != null) {</span>
+<span class="nc" id="L2120">        text.append(token.before());</span>
+<span class="nc bnc" id="L2121" title="All 4 branches missed.">        assert last != null;</span>
+<span class="nc" id="L2122">        int missingWhitespace = (token.beginPosition() - last.endPosition()) - token.before().length();</span>
+<span class="nc bnc" id="L2123" title="All 2 branches missed.">        while (missingWhitespace &gt; 0) {</span>
+<span class="nc" id="L2124">          text.append(' ');</span>
+<span class="nc" id="L2125">          missingWhitespace -= 1;</span>
+        }
+      }
+<span class="nc bnc" id="L2128" title="All 2 branches missed.">      if (token.originalText() != null) { text.append(token.originalText()); } else { text.append(token.word()); }</span>
+<span class="nc" id="L2129">      last = token;</span>
+    }
+<span class="nc" id="L2131">    return text.toString();</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

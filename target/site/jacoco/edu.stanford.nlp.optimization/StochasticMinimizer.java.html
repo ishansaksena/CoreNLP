@@ -1,0 +1,528 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StochasticMinimizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">StochasticMinimizer.java</span></div><h1>StochasticMinimizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.Timing;
+
+import java.text.NumberFormat;
+import java.text.DecimalFormat;
+import java.io.PrintWriter;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Random;
+import edu.stanford.nlp.util.Pair;
+
+/**
+ * Stochastic Gradient Descent Minimizer.
+ * Note: If you want a fast SGD minimizer, then you probably want to use
+ * StochasticInPlaceMinimizer, not this class!
+ *
+ * The basic way to use the minimizer is with a null constructor, then
+ * the simple minimize method:
+ * &lt;p/&gt;
+ * &lt;p&gt;&lt;code&gt;Minimizer smd = new SGDMinimizer();&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;DiffFunction df = new SomeDiffFunction(); //Note that it must be a incidence of AbstractStochasticCachingDiffFunction&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;double tol = 1e-4;&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;double[] initial = getInitialGuess();&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;int maxIterations = someSafeNumber;&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;double[] minimum = qnm.minimize(df,tol,initial,maxIterations);&lt;/code&gt;
+ * &lt;p/&gt;
+ * Constructing with a null constructor will use the default values of
+ * &lt;p&gt;
+ * &lt;br&gt;&lt;code&gt;batchSize = 15;&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;initialGain = 0.1;&lt;/code&gt;
+ * &lt;p/&gt;
+ *
+ * @author &lt;a href=&quot;mailto:akleeman@stanford.edu&quot;&gt;Alex Kleeman&lt;/a&gt;
+ * @version 1.0
+ * @since 1.0
+ */
+<span class="nc" id="L42">public abstract class StochasticMinimizer&lt;T extends Function&gt; implements Minimizer&lt;T&gt;, HasEvaluators  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L45">  private static Redwood.RedwoodChannels log = Redwood.channels(StochasticMinimizer.class);</span>
+
+<span class="nc" id="L47">  public boolean outputIterationsToFile = false;</span>
+<span class="nc" id="L48">  public int outputFrequency = 1000;</span>
+<span class="nc" id="L49">  public double gain = 0.1;</span>
+
+  protected double[] x, newX, grad, newGrad,v;
+  protected int numBatches;
+  protected int k;
+<span class="nc" id="L54">  protected int bSize = 15;</span>
+<span class="nc" id="L55">  protected boolean quiet = false;</span>
+<span class="nc" id="L56">  protected List&lt;double[]&gt; gradList = null;</span>
+<span class="nc" id="L57">  protected int memory = 10;</span>
+<span class="nc" id="L58">  protected int numPasses = -1;</span>
+<span class="nc" id="L59">  protected Random gen = new Random(1);</span>
+<span class="nc" id="L60">  protected PrintWriter file = null;</span>
+<span class="nc" id="L61">  protected PrintWriter infoFile = null;</span>
+<span class="nc" id="L62">  protected long maxTime = Long.MAX_VALUE;</span>
+
+<span class="nc" id="L64">  private int evaluateIters = 0;    // Evaluate every x iterations (0 = no evaluation)</span>
+  private Evaluator[] evaluators;  // separate set of evaluators to check how optimization is going
+
+  public void shutUp() {
+<span class="nc" id="L68">    this.quiet = true;</span>
+<span class="nc" id="L69">  }</span>
+
+<span class="nc" id="L71">  protected static final NumberFormat nf = new DecimalFormat(&quot;0.000E0&quot;);</span>
+
+
+  protected abstract String getName();
+
+  protected abstract void takeStep(AbstractStochasticCachingDiffFunction dfunction);
+
+  public void setEvaluators(int iters, Evaluator[] evaluators)
+  {
+<span class="nc" id="L80">    this.evaluateIters = iters;</span>
+<span class="nc" id="L81">    this.evaluators = evaluators;</span>
+<span class="nc" id="L82">  }</span>
+
+  /*
+    This is the scaling factor for the gains to ensure convergence
+  */
+  protected static double gainSchedule(int it, double tau){
+<span class="nc" id="L88">    return (tau / (tau + it));</span>
+  }
+
+  /*
+   * This is used to smooth the gradients, providing a more robust calculation which
+   * generally leads to a better routine.
+   */
+
+  protected static double[] smooth(List&lt;double[]&gt; toSmooth){
+<span class="nc" id="L97">    double[] smoothed = new double[toSmooth.get(0).length];</span>
+
+<span class="nc bnc" id="L99" title="All 2 branches missed.">    for(double[] thisArray:toSmooth){</span>
+<span class="nc" id="L100">      ArrayMath.pairwiseAddInPlace(smoothed,thisArray);</span>
+<span class="nc" id="L101">    }</span>
+
+<span class="nc" id="L103">    ArrayMath.multiplyInPlace(smoothed,1/((double) toSmooth.size() ));</span>
+<span class="nc" id="L104">    return smoothed;</span>
+  }
+
+
+  private void initFiles() {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">    if (outputIterationsToFile) {</span>
+
+<span class="nc" id="L111">      String fileName = getName() + &quot;.output&quot;;</span>
+<span class="nc" id="L112">      String infoName = getName() + &quot;.info&quot;;</span>
+
+      try {
+<span class="nc" id="L115">        file = new PrintWriter(new FileOutputStream(fileName),true);</span>
+<span class="nc" id="L116">        infoFile = new PrintWriter(new FileOutputStream(infoName),true);</span>
+      }
+<span class="nc" id="L118">      catch (IOException e) {</span>
+<span class="nc" id="L119">        log.info(&quot;Caught IOException outputting data to file: &quot; + e.getMessage());</span>
+<span class="nc" id="L120">        System.exit(1);</span>
+<span class="nc" id="L121">      }</span>
+    }
+<span class="nc" id="L123">  }</span>
+
+
+  public abstract Pair&lt;Integer,Double&gt; tune(Function function,double[] initial, long msPerTest);
+
+  public double tuneDouble(edu.stanford.nlp.optimization.Function function, double[] initial, long msPerTest,PropertySetter&lt;Double&gt; ps,double lower,double upper){
+<span class="nc" id="L129">    return this.tuneDouble(function, initial, msPerTest, ps, lower, upper, 1e-3*Math.abs(upper-lower));</span>
+  }
+
+  public double tuneDouble(edu.stanford.nlp.optimization.Function function, double[] initial, long msPerTest,PropertySetter&lt;Double&gt; ps,double lower,double upper,double TOL){
+
+<span class="nc" id="L134">    double[] xtest = new double[initial.length];</span>
+<span class="nc" id="L135">    this.maxTime = msPerTest;</span>
+    // check for stochastic derivatives
+<span class="nc bnc" id="L137" title="All 2 branches missed.">    if (!(function instanceof AbstractStochasticCachingDiffFunction)) {</span>
+<span class="nc" id="L138">      throw new UnsupportedOperationException();</span>
+    }
+<span class="nc" id="L140">    AbstractStochasticCachingDiffFunction dfunction = (AbstractStochasticCachingDiffFunction) function;</span>
+
+<span class="nc" id="L142">    List&lt;Pair&lt;Double,Double&gt;&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L143">    Pair&lt;Double,Double&gt; best = new Pair&lt;&gt;(lower, Double.POSITIVE_INFINITY); //this is set to lower because the first it will always use the lower first, so it has to be best</span>
+<span class="nc" id="L144">    Pair&lt;Double,Double&gt; low = new Pair&lt;&gt;(lower, Double.POSITIVE_INFINITY);</span>
+<span class="nc" id="L145">    Pair&lt;Double,Double&gt; high = new Pair&lt;&gt;(upper, Double.POSITIVE_INFINITY);</span>
+<span class="nc" id="L146">    Pair&lt;Double,Double&gt; cur = new Pair&lt;&gt;();</span>
+<span class="nc" id="L147">    Pair&lt;Double,Double&gt; tmp = new Pair&lt;&gt;();</span>
+
+<span class="nc" id="L149">    List&lt;Double&gt; queue = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L150">    queue.add(lower);</span>
+<span class="nc" id="L151">    queue.add(upper);</span>
+    //queue.add(0.5* (lower + upper));
+
+<span class="nc" id="L154">    boolean  toContinue = true;</span>
+<span class="nc" id="L155">    this.numPasses = 10000;</span>
+
+    do{
+<span class="nc" id="L158">      System.arraycopy(initial, 0, xtest, 0, initial.length);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">      if(queue.size() != 0){</span>
+<span class="nc" id="L160">        cur.first = queue.remove(0);</span>
+      }else{
+<span class="nc" id="L162">        cur.first = 0.5*( low.first() + high.first() );</span>
+      }
+
+<span class="nc" id="L165">      ps.set(cur.first() );</span>
+
+<span class="nc" id="L167">      log.info(&quot;&quot;);</span>
+<span class="nc" id="L168">      log.info(&quot;About to test with batch size:  &quot; + bSize +</span>
+              &quot;  gain: &quot;  + gain + &quot; and  &quot; +
+<span class="nc" id="L170">              ps.toString() + &quot; set to  &quot; + cur.first());</span>
+
+<span class="nc" id="L172">      xtest = this.minimize(function, 1e-100, xtest);</span>
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">      if(Double.isNaN( xtest[0] ) ){</span>
+<span class="nc" id="L175">        cur.second = Double.POSITIVE_INFINITY;</span>
+      } else {
+<span class="nc" id="L177">        cur.second = dfunction.valueAt(xtest);</span>
+      }
+
+<span class="nc bnc" id="L180" title="All 2 branches missed.">      if( cur.second() &lt; best.second() ){</span>
+
+<span class="nc" id="L182">        copyPair(best,tmp);</span>
+<span class="nc" id="L183">        copyPair(cur,best);</span>
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if(tmp.first() &gt; best.first()){</span>
+<span class="nc" id="L186">          copyPair(tmp,high); // The old best is now the upper bound</span>
+        }else{
+<span class="nc" id="L188">          copyPair(tmp,low);  // The old best is now the lower bound</span>
+        }
+<span class="nc" id="L190">        queue.add( 0.5 * ( cur.first() + high.first()  ) ); // check in the right interval next</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      } else if ( cur.first() &lt; best.first() ){</span>
+<span class="nc" id="L192">        copyPair(cur,low);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">      } else if( cur.first() &gt; best.first()){</span>
+<span class="nc" id="L194">        copyPair(cur,high);</span>
+      }
+
+<span class="nc bnc" id="L197" title="All 2 branches missed.">      if( Math.abs( low.first() - high.first() ) &lt; TOL   ) {</span>
+<span class="nc" id="L198">        toContinue = false;</span>
+      }
+
+<span class="nc" id="L201">      res.add(new Pair&lt;&gt;(cur.first(), cur.second()));</span>
+
+<span class="nc" id="L203">      log.info(&quot;&quot;);</span>
+<span class="nc" id="L204">      log.info(&quot;Final value is: &quot; + nf.format(cur.second()));</span>
+<span class="nc" id="L205">      log.info(&quot;Optimal so far using &quot; + ps.toString() + &quot; is: &quot;+ best.first() );</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    } while(toContinue);</span>
+
+
+    //output the results to screen.
+<span class="nc" id="L210">    log.info(&quot;-------------&quot;);</span>
+<span class="nc" id="L211">    log.info(&quot; RESULTS          &quot;);</span>
+<span class="nc" id="L212">    log.info(ps.getClass().toString());</span>
+<span class="nc" id="L213">    log.info(&quot;-------------&quot;);</span>
+<span class="nc" id="L214">    log.info(&quot;  val    ,    function after &quot; + msPerTest + &quot; ms&quot;);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">    for (Pair&lt;Double, Double&gt; re : res) {</span>
+<span class="nc" id="L216">      log.info(re.first() + &quot;    ,    &quot; + re.second());</span>
+<span class="nc" id="L217">    }</span>
+<span class="nc" id="L218">    log.info(&quot;&quot;);</span>
+<span class="nc" id="L219">    log.info(&quot;&quot;);</span>
+
+<span class="nc" id="L221">    return best.first();</span>
+
+  }
+
+  private static void copyPair(Pair&lt;Double,Double&gt; from, Pair&lt;Double,Double&gt; to) {
+<span class="nc" id="L226">    to.first = from.first();</span>
+<span class="nc" id="L227">    to.second = from.second();</span>
+<span class="nc" id="L228">  }</span>
+
+
+  private class setGain implements PropertySetter&lt;Double&gt;{
+<span class="nc" id="L232">    StochasticMinimizer&lt;T&gt; parent = null;</span>
+
+<span class="nc" id="L234">    public setGain(StochasticMinimizer&lt;T&gt; min) {</span>
+<span class="nc" id="L235">      parent = min;</span>
+<span class="nc" id="L236">    }</span>
+
+    public void set(Double in) {
+<span class="nc" id="L239">      gain = in ;</span>
+<span class="nc" id="L240">    }</span>
+  }
+
+
+  public double tuneGain(Function function, double[] initial, long msPerTest, double lower, double upper){
+
+<span class="nc" id="L246">    return tuneDouble(function,initial,msPerTest,new setGain(this),lower,upper);</span>
+  }
+
+
+  // [cdm 2012: The version that used to be here was clearly buggy;
+  // I changed it a little, but didn't test it. It's now more correct, but
+  // I think it is still conceptually faulty, since it will keep growing the
+  // batch size so long as any minute improvement in the function value is
+  // obtained, whereas the whole point of using a small batch is to get speed
+  // at the cost of small losses.]
+  public int tuneBatch(Function function, double[] initial, long msPerTest, int bStart) {
+
+<span class="nc" id="L258">    double[] xTest = new double[initial.length];</span>
+<span class="nc" id="L259">    int bOpt = 0;</span>
+<span class="nc" id="L260">    double min = Double.POSITIVE_INFINITY;</span>
+<span class="nc" id="L261">    this.maxTime = msPerTest;</span>
+<span class="nc" id="L262">    double prev = Double.POSITIVE_INFINITY;</span>
+
+    // check for stochastic derivatives
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    if (!(function instanceof AbstractStochasticCachingDiffFunction)) {</span>
+<span class="nc" id="L266">      throw new UnsupportedOperationException();</span>
+    }
+<span class="nc" id="L268">    AbstractStochasticCachingDiffFunction dFunction = (AbstractStochasticCachingDiffFunction) function;</span>
+
+<span class="nc" id="L270">    int b = bStart;</span>
+<span class="nc" id="L271">    boolean  toContinue = true;</span>
+
+    do {
+<span class="nc" id="L274">      System.arraycopy(initial, 0, xTest, 0, initial.length);</span>
+<span class="nc" id="L275">      log.info(&quot;&quot;);</span>
+<span class="nc" id="L276">      log.info(&quot;Testing with batch size:  &quot; + b );</span>
+<span class="nc" id="L277">      bSize = b;</span>
+<span class="nc" id="L278">      shutUp();</span>
+<span class="nc" id="L279">      this.minimize(function, 1e-5, xTest);</span>
+<span class="nc" id="L280">      double result = dFunction.valueAt(xTest);</span>
+
+<span class="nc bnc" id="L282" title="All 2 branches missed.">      if (result &lt; min) {</span>
+<span class="nc" id="L283">        min = result;</span>
+<span class="nc" id="L284">        bOpt = bSize;</span>
+<span class="nc" id="L285">        b *= 2;</span>
+<span class="nc" id="L286">        prev = result;</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">      } else if(result &lt; prev) {</span>
+<span class="nc" id="L288">        b *= 2;</span>
+<span class="nc" id="L289">        prev = result;</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">      } else if (result &gt; prev) {</span>
+<span class="nc" id="L291">        toContinue = false;</span>
+      }
+
+<span class="nc" id="L294">      log.info(&quot;&quot;);</span>
+<span class="nc" id="L295">      log.info(&quot;Final value is: &quot; + nf.format(result));</span>
+<span class="nc" id="L296">      log.info(&quot;Optimal so far is:  batch size: &quot; + bOpt );</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">    } while (toContinue);</span>
+
+<span class="nc" id="L299">    return bOpt;</span>
+  }
+
+  public Pair&lt;Integer,Double&gt; tune(Function function, double[] initial, long msPerTest,List&lt;Integer&gt; batchSizes, List&lt;Double&gt; gains){
+
+<span class="nc" id="L304">    double[] xtest = new double[initial.length];</span>
+<span class="nc" id="L305">    int bOpt = 0;</span>
+<span class="nc" id="L306">    double gOpt = 0.0;</span>
+<span class="nc" id="L307">    double min = Double.POSITIVE_INFINITY;</span>
+
+<span class="nc" id="L309">    double[][] results = new double[batchSizes.size()][gains.size()];</span>
+
+<span class="nc" id="L311">    this.maxTime = msPerTest;</span>
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    for( int b=0;b&lt;batchSizes.size();b++){</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">      for(int g=0;g&lt;gains.size();g++){</span>
+<span class="nc" id="L315">        System.arraycopy(initial, 0, xtest, 0, initial.length);</span>
+<span class="nc" id="L316">        bSize = batchSizes.get(b);</span>
+<span class="nc" id="L317">        gain = gains.get(g);</span>
+<span class="nc" id="L318">        log.info(&quot;&quot;);</span>
+<span class="nc" id="L319">        log.info(&quot;Testing with batch size: &quot; + bSize + &quot;    gain:  &quot; + nf.format(gain) );</span>
+<span class="nc" id="L320">        this.quiet = true;</span>
+<span class="nc" id="L321">        this.minimize(function, 1e-100, xtest);</span>
+<span class="nc" id="L322">        results[b][g] = function.valueAt(xtest);</span>
+
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if( results[b][g] &lt; min ){</span>
+<span class="nc" id="L325">          min = results[b][g];</span>
+<span class="nc" id="L326">          bOpt = bSize;</span>
+<span class="nc" id="L327">          gOpt = gain;</span>
+        }
+
+<span class="nc" id="L330">        log.info(&quot;&quot;);</span>
+<span class="nc" id="L331">        log.info(&quot;Final value is: &quot; + nf.format(results[b][g]));</span>
+<span class="nc" id="L332">        log.info(&quot;Optimal so far is:  batch size: &quot; + bOpt + &quot;   gain:  &quot; + nf.format(gOpt) );</span>
+
+      }
+    }
+
+<span class="nc" id="L337">    return new Pair&lt;&gt;(bOpt, gOpt);</span>
+  }
+
+
+  //This can be filled if an extending class needs to initialize things.
+  protected void init(AbstractStochasticCachingDiffFunction func){
+<span class="nc" id="L343">  }</span>
+
+
+  private void doEvaluation(double[] x) {
+    // Evaluate solution
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    if (evaluators == null) return;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">    for (Evaluator eval:evaluators) {</span>
+<span class="nc" id="L350">      sayln(&quot;  Evaluating: &quot; + eval.toString());</span>
+<span class="nc" id="L351">      eval.evaluate(x);</span>
+    }
+<span class="nc" id="L353">  }</span>
+
+  public double[] minimize(Function function, double functionTolerance, double[] initial) {
+<span class="nc" id="L356">    return minimize(function, functionTolerance, initial, -1);</span>
+  }
+
+
+  public double[] minimize(Function function, double functionTolerance, double[] initial, int maxIterations) {
+
+    // check for stochastic derivatives
+<span class="nc bnc" id="L363" title="All 2 branches missed.">    if (!(function instanceof AbstractStochasticCachingDiffFunction)) {</span>
+<span class="nc" id="L364">      throw new UnsupportedOperationException();</span>
+    }
+<span class="nc" id="L366">    AbstractStochasticCachingDiffFunction dfunction = (AbstractStochasticCachingDiffFunction) function;</span>
+
+<span class="nc" id="L368">    dfunction.method = StochasticCalculateMethods.GradientOnly;</span>
+
+    /* ---
+      StochasticDiffFunctionTester sdft = new StochasticDiffFunctionTester(dfunction);
+      ArrayMath.add(initial, gen.nextDouble() ); // to make sure that priors are working.
+      sdft.testSumOfBatches(initial, 1e-4);
+      System.exit(1);
+    --- */
+
+<span class="nc" id="L377">    x = initial;</span>
+<span class="nc" id="L378">    grad = new double[x.length];</span>
+<span class="nc" id="L379">    newX = new double[x.length];</span>
+<span class="nc" id="L380">    gradList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L381">    numBatches =  dfunction.dataDimension()/ bSize;</span>
+<span class="nc" id="L382">    outputFrequency = (int) Math.ceil( ((double) numBatches) /( (double) outputFrequency) )  ;</span>
+
+<span class="nc" id="L384">    init(dfunction);</span>
+<span class="nc" id="L385">    initFiles();</span>
+
+<span class="nc bnc" id="L387" title="All 4 branches missed.">    boolean have_max = (maxIterations &gt; 0 || numPasses &gt; 0);</span>
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">    if (!have_max){</span>
+<span class="nc" id="L390">      throw new UnsupportedOperationException(&quot;No maximum number of iterations has been specified.&quot;);</span>
+    }else{
+<span class="nc" id="L392">      maxIterations = Math.max(maxIterations, numPasses)*numBatches;</span>
+    }
+
+<span class="nc" id="L395">    sayln(&quot;       Batchsize of: &quot; + bSize);</span>
+<span class="nc" id="L396">    sayln(&quot;       Data dimension of: &quot; + dfunction.dataDimension() );</span>
+<span class="nc" id="L397">    sayln(&quot;       Batches per pass through data:  &quot; + numBatches );</span>
+<span class="nc" id="L398">    sayln(&quot;       Max iterations is = &quot; + maxIterations);</span>
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">    if (outputIterationsToFile) {</span>
+<span class="nc" id="L401">      infoFile.println(function.domainDimension() + &quot;; DomainDimension &quot; );</span>
+<span class="nc" id="L402">      infoFile.println(bSize + &quot;; batchSize &quot;);</span>
+<span class="nc" id="L403">      infoFile.println(maxIterations + &quot;; maxIterations&quot;);</span>
+<span class="nc" id="L404">      infoFile.println(numBatches + &quot;; numBatches &quot;);</span>
+<span class="nc" id="L405">      infoFile.println(outputFrequency  + &quot;; outputFrequency&quot;);</span>
+    }
+
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //            Loop
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+<span class="nc" id="L413">    Timing total = new Timing();</span>
+<span class="nc" id="L414">    Timing current = new Timing();</span>
+<span class="nc" id="L415">    total.start();</span>
+<span class="nc" id="L416">    current.start();</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">    for (k = 0; k&lt;maxIterations ; k++)  {</span>
+      try{
+<span class="nc bnc" id="L419" title="All 6 branches missed.">        boolean doEval = (k &gt; 0 &amp;&amp; evaluateIters &gt; 0 &amp;&amp; k % evaluateIters == 0);</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        if (doEval) {</span>
+<span class="nc" id="L421">          doEvaluation(x);</span>
+        }
+<span class="nc" id="L423">        int pass = k/numBatches;</span>
+<span class="nc" id="L424">        int batch = k%numBatches;</span>
+<span class="nc" id="L425">        say(&quot;Iter: &quot; + k + &quot; pass &quot; + pass + &quot; batch &quot; + batch);</span>
+
+        // restrict number of saved gradients
+        //  (recycle memory of first gradient in list for new gradient)
+<span class="nc bnc" id="L429" title="All 4 branches missed.">        if(k &gt; 0 &amp;&amp; gradList.size() &gt;= memory){</span>
+<span class="nc" id="L430">          newGrad = gradList.remove(0);</span>
+        }else{
+<span class="nc" id="L432">          newGrad = new double[grad.length];</span>
+        }
+
+<span class="nc" id="L435">        dfunction.hasNewVals = true;</span>
+<span class="nc" id="L436">        System.arraycopy(dfunction.derivativeAt(x,v,bSize),0,newGrad,0,newGrad.length);</span>
+<span class="nc" id="L437">        ArrayMath.assertFinite(newGrad,&quot;newGrad&quot;);</span>
+<span class="nc" id="L438">        gradList.add(newGrad);</span>
+<span class="nc" id="L439">        grad = smooth(gradList);</span>
+
+        //Get the next X
+<span class="nc" id="L442">        takeStep(dfunction);</span>
+
+<span class="nc" id="L444">        ArrayMath.assertFinite(newX,&quot;newX&quot;);</span>
+
+        //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // THIS IS FOR DEBUG ONLY
+        //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+<span class="nc bnc" id="L449" title="All 6 branches missed.">        if(outputIterationsToFile &amp;&amp; (k%outputFrequency == 0) &amp;&amp; k!=0 ) {</span>
+<span class="nc" id="L450">          double curVal = dfunction.valueAt(x);</span>
+<span class="nc" id="L451">          say(&quot; TrueValue{ &quot; + curVal + &quot; } &quot;);</span>
+<span class="nc" id="L452">          file.println(k + &quot; , &quot; + curVal + &quot; , &quot; + total.report() );</span>
+        }
+        //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // END OF DEBUG STUFF
+        //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (k &gt;= maxIterations) {</span>
+<span class="nc" id="L459">          sayln(&quot;Stochastic Optimization complete.  Stopped after max iterations&quot;);</span>
+<span class="nc" id="L460">          x = newX;</span>
+<span class="nc" id="L461">          break;</span>
+        }
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (total.report() &gt;= maxTime){</span>
+<span class="nc" id="L465">          sayln(&quot;Stochastic Optimization complete.  Stopped after max time&quot;);</span>
+<span class="nc" id="L466">          x = newX;</span>
+<span class="nc" id="L467">          break;</span>
+        }
+
+<span class="nc" id="L470">        System.arraycopy(newX, 0, x, 0, x.length);</span>
+
+<span class="nc" id="L472">        say(&quot;[&quot; + ( total.report() )/1000.0 + &quot; s &quot; );</span>
+<span class="nc" id="L473">        say(&quot;{&quot; + (current.restart()/1000.0) + &quot; s}] &quot;);</span>
+<span class="nc" id="L474">        say(&quot; &quot;+dfunction.lastValue());</span>
+
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        if (quiet) {</span>
+<span class="nc" id="L477">          log.info(&quot;.&quot;);</span>
+        }else{
+<span class="nc" id="L479">          sayln(&quot;&quot;);</span>
+        }
+
+<span class="nc" id="L482">      }catch(ArrayMath.InvalidElementException e){</span>
+<span class="nc" id="L483">        log.info(e.toString());</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        for(int i=0;i&lt;x.length;i++){ x[i]=Double.NaN; }</span>
+<span class="nc" id="L485">        break;</span>
+<span class="nc" id="L486">      }</span>
+
+    }
+<span class="nc bnc" id="L489" title="All 2 branches missed.">    if (evaluateIters &gt; 0) {</span>
+      // do final evaluation
+<span class="nc" id="L491">      doEvaluation(x);</span>
+    }
+
+<span class="nc bnc" id="L494" title="All 2 branches missed.">    if(outputIterationsToFile){</span>
+<span class="nc" id="L495">      infoFile.println(k + &quot;; Iterations&quot;);</span>
+<span class="nc" id="L496">      infoFile.println(( total.report() )/1000.0 + &quot;; Completion Time&quot;);</span>
+<span class="nc" id="L497">      infoFile.println(dfunction.valueAt(x) + &quot;; Finalvalue&quot;);</span>
+
+<span class="nc" id="L499">      infoFile.close();</span>
+<span class="nc" id="L500">      file.close();</span>
+<span class="nc" id="L501">      log.info(&quot;Output Files Closed&quot;);</span>
+      //System.exit(1);
+    }
+
+<span class="nc" id="L505">    say(&quot;Completed in: &quot; + ( total.report() )/1000.0 + &quot; s&quot;);</span>
+
+<span class="nc" id="L507">    return x;</span>
+  }
+
+
+<span class="nc" id="L511">  public interface PropertySetter &lt;T1&gt; {</span>
+    void set(T1 in);
+  }
+
+  protected void sayln(String s) {
+<span class="nc bnc" id="L516" title="All 2 branches missed.">    if (!quiet) {</span>
+<span class="nc" id="L517">      log.info(s);</span>
+    }
+<span class="nc" id="L519">  }</span>
+
+  protected void say(String s) {
+<span class="nc bnc" id="L522" title="All 2 branches missed.">    if (!quiet) {</span>
+<span class="nc" id="L523">      log.info(s);</span>
+    }
+<span class="nc" id="L525">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

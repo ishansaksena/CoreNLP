@@ -1,0 +1,811 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OpenIE.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.naturalli</a> &gt; <span class="el_source">OpenIE.java</span></div><h1>OpenIE.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.naturalli; 
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.ie.util.RelationTriple;
+import edu.stanford.nlp.international.Language;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.pipeline.*;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexMatcher;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexPattern;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.trees.GrammaticalRelation;
+import edu.stanford.nlp.trees.UniversalEnglishGrammaticalRelations;
+import edu.stanford.nlp.util.*;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import edu.stanford.nlp.coref.CorefCoreAnnotations;
+
+import edu.stanford.nlp.coref.data.CorefChain;
+
+/**
+ * &lt;p&gt;
+ * An OpenIE system based on valid Natural Logic deletions of a sentence.
+ * The system is described in:
+ * &lt;/p&gt;
+ *
+ * &lt;pre&gt;
+ *   &quot;Leveraging Linguistic Structure For Open Domain Information Extraction.&quot; Gabor Angeli, Melvin Johnson Premkumar, Christopher Manning. ACL 2015.
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * The paper can be found at &lt;a href=&quot;http://nlp.stanford.edu/pubs/2015angeli-openie.pdf&quot;&gt;http://nlp.stanford.edu/pubs/2015angeli-openie.pdf&lt;/a&gt;.
+ * &lt;/p&gt;
+
+ * &lt;p&gt;
+ * Documentation on the system can be found on
+ * &lt;a href=&quot;http://nlp.stanford.edu/software/openie.shtml&quot;&gt;the project homepage&lt;/a&gt;,
+ * or the &lt;a href=&quot;http://stanfordnlp.github.io/CoreNLP/openie.html&quot;&gt;CoreNLP annotator documentation page&lt;/a&gt;.
+ * The simplest invocation of the system would be something like:
+ * &lt;/p&gt;
+ *
+ * &lt;pre&gt;
+ * java -mx1g -cp stanford-openie.jar:stanford-openie-models.jar edu.stanford.nlp.naturalli.OpenIE
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ *   Note that this class serves both as an entry point for the OpenIE system, but also as a CoreNLP annotator
+ *   which can be plugged into the CoreNLP pipeline (or any other annotation pipeline).
+ * &lt;/p&gt;
+ *
+ * @see OpenIE#annotate(Annotation)
+ * @see OpenIE#main(String[])
+ *
+ * @author Gabor Angeli
+ */
+//
+// TODO(gabor): handle things like &quot;One example of chemical energy is that found in the food that we eat .&quot;
+//
+<span class="nc bnc" id="L76" title="All 2 branches missed.">@SuppressWarnings({&quot;FieldCanBeLocal&quot;, &quot;UnusedDeclaration&quot;})</span>
+public class OpenIE implements Annotator  {
+
+  /** A logger for this class */
+<span class="nc" id="L80">  private static Redwood.RedwoodChannels log = Redwood.channels(OpenIE.class);</span>
+
+<span class="nc" id="L82">  private enum OutputFormat { REVERB, OLLIE, DEFAULT, QA_SRL }</span>
+
+  /**
+   * A pattern for rewriting &quot;NN_1 is a JJ NN_2&quot; --&gt; NN_1 is JJ&quot;
+   */
+<span class="nc" id="L87">  private static SemgrexPattern adjectivePattern = SemgrexPattern.compile(&quot;{}=obj &gt;nsubj {}=subj &gt;cop {}=be &gt;det {word:/an?/} &gt;amod {}=adj ?&gt;/prep_.*/=prep {}=pobj&quot;);</span>
+
+  //
+  // Static Options (for running standalone)
+  //
+
+  @ArgumentParser.Option(name=&quot;format&quot;, gloss=&quot;The format to output the triples in.&quot;)
+<span class="nc" id="L94">  private static OutputFormat FORMAT = OutputFormat.DEFAULT;</span>
+
+  @ArgumentParser.Option(name=&quot;filelist&quot;, gloss=&quot;The files to annotate, as a list of files one per line.&quot;)
+<span class="nc" id="L97">  private static File FILELIST  = null;</span>
+
+  @ArgumentParser.Option(name=&quot;output&quot;, gloss=&quot;The files to annotate, as a list of files one per line.&quot;)
+<span class="nc" id="L100">  private static PrintStream OUTPUT  = System.out;</span>
+
+  //
+  // Annotator Options (for running in the pipeline)
+  //
+<span class="nc" id="L105">  @ArgumentParser.Option(name=&quot;splitter.model&quot;, gloss=&quot;The location of the clause splitting model.&quot;)</span>
+  private String splitterModel = DefaultPaths.DEFAULT_OPENIE_CLAUSE_SEARCHER;
+
+<span class="nc" id="L108">  @ArgumentParser.Option(name=&quot;splitter.nomodel&quot;, gloss=&quot;If true, don't load a clause splitter model. This is primarily useful for training.&quot;)</span>
+  private boolean noModel = false;
+
+<span class="nc" id="L111">  @ArgumentParser.Option(name=&quot;splitter.threshold&quot;, gloss=&quot;The minimum threshold for accepting a clause.&quot;)</span>
+  private double splitterThreshold = 0.1;
+
+<span class="nc" id="L114">  @ArgumentParser.Option(name=&quot;splitter.disable&quot;, gloss=&quot;If true, don't run the sentence splitter&quot;)</span>
+  private boolean splitterDisable = false;
+
+<span class="nc" id="L117">  @ArgumentParser.Option(name=&quot;max_entailments_per_clause&quot;, gloss=&quot;The maximum number of entailments allowed per sentence of input.&quot;)</span>
+  private int entailmentsPerSentence = 1000;
+
+<span class="nc" id="L120">  @ArgumentParser.Option(name=&quot;ignore_affinity&quot;, gloss=&quot;If true, don't use the affinity models for dobj and pp attachment.&quot;)</span>
+  private boolean ignoreAffinity = false;
+
+<span class="nc" id="L123">  @ArgumentParser.Option(name=&quot;affinity_models&quot;, gloss=&quot;The directory (or classpath directory) containing the affinity models for pp/obj attachments.&quot;)</span>
+  private String affinityModels = DefaultPaths.DEFAULT_NATURALLI_AFFINITIES;
+
+<span class="nc" id="L126">  @ArgumentParser.Option(name=&quot;affinity_probability_cap&quot;, gloss=&quot;The affinity to consider 1.0&quot;)</span>
+  private double affinityProbabilityCap = 1.0 / 3.0;
+
+<span class="nc" id="L129">  @ArgumentParser.Option(name=&quot;triple.strict&quot;, gloss=&quot;If true, only generate triples if the entire fragment has been consumed.&quot;)</span>
+  private boolean consumeAll = true;
+
+<span class="nc" id="L132">  @ArgumentParser.Option(name=&quot;triple.all_nominals&quot;, gloss=&quot;If true, generate not only named entity nominal relations.&quot;)</span>
+  private boolean allNominals = false;
+
+<span class="nc" id="L135">  @ArgumentParser.Option(name=&quot;resolve_coref&quot;, gloss=&quot;If true, resolve pronouns to their canonical mention&quot;)</span>
+  private boolean resolveCoref = false;
+
+<span class="nc" id="L138">  @ArgumentParser.Option(name=&quot;strip_entailments&quot;, gloss=&quot;If true, don't keep the entailed sentences annotations around.&quot;)</span>
+  private boolean stripEntailments = false;
+
+  /**
+   * The natural logic weights loaded from the models file.
+   * This is primarily the prepositional attachment statistics.
+   */
+  private final NaturalLogicWeights weights;
+
+  /**
+   * The clause splitter model, if one is to be used.
+   * This component splits a sentence into a set of entailed clauses, but does not yet
+   * maximally shorten them.
+   * This is the implementation of stage 1 of the OpenIE pipeline.
+   */
+  public final Optional&lt;ClauseSplitter&gt; clauseSplitter;
+
+  /**
+   * The forward entailer model, running a search from clauses to maximally shortened clauses.
+   * This is the implementation of stage 2 of the OpenIE pipeline.
+   */
+  public final ForwardEntailer forwardEntailer;
+
+  /**
+   * The relation triple segmenter, which converts a maximally shortened clause into an OpenIE
+   * extraction triple.
+   * This is the implementation of stage 3 of the OpenIE pipeline.
+   */
+  public RelationTripleSegmenter segmenter;
+
+
+  /** Create a new OpenIE system, with default properties */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  public OpenIE() {
+<span class="nc" id="L172">    this(new Properties());</span>
+<span class="nc" id="L173">  }</span>
+
+
+  /**
+   * Create a ne OpenIE system, based on the given properties.
+   * @param props The properties to parametrize the system with.
+   */
+<span class="nc" id="L180">  public OpenIE(Properties props) {</span>
+    // Fill the properties
+<span class="nc" id="L182">    ArgumentParser.fillOptions(this, props);</span>
+<span class="nc" id="L183">    Properties withoutOpenIEPrefix = new Properties();</span>
+<span class="nc" id="L184">    Enumeration&lt;Object&gt; keys = props.keys();</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">    while (keys.hasMoreElements()) {</span>
+<span class="nc" id="L186">      String key = keys.nextElement().toString();</span>
+<span class="nc" id="L187">      withoutOpenIEPrefix.setProperty(key.replace(&quot;openie.&quot;, &quot;&quot;), props.getProperty(key));</span>
+<span class="nc" id="L188">    }</span>
+<span class="nc" id="L189">    ArgumentParser.fillOptions(this, withoutOpenIEPrefix);</span>
+
+    // Create the clause splitter
+    try {
+<span class="nc bnc" id="L193" title="All 2 branches missed.">      if (splitterDisable) {</span>
+<span class="nc" id="L194">        clauseSplitter = Optional.empty();</span>
+      } else {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (noModel) {</span>
+<span class="nc" id="L197">          log.info(&quot;Not loading a splitter model&quot;);</span>
+<span class="nc" id="L198">          clauseSplitter = Optional.of(ClauseSplitterSearchProblem::new);</span>
+        } else {
+<span class="nc" id="L200">          clauseSplitter = Optional.of(ClauseSplitter.load(splitterModel));</span>
+        }
+      }
+<span class="nc" id="L203">    } catch (IOException e) {</span>
+      //throw new RuntimeIOException(&quot;Could not load clause splitter model at &quot; + splitterModel + &quot;: &quot; + e.getClass() + &quot;: &quot; + e.getMessage());
+<span class="nc" id="L205">      throw new RuntimeIOException(&quot;Could not load clause splitter model at &quot; + splitterModel, e);</span>
+<span class="nc" id="L206">    }</span>
+
+    // Create the forward entailer
+    try {
+<span class="nc bnc" id="L210" title="All 2 branches missed.">      this.weights = ignoreAffinity ? new NaturalLogicWeights(affinityProbabilityCap) : new NaturalLogicWeights(affinityModels, affinityProbabilityCap);</span>
+<span class="nc" id="L211">    } catch (IOException e) {</span>
+<span class="nc" id="L212">      throw new RuntimeIOException(&quot;Could not load affinity model at &quot; + affinityModels + &quot;: &quot; + e.getMessage());</span>
+<span class="nc" id="L213">    }</span>
+<span class="nc" id="L214">    forwardEntailer = new ForwardEntailer(entailmentsPerSentence, weights);</span>
+
+    // Create the relation segmenter
+<span class="nc" id="L217">    segmenter = new RelationTripleSegmenter(allNominals);</span>
+<span class="nc" id="L218">  }</span>
+
+  /**
+   * Find the clauses in a sentence, where the sentence is expressed as a dependency tree.
+   *
+   * @param tree The dependency tree representation of the sentence.
+   * @param assumedTruth The assumed truth of the sentence. This is almost always true, unless you are
+   *                     doing some more nuanced reasoning.
+   *
+   * @return A set of clauses extracted from the sentence. This includes the original sentence.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;SentenceFragment&gt; clausesInSentence(SemanticGraph tree, boolean assumedTruth) {
+<span class="nc bnc" id="L231" title="All 2 branches missed.">    if (clauseSplitter.isPresent()) {</span>
+<span class="nc" id="L232">      return clauseSplitter.get().apply(tree, assumedTruth).topClauses(splitterThreshold, 32);</span>
+    } else {
+<span class="nc" id="L234">      return Collections.emptyList();</span>
+    }
+  }
+
+  /**
+   * Find the clauses in a sentence.
+   * This runs the clause splitting component of the OpenIE system only.
+   *
+   * @see OpenIE#clausesInSentence(SemanticGraph, boolean)
+   *
+   * @param sentence The raw sentence to extract clauses from.
+   *
+   * @return A set of clauses extracted from the sentence. This includes the original sentence.
+   */
+  public List&lt;SentenceFragment&gt; clausesInSentence(CoreMap sentence) {
+<span class="nc" id="L249">    return clausesInSentence(sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class), true);</span>
+  }
+
+  /**
+   * Returns all of the entailed shortened clauses (as per natural logic) from the given clause.
+   * This runs the forward entailment component of the OpenIE system only.
+   * It is usually chained together with the clause splitting component: {@link OpenIE#clausesInSentence(CoreMap)}.
+   *
+   * @param clause The premise clause, as a sentence fragment in itself.
+   *
+   * @return A list of entailed clauses.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;SentenceFragment&gt; entailmentsFromClause(SentenceFragment clause) {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    if (clause.parseTree.isEmpty()) {</span>
+<span class="nc" id="L264">      return Collections.emptyList();</span>
+    } else {
+      // Get the forward entailments
+<span class="nc" id="L267">      List&lt;SentenceFragment&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">      if (entailmentsPerSentence &gt; 0) {</span>
+<span class="nc" id="L269">        list.addAll(forwardEntailer.apply(clause.parseTree, true).search()</span>
+<span class="nc" id="L270">            .stream().map(x -&gt; x.changeScore(x.score * clause.score)).collect(Collectors.toList()));</span>
+      }
+<span class="nc" id="L272">      list.add(clause);</span>
+
+      // A special case for adjective entailments
+<span class="nc" id="L275">      List&lt;SentenceFragment&gt; adjFragments = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L276">      SemgrexMatcher matcher = adjectivePattern.matcher(clause.parseTree);</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">      OUTER: while (matcher.find()) {</span>
+        // (get nodes)
+<span class="nc" id="L279">        IndexedWord subj = matcher.getNode(&quot;subj&quot;);</span>
+<span class="nc" id="L280">        IndexedWord be = matcher.getNode(&quot;be&quot;);</span>
+<span class="nc" id="L281">        IndexedWord adj = matcher.getNode(&quot;adj&quot;);</span>
+<span class="nc" id="L282">        IndexedWord obj = matcher.getNode(&quot;obj&quot;);</span>
+<span class="nc" id="L283">        IndexedWord pobj = matcher.getNode(&quot;pobj&quot;);</span>
+<span class="nc" id="L284">        String prep = matcher.getRelnString(&quot;prep&quot;);</span>
+        // (if the adjective, or any earlier adjective, is privative, then all bets are off)
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        for (SemanticGraphEdge edge : clause.parseTree.outgoingEdgeIterable(obj)) {</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">          if (&quot;amod&quot;.equals(edge.getRelation().toString()) &amp;&amp; edge.getDependent().index() &lt;= adj.index() &amp;&amp;</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">              Util.PRIVATIVE_ADJECTIVES.contains(edge.getDependent().word().toLowerCase())) {</span>
+<span class="nc" id="L289">            continue OUTER;</span>
+          }
+<span class="nc" id="L291">        }</span>
+        // (create the core tree)
+<span class="nc" id="L293">        SemanticGraph tree = new SemanticGraph();</span>
+<span class="nc" id="L294">        tree.addRoot(adj);</span>
+<span class="nc" id="L295">        tree.addVertex(subj);</span>
+<span class="nc" id="L296">        tree.addVertex(be);</span>
+<span class="nc" id="L297">        tree.addEdge(adj, be, GrammaticalRelation.valueOf(Language.English, &quot;cop&quot;), Double.NEGATIVE_INFINITY, false);</span>
+<span class="nc" id="L298">        tree.addEdge(adj, subj, GrammaticalRelation.valueOf(Language.English, &quot;nsubj&quot;), Double.NEGATIVE_INFINITY, false);</span>
+        // (add pp attachment, if it existed)
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (pobj != null) {</span>
+<span class="nc bnc" id="L301" title="All 4 branches missed.">          assert prep != null;</span>
+<span class="nc" id="L302">          tree.addEdge(adj, pobj, GrammaticalRelation.valueOf(Language.English, prep), Double.NEGATIVE_INFINITY, false);</span>
+        }
+        // (check for monotonicity)
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        if (adj.get(NaturalLogicAnnotations.PolarityAnnotation.class).isUpwards() &amp;&amp;</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            be.get(NaturalLogicAnnotations.PolarityAnnotation.class).isUpwards()) {</span>
+          // (add tree)
+<span class="nc" id="L308">          adjFragments.add(new SentenceFragment(tree, clause.assumedTruth, false));</span>
+        }
+<span class="nc" id="L310">      }</span>
+<span class="nc" id="L311">      list.addAll(adjFragments);</span>
+<span class="nc" id="L312">      return list;</span>
+    }
+  }
+
+  /**
+   * Returns all the maximally shortened entailed fragments (as per natural logic)
+   * from the given collection of clauses.
+   *
+   * @param clauses The clauses to shorten further.
+   *
+   * @return A set of sentence fragments corresponding to the maximally shortened entailed clauses.
+   */
+  public Set&lt;SentenceFragment&gt; entailmentsFromClauses(Collection&lt;SentenceFragment&gt; clauses) {
+<span class="nc" id="L325">    Set&lt;SentenceFragment&gt; entailments = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">    for (SentenceFragment clause : clauses) {</span>
+<span class="nc" id="L327">      entailments.addAll(entailmentsFromClause(clause));</span>
+<span class="nc" id="L328">    }</span>
+<span class="nc" id="L329">    return entailments;</span>
+  }
+
+  /**
+   * Returns the possible relation triple in this sentence fragment.
+   *
+   * @see OpenIE#relationInFragment(SentenceFragment, CoreMap)
+   */
+  public Optional&lt;RelationTriple&gt; relationInFragment(SentenceFragment fragment) {
+<span class="nc" id="L338">    return segmenter.segment(fragment.parseTree, Optional.of(fragment.score), consumeAll);</span>
+  }
+
+  /**
+   * Returns the possible relation triple in this set of sentence fragments.
+   *
+   * @see OpenIE#relationsInFragments(Collection, CoreMap)
+   */
+  public List&lt;RelationTriple&gt; relationsInFragments(Collection&lt;SentenceFragment&gt; fragments) {
+<span class="nc" id="L347">    return fragments.stream().map(this::relationInFragment).filter(Optional::isPresent).map(Optional::get).collect(Collectors.toList());</span>
+  }
+
+  /**
+   * Returns the possible relation triple in this sentence fragment.
+   *
+   * @param fragment The sentence fragment to try to extract relations from.
+   * @param sentence The containing sentence for the fragment.
+   *
+   * @return A relation triple if we could find one; otherwise, {@link Optional#empty()}.
+   */
+  private Optional&lt;RelationTriple&gt; relationInFragment(SentenceFragment fragment, CoreMap sentence) {
+<span class="nc" id="L359">    return segmenter.segment(fragment.parseTree, Optional.of(fragment.score), consumeAll);</span>
+  }
+
+  /**
+   * Returns a list of OpenIE relations from the given set of sentence fragments.
+   *
+   * @param fragments The sentence fragments to extract relations from.
+   * @param sentence The containing sentence that these fragments were extracted from.
+   *
+   * @return A list of OpenIE triples, corresponding to all the triples that could be extracted from the given fragments.
+   */
+  private List&lt;RelationTriple&gt; relationsInFragments(Collection&lt;SentenceFragment&gt; fragments, CoreMap sentence) {
+<span class="nc" id="L371">    return fragments.stream().map(x -&gt; relationInFragment(x, sentence)).filter(Optional::isPresent).map(Optional::get).collect(Collectors.toList());</span>
+  }
+
+  /**
+   * Extract the relations in this clause.
+   *
+   * @see OpenIE#entailmentsFromClause(SentenceFragment)
+   * @see OpenIE#relationsInFragments(Collection)
+   */
+  public List&lt;RelationTriple&gt; relationsInClause(SentenceFragment clause) {
+<span class="nc" id="L381">    return relationsInFragments(entailmentsFromClause(clause));</span>
+  }
+
+  /**
+   * Extract the relations in this sentence.
+   *
+   * @see OpenIE#clausesInSentence(CoreMap)
+   * @see OpenIE#entailmentsFromClause(SentenceFragment)
+   * @see OpenIE#relationsInFragments(Collection)
+   */
+  public List&lt;RelationTriple&gt; relationsInSentence(CoreMap sentence) {
+<span class="nc" id="L392">    return relationsInFragments(entailmentsFromClauses(clausesInSentence(sentence)));</span>
+  }
+
+
+  /**
+   * Create a copy of the passed parse tree, canonicalizing pronominal nodes with their canonical mention.
+   * Canonical mentions are tied together with the &lt;i&gt;compound&lt;/i&gt; dependency arc; otherwise, the structure of
+   * the tree remains unchanged.
+   *
+   * @param parse The original dependency parse of the sentence.
+   * @param canonicalMentionMap The map from tokens to their canonical mentions.
+   *
+   * @return A &lt;b&gt;copy&lt;/b&gt; of the passed parse tree, with pronouns replaces with their canonical mention.
+   */
+  private static SemanticGraph canonicalizeCoref(SemanticGraph parse, Map&lt;CoreLabel, List&lt;CoreLabel&gt;&gt; canonicalMentionMap) {
+<span class="nc" id="L407">    parse = new SemanticGraph(parse);</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">    for (IndexedWord node : new HashSet&lt;&gt;(parse.vertexSet())) {  // copy the vertex set to prevent ConcurrentModificationExceptions</span>
+<span class="nc bnc" id="L409" title="All 4 branches missed.">      if (node.tag() != null &amp;&amp; node.tag().startsWith(&quot;PRP&quot;)) {</span>
+<span class="nc" id="L410">        List&lt;CoreLabel&gt; canonicalMention = canonicalMentionMap.get(node.backingLabel());</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (canonicalMention != null) {</span>
+          // Case: this node is a preposition with a valid antecedent.
+          // 1. Save the attaching edges
+<span class="nc" id="L414">          List&lt;SemanticGraphEdge&gt; incomingEdges = parse.incomingEdgeList(node);</span>
+<span class="nc" id="L415">          List&lt;SemanticGraphEdge&gt; outgoingEdges = parse.outgoingEdgeList(node);</span>
+          // 2. Remove the node
+<span class="nc" id="L417">          parse.removeVertex(node);</span>
+          // 3. Add the new head word
+<span class="nc" id="L419">          IndexedWord headWord = new IndexedWord(canonicalMention.get(canonicalMention.size() - 1));</span>
+<span class="nc" id="L420">          headWord.setPseudoPosition(node.pseudoPosition());</span>
+<span class="nc" id="L421">          parse.addVertex(headWord);</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">          for (SemanticGraphEdge edge : incomingEdges) {</span>
+<span class="nc" id="L423">            parse.addEdge(edge.getGovernor(), headWord, edge.getRelation(), edge.getWeight(), edge.isExtra());</span>
+<span class="nc" id="L424">          }</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">          for (SemanticGraphEdge edge : outgoingEdges) {</span>
+<span class="nc" id="L426">            parse.addEdge(headWord, edge.getDependent(), edge.getRelation(), edge.getWeight(), edge.isExtra());</span>
+<span class="nc" id="L427">          }</span>
+          // 4. Add other words
+<span class="nc" id="L429">          double pseudoPosition = headWord.pseudoPosition() - 1e-3;</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">          for (int i = canonicalMention.size() - 2; i &gt;= 0; --i) {</span>
+            // Create the node
+<span class="nc" id="L432">            IndexedWord dependent = new IndexedWord(canonicalMention.get(i));</span>
+            // Set its pseudo position appropriately
+<span class="nc" id="L434">            dependent.setPseudoPosition(pseudoPosition);</span>
+<span class="nc" id="L435">            pseudoPosition -= 1e-3;</span>
+            // Add the node to the graph
+<span class="nc" id="L437">            parse.addVertex(dependent);</span>
+<span class="nc" id="L438">            parse.addEdge(headWord, dependent, UniversalEnglishGrammaticalRelations.COMPOUND_MODIFIER, 1.0, false);</span>
+          }
+
+        }
+      }
+<span class="nc" id="L443">    }</span>
+<span class="nc" id="L444">    return parse;</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   *   Annotate a single sentence.
+   * &lt;/p&gt;
+   * &lt;p&gt;
+   *   This annotator will, in particular, set the {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotations.EntailedSentencesAnnotation}
+   *   and {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotations.RelationTriplesAnnotation} annotations.
+   * &lt;/p&gt;
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public void annotateSentence(CoreMap sentence, Map&lt;CoreLabel, List&lt;CoreLabel&gt;&gt; canonicalMentionMap) {
+<span class="nc" id="L458">    List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">    if (tokens.size() &lt; 2) {</span>
+
+      // Short sentence. Skip annotating it.
+<span class="nc" id="L462">      sentence.set(NaturalLogicAnnotations.RelationTriplesAnnotation.class, Collections.emptyList());</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">      if (!stripEntailments) {</span>
+<span class="nc" id="L464">        sentence.set(NaturalLogicAnnotations.EntailedSentencesAnnotation.class, Collections.emptySet());</span>
+      }
+
+    } else {
+
+      // Get the dependency tree
+<span class="nc" id="L470">      SemanticGraph parse = sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class);</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">      if (parse == null) {</span>
+<span class="nc" id="L472">        parse = sentence.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class);</span>
+      }
+<span class="nc bnc" id="L474" title="All 2 branches missed.">      if (parse == null) {</span>
+<span class="nc" id="L475">        throw new IllegalStateException(&quot;Cannot run OpenIE without a parse tree!&quot;);</span>
+      }
+      // Clean the tree
+<span class="nc" id="L478">      parse = new SemanticGraph(parse);</span>
+<span class="nc" id="L479">      Util.cleanTree(parse);</span>
+
+      // Resolve Coreference
+<span class="nc" id="L482">      SemanticGraph canonicalizedParse = parse;</span>
+<span class="nc bnc" id="L483" title="All 4 branches missed.">      if (resolveCoref &amp;&amp; !canonicalMentionMap.isEmpty()) {</span>
+<span class="nc" id="L484">        canonicalizedParse = canonicalizeCoref(parse, canonicalMentionMap);</span>
+      }
+
+      // Run OpenIE
+      // (clauses)
+<span class="nc" id="L489">      List&lt;SentenceFragment&gt; clauses = clausesInSentence(canonicalizedParse, true);  // note: uses coref-canonicalized parse</span>
+      // (entailment)
+<span class="nc" id="L491">      Set&lt;SentenceFragment&gt; fragments = entailmentsFromClauses(clauses);</span>
+      // (segment)
+<span class="nc" id="L493">      List&lt;RelationTriple&gt; extractions = segmenter.extract(parse, tokens);  // note: uses non-coref-canonicalized parse!</span>
+<span class="nc" id="L494">      extractions.addAll(relationsInFragments(fragments, sentence));</span>
+
+      // Set the annotations
+<span class="nc" id="L497">      sentence.set(NaturalLogicAnnotations.EntailedSentencesAnnotation.class, fragments);</span>
+<span class="nc" id="L498">      sentence.set(NaturalLogicAnnotations.RelationTriplesAnnotation.class,</span>
+          new ArrayList&lt;&gt;(new HashSet&lt;&gt;(extractions)));  // uniq the extractions
+<span class="nc bnc" id="L500" title="All 2 branches missed.">      if (stripEntailments) {</span>
+<span class="nc" id="L501">        sentence.remove(NaturalLogicAnnotations.EntailedSentencesAnnotation.class);</span>
+      }
+    }
+<span class="nc" id="L504">  }</span>
+
+
+  /**
+   * {@inheritDoc}
+   *
+   * &lt;p&gt;
+   *   This annotator will, in particular, set the {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotations.EntailedSentencesAnnotation}
+   *   and {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotations.RelationTriplesAnnotation} annotations.
+   * &lt;/p&gt;
+   */
+  @Override
+  public void annotate(Annotation annotation) {
+    // Accumulate Coref data
+    Map&lt;Integer, CorefChain&gt; corefChains;
+<span class="nc" id="L519">    Map&lt;CoreLabel, List&lt;CoreLabel&gt;&gt; canonicalMentionMap = new IdentityHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L520" title="All 4 branches missed.">    if (resolveCoref &amp;&amp; (corefChains = annotation.get(CorefCoreAnnotations.CorefChainAnnotation.class)) != null) {</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">      for (CorefChain chain : corefChains.values()) {</span>
+        // Make sure it's a real chain and not a singleton
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (chain.getMentionsInTextualOrder().size() &lt; 2) {</span>
+<span class="nc" id="L524">          continue;</span>
+        }
+
+        // Metadata
+<span class="nc" id="L528">        List&lt;CoreLabel&gt; canonicalMention = null;</span>
+<span class="nc" id="L529">        double canonicalMentionScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L530">        Set&lt;CoreLabel&gt; tokensToMark = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L531">        List&lt;CorefChain.CorefMention&gt; mentions = chain.getMentionsInTextualOrder();</span>
+
+        // Iterate over mentions
+<span class="nc bnc" id="L534" title="All 2 branches missed.">        for (int i = 0; i &lt; mentions.size(); ++i) {</span>
+          // Get some data on this mention
+<span class="nc" id="L536">          Pair&lt;List&lt;CoreLabel&gt;, Double&gt; info = grokCorefMention(annotation, mentions.get(i));</span>
+          // Figure out if it should be the canonical mention
+<span class="nc bnc" id="L538" title="All 2 branches missed.">          double score = info.second + ((double) i) / ((double) mentions.size()) + (mentions.get(i) == chain.getRepresentativeMention() ? 1.0 : 0.0);</span>
+<span class="nc bnc" id="L539" title="All 4 branches missed.">          if (canonicalMention == null || score &gt; canonicalMentionScore) {</span>
+<span class="nc" id="L540">            canonicalMention = info.first;</span>
+<span class="nc" id="L541">            canonicalMentionScore = score;</span>
+          }
+
+          // Register the participating tokens
+<span class="nc bnc" id="L545" title="All 2 branches missed.">          if (info.first.size() == 1) {  // Only mark single-node tokens!</span>
+<span class="nc" id="L546">            tokensToMark.addAll(info.first);</span>
+          }
+        }
+
+        // Mark the tokens as coreferent
+<span class="nc bnc" id="L551" title="All 4 branches missed.">        assert canonicalMention != null;</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        for (CoreLabel token : tokensToMark) {</span>
+<span class="nc" id="L553">          List&lt;CoreLabel&gt; existingMention = canonicalMentionMap.get(token);</span>
+<span class="nc bnc" id="L554" title="All 4 branches missed.">          if (existingMention == null || existingMention.isEmpty() ||</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">              &quot;O&quot;.equals(existingMention.get(0).ner())) {  // Don't clobber existing good mentions</span>
+<span class="nc" id="L556">            canonicalMentionMap.put(token, canonicalMention);</span>
+          }
+<span class="nc" id="L558">        }</span>
+
+<span class="nc" id="L560">      }</span>
+    }
+
+    // Annotate each sentence
+<span class="nc" id="L564">    annotation.get(CoreAnnotations.SentencesAnnotation.class).forEach(x -&gt; this.annotateSentence(x, canonicalMentionMap));</span>
+<span class="nc" id="L565">  }</span>
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirementsSatisfied() {
+<span class="nc" id="L570">    return Collections.unmodifiableSet(new ArraySet&lt;&gt;(Arrays.asList(</span>
+        NaturalLogicAnnotations.RelationTriplesAnnotation.class,
+        NaturalLogicAnnotations.EntailedSentencesAnnotation.class
+    )));
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requires() {
+<span class="nc" id="L579">    Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirements = new HashSet&lt;&gt;(Arrays.asList(</span>
+        CoreAnnotations.TextAnnotation.class,
+        CoreAnnotations.TokensAnnotation.class,
+        CoreAnnotations.IndexAnnotation.class,
+        CoreAnnotations.SentencesAnnotation.class,
+        CoreAnnotations.SentenceIndexAnnotation.class,
+        CoreAnnotations.PartOfSpeechAnnotation.class,
+        CoreAnnotations.LemmaAnnotation.class,
+        NaturalLogicAnnotations.PolarityAnnotation.class,
+        SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class
+        //CoreAnnotations.OriginalTextAnnotation.class
+    ));
+<span class="nc bnc" id="L591" title="All 2 branches missed.">    if (resolveCoref) {</span>
+<span class="nc" id="L592">      requirements.add(edu.stanford.nlp.coref.CorefCoreAnnotations.CorefChainAnnotation.class);</span>
+    }
+<span class="nc" id="L594">    return Collections.unmodifiableSet(requirements);</span>
+  }
+
+  /**
+   * A utility to get useful information out of a CorefMention. In particular, it returns the CoreLabels which are
+   * associated with this mention, and it returns a score for how much we think this mention should be the canonical
+   * mention.
+   *
+   * @param doc The document this mention is referenced into.
+   * @param mention The mention itself.
+   * @return A pair of the tokens in the mention, and a score for how much we like this mention as the canonical mention.
+   */
+  private static Pair&lt;List&lt;CoreLabel&gt;, Double&gt; grokCorefMention(Annotation doc, CorefChain.CorefMention mention) {
+<span class="nc" id="L607">    List&lt;CoreLabel&gt; tokens = doc.get(CoreAnnotations.SentencesAnnotation.class).get(mention.sentNum - 1).get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L608">    List&lt;CoreLabel&gt; mentionAsTokens = tokens.subList(mention.startIndex - 1, mention.endIndex - 1);</span>
+    // Try to assess this mention's NER type
+<span class="nc" id="L610">    Counter&lt;String&gt; nerVotes = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L611" title="All 4 branches missed.">    mentionAsTokens.stream().filter(token -&gt; token.ner() != null &amp;&amp; !&quot;O&quot;.equals(token.ner())).forEach(token -&gt; nerVotes.incrementCount(token.ner()));</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">    String ner = Counters.argmax(nerVotes, (o1, o2) -&gt; o1 == null ? 0 : o1.compareTo(o2));</span>
+<span class="nc" id="L613">    double nerCount = nerVotes.getCount(ner);</span>
+<span class="nc" id="L614">    double nerScore = nerCount * nerCount / ((double) mentionAsTokens.size());</span>
+    // Return
+<span class="nc" id="L616">    return Pair.makePair(mentionAsTokens, nerScore);</span>
+  }
+
+  /**
+   * Prints an OpenIE triple to a String, according to the output format requested in
+   * the annotator.
+   *
+   * @param extraction The triple to write.
+   * @param docid The document ID (for the ReVerb format)
+   * @param sentence The sentence the triple was extracted from (for the ReVerb format)
+   *
+   * @return A String representation of the triple.
+   */
+  public static String tripleToString(RelationTriple extraction, String docid, CoreMap sentence) {
+<span class="nc bnc" id="L630" title="All 5 branches missed.">    switch (FORMAT) {</span>
+      case REVERB:
+<span class="nc" id="L632">        return extraction.toReverbString(docid, sentence);</span>
+      case OLLIE:
+<span class="nc" id="L634">        return extraction.confidenceGloss() + &quot;: (&quot; + extraction.subjectGloss() + &quot;; &quot; + extraction.relationGloss() + &quot;; &quot; + extraction.objectGloss() + &quot;)&quot;;</span>
+      case DEFAULT:
+<span class="nc" id="L636">        return extraction.toString();</span>
+      case QA_SRL:
+<span class="nc" id="L638">        return extraction.toQaSrlString(sentence);</span>
+      default:
+<span class="nc" id="L640">        throw new IllegalStateException(&quot;Format is not implemented: &quot; + FORMAT);</span>
+    }
+
+  }
+
+  /**
+   * Process a single file or line of standard in.
+   * @param pipeline The annotation pipeline to run the lines of the input through.
+   * @param docid The docid of the document we are extracting.
+   * @param document the document to annotate.
+   */
+  @SuppressWarnings(&quot;SynchronizeOnNonFinalField&quot;)
+  private static void processDocument(AnnotationPipeline pipeline, String docid, String document) {
+    // Error checks
+<span class="nc bnc" id="L654" title="All 2 branches missed.">    if (document.trim().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L655">      return;</span>
+    }
+
+    // Annotate the document
+<span class="nc" id="L659">    Annotation ann = new Annotation(document);</span>
+<span class="nc" id="L660">    pipeline.annotate(ann);</span>
+
+    // Get the extractions
+<span class="nc" id="L663">    boolean empty = true;</span>
+<span class="nc" id="L664">    synchronized (OUTPUT) {</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">      for (CoreMap sentence : ann.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        for (RelationTriple extraction : sentence.get(NaturalLogicAnnotations.RelationTriplesAnnotation.class)) {</span>
+          // Print the extractions
+<span class="nc" id="L668">          OUTPUT.println(tripleToString(extraction, docid, sentence));</span>
+<span class="nc" id="L669">          empty = false;</span>
+<span class="nc" id="L670">        }</span>
+<span class="nc" id="L671">      }</span>
+<span class="nc" id="L672">    }</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">    if (empty) {</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">      log.info(&quot;No extractions in: &quot; + (&quot;stdin&quot;.equals(docid) ? document : docid));</span>
+    }
+<span class="nc" id="L676">  }</span>
+
+  /**
+   * An entry method for annotating standard in with OpenIE extractions.
+   */
+  public static void main(String[] args) throws IOException, InterruptedException {
+    // Parse the arguments
+<span class="nc" id="L683">    Properties props = StringUtils.argsToProperties(args, new HashMap&lt;String, Integer&gt;(){{</span>
+<span class="nc" id="L684">      put(&quot;openie.resolve_coref&quot;, 0);</span>
+<span class="nc" id="L685">      put(&quot;resolve_coref&quot;, 0);</span>
+<span class="nc" id="L686">      put(&quot;openie.splitter.nomodel&quot;, 0);</span>
+<span class="nc" id="L687">      put(&quot;splitter.nomodel&quot;, 0);</span>
+<span class="nc" id="L688">      put(&quot;openie.splitter.disable&quot;, 0);</span>
+<span class="nc" id="L689">      put(&quot;splitter.disable&quot;, 0);</span>
+<span class="nc" id="L690">      put(&quot;openie.ignore_affinity&quot;, 0);</span>
+<span class="nc" id="L691">      put(&quot;splitter.ignore_affinity&quot;, 0);</span>
+<span class="nc" id="L692">      put(&quot;openie.triple.strict&quot;, 0);</span>
+<span class="nc" id="L693">      put(&quot;splitter.triple.strict&quot;, 0);</span>
+<span class="nc" id="L694">      put(&quot;openie.triple.all_nominals&quot;, 0);</span>
+<span class="nc" id="L695">      put(&quot;splitter.triple.all_nominals&quot;, 0);</span>
+<span class="nc" id="L696">    }});</span>
+<span class="nc" id="L697">    ArgumentParser.fillOptions(new Class[]{OpenIE.class, ArgumentParser.class}, props);</span>
+<span class="nc" id="L698">    AtomicInteger exceptionCount = new AtomicInteger(0);</span>
+<span class="nc" id="L699">    ExecutorService exec = Executors.newFixedThreadPool(ArgumentParser.threads);</span>
+
+    // Parse the files to process
+    String[] filesToProcess;
+<span class="nc bnc" id="L703" title="All 2 branches missed.">    if (FILELIST != null) {</span>
+<span class="nc" id="L704">      filesToProcess = IOUtils.linesFromFile(FILELIST.getPath()).stream()</span>
+<span class="nc" id="L705">          .map(String::trim)</span>
+<span class="nc" id="L706">          .map(path -&gt; path.replaceAll(&quot;^~&quot;, &quot;$HOME&quot;))</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">          .map(path -&gt; new File(path).exists() ? path : StringUtils.expandEnvironmentVariables(path))</span>
+<span class="nc" id="L708">          .toArray(String[]::new);</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">    } else if (!&quot;&quot;.equals(props.getProperty(&quot;&quot;, &quot;&quot;))) {</span>
+<span class="nc" id="L710">      filesToProcess = props.getProperty(&quot;&quot;, &quot;&quot;).split(&quot;\\s+&quot;);</span>
+    } else {
+<span class="nc" id="L712">      filesToProcess = new String[0];</span>
+    }
+
+    // Tweak the arguments
+<span class="nc bnc" id="L716" title="All 2 branches missed.">    if (&quot;&quot;.equals(props.getProperty(&quot;annotators&quot;, &quot;&quot;))) {</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">      if (!&quot;false&quot;.equalsIgnoreCase(props.getProperty(&quot;resolve_coref&quot;, props.getProperty(&quot;openie.resolve_coref&quot;, &quot;false&quot;)))) {</span>
+<span class="nc" id="L718">        props.setProperty(&quot;coref.md.type&quot;, &quot;dep&quot;);  // so we don't need the `parse` annotator</span>
+<span class="nc" id="L719">        props.setProperty(&quot;coref.mode&quot;, &quot;statistical&quot;);  // explicitly ask for scoref</span>
+<span class="nc" id="L720">        props.setProperty(&quot;annotators&quot;, &quot;tokenize,ssplit,pos,lemma,depparse,ner,mention,coref,natlog,openie&quot;);</span>
+      } else {
+<span class="nc" id="L722">        props.setProperty(&quot;annotators&quot;, &quot;tokenize,ssplit,pos,lemma,depparse,natlog,openie&quot;);</span>
+      }
+    }
+<span class="nc bnc" id="L725" title="All 2 branches missed.">    if (&quot;&quot;.equals(props.getProperty(&quot;depparse.extradependencies&quot;, &quot;&quot;))) {</span>
+<span class="nc" id="L726">      props.setProperty(&quot;depparse.extradependencies&quot;, &quot;ref_only_uncollapsed&quot;);</span>
+    }
+<span class="nc bnc" id="L728" title="All 2 branches missed.">    if (&quot;&quot;.equals(props.getProperty(&quot;parse.extradependencies&quot;, &quot;&quot;))) {</span>
+<span class="nc" id="L729">      props.setProperty(&quot;parse.extradependencies&quot;, &quot;ref_only_uncollapsed&quot;);</span>
+    }
+<span class="nc bnc" id="L731" title="All 2 branches missed.">    if (&quot;&quot;.equals(props.getProperty(&quot;tokenize.class&quot;, &quot;&quot;))) {</span>
+<span class="nc" id="L732">      props.setProperty(&quot;tokenize.class&quot;, &quot;PTBTokenizer&quot;);</span>
+    }
+<span class="nc bnc" id="L734" title="All 2 branches missed.">    if (&quot;&quot;.equals(props.getProperty(&quot;tokenize.language&quot;, &quot;&quot;))) {</span>
+<span class="nc" id="L735">      props.setProperty(&quot;tokenize.language&quot;, &quot;en&quot;);</span>
+    }
+    // Tweak properties for console mode.
+    // In particular, in this mode we can assume every line of standard in is a new sentence.
+<span class="nc bnc" id="L739" title="All 4 branches missed.">    if (filesToProcess.length == 0 &amp;&amp; &quot;&quot;.equals(props.getProperty(&quot;ssplit.isOneSentence&quot;, &quot;&quot;))) {</span>
+<span class="nc" id="L740">      props.setProperty(&quot;ssplit.isOneSentence&quot;, &quot;true&quot;);</span>
+    }
+    // Some error checks on the arguments
+<span class="nc bnc" id="L743" title="All 2 branches missed.">    if (!props.getProperty(&quot;annotators&quot;).toLowerCase().contains(&quot;openie&quot;)) {</span>
+<span class="nc" id="L744">      log.error(&quot;If you specify custom annotators, you must at least include 'openie'&quot;);</span>
+<span class="nc" id="L745">      System.exit(1);</span>
+    }
+    // Copy properties that are missing the 'openie' prefix
+<span class="nc bnc" id="L748" title="All 2 branches missed.">    new HashSet&lt;&gt;(props.keySet()).stream().filter(key -&gt; !key.toString().startsWith(&quot;openie.&quot;)).forEach(key -&gt; props.setProperty(&quot;openie.&quot; + key.toString(), props.getProperty(key.toString())));</span>
+
+    // Create the pipeline
+<span class="nc" id="L751">    StanfordCoreNLP pipeline = new StanfordCoreNLP(props);</span>
+
+    // Run OpenIE
+<span class="nc bnc" id="L754" title="All 2 branches missed.">    if (filesToProcess.length == 0) {</span>
+      // Running from stdin; one document per line.
+<span class="nc" id="L756">      log.info(&quot;Processing from stdin. Enter one sentence per line.&quot;);</span>
+<span class="nc" id="L757">      Scanner scanner = new Scanner(System.in);</span>
+      String line;
+      try {
+<span class="nc" id="L760">        line = scanner.nextLine();</span>
+<span class="nc" id="L761">      } catch (NoSuchElementException e) {</span>
+<span class="nc" id="L762">        log.info(&quot;No lines found on standard in&quot;);</span>
+<span class="nc" id="L763">        return;</span>
+<span class="nc" id="L764">      }</span>
+<span class="nc bnc" id="L765" title="All 2 branches missed.">      while (line != null) {</span>
+<span class="nc" id="L766">        processDocument(pipeline, &quot;stdin&quot;, line);</span>
+        try {
+<span class="nc" id="L768">          line = scanner.nextLine();</span>
+<span class="nc" id="L769">        } catch (NoSuchElementException e) {</span>
+<span class="nc" id="L770">          return;</span>
+<span class="nc" id="L771">        }</span>
+      }
+<span class="nc" id="L773">    } else {</span>
+      // Running from file parameters.
+      // Make sure we can read all the files in the queue.
+      // This will prevent a nasty surprise 10 hours into a running job...
+<span class="nc bnc" id="L777" title="All 2 branches missed.">      for (String file : filesToProcess) {</span>
+<span class="nc bnc" id="L778" title="All 4 branches missed.">        if (!new File(file).exists() || !new File(file).canRead()) {</span>
+<span class="nc" id="L779">          log.error(&quot;Cannot read file (or file does not exist: '&quot; + file + &quot;'&quot;);</span>
+        }
+      }
+      // Actually process the files.
+<span class="nc bnc" id="L783" title="All 2 branches missed.">      for (String file : filesToProcess) {</span>
+<span class="nc" id="L784">        log.info(&quot;Processing file: &quot; + file);</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">        if (ArgumentParser.threads &gt; 1) {</span>
+          // Multi-threaded: submit a job to run
+<span class="nc" id="L787">          final String fileToSubmit = file;</span>
+<span class="nc" id="L788">          exec.submit(() -&gt; {</span>
+            try {
+<span class="nc" id="L790">              processDocument(pipeline, file, IOUtils.slurpFile(new File(fileToSubmit)));</span>
+<span class="nc" id="L791">            } catch (Throwable t) {</span>
+<span class="nc" id="L792">              t.printStackTrace();</span>
+<span class="nc" id="L793">              exceptionCount.incrementAndGet();</span>
+<span class="nc" id="L794">            }</span>
+<span class="nc" id="L795">          });</span>
+<span class="nc" id="L796">        } else {</span>
+          // Single-threaded: just run the job
+<span class="nc" id="L798">          processDocument(pipeline, file, IOUtils.slurpFile(new File(file)));</span>
+        }
+      }
+    }
+
+    // Exit
+<span class="nc" id="L804">    exec.shutdown();</span>
+<span class="nc" id="L805">    log.info(&quot;All files have been queued; awaiting termination...&quot;);</span>
+<span class="nc" id="L806">    exec.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);</span>
+<span class="nc" id="L807">    log.info(&quot;DONE processing files. &quot; + exceptionCount.get() + &quot; exceptions encountered.&quot;);</span>
+<span class="nc" id="L808">    System.exit(exceptionCount.get());</span>
+<span class="nc" id="L809">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

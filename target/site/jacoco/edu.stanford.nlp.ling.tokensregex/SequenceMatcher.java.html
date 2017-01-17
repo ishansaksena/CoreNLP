@@ -1,0 +1,1674 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SequenceMatcher.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ling.tokensregex</a> &gt; <span class="el_source">SequenceMatcher.java</span></div><h1>SequenceMatcher.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ling.tokensregex;
+
+import edu.stanford.nlp.util.*;
+
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static edu.stanford.nlp.ling.tokensregex.SequenceMatcher.FindType.FIND_NONOVERLAPPING;
+
+/**
+ * A generic sequence matcher.
+ *
+ * &lt;p&gt;
+ * Similar to Java's {@code Matcher} except it matches sequences over an arbitrary type {@code T}
+ *   instead of characters.
+ * For a type {@code T} to be matchable, it has to have a corresponding {@code NodePattern&lt;T&gt;} that indicates
+ *    whether a node is matched or not.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * A matcher is created as follows:
+ * &lt;pre&gt;&lt;code&gt;
+ *   SequencePattern&lt;T&gt; p = SequencePattern&lt;T&gt;.compile(&quot;...&quot;);
+ *   SequencePattern&lt;T&gt; m = p.getMatcher(List&lt;T&gt; sequence);
+ * &lt;/code&gt;&lt;/pre&gt;
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * Functions for searching
+ * &lt;pre&gt;&lt;code&gt;
+ *    boolean matches()
+ *    boolean find()
+ *    boolean find(int start)
+ * &lt;/code&gt;&lt;/pre&gt;
+ * Functions for retrieving matched patterns
+ * &lt;pre&gt;&lt;code&gt;
+ *    int groupCount()
+ *    List&amp;lt;T&amp;gt; groupNodes(), List&amp;lt;T&amp;gt; groupNodes(int g)
+ *    String group(), String group(int g)
+ *    int start(), int start(int g), int end(), int end(int g)
+ * &lt;/code&gt;&lt;/pre&gt;
+ * Functions for replacing
+ * &lt;pre&gt;&lt;code&gt;
+ *    List&amp;lt;T&amp;gt; replaceFirst(List&amp;lt;T&amp;gt; seq), List replaceAll(List&amp;lt;T&amp;gt; seq)
+ *    List&amp;lt;T&amp;gt; replaceFirstExtended(List&amp;lt;MatchReplacement&amp;lt;T&amp;gt;&amp;gt; seq), List&amp;lt;T&amp;gt; replaceAllExtended(List&amp;lt;MatchReplacement&amp;lt;T&amp;gt;&amp;gt; seq)
+ * &lt;/code&gt;&lt;/pre&gt;
+ * Functions for defining the region of the sequence to search over
+ *  (default region is entire sequence)
+ * &lt;pre&gt;&lt;code&gt;
+ *     void region(int start, int end)
+ *     int regionStart()
+ *     int regionEnd()
+ * &lt;/code&gt;&lt;/pre&gt;
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * NOTE: When find is used, matches are attempted starting from the specified start index of the sequence
+ *   The match with the earliest starting index is returned.
+ * &lt;/p&gt;
+ *
+ * @author Angel Chang
+ */
+public class SequenceMatcher&lt;T&gt; extends BasicSequenceMatchResult&lt;T&gt; {
+<span class="fc" id="L65">  private static final Logger logger = Logger.getLogger(SequenceMatcher.class.getName());</span>
+
+<span class="fc" id="L67">  boolean includeEmptyMatches = false;</span>
+<span class="fc" id="L68">  boolean matchingCompleted = false;</span>
+<span class="fc" id="L69">  boolean matched = false;</span>
+<span class="fc" id="L70">  boolean matchWithResult = false; // If result of matches should be kept</span>
+<span class="fc" id="L71">  int nextMatchStart = 0;</span>
+
+<span class="fc" id="L73">  int regionStart = 0;</span>
+<span class="fc" id="L74">  int regionEnd = -1;</span>
+
+  // TODO: Check and fix implementation for FIND_ALL
+  /**
+   * Type of search to perform
+   * &lt;ul&gt;
+   * &lt;li&gt;FIND_NONOVERLAPPING - Find nonoverlapping matches (default)&lt;/li&gt;
+   * &lt;li&gt;FIND_ALL - Find all potential matches
+   *            Greedy/reluctant quantifiers are not enforced
+   *            (perhaps should add syntax where some of them are enforced...)&lt;/li&gt;
+   * &lt;/ul&gt;
+   */
+<span class="pc" id="L86">  public enum FindType { FIND_NONOVERLAPPING, FIND_ALL }</span>
+<span class="fc" id="L87">  FindType findType = FIND_NONOVERLAPPING;</span>
+
+  // For FIND_ALL
+<span class="fc" id="L90">  Iterator&lt;Integer&gt; curMatchIter = null;</span>
+<span class="fc" id="L91">  MatchedStates&lt;T&gt; curMatchStates = null;</span>
+<span class="fc" id="L92">  Set&lt;String&gt; prevMatchedSignatures = new HashSet&lt;&gt;();</span>
+
+  // Branching limit for searching with back tracking. Higher value makes the search faster but uses more memory.
+<span class="fc" id="L95">  int branchLimit = 32;</span>
+
+  protected SequenceMatcher(SequencePattern&lt;T&gt; pattern, List&lt;? extends T&gt; elements)
+<span class="fc" id="L98">  {</span>
+<span class="fc" id="L99">    this.pattern = pattern;</span>
+    // NOTE: It is important elements DO NOT change as we do matches
+    // TODO: Should we just make a copy of the elements?
+<span class="fc" id="L102">    this.elements = elements;</span>
+<span class="pc bpc" id="L103" title="1 of 2 branches missed.">    if (elements == null) {</span>
+<span class="nc" id="L104">      throw new IllegalArgumentException(&quot;Cannot match against null elements&quot;);</span>
+    }
+<span class="fc" id="L106">    this.regionEnd = elements.size();</span>
+<span class="fc" id="L107">    this.priority = pattern.priority;</span>
+<span class="fc" id="L108">    this.score = pattern.weight;</span>
+<span class="fc" id="L109">    this.varGroupBindings = pattern.varGroupBindings;</span>
+<span class="fc" id="L110">    matchedGroups = new MatchedGroup[pattern.totalGroups];</span>
+<span class="fc" id="L111">  }</span>
+
+  public void setBranchLimit(int blimit){
+<span class="nc" id="L114">    this.branchLimit = blimit;</span>
+<span class="nc" id="L115">  }</span>
+
+
+  /**
+   * Interface that specifies what to replace a matched pattern with
+   * @param &lt;T&gt;
+   */
+  public interface MatchReplacement&lt;T&gt; {
+    /**
+     * Append to replacement list
+     * @param match Current matched sequence
+     * @param list replacement list
+     */
+    public void append(SequenceMatchResult&lt;T&gt; match, List list);
+  }
+
+  /**
+   * Replacement item is a sequence of items
+   * @param &lt;T&gt;
+   */
+  public static class BasicMatchReplacement&lt;T&gt; implements MatchReplacement&lt;T&gt;  {
+    List&lt;T&gt; replacement;
+
+    @SafeVarargs
+<span class="nc" id="L139">    public BasicMatchReplacement(T... replacement) {</span>
+<span class="nc" id="L140">      this.replacement = Arrays.asList(replacement);</span>
+<span class="nc" id="L141">    }</span>
+
+<span class="nc" id="L143">    public BasicMatchReplacement(List&lt;T&gt; replacement) {</span>
+<span class="nc" id="L144">      this.replacement = replacement;</span>
+<span class="nc" id="L145">    }</span>
+
+    /**
+     * Append to replacement list our list of replacement items
+     * @param match Current matched sequence
+     * @param list replacement list
+     */
+    @Override
+    public void append(SequenceMatchResult&lt;T&gt; match, List list) {
+<span class="nc" id="L154">      list.addAll(replacement);</span>
+<span class="nc" id="L155">    }</span>
+  }
+
+  /**
+   * Replacement item is a matched group specified with a group name
+   * @param &lt;T&gt;
+   */
+  public static class NamedGroupMatchReplacement&lt;T&gt; implements MatchReplacement&lt;T&gt; {
+    String groupName;
+
+<span class="nc" id="L165">    public NamedGroupMatchReplacement(String groupName) {</span>
+<span class="nc" id="L166">      this.groupName = groupName;</span>
+<span class="nc" id="L167">    }</span>
+
+    /**
+     * Append to replacement list the matched group with the specified group name
+     * @param match Current matched sequence
+     * @param list replacement list
+     */
+    public void append(SequenceMatchResult&lt;T&gt; match, List list) {
+<span class="nc" id="L175">      list.addAll(match.groupNodes(groupName));</span>
+<span class="nc" id="L176">    }</span>
+  }
+
+  /**
+   * Replacement item is a matched group specified with a group id
+   * @param &lt;T&gt;
+   */
+  public static class GroupMatchReplacement&lt;T&gt; implements MatchReplacement&lt;T&gt; {
+    int group;
+
+<span class="nc" id="L186">    public GroupMatchReplacement(int group) {</span>
+<span class="nc" id="L187">      this.group = group;</span>
+<span class="nc" id="L188">    }</span>
+
+    /**
+     * Append to replacement list the matched group with the specified group id
+     * @param match Current matched sequence
+     * @param list replacement list
+     */
+    public void append(SequenceMatchResult&lt;T&gt; match, List list) {
+<span class="nc" id="L196">      list.addAll(match.groupNodes(group));</span>
+<span class="nc" id="L197">    }</span>
+  }
+
+  /**
+   * Replaces all occurrences of the pattern with the specified list
+   *   of replacement items (can include matched groups).
+   * @param replacement What to replace the matched sequence with
+   * @return New list with all occurrences of the pattern replaced
+   * @see #replaceFirst(java.util.List)
+   * @see #replaceFirstExtended(java.util.List)
+   * @see #replaceAllExtended(java.util.List)
+   */
+  public List&lt;T&gt; replaceAllExtended(List&lt;MatchReplacement&lt;T&gt;&gt; replacement) {
+<span class="nc" id="L210">    List&lt;T&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L211">    FindType oldFindType = findType;</span>
+<span class="nc" id="L212">    findType = FindType.FIND_NONOVERLAPPING;</span>
+<span class="nc" id="L213">    int index = 0;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    while (find()) {</span>
+      // Copy from current index to found index
+<span class="nc" id="L216">      res.addAll(elements().subList(index, start()));</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">      for (MatchReplacement&lt;T&gt; r:replacement) {</span>
+<span class="nc" id="L218">        r.append(this, res);</span>
+<span class="nc" id="L219">      }</span>
+<span class="nc" id="L220">      index = end();</span>
+    }
+<span class="nc" id="L222">    res.addAll(elements().subList(index, elements().size()));</span>
+<span class="nc" id="L223">    findType = oldFindType;</span>
+<span class="nc" id="L224">    return res;</span>
+  }
+
+  /**
+   * Replaces the first occurrence of the pattern with the specified list
+   *   of replacement items (can include matched groups).
+   * @param replacement What to replace the matched sequence with
+   * @return New list with the first occurrence of the pattern replaced
+   * @see #replaceFirst(java.util.List)
+   * @see #replaceAll(java.util.List)
+   * @see #replaceAllExtended(java.util.List)
+   */
+  public List&lt;T&gt; replaceFirstExtended(List&lt;MatchReplacement&lt;T&gt;&gt; replacement) {
+<span class="nc" id="L237">    List&lt;T&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L238">    FindType oldFindType = findType;</span>
+<span class="nc" id="L239">    findType = FindType.FIND_NONOVERLAPPING;</span>
+<span class="nc" id="L240">    int index = 0;</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">    if (find()) {</span>
+      // Copy from current index to found index
+<span class="nc" id="L243">      res.addAll(elements().subList(index, start()));</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">      for (MatchReplacement&lt;T&gt; r:replacement) {</span>
+<span class="nc" id="L245">        r.append(this, res);</span>
+<span class="nc" id="L246">      }</span>
+<span class="nc" id="L247">      index = end();</span>
+    }
+<span class="nc" id="L249">    res.addAll(elements().subList(index, elements().size()));</span>
+<span class="nc" id="L250">    findType = oldFindType;</span>
+<span class="nc" id="L251">    return res;</span>
+  }
+
+  /**
+   * Replaces all occurrences of the pattern with the specified list.
+   * Use {@link #replaceAllExtended(java.util.List)} to replace with matched groups.
+   * @param replacement What to replace the matched sequence with
+   * @return New list with all occurrences of the pattern replaced
+   * @see #replaceAllExtended(java.util.List)
+   * @see #replaceFirst(java.util.List)
+   * @see #replaceFirstExtended(java.util.List)
+   */
+  public List&lt;T&gt; replaceAll(List&lt;T&gt; replacement) {
+<span class="nc" id="L264">    List&lt;T&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L265">    FindType oldFindType = findType;</span>
+<span class="nc" id="L266">    findType = FindType.FIND_NONOVERLAPPING;</span>
+<span class="nc" id="L267">    int index = 0;</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">    while (find()) {</span>
+      // Copy from current index to found index
+<span class="nc" id="L270">      res.addAll(elements().subList(index, start()));</span>
+<span class="nc" id="L271">      res.addAll(replacement);</span>
+<span class="nc" id="L272">      index = end();</span>
+    }
+<span class="nc" id="L274">    res.addAll(elements().subList(index, elements().size()));</span>
+<span class="nc" id="L275">    findType = oldFindType;</span>
+<span class="nc" id="L276">    return res;</span>
+  }
+
+  /**
+   * Replaces the first occurrence of the pattern with the specified list.
+   * Use {@link #replaceFirstExtended(java.util.List)} to replace with matched groups.
+   * @param replacement What to replace the matched sequence with
+   * @return New list with the first occurrence of the pattern replaced
+   * @see #replaceAll(java.util.List)
+   * @see #replaceAllExtended(java.util.List)
+   * @see #replaceFirstExtended(java.util.List)
+   */
+  public List&lt;T&gt; replaceFirst(List&lt;T&gt; replacement) {
+<span class="nc" id="L289">    List&lt;T&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L290">    FindType oldFindType = findType;</span>
+<span class="nc" id="L291">    findType = FindType.FIND_NONOVERLAPPING;</span>
+<span class="nc" id="L292">    int index = 0;</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">    if (find()) {</span>
+      // Copy from current index to found index
+<span class="nc" id="L295">      res.addAll(elements().subList(index, start()));</span>
+<span class="nc" id="L296">      res.addAll(replacement);</span>
+<span class="nc" id="L297">      index = end();</span>
+    }
+<span class="nc" id="L299">    res.addAll(elements().subList(index, elements().size()));</span>
+<span class="nc" id="L300">    findType = oldFindType;</span>
+<span class="nc" id="L301">    return res;</span>
+  }
+
+  public FindType getFindType() {
+<span class="nc" id="L305">    return findType;</span>
+  }
+
+  public void setFindType(FindType findType) {
+<span class="nc" id="L309">    this.findType = findType;</span>
+<span class="nc" id="L310">  }</span>
+
+  public boolean isMatchWithResult() {
+<span class="nc" id="L313">    return matchWithResult;</span>
+  }
+
+  public void setMatchWithResult(boolean matchWithResult) {
+<span class="nc" id="L317">    this.matchWithResult = matchWithResult;</span>
+<span class="nc" id="L318">  }</span>
+
+  /**
+   * Reset the matcher and then searches for pattern at the specified start index
+   * @param start - Index at which to start the search
+   * @return true if a match is found (false otherwise)
+   * @throws IndexOutOfBoundsException if start is {@literal &lt;} 0 or larger then the size of the sequence
+   * @see #find()
+   */
+  public boolean find(int start)
+  {
+<span class="nc bnc" id="L329" title="All 4 branches missed.">    if (start &lt; 0 || start &gt; elements.size()) {</span>
+<span class="nc" id="L330">      throw new IndexOutOfBoundsException(&quot;Invalid region start=&quot; + start + &quot;, need to be between 0 and &quot; + elements.size());</span>
+    }
+<span class="nc" id="L332">    reset();</span>
+<span class="nc" id="L333">    return find(start, false);</span>
+  }
+
+  protected boolean find(int start, boolean matchStart) {
+<span class="fc" id="L337">    boolean done = false;</span>
+<span class="fc bfc" id="L338" title="All 2 branches covered.">    while (!done) {</span>
+<span class="fc" id="L339">      boolean res = find0(start, matchStart);</span>
+<span class="fc bfc" id="L340" title="All 2 branches covered.">      if (res) {</span>
+<span class="fc" id="L341">        boolean empty = this.group().isEmpty();</span>
+<span class="pc bpc" id="L342" title="3 of 4 branches missed.">        if (!empty || includeEmptyMatches) return res;</span>
+        else {
+<span class="nc" id="L344">          start = start + 1;</span>
+        }
+      }
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">      done = !res;</span>
+<span class="fc" id="L348">    }</span>
+<span class="fc" id="L349">    return false;</span>
+  }
+
+  protected boolean find0(int start, boolean matchStart)
+  {
+<span class="fc" id="L354">    boolean match = false;</span>
+<span class="fc" id="L355">    matched = false;</span>
+<span class="fc" id="L356">    matchingCompleted = false;</span>
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">    if (matchStart)  {</span>
+<span class="nc" id="L358">      match = findMatchStart(start, false);</span>
+    } else {
+<span class="fc bfc" id="L360" title="All 2 branches covered.">      for (int i = start; i &lt; regionEnd; i++) {</span>
+<span class="fc" id="L361">        match = findMatchStart(i, false);</span>
+<span class="fc bfc" id="L362" title="All 2 branches covered.">        if (match) {</span>
+<span class="fc" id="L363">          break;</span>
+        }
+      }
+    }
+<span class="fc" id="L367">    matched = match;</span>
+<span class="fc" id="L368">    matchingCompleted = true;</span>
+<span class="fc bfc" id="L369" title="All 2 branches covered.">    if (matched) {</span>
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">      nextMatchStart = (findType == FindType.FIND_NONOVERLAPPING)? end(): start()+1;</span>
+    } else {
+<span class="fc" id="L372">      nextMatchStart = -1;</span>
+    }
+<span class="fc" id="L374">    return match;</span>
+  }
+
+  /**
+   * Searches for pattern in the region starting
+   *  at the next index
+   * @return true if a match is found (false otherwise)
+   */
+  private boolean findNextNonOverlapping()
+  {
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">    if (nextMatchStart &lt; 0) { return false; }</span>
+<span class="fc" id="L385">    return find(nextMatchStart, false);</span>
+  }
+
+  private boolean findNextAll()
+  {
+<span class="nc bnc" id="L390" title="All 4 branches missed.">    if (curMatchIter != null &amp;&amp; curMatchIter.hasNext()) {</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">      while (curMatchIter.hasNext()) {</span>
+<span class="nc" id="L392">        int next = curMatchIter.next();</span>
+<span class="nc" id="L393">        curMatchStates.setMatchedGroups(next);</span>
+<span class="nc" id="L394">        String sig = getMatchedSignature();</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (!prevMatchedSignatures.contains(sig)) {</span>
+<span class="nc" id="L396">          prevMatchedSignatures.add(sig);</span>
+<span class="nc" id="L397">          return true;</span>
+        }
+<span class="nc" id="L399">      }</span>
+    }
+<span class="nc bnc" id="L401" title="All 2 branches missed.">    if (nextMatchStart &lt; 0) { return false; }</span>
+<span class="nc" id="L402">    prevMatchedSignatures.clear();</span>
+<span class="nc" id="L403">    boolean matched = find(nextMatchStart, false);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">    if (matched) {</span>
+<span class="nc" id="L405">      Collection&lt;Integer&gt; matchedBranches = curMatchStates.getMatchIndices();</span>
+<span class="nc" id="L406">      curMatchIter = matchedBranches.iterator();</span>
+<span class="nc" id="L407">      int next = curMatchIter.next();</span>
+<span class="nc" id="L408">      curMatchStates.setMatchedGroups(next);</span>
+<span class="nc" id="L409">      prevMatchedSignatures.add(getMatchedSignature());</span>
+    }
+<span class="nc" id="L411">    return matched;</span>
+  }
+
+  /**
+   * Applies the matcher and returns all non overlapping matches
+   * @return a Iterable of match results
+   */
+  public Iterable&lt;SequenceMatchResult&lt;T&gt;&gt; findAllNonOverlapping() {
+<span class="nc" id="L419">    Iterator&lt;SequenceMatchResult&lt;T&gt;&gt; iter = new Iterator&lt;SequenceMatchResult&lt;T&gt;&gt;() {</span>
+      SequenceMatchResult&lt;T&gt; next;
+
+      private SequenceMatchResult&lt;T&gt; getNext() {
+<span class="nc" id="L423">        boolean found = find();</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">        if (found) {</span>
+<span class="nc" id="L425">          return toBasicSequenceMatchResult();</span>
+        } else {
+<span class="nc" id="L427">          return null;</span>
+        }
+      }
+
+      @Override
+      public boolean hasNext() {
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (next == null) {</span>
+<span class="nc" id="L434">          next = getNext();</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">          return (next != null);</span>
+        } else {
+<span class="nc" id="L437">          return true;</span>
+        }
+      }
+
+      @Override
+      public SequenceMatchResult&lt;T&gt; next() {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (!hasNext()) { throw new NoSuchElementException(); }</span>
+<span class="nc" id="L444">        SequenceMatchResult&lt;T&gt; res = next;</span>
+<span class="nc" id="L445">        next = null;</span>
+<span class="nc" id="L446">        return res;</span>
+      }
+
+      public void remove() {
+<span class="nc" id="L450">        throw new UnsupportedOperationException();</span>
+      }
+    };
+<span class="nc" id="L453">    return new IterableIterator&lt;&gt;(iter);</span>
+  }
+
+  /**
+   * Searches for the next occurrence of the pattern
+   * @return true if a match is found (false otherwise)
+   * @see #find(int)
+   */
+  public boolean find()
+  {
+<span class="pc bpc" id="L463" title="2 of 3 branches missed.">    switch (findType) {</span>
+      case FIND_NONOVERLAPPING:
+<span class="fc" id="L465">        return findNextNonOverlapping();</span>
+      case FIND_ALL:
+<span class="nc" id="L467">        return findNextAll();</span>
+      default:
+<span class="nc" id="L469">        throw new UnsupportedOperationException(&quot;Unsupported findType &quot; + findType);</span>
+    }
+  }
+
+  protected boolean findMatchStart(int start, boolean matchAllTokens) {
+<span class="pc bpc" id="L474" title="2 of 3 branches missed.">    switch (findType) {</span>
+      case FIND_NONOVERLAPPING:
+<span class="fc" id="L476">        return findMatchStartBacktracking(start, matchAllTokens);</span>
+      case FIND_ALL:
+        // TODO: Should use backtracking here too, need to keep track of todo stack
+        // so we can recover after finding a match
+<span class="nc" id="L480">        return findMatchStartNoBacktracking(start, matchAllTokens);</span>
+      default:
+<span class="nc" id="L482">        throw new UnsupportedOperationException(&quot;Unsupported findType &quot; + findType);</span>
+    }
+  }
+
+  // Does not do backtracking - alternative matches are stored as we go
+  protected boolean findMatchStartNoBacktracking(int start, boolean matchAllTokens) {
+<span class="nc" id="L488">    boolean matchAll = true;</span>
+<span class="nc" id="L489">    MatchedStates&lt;T&gt; cStates = getStartStates();</span>
+<span class="nc" id="L490">    cStates.matchLongest = matchAllTokens;</span>
+    // Save cStates for FIND_ALL ....
+<span class="nc" id="L492">    curMatchStates = cStates;</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">    for(int i = start; i &lt; regionEnd; i++){</span>
+<span class="nc" id="L494">      boolean match = cStates.match(i);</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">      if (cStates == null || cStates.size() == 0) {</span>
+<span class="nc" id="L496">        break;</span>
+      }
+<span class="nc bnc" id="L498" title="All 2 branches missed.">      if (!matchAllTokens) {</span>
+<span class="nc bnc" id="L499" title="All 6 branches missed.">        if ((matchAll &amp;&amp; cStates.isAllMatch())</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">            || (!matchAll &amp;&amp; cStates.isMatch())) {</span>
+<span class="nc" id="L501">          cStates.completeMatch();</span>
+<span class="nc" id="L502">          return true;</span>
+        }
+      }
+    }
+<span class="nc" id="L506">    cStates.completeMatch();</span>
+<span class="nc" id="L507">    return cStates.isMatch();</span>
+  }
+
+  // Does some backtracking...
+  protected boolean findMatchStartBacktracking(int start, boolean matchAllTokens) {
+<span class="fc" id="L512">    boolean matchAll = true;</span>
+<span class="fc" id="L513">    Stack&lt;MatchedStates&gt; todo = new Stack&lt;&gt;();</span>
+<span class="fc" id="L514">    MatchedStates cStates = getStartStates();</span>
+<span class="fc" id="L515">    cStates.matchLongest = matchAllTokens;</span>
+<span class="fc" id="L516">    cStates.curPosition = start-1;</span>
+<span class="fc" id="L517">    todo.push(cStates);</span>
+<span class="fc bfc" id="L518" title="All 2 branches covered.">    while (!todo.empty()) {</span>
+<span class="fc" id="L519">      cStates = todo.pop();</span>
+<span class="fc" id="L520">      int s = cStates.curPosition+1;</span>
+<span class="fc bfc" id="L521" title="All 2 branches covered.">      for(int i = s; i &lt; regionEnd; i++){</span>
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">        if (Thread.interrupted()) {</span>
+<span class="nc" id="L523">          throw new RuntimeInterruptedException();</span>
+        }
+<span class="fc" id="L525">        boolean match = cStates.match(i);</span>
+<span class="pc bpc" id="L526" title="1 of 4 branches missed.">        if (cStates == null || cStates.size() == 0) {</span>
+<span class="fc" id="L527">          break;</span>
+        }
+<span class="fc bfc" id="L529" title="All 2 branches covered.">        if (!matchAllTokens) {</span>
+<span class="pc bpc" id="L530" title="3 of 6 branches missed.">          if ((matchAll &amp;&amp; cStates.isAllMatch())</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">              || (!matchAll &amp;&amp; cStates.isMatch())) {</span>
+<span class="nc" id="L532">            cStates.completeMatch();</span>
+<span class="nc" id="L533">            return true;</span>
+          }
+        }
+<span class="pc bpc" id="L536" title="2 of 4 branches missed.">        if (branchLimit &gt;= 0 &amp;&amp; cStates.branchSize() &gt; branchLimit) {</span>
+<span class="nc" id="L537">          MatchedStates s2 = cStates.split(branchLimit);</span>
+<span class="nc" id="L538">          todo.push(s2);</span>
+        }
+      }
+<span class="fc bfc" id="L541" title="All 2 branches covered.">      if (cStates.isMatch()) {</span>
+<span class="fc" id="L542">        cStates.completeMatch();</span>
+<span class="fc" id="L543">        return true;</span>
+      }
+<span class="fc" id="L545">      cStates.clean();</span>
+<span class="fc" id="L546">    }</span>
+<span class="fc" id="L547">    return false;</span>
+  }
+
+  /**
+   * Checks if the pattern matches the entire sequence
+   * @return true if the entire sequence is matched (false otherwise)
+   * @see #find()
+   */
+  public boolean matches() {
+<span class="fc" id="L556">    matched = false;</span>
+<span class="fc" id="L557">    matchingCompleted = false;</span>
+<span class="fc" id="L558">    boolean status = findMatchStart(0, true);</span>
+<span class="fc bfc" id="L559" title="All 2 branches covered.">    if (status) {</span>
+      // Check if entire region is matched
+<span class="pc bpc" id="L561" title="2 of 4 branches missed.">      status = ((matchedGroups[0].matchBegin == regionStart) &amp;&amp; (matchedGroups[0].matchEnd == regionEnd));</span>
+    }
+<span class="fc" id="L563">    matchingCompleted = true;</span>
+<span class="fc" id="L564">    matched = status;</span>
+<span class="fc" id="L565">    return status;</span>
+  }
+
+  private void clearMatched() {
+<span class="fc bfc" id="L569" title="All 2 branches covered.">    for (int i = 0; i &lt; matchedGroups.length; i++) {</span>
+<span class="fc" id="L570">      matchedGroups[i] = null;</span>
+    }
+<span class="pc bpc" id="L572" title="1 of 2 branches missed.">    if (matchedResults != null) {</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">      for (int i = 0; i &lt; matchedResults.length; i++) {</span>
+<span class="nc" id="L574">        matchedResults[i] = null;</span>
+      }
+    }
+<span class="fc" id="L577">  }</span>
+
+  private String getStateMessage() {
+<span class="nc bnc" id="L580" title="All 2 branches missed.">    if (!matchingCompleted) {</span>
+<span class="nc" id="L581">      return &quot;Matching not completed&quot;;</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">    } else if (!matched) {</span>
+<span class="nc" id="L583">      return &quot;No match found&quot;;</span>
+    } else {
+<span class="nc" id="L585">      return &quot;Match successful&quot;;</span>
+    }
+  }
+
+  /**
+   * Set region to search in
+   * @param start - start index
+   * @param end - end index (exclusive)
+   */
+  public void region(int start, int end) {
+<span class="nc bnc" id="L595" title="All 4 branches missed.">    if (start &lt; 0 || start &gt; elements.size()) {</span>
+<span class="nc" id="L596">      throw new IndexOutOfBoundsException(&quot;Invalid region start=&quot; + start + &quot;, need to be between 0 and &quot; + elements.size());</span>
+    }
+<span class="nc bnc" id="L598" title="All 4 branches missed.">    if (end &lt; 0 || end &gt; elements.size()) {</span>
+<span class="nc" id="L599">      throw new IndexOutOfBoundsException(&quot;Invalid region end=&quot; + end + &quot;, need to be between 0 and &quot; + elements.size());</span>
+    }
+<span class="nc bnc" id="L601" title="All 2 branches missed.">    if (start &gt; end) {</span>
+<span class="nc" id="L602">      throw new IndexOutOfBoundsException(&quot;Invalid region end=&quot; + end + &quot;, need to be larger then start=&quot; + start);</span>
+    }
+<span class="nc" id="L604">    this.regionStart = start;</span>
+<span class="nc" id="L605">    this.nextMatchStart = start;</span>
+<span class="nc" id="L606">    this.regionEnd = end;</span>
+<span class="nc" id="L607">  }</span>
+
+  public int regionEnd()
+  {
+<span class="nc" id="L611">    return regionEnd;</span>
+  }
+
+  public int regionStart()
+  {
+<span class="nc" id="L616">    return regionStart;</span>
+  }
+
+  /**
+   * Returns a copy of the current match results.  Use this method
+   * to save away match results for later use, since future operations
+   * using the SequenceMatcher changes the match results.
+   * @return Copy of the the current match results
+   */
+  public BasicSequenceMatchResult&lt;T&gt; toBasicSequenceMatchResult() {
+<span class="nc bnc" id="L626" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L627">      return super.toBasicSequenceMatchResult();</span>
+    } else {
+<span class="nc" id="L629">      String message = getStateMessage();</span>
+<span class="nc" id="L630">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public int start(int group) {
+<span class="nc bnc" id="L635" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L636">      return super.start(group);</span>
+    } else {
+<span class="nc" id="L638">      String message = getStateMessage();</span>
+<span class="nc" id="L639">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public int end(int group) {
+<span class="pc bpc" id="L644" title="2 of 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="fc" id="L645">      return super.end(group);</span>
+    } else {
+<span class="nc" id="L647">      String message = getStateMessage();</span>
+<span class="nc" id="L648">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public List&lt;T&gt; groupNodes(int group) {
+<span class="pc bpc" id="L653" title="2 of 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="fc" id="L654">      return super.groupNodes(group);</span>
+    } else {
+<span class="nc" id="L656">      String message = getStateMessage();</span>
+<span class="nc" id="L657">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public Object groupValue(int group) {
+<span class="nc bnc" id="L662" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L663">      return super.groupValue(group);</span>
+    } else {
+<span class="nc" id="L665">      String message = getStateMessage();</span>
+<span class="nc" id="L666">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public MatchedGroupInfo&lt;T&gt; groupInfo(int group) {
+<span class="nc bnc" id="L671" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L672">      return super.groupInfo(group);</span>
+    } else {
+<span class="nc" id="L674">      String message = getStateMessage();</span>
+<span class="nc" id="L675">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public List&lt;Object&gt; groupMatchResults(int group) {
+<span class="nc bnc" id="L680" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L681">      return super.groupMatchResults(group);</span>
+    } else {
+<span class="nc" id="L683">      String message = getStateMessage();</span>
+<span class="nc" id="L684">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public Object groupMatchResult(int group, int index) {
+<span class="nc bnc" id="L689" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L690">      return super.groupMatchResult(group, index);</span>
+    } else {
+<span class="nc" id="L692">      String message = getStateMessage();</span>
+<span class="nc" id="L693">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  public Object nodeMatchResult(int index) {
+<span class="nc bnc" id="L698" title="All 4 branches missed.">    if (matchingCompleted &amp;&amp; matched) {</span>
+<span class="nc" id="L699">      return super.nodeMatchResult(index);</span>
+    } else {
+<span class="nc" id="L701">      String message = getStateMessage();</span>
+<span class="nc" id="L702">      throw new IllegalStateException(message);</span>
+    }
+  }
+
+  /**
+   * Clears matcher
+   * - Clears matched groups, reset region to be entire sequence
+   */
+  public void reset() {
+<span class="nc" id="L711">    regionStart = 0;</span>
+<span class="nc" id="L712">    regionEnd = elements.size();</span>
+<span class="nc" id="L713">    nextMatchStart = 0;</span>
+<span class="nc" id="L714">    matchingCompleted = false;</span>
+<span class="nc" id="L715">    matched = false;</span>
+<span class="nc" id="L716">    clearMatched();</span>
+
+    // Clearing for FIND_ALL
+<span class="nc" id="L719">    prevMatchedSignatures.clear();</span>
+<span class="nc" id="L720">    curMatchIter = null;</span>
+<span class="nc" id="L721">    curMatchStates = null;</span>
+<span class="nc" id="L722">  }</span>
+
+  /**
+   * Returns the ith element
+   * @param i - index
+   * @return ith element
+   */
+  public T get(int i)
+  {
+<span class="fc" id="L731">    return elements.get(i);</span>
+  }
+
+  /** Returns a non-null MatchedStates, which has a non-empty states list inside. */
+  private MatchedStates&lt;T&gt; getStartStates()
+  {
+<span class="fc" id="L737">    return new MatchedStates&lt;&gt;(this, pattern.root);</span>
+  }
+
+  /**
+   * Contains information about a branch of running the NFA matching
+   */
+  private static class BranchState
+  {
+    // Branch id
+    int bid;
+    // Parent branch state
+    BranchState parent;
+    // Map of group id to matched group
+    Map&lt;Integer,MatchedGroup&gt; matchedGroups;
+    // Map of sequence index id to matched node result
+    Map&lt;Integer,Object&gt; matchedResults;
+    // Map of state to object storing information about the state for this branch of execution
+    // Used for states corresponding to
+    //    repeating patterns: key is RepeatState, object is Pair&lt;Integer,Boolean&gt;
+    //                        pair indicates sequence index and whether the match was complete
+    //    multinode patterns: key is MultiNodePatternState, object is Interval&lt;Integer&gt;
+    //                        the interval indicates the start and end node indices for the multinode pattern
+    //    conjunction patterns: key is ConjStartState, object is ConjMatchStateInfo
+    Map&lt;SequencePattern.State, Object&gt; matchStateInfo;
+    //Map&lt;SequencePattern.State, Pair&lt;Integer,Boolean&gt;&gt; matchStateCount;
+    Set&lt;Integer&gt; bidsToCollapse; // Branch ids to collapse together with this branch
+                                 // Used for conjunction states, which requires multiple paths
+                                 // through the NFA to hold
+    Set&lt;Integer&gt; collapsedBids;  // Set of Branch ids that has already been collapsed ...
+                                // assumes that after being collapsed no more collapsing required
+
+    public BranchState(int bid) {
+<span class="fc" id="L769">      this(bid, null);</span>
+<span class="fc" id="L770">    }</span>
+
+<span class="fc" id="L772">    public BranchState(int bid, BranchState parent) {</span>
+<span class="fc" id="L773">      this.bid = bid;</span>
+<span class="fc" id="L774">      this.parent = parent;</span>
+<span class="fc bfc" id="L775" title="All 2 branches covered.">      if (parent != null) {</span>
+<span class="pc bpc" id="L776" title="1 of 2 branches missed.">        if (parent.matchedGroups != null) {</span>
+<span class="fc" id="L777">          matchedGroups = new LinkedHashMap&lt;&gt;(parent.matchedGroups);</span>
+        }
+<span class="pc bpc" id="L779" title="1 of 2 branches missed.">        if (parent.matchedResults != null) {</span>
+<span class="nc" id="L780">          matchedResults = new LinkedHashMap&lt;&gt;(parent.matchedResults);</span>
+        }
+        /*        if (parent.matchStateCount != null) {
+    matchStateCount = new LinkedHashMap&lt;SequencePattern.State, Pair&lt;Integer,Boolean&gt;&gt;(parent.matchStateCount);
+  }      */
+<span class="fc bfc" id="L785" title="All 2 branches covered.">        if (parent.matchStateInfo != null) {</span>
+<span class="fc" id="L786">          matchStateInfo = new LinkedHashMap&lt;&gt;(parent.matchStateInfo);</span>
+        }
+<span class="pc bpc" id="L788" title="1 of 2 branches missed.">        if (parent.bidsToCollapse != null) {</span>
+<span class="nc" id="L789">          bidsToCollapse = new ArraySet&lt;&gt;(parent.bidsToCollapse.size());</span>
+<span class="nc" id="L790">          bidsToCollapse.addAll(parent.bidsToCollapse);</span>
+        }
+<span class="pc bpc" id="L792" title="1 of 2 branches missed.">        if (parent.collapsedBids != null) {</span>
+<span class="nc" id="L793">          collapsedBids = new ArraySet&lt;&gt;(parent.collapsedBids.size());</span>
+<span class="nc" id="L794">          collapsedBids.addAll(parent.collapsedBids);</span>
+        }
+      }
+<span class="fc" id="L797">    }</span>
+
+    // Add to list of related branch ids that we would like to keep...
+    private void updateKeepBids(BitSet bids) {
+<span class="fc bfc" id="L801" title="All 2 branches covered.">      if (matchStateInfo != null) {</span>
+        // TODO: Make values of matchStateInfo more organized (implement some interface) so we don't
+        // need this kind of specialized code
+<span class="fc bfc" id="L804" title="All 2 branches covered.">        for (SequencePattern.State s:matchStateInfo.keySet()) {</span>
+<span class="pc bpc" id="L805" title="1 of 2 branches missed.">          if (s instanceof SequencePattern.ConjStartState) {</span>
+<span class="nc" id="L806">            SequencePattern.ConjMatchStateInfo info = (SequencePattern.ConjMatchStateInfo) matchStateInfo.get(s);</span>
+<span class="nc" id="L807">            info.updateKeepBids(bids);</span>
+          }
+<span class="fc" id="L809">        }</span>
+      }
+<span class="fc" id="L811">    }</span>
+
+    private void addBidsToCollapse(int[] bids)
+    {
+<span class="nc bnc" id="L815" title="All 2 branches missed.">      if (bidsToCollapse == null) {</span>
+<span class="nc" id="L816">        bidsToCollapse = new ArraySet&lt;&gt;(bids.length);</span>
+      }
+<span class="nc bnc" id="L818" title="All 2 branches missed.">      for (int b:bids) {</span>
+<span class="nc bnc" id="L819" title="All 2 branches missed.">        if (b != bid) {</span>
+<span class="nc" id="L820">          bidsToCollapse.add(b);</span>
+        }
+      }
+<span class="nc" id="L823">    }</span>
+
+    private void addMatchedGroups(Map&lt;Integer,MatchedGroup&gt; g)
+    {
+<span class="nc bnc" id="L827" title="All 2 branches missed.">      for (Integer k:g.keySet()) {</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        if (!matchedGroups.containsKey(k)) {</span>
+<span class="nc" id="L829">          matchedGroups.put(k, g.get(k));</span>
+        }
+<span class="nc" id="L831">      }</span>
+<span class="nc" id="L832">    }</span>
+
+    private void addMatchedResults(Map&lt;Integer,Object&gt; res)
+    {
+<span class="nc bnc" id="L836" title="All 2 branches missed.">      if (res != null) {</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">        for (Integer k:res.keySet()) {</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">          if (!matchedResults.containsKey(k)) {</span>
+<span class="nc" id="L839">            matchedResults.put(k, res.get(k));</span>
+          }
+<span class="nc" id="L841">        }</span>
+      }
+<span class="nc" id="L843">    }</span>
+  }
+
+  private static class State
+  {
+    int bid;
+    SequencePattern.State tstate;
+
+<span class="fc" id="L851">    public State(int bid, SequencePattern.State tstate) {</span>
+<span class="fc" id="L852">      this.bid = bid;</span>
+<span class="fc" id="L853">      this.tstate = tstate;</span>
+<span class="fc" id="L854">    }</span>
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L858" title="All 2 branches missed.">      if (this == o) {</span>
+<span class="nc" id="L859">        return true;</span>
+      }
+<span class="nc bnc" id="L861" title="All 4 branches missed.">      if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L862">        return false;</span>
+      }
+
+<span class="nc" id="L865">      State state = (State) o;</span>
+
+<span class="nc bnc" id="L867" title="All 2 branches missed.">      if (bid != state.bid) {</span>
+<span class="nc" id="L868">        return false;</span>
+      }
+<span class="nc bnc" id="L870" title="All 6 branches missed.">      if (tstate != null ? !tstate.equals(state.tstate) : state.tstate != null) {</span>
+<span class="nc" id="L871">        return false;</span>
+      }
+
+<span class="nc" id="L874">      return true;</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L879">      int result = bid;</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">      result = 31 * result + (tstate != null ? tstate.hashCode() : 0);</span>
+<span class="nc" id="L881">      return result;</span>
+    }
+  }
+
+  /**
+   * Overall information about the branching of paths through the NFA
+   *  (maintained for one attempt at matching, with multiple MatchedStates)
+   */
+<span class="fc" id="L889">  static class BranchStates</span>
+  {
+    // Index of global branch id to pair of parent branch id and branch index
+    // (the branch index is with respect to parent, from 1 to number of branches the parent has)
+    // TODO: This index can grow rather large, use index that allows for shrinkage
+    //       (has remove function and generate new id every time)
+<span class="fc" id="L895">    HashIndex&lt;Pair&lt;Integer,Integer&gt;&gt; bidIndex = new HashIndex&lt;&gt;(512);</span>
+    // Map of branch id to branch state
+<span class="fc" id="L897">    Map&lt;Integer,BranchState&gt; branchStates = new HashMap&lt;&gt;();//Generics.newHashMap();</span>
+    // The activeMatchedStates is only kept to determine what branch states are still needed
+    // It's okay if it overly conservative and has more states than needed,
+    // And while ideally a set, it's okay to have duplicates (esp if it is a bit faster for normal cases).
+<span class="fc" id="L901">    Collection&lt;MatchedStates&gt; activeMatchedStates = new ArrayList&lt;&gt;();//= Generics.newHashSet();</span>
+
+    /**
+     * Links specified MatchedStates to us (list of MatchedStates
+     *   is used to determine what branch states still need to be kept)
+     * @param s
+     */
+    private void link(MatchedStates s)
+    {
+<span class="fc" id="L910">      activeMatchedStates.add(s);</span>
+<span class="fc" id="L911">    }</span>
+
+    /**
+     * Unlinks specified MatchedStates to us (list of MatchedStates
+     *   is used to determine what branch states still need to be kept)
+     * @param s
+     */
+    private void unlink(MatchedStates s) {
+      // Make sure all instances of s are removed
+<span class="fc bfc" id="L920" title="All 2 branches covered.">      while (activeMatchedStates.remove(s)) {}</span>
+<span class="fc" id="L921">    }</span>
+
+    protected int getBid(int parent, int child)
+    {
+<span class="nc" id="L925">      return bidIndex.indexOf(new Pair&lt;&gt;(parent,child));</span>
+    }
+
+    protected int newBid(int parent, int child)
+    {
+<span class="fc" id="L930">      return bidIndex.addToIndexUnsafe(new Pair&lt;&gt;(parent,child));</span>
+    }
+
+    protected int size()
+    {
+<span class="fc" id="L935">      return branchStates.size();</span>
+    }
+
+    /**
+     * Removes branch states are are no longer needed
+     */
+    private void condense()
+    {
+<span class="fc" id="L943">      BitSet keepBidStates = new BitSet();</span>
+//      Set&lt;Integer&gt; curBidSet = new HashSet&lt;Integer&gt;();//Generics.newHashSet();
+//      Set&lt;Integer&gt; keepBidStates = new HashSet&lt;Integer&gt;();//Generics.newHashSet();
+<span class="fc bfc" id="L946" title="All 2 branches covered.">      for (MatchedStates ms:activeMatchedStates) {</span>
+        // Trim out unneeded states info
+<span class="fc" id="L948">        List&lt;State&gt; states = ms.states;</span>
+<span class="pc bpc" id="L949" title="1 of 2 branches missed.">        if (logger.isLoggable(Level.FINEST)) {</span>
+<span class="nc" id="L950">          logger.finest(&quot;Condense matched state: curPosition=&quot; + ms.curPosition</span>
+<span class="nc" id="L951">              + &quot;, totalTokens=&quot; + ms.matcher.elements.size()</span>
+<span class="nc" id="L952">              + &quot;, nStates=&quot; + states.size());</span>
+        }
+<span class="fc bfc" id="L954" title="All 2 branches covered.">        for (State state: states) {</span>
+<span class="fc" id="L955">          keepBidStates.set(state.bid);</span>
+<span class="fc" id="L956">        }</span>
+<span class="fc" id="L957">      }</span>
+<span class="fc bfc" id="L958" title="All 2 branches covered.">      for (MatchedStates ms : activeMatchedStates) {</span>
+<span class="fc bfc" id="L959" title="All 2 branches covered.">        for (State state : (List&lt;State&gt;) ms.states) {</span>
+<span class="fc" id="L960">          int bid = state.bid;</span>
+<span class="fc" id="L961">          BranchState bs = getBranchState(bid);</span>
+<span class="pc bpc" id="L962" title="1 of 2 branches missed.">          if (bs != null) {</span>
+<span class="fc" id="L963">            keepBidStates.set(bs.bid);</span>
+<span class="fc" id="L964">            bs.updateKeepBids(keepBidStates);</span>
+<span class="pc bpc" id="L965" title="1 of 2 branches missed.">            if (bs.bidsToCollapse != null) {</span>
+<span class="nc" id="L966">              mergeBranchStates(bs);</span>
+            }
+          }
+<span class="fc" id="L969">        }</span>
+<span class="fc" id="L970">      }</span>
+<span class="fc" id="L971">      Iterator&lt;Integer&gt; iter = branchStates.keySet().iterator();</span>
+<span class="fc bfc" id="L972" title="All 2 branches covered.">      while (iter.hasNext()) {</span>
+<span class="fc" id="L973">        int bid = iter.next();</span>
+<span class="fc bfc" id="L974" title="All 2 branches covered.">        if (!keepBidStates.get(bid)) {</span>
+<span class="pc bpc" id="L975" title="1 of 2 branches missed.">          if (logger.isLoggable(Level.FINEST)) {</span>
+<span class="nc" id="L976">            logger.finest(&quot;Remove state for bid=&quot; + bid);</span>
+          }
+<span class="fc" id="L978">          iter.remove();</span>
+        }
+<span class="fc" id="L980">      }</span>
+      /* note[gabor]: replaced code below with the above
+      Collection&lt;Integer&gt; curBidStates = new ArrayList&lt;Integer&gt;(branchStates.keySet());
+      for (int bid:curBidStates) {
+        if (!keepBidStates.get(bid)) {
+          if (logger.isLoggable(Level.FINEST)) {
+            logger.finest(&quot;Remove state for bid=&quot; + bid);
+          }
+          branchStates.remove(bid);
+        }
+      }  */
+
+
+      // TODO: We should be able to trim some bids from our bidIndex as well....
+      /*
+      if (bidIndex.size() &gt; 1000) {
+        logger.warning(&quot;Large bid index of size &quot; + bidIndex.size());
+      }
+      */
+<span class="fc" id="L999">    }</span>
+
+    /** A safe version of {@link SequenceMatcher.BranchStates#getParents(int, Integer[])} */
+    private List&lt;Integer&gt; getParents(int bid) {
+<span class="nc" id="L1003">      List&lt;Integer&gt; pids = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1004">      Pair&lt;Integer,Integer&gt; p = bidIndex.get(bid);</span>
+<span class="nc bnc" id="L1005" title="All 4 branches missed.">      while (p != null &amp;&amp; p.first() &gt;= 0) {</span>
+<span class="nc" id="L1006">        pids.add(p.first());</span>
+<span class="nc" id="L1007">        p = bidIndex.get(p.first());</span>
+      }
+<span class="nc" id="L1009">      Collections.reverse(pids);</span>
+<span class="nc" id="L1010">      return pids;</span>
+    }
+
+    /**
+     * Given a branch id, return a list of parent branches
+     * @param bid  branch id
+     * @return list of parent branch ids
+     */
+    private List&lt;Integer&gt; getParents(int bid, Integer[] buffer)
+    {
+<span class="fc" id="L1020">      int index = buffer.length - 1;</span>
+<span class="fc" id="L1021">      buffer[index] = bid;</span>
+<span class="fc" id="L1022">      index -= 1;</span>
+<span class="fc" id="L1023">      Pair&lt;Integer,Integer&gt; p = bidIndex.get(bid);</span>
+<span class="pc bpc" id="L1024" title="1 of 4 branches missed.">      while (p != null &amp;&amp; p.first() &gt;= 0) {</span>
+<span class="fc" id="L1025">        buffer[index] = p.first;</span>
+<span class="fc" id="L1026">        index -= 1;</span>
+<span class="pc bpc" id="L1027" title="1 of 2 branches missed.">        if (index &lt; 0) {</span>
+<span class="nc" id="L1028">          return getParents(bid);  // optimization failed -- back off to the old version</span>
+        }
+<span class="fc" id="L1030">        p = bidIndex.get(p.first());</span>
+      }
+<span class="fc" id="L1032">      return Arrays.asList(buffer).subList(index + 1, buffer.length);</span>
+    }
+
+    /**
+     * Returns the branch state for a given branch id
+     * (the appropriate ancestor branch state is returned if
+     *  there is no branch state associated with the given branch id)
+     * @param bid branch id
+     * @return BranchState associated with the given branch id
+     */
+    protected BranchState getBranchState(int bid)
+    {
+
+<span class="fc" id="L1045">      BranchState bs = branchStates.get(bid);</span>
+<span class="fc bfc" id="L1046" title="All 2 branches covered.">      if (bs == null) {</span>
+<span class="fc" id="L1047">        BranchState pbs = null;</span>
+<span class="fc" id="L1048">        int id = bid;</span>
+<span class="fc bfc" id="L1049" title="All 4 branches covered.">        while (pbs == null &amp;&amp; id &gt;= 0) {</span>
+<span class="fc" id="L1050">          Pair&lt;Integer, Integer&gt; p = bidIndex.get(id);</span>
+<span class="fc" id="L1051">          id = p.first;</span>
+<span class="fc" id="L1052">          pbs = branchStates.get(id);</span>
+<span class="fc" id="L1053">        }</span>
+<span class="fc" id="L1054">        bs = pbs;</span>
+      }
+<span class="fc" id="L1056">      return bs;</span>
+    }
+
+    /**
+     * Returns the branch state for a given branch id
+     * (the appropriate ancestor branch state is returned if
+     *  there is no branch state associated with the given branch id)
+     * If add is true, then adds a new branch state for this branch id
+     * (ensuring that the returned branch state is for the specified branch id)
+     * @param bid branch id
+     * @param add whether a new branched state should be added
+     * @return BranchState associated with the given branch id
+     */
+    protected BranchState getBranchState(int bid, boolean add)
+    {
+<span class="fc" id="L1071">      BranchState bs = getBranchState(bid);</span>
+<span class="fc bfc" id="L1072" title="All 2 branches covered.">      if (add) {</span>
+<span class="fc bfc" id="L1073" title="All 2 branches covered.">        if (bs == null) {</span>
+<span class="fc" id="L1074">          bs = new BranchState(bid);</span>
+<span class="fc bfc" id="L1075" title="All 2 branches covered.">        } else if (bs.bid != bid) {</span>
+<span class="fc" id="L1076">          bs = new BranchState(bid, bs);</span>
+        }
+<span class="fc" id="L1078">        branchStates.put(bid, bs);</span>
+      }
+<span class="fc" id="L1080">      return bs;</span>
+    }
+
+    protected Map&lt;Integer,MatchedGroup&gt; getMatchedGroups(int bid, boolean add)
+    {
+<span class="fc" id="L1085">      BranchState bs = getBranchState(bid, add);</span>
+<span class="pc bpc" id="L1086" title="1 of 2 branches missed.">      if (bs == null) {</span>
+<span class="nc" id="L1087">        return null;</span>
+      }
+<span class="fc bfc" id="L1089" title="All 4 branches covered.">      if (add &amp;&amp; bs.matchedGroups == null) {</span>
+<span class="fc" id="L1090">        bs.matchedGroups = new LinkedHashMap&lt;&gt;();</span>
+      }
+<span class="fc" id="L1092">      return bs.matchedGroups;</span>
+    }
+
+    protected MatchedGroup getMatchedGroup(int bid, int groupId)
+    {
+<span class="fc" id="L1097">      Map&lt;Integer,MatchedGroup&gt; map = getMatchedGroups(bid, false);</span>
+<span class="pc bpc" id="L1098" title="1 of 2 branches missed.">      if (map != null) {</span>
+<span class="fc" id="L1099">        return map.get(groupId);</span>
+      } else {
+<span class="nc" id="L1101">        return null;</span>
+      }
+    }
+
+    protected void setGroupStart(int bid, int captureGroupId, int curPosition)
+    {
+<span class="fc bfc" id="L1107" title="All 2 branches covered.">      if (captureGroupId &gt;= 0) {</span>
+<span class="fc" id="L1108">        Map&lt;Integer,MatchedGroup&gt; matchedGroups = getMatchedGroups(bid, true);</span>
+<span class="fc" id="L1109">        MatchedGroup mg = matchedGroups.get(captureGroupId);</span>
+<span class="fc bfc" id="L1110" title="All 2 branches covered.">        if (mg != null) {</span>
+          // This is possible if we have patterns like &quot;( ... )+&quot; in which case multiple nodes can match as the subgroup
+          // We will match the first occurrence and use that as the subgroup  (Java uses the last match as the subgroup)
+<span class="fc" id="L1113">          logger.fine(&quot;Setting matchBegin=&quot; + curPosition + &quot;: Capture group &quot; + captureGroupId + &quot; already exists: &quot; + mg);</span>
+        }
+<span class="fc" id="L1115">        matchedGroups.put(captureGroupId, new MatchedGroup(curPosition, -1, null));</span>
+      }
+<span class="fc" id="L1117">    }</span>
+
+    protected void setGroupEnd(int bid, int captureGroupId, int curPosition, Object value)
+    {
+<span class="fc bfc" id="L1121" title="All 2 branches covered.">      if (captureGroupId &gt;= 0) {</span>
+<span class="fc" id="L1122">        Map&lt;Integer,MatchedGroup&gt; matchedGroups = getMatchedGroups(bid, true);</span>
+<span class="fc" id="L1123">        MatchedGroup mg = matchedGroups.get(captureGroupId);</span>
+<span class="fc" id="L1124">        int end = curPosition+1;</span>
+<span class="pc bpc" id="L1125" title="1 of 2 branches missed.">        if (mg != null) {</span>
+<span class="pc bpc" id="L1126" title="1 of 2 branches missed.">          if (mg.matchEnd == -1) {</span>
+<span class="fc" id="L1127">            matchedGroups.put(captureGroupId, new MatchedGroup(mg.matchBegin, end, value));</span>
+          } else {
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">            if (mg.matchEnd != end) {</span>
+<span class="nc" id="L1130">              logger.warning(&quot;Cannot set matchEnd=&quot; + end + &quot;: Capture group &quot; + captureGroupId + &quot; already ended: &quot; + mg);</span>
+            }
+          }
+        } else {
+<span class="nc" id="L1134">          logger.warning(&quot;Cannot set matchEnd=&quot; + end + &quot;: Capture group &quot; + captureGroupId + &quot; is null&quot;);</span>
+        }
+      }
+<span class="fc" id="L1137">    }</span>
+
+    protected void clearGroupStart(int bid, int captureGroupId)
+    {
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">      if (captureGroupId &gt;= 0) {</span>
+<span class="nc" id="L1142">        Map&lt;Integer,MatchedGroup&gt; matchedGroups = getMatchedGroups(bid, false);</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">        if (matchedGroups != null) {</span>
+<span class="nc" id="L1144">          matchedGroups.remove(captureGroupId);</span>
+        }
+      }
+<span class="nc" id="L1147">    }</span>
+
+    protected Map&lt;Integer,Object&gt; getMatchedResults(int bid, boolean add)
+    {
+<span class="nc" id="L1151">      BranchState bs = getBranchState(bid, add);</span>
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">      if (bs == null) {</span>
+<span class="nc" id="L1153">        return null;</span>
+      }
+<span class="nc bnc" id="L1155" title="All 4 branches missed.">      if (add &amp;&amp; bs.matchedResults == null) {</span>
+<span class="nc" id="L1156">        bs.matchedResults = new LinkedHashMap&lt;&gt;();</span>
+      }
+<span class="nc" id="L1158">      return bs.matchedResults;</span>
+    }
+
+    protected Object getMatchedResult(int bid, int index)
+    {
+<span class="nc" id="L1163">      Map&lt;Integer,Object&gt; map = getMatchedResults(bid, false);</span>
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">      if (map != null) {</span>
+<span class="nc" id="L1165">        return map.get(index);</span>
+      } else {
+<span class="nc" id="L1167">        return null;</span>
+      }
+    }
+
+    protected void setMatchedResult(int bid, int index, Object obj)
+    {
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">      if (index &gt;= 0) {</span>
+<span class="nc" id="L1174">        Map&lt;Integer,Object&gt; matchedResults = getMatchedResults(bid, true);</span>
+<span class="nc" id="L1175">        Object oldObj = matchedResults.get(index);</span>
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">        if (oldObj != null) {</span>
+<span class="nc" id="L1177">          logger.warning(&quot;Setting matchedResult=&quot; + obj + &quot;: index &quot; + index + &quot; already exists: &quot; + oldObj);</span>
+        }
+<span class="nc" id="L1179">        matchedResults.put(index, obj);</span>
+      }
+<span class="nc" id="L1181">    }</span>
+
+    protected int getBranchId(int bid, int nextBranchIndex, int nextTotal)
+    {
+<span class="pc bpc" id="L1185" title="2 of 4 branches missed.">      if (nextBranchIndex &lt;= 0 || nextBranchIndex &gt; nextTotal) {</span>
+<span class="nc" id="L1186">        throw new IllegalArgumentException(&quot;Invalid nextBranchIndex=&quot; + nextBranchIndex + &quot;, nextTotal=&quot; + nextTotal);</span>
+      }
+<span class="fc bfc" id="L1188" title="All 2 branches covered.">      if (nextTotal == 1) {</span>
+<span class="fc" id="L1189">        return bid;</span>
+      } else {
+<span class="fc" id="L1191">        Pair&lt;Integer,Integer&gt; p = new Pair&lt;&gt;(bid, nextBranchIndex);</span>
+<span class="fc" id="L1192">        int i = bidIndex.indexOf(p);</span>
+<span class="fc bfc" id="L1193" title="All 2 branches covered.">        if (i &lt; 0) {</span>
+<span class="fc bfc" id="L1194" title="All 2 branches covered.">          for (int j = 0; j &lt; nextTotal; j++) {</span>
+<span class="fc" id="L1195">            bidIndex.add(new Pair&lt;&gt;(bid, j + 1));</span>
+          }
+<span class="fc" id="L1197">          i = bidIndex.indexOf(p);</span>
+        }
+<span class="fc" id="L1199">        return i;</span>
+      }
+    }
+
+    protected Map&lt;SequencePattern.State,Object&gt; getMatchStateInfo(int bid, boolean add)
+    {
+<span class="fc" id="L1205">      BranchState bs = getBranchState(bid, add);</span>
+<span class="pc bpc" id="L1206" title="1 of 2 branches missed.">      if (bs == null) {</span>
+<span class="nc" id="L1207">        return null;</span>
+      }
+<span class="fc bfc" id="L1209" title="All 4 branches covered.">      if (add &amp;&amp; bs.matchStateInfo == null) {</span>
+<span class="fc" id="L1210">        bs.matchStateInfo = new LinkedHashMap&lt;&gt;();</span>
+      }
+<span class="fc" id="L1212">      return bs.matchStateInfo;</span>
+    }
+
+    protected Object getMatchStateInfo(int bid, SequencePattern.State node)
+    {
+<span class="fc" id="L1217">      Map&lt;SequencePattern.State,Object&gt; matchStateInfo = getMatchStateInfo(bid, false);</span>
+<span class="pc bpc" id="L1218" title="1 of 2 branches missed.">      return (matchStateInfo != null)? matchStateInfo.get(node):null;</span>
+    }
+
+    protected void removeMatchStateInfo(int bid, SequencePattern.State node)
+    {
+<span class="fc" id="L1223">      Object obj = getMatchStateInfo(bid, node);</span>
+<span class="fc bfc" id="L1224" title="All 2 branches covered.">      if (obj != null) {</span>
+<span class="fc" id="L1225">        Map&lt;SequencePattern.State,Object&gt; matchStateInfo = getMatchStateInfo(bid, true);</span>
+<span class="fc" id="L1226">        matchStateInfo.remove(node);</span>
+      }
+<span class="fc" id="L1228">    }</span>
+
+    protected void setMatchStateInfo(int bid, SequencePattern.State node, Object obj)
+    {
+<span class="nc" id="L1232">      Map&lt;SequencePattern.State,Object&gt; matchStateInfo = getMatchStateInfo(bid, true);</span>
+<span class="nc" id="L1233">      matchStateInfo.put(node, obj);</span>
+<span class="nc" id="L1234">    }</span>
+
+    protected void startMatchedCountInc(int bid, SequencePattern.State node) {
+<span class="fc" id="L1237">      startMatchedCountInc(bid, node, 1, 1);</span>
+<span class="fc" id="L1238">    }</span>
+
+    protected void startMatchedCountDec(int bid, SequencePattern.State node) {
+<span class="fc" id="L1241">      startMatchedCountInc(bid, node, 0, -1);</span>
+<span class="fc" id="L1242">    }</span>
+
+    protected void startMatchedCountInc(int bid, SequencePattern.State node, int initialValue, int delta)
+    {
+<span class="fc" id="L1246">      Map&lt;SequencePattern.State,Object&gt; matchStateCount = getMatchStateInfo(bid, true);</span>
+<span class="fc" id="L1247">      Pair&lt;Integer,Boolean&gt; p = (Pair&lt;Integer,Boolean&gt;) matchStateCount.get(node);</span>
+<span class="fc bfc" id="L1248" title="All 2 branches covered.">      if (p == null) {</span>
+<span class="fc" id="L1249">        matchStateCount.put(node, new Pair&lt;&gt;(initialValue, false));</span>
+      } else {
+<span class="fc" id="L1251">        matchStateCount.put(node, new Pair&lt;&gt;(p.first() + delta, false));</span>
+      }
+<span class="fc" id="L1253">    }</span>
+
+    protected int endMatchedCountInc(int bid, SequencePattern.State node)
+    {
+<span class="fc" id="L1257">      Map&lt;SequencePattern.State,Object&gt; matchStateCount = getMatchStateInfo(bid, false);</span>
+<span class="fc bfc" id="L1258" title="All 2 branches covered.">      if (matchStateCount == null) { return 0; }</span>
+<span class="fc" id="L1259">      matchStateCount = getMatchStateInfo(bid, true);</span>
+<span class="fc" id="L1260">      Pair&lt;Integer,Boolean&gt; p = (Pair&lt;Integer,Boolean&gt;) matchStateCount.get(node);</span>
+<span class="fc bfc" id="L1261" title="All 2 branches covered.">      if (p != null) {</span>
+<span class="fc" id="L1262">        int v = p.first();</span>
+<span class="fc" id="L1263">        matchStateCount.put(node, new Pair&lt;&gt;(v, true));</span>
+<span class="fc" id="L1264">        return v;</span>
+      } else {
+<span class="fc" id="L1266">        return 0;</span>
+      }
+    }
+
+    protected void clearMatchedCount(int bid, SequencePattern.State node)
+    {
+<span class="fc" id="L1272">      removeMatchStateInfo(bid, node);</span>
+<span class="fc" id="L1273">    }</span>
+
+    protected void setMatchedInterval(int bid, SequencePattern.State node, HasInterval&lt;Integer&gt; interval)
+    {
+<span class="nc" id="L1277">      Map&lt;SequencePattern.State,Object&gt; matchStateInfo = getMatchStateInfo(bid, true);</span>
+<span class="nc" id="L1278">      HasInterval&lt;Integer&gt; p = (HasInterval&lt;Integer&gt;) matchStateInfo.get(node);</span>
+<span class="nc bnc" id="L1279" title="All 2 branches missed.">      if (p == null) {</span>
+<span class="nc" id="L1280">        matchStateInfo.put(node, interval);</span>
+      } else {
+<span class="nc" id="L1282">        logger.warning(&quot;Interval already exists for bid=&quot; + bid);</span>
+      }
+<span class="nc" id="L1284">    }</span>
+
+    protected HasInterval&lt;Integer&gt; getMatchedInterval(int bid, SequencePattern.State node)
+    {
+<span class="nc" id="L1288">      Map&lt;SequencePattern.State,Object&gt; matchStateInfo = getMatchStateInfo(bid, true);</span>
+<span class="nc" id="L1289">      HasInterval&lt;Integer&gt; p = (HasInterval&lt;Integer&gt;) matchStateInfo.get(node);</span>
+<span class="nc" id="L1290">      return p;</span>
+    }
+
+    protected void addBidsToCollapse(int bid, int[] bids)
+    {
+<span class="nc" id="L1295">      BranchState bs = getBranchState(bid, true);</span>
+<span class="nc" id="L1296">      bs.addBidsToCollapse(bids);</span>
+<span class="nc" id="L1297">    }</span>
+
+    private void mergeBranchStates(BranchState bs)
+    {
+<span class="pc bpc" id="L1301" title="3 of 4 branches missed.">      if (bs.bidsToCollapse != null &amp;&amp; bs.bidsToCollapse.size() &gt; 0) {</span>
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">        for (int cbid:bs.bidsToCollapse) {</span>
+          // Copy over the matched group info
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">          if (cbid != bs.bid) {</span>
+<span class="nc" id="L1305">            BranchState cbs = getBranchState(cbid);</span>
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">            if (cbs != null) {</span>
+<span class="nc" id="L1307">              bs.addMatchedGroups(cbs.matchedGroups);</span>
+<span class="nc" id="L1308">              bs.addMatchedResults(cbs.matchedResults);</span>
+            } else {
+<span class="nc" id="L1310">              logger.finest(&quot;Unable to find state info for bid=&quot; + cbid);</span>
+            }
+          }
+<span class="nc" id="L1313">        }</span>
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">        if (bs.collapsedBids == null) {</span>
+<span class="nc" id="L1315">          bs.collapsedBids = bs.bidsToCollapse;</span>
+        } else {
+<span class="nc" id="L1317">          bs.collapsedBids.addAll(bs.bidsToCollapse);</span>
+        }
+<span class="nc" id="L1319">        bs.bidsToCollapse = null;</span>
+      }
+<span class="fc" id="L1321">    }</span>
+
+  }
+
+  private String getMatchedSignature() {
+<span class="nc bnc" id="L1326" title="All 2 branches missed.">    if (matchedGroups == null) return null;</span>
+<span class="nc" id="L1327">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1328" title="All 2 branches missed.">    for (MatchedGroup g : matchedGroups) {</span>
+<span class="nc" id="L1329">      sb.append(&quot;(&quot;).append(g.matchBegin).append(&quot;,&quot;).append(g.matchEnd).append(&quot;)&quot;);</span>
+    }
+<span class="nc" id="L1331">    return sb.toString();</span>
+  }
+
+  /**
+   * Utility class that helps us perform pattern matching against a sequence
+   * Keeps information about:
+   * &lt;ul&gt;
+   * &lt;li&gt;the states we need to visit&lt;/li&gt;
+   * &lt;li&gt;the current position in the sequence we are at&lt;/li&gt;
+   * &lt;li&gt;state for each branch we took&lt;/li&gt;
+   * &lt;/ul&gt;
+   * @param &lt;T&gt;  Type of node that the matcher is operating on
+   */
+  static class MatchedStates&lt;T&gt;
+  {
+    // Sequence matcher with pattern that we are matching against and sequence
+    final SequenceMatcher&lt;T&gt; matcher;
+    // Branch states
+    BranchStates branchStates;
+    // set of old states along with their branch ids (used to avoid reallocating mem)
+    List&lt;State&gt; oldStates;
+    // new states to be explored (along with their branch ids)
+    List&lt;State&gt; states;
+    // Current position to match
+<span class="fc" id="L1355">    int curPosition = -1;</span>
+    // Favor matching longest
+    boolean matchLongest;
+
+    protected MatchedStates(SequenceMatcher&lt;T&gt; matcher, SequencePattern.State state)
+    {
+<span class="fc" id="L1361">      this(matcher, new BranchStates());</span>
+<span class="fc" id="L1362">      int bid = branchStates.newBid(-1, 0);</span>
+<span class="fc" id="L1363">      states.add(new State(bid,state));</span>
+<span class="fc" id="L1364">    }</span>
+
+<span class="fc" id="L1366">    private MatchedStates(SequenceMatcher&lt;T&gt; matcher, BranchStates branchStates) {</span>
+<span class="fc" id="L1367">      this.matcher = matcher;</span>
+<span class="fc" id="L1368">      states = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1369">      oldStates = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1370">      this.branchStates = branchStates;</span>
+<span class="fc" id="L1371">      branchStates.link(this);</span>
+<span class="fc" id="L1372">    }</span>
+
+    protected BranchStates getBranchStates()
+    {
+<span class="fc" id="L1376">      return branchStates;</span>
+    }
+
+    /**
+     * Split part of the set of states to explore into another MatchedStates
+     * @param branchLimit - rough limit on the number of branches we want
+     *                      to keep in each MatchedStates
+     * @return new MatchedStates with part of the states still to be explored
+     */
+    protected MatchedStates split(int branchLimit)
+    {
+<span class="nc" id="L1387">      Set&lt;Integer&gt; curBidSet = new HashSet&lt;&gt;();//Generics.newHashSet();</span>
+<span class="nc bnc" id="L1388" title="All 2 branches missed.">      for (State state:states) {</span>
+<span class="nc" id="L1389">        curBidSet.add(state.bid);</span>
+<span class="nc" id="L1390">      }</span>
+<span class="nc" id="L1391">      List&lt;Integer&gt; bids = new ArrayList&lt;&gt;(curBidSet);</span>
+<span class="nc" id="L1392">      Collections.sort(bids, (o1, o2) -&gt; {</span>
+<span class="nc" id="L1393">        int res = compareMatches(o1, o2);</span>
+<span class="nc" id="L1394">        return res;</span>
+      });
+
+<span class="nc" id="L1397">      MatchedStates&lt;T&gt; newStates = new MatchedStates&lt;&gt;(matcher, branchStates);</span>
+<span class="nc" id="L1398">      int v = Math.min(branchLimit, (bids.size()+1)/2);</span>
+<span class="nc" id="L1399">      Set&lt;Integer&gt; keepBidSet = new HashSet&lt;&gt;();//Generics.newHashSet();</span>
+<span class="nc" id="L1400">      keepBidSet.addAll(bids.subList(0, v));</span>
+<span class="nc" id="L1401">      swapAndClear();</span>
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">      for (State s:oldStates) {</span>
+<span class="nc bnc" id="L1403" title="All 2 branches missed.">        if (keepBidSet.contains(s.bid)) {</span>
+<span class="nc" id="L1404">          states.add(s);</span>
+        } else {
+<span class="nc" id="L1406">          newStates.states.add(s);</span>
+        }
+<span class="nc" id="L1408">      }</span>
+<span class="nc" id="L1409">      newStates.curPosition = curPosition;</span>
+<span class="nc" id="L1410">      branchStates.condense();</span>
+<span class="nc" id="L1411">      return newStates;</span>
+    }
+
+    protected List&lt;? extends T&gt; elements()
+    {
+<span class="nc" id="L1416">      return matcher.elements;</span>
+    }
+
+    protected T get()
+    {
+<span class="fc" id="L1421">      return matcher.get(curPosition);</span>
+    }
+
+    protected int size()
+    {
+<span class="fc" id="L1426">      return states.size();</span>
+    }
+
+    protected int branchSize()
+    {
+<span class="fc" id="L1431">      return branchStates.size();</span>
+    }
+
+    private void swap()
+    {
+<span class="fc" id="L1436">      List&lt;State&gt; tmpStates = oldStates;</span>
+<span class="fc" id="L1437">      oldStates = states;</span>
+<span class="fc" id="L1438">      states = tmpStates;</span>
+<span class="fc" id="L1439">    }</span>
+
+    private void swapAndClear()
+    {
+<span class="fc" id="L1443">      swap();</span>
+<span class="fc" id="L1444">      states.clear();</span>
+<span class="fc" id="L1445">    }</span>
+
+    // Attempts to match element at the specified position
+    private boolean match(int position)
+    {
+<span class="fc" id="L1450">      curPosition = position;</span>
+<span class="fc" id="L1451">      boolean matched = false;</span>
+
+<span class="fc" id="L1453">      swapAndClear();</span>
+      // Start with old state, and try to match next element
+      // New states to search after successful match will be updated during the match process
+<span class="fc bfc" id="L1456" title="All 2 branches covered.">      for (State state:oldStates) {</span>
+<span class="fc bfc" id="L1457" title="All 2 branches covered.">        if (state.tstate.match(state.bid, this)) {</span>
+<span class="fc" id="L1458">          matched = true;</span>
+        }
+<span class="fc" id="L1460">      }</span>
+
+      // Run NFA to process non consuming states
+<span class="fc" id="L1463">      boolean done = false;</span>
+<span class="fc bfc" id="L1464" title="All 2 branches covered.">      while (!done) {</span>
+<span class="fc" id="L1465">        swapAndClear();</span>
+<span class="fc" id="L1466">        boolean matched0 = false;</span>
+<span class="fc bfc" id="L1467" title="All 2 branches covered.">        for (State state:oldStates) {</span>
+<span class="pc bpc" id="L1468" title="1 of 2 branches missed.">          if (state.tstate.match0(state.bid, this)) {</span>
+<span class="nc" id="L1469">            matched0 = true;</span>
+          }
+<span class="fc" id="L1471">        }</span>
+<span class="pc bpc" id="L1472" title="1 of 2 branches missed.">        done = !matched0;</span>
+<span class="fc" id="L1473">      }</span>
+
+<span class="fc" id="L1475">      branchStates.condense();</span>
+<span class="fc" id="L1476">      return matched;</span>
+    }
+
+
+<span class="fc" id="L1480">    private final Integer[] p1Buffer = new Integer[128];</span>
+<span class="fc" id="L1481">    private final Integer[] p2Buffer = new Integer[128];</span>
+    protected int compareMatches(int bid1, int bid2)
+    {
+<span class="pc bpc" id="L1484" title="1 of 2 branches missed.">      if (bid1 == bid2) return 0;</span>
+<span class="fc" id="L1485">      List&lt;Integer&gt; p1 = branchStates.getParents(bid1, p1Buffer);</span>
+//      p1.add(bid1);
+<span class="fc" id="L1487">      List&lt;Integer&gt; p2 = branchStates.getParents(bid2, p2Buffer);</span>
+//      p2.add(bid2);
+<span class="fc" id="L1489">      int n = Math.min(p1.size(), p2.size());</span>
+<span class="pc bpc" id="L1490" title="1 of 2 branches missed.">      for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc bfc" id="L1491" title="All 2 branches covered.">        if (p1.get(i) &lt; p2.get(i)) return -1;</span>
+<span class="pc bpc" id="L1492" title="1 of 2 branches missed.">        if (p1.get(i) &gt; p2.get(i)) return 1;</span>
+      }
+<span class="nc bnc" id="L1494" title="All 2 branches missed.">      if (p1.size() &lt; p2.size()) return -1;</span>
+<span class="nc bnc" id="L1495" title="All 2 branches missed.">      if (p1.size() &gt; p2.size()) return 1;</span>
+<span class="nc" id="L1496">      return 0;</span>
+    }
+
+    /**
+     * Returns index of state that results in match (-1 if no matches)
+     */
+    private int getMatchIndex()
+    {
+<span class="fc bfc" id="L1504" title="All 2 branches covered.">      for (int i = 0; i &lt; states.size(); i++) {</span>
+<span class="fc" id="L1505">        State state = states.get(i);</span>
+<span class="fc bfc" id="L1506" title="All 2 branches covered.">        if (state.tstate.equals(SequencePattern.MATCH_STATE)) {</span>
+<span class="fc" id="L1507">          return i;</span>
+        }
+      }
+<span class="fc" id="L1510">      return -1;</span>
+    }
+
+    /**
+     * Returns a set of indices that results in a match
+     */
+    private Collection&lt;Integer&gt; getMatchIndices()
+    {
+<span class="nc" id="L1518">      HashSet&lt;Integer&gt; allMatchIndices = new LinkedHashSet&lt;&gt;();// Generics.newHashSet();</span>
+<span class="nc bnc" id="L1519" title="All 2 branches missed.">      for (int i = 0; i &lt; states.size(); i++) {</span>
+<span class="nc" id="L1520">        State state = states.get(i);</span>
+<span class="nc bnc" id="L1521" title="All 2 branches missed.">        if (state.tstate.equals(SequencePattern.MATCH_STATE)) {</span>
+<span class="nc" id="L1522">          allMatchIndices.add(i);</span>
+        }
+      }
+<span class="nc" id="L1525">      return allMatchIndices;</span>
+    }
+
+    /**
+     * Of the potential match indices, selects one and returns it
+     *  (returns -1 if no matches)
+     */
+    private int selectMatchIndex()
+    {
+<span class="fc" id="L1534">      int best = -1;</span>
+<span class="fc" id="L1535">      int bestbid = -1;</span>
+<span class="fc" id="L1536">      MatchedGroup bestMatched = null;</span>
+<span class="fc" id="L1537">      int bestMatchedLength = -1;</span>
+<span class="fc bfc" id="L1538" title="All 2 branches covered.">      for (int i = 0; i &lt; states.size(); i++) {</span>
+<span class="fc" id="L1539">        State state = states.get(i);</span>
+<span class="fc bfc" id="L1540" title="All 2 branches covered.">        if (state.tstate.equals(SequencePattern.MATCH_STATE)) {</span>
+<span class="fc bfc" id="L1541" title="All 2 branches covered.">          if (best &lt; 0) {</span>
+<span class="fc" id="L1542">            best = i;</span>
+<span class="fc" id="L1543">            bestbid = state.bid;</span>
+<span class="fc" id="L1544">            bestMatched = branchStates.getMatchedGroup(bestbid, 0);</span>
+<span class="pc bpc" id="L1545" title="1 of 2 branches missed.">            bestMatchedLength = (bestMatched != null)? bestMatched.matchLength() : -1;</span>
+          } else {
+            // Compare if this match is better?
+<span class="fc" id="L1548">            int bid = state.bid;</span>
+<span class="fc" id="L1549">            MatchedGroup mg = branchStates.getMatchedGroup(bid, 0);</span>
+<span class="pc bpc" id="L1550" title="1 of 2 branches missed.">            int matchLength = (mg != null)? mg.matchLength() : -1;</span>
+            // Select the branch that matched the most
+            // TODO: Do we need to roll the matchedLength to bestMatchedLength check into the compareMatches?
+            boolean better;
+<span class="fc bfc" id="L1554" title="All 2 branches covered.">            if (matchLongest) {</span>
+<span class="pc bpc" id="L1555" title="3 of 6 branches missed.">              better = (matchLength &gt; bestMatchedLength || (matchLength == bestMatchedLength &amp;&amp; compareMatches(bestbid, bid) &gt; 0));</span>
+            } else {
+<span class="pc bpc" id="L1557" title="1 of 2 branches missed.">              better = compareMatches(bestbid, bid) &gt; 0;</span>
+            }
+<span class="pc bpc" id="L1559" title="1 of 2 branches missed.">            if (better) {</span>
+<span class="nc" id="L1560">              bestbid = bid;</span>
+<span class="nc" id="L1561">              best = i;</span>
+<span class="nc" id="L1562">              bestMatched = branchStates.getMatchedGroup(bestbid, 0);</span>
+<span class="nc bnc" id="L1563" title="All 2 branches missed.">              bestMatchedLength = (bestMatched != null)? bestMatched.matchLength() : -1;</span>
+            }
+          }
+        }
+      }
+<span class="fc" id="L1568">      return best;</span>
+    }
+
+    private void completeMatch()
+    {
+<span class="fc" id="L1573">      int matchStateIndex = selectMatchIndex();</span>
+<span class="fc" id="L1574">      setMatchedGroups(matchStateIndex);</span>
+<span class="fc" id="L1575">    }</span>
+
+    /**
+     * Set the indices of the matched groups
+     * @param matchStateIndex
+     */
+    private void setMatchedGroups(int matchStateIndex)
+    {
+<span class="fc" id="L1583">      matcher.clearMatched();</span>
+<span class="pc bpc" id="L1584" title="1 of 2 branches missed.">      if (matchStateIndex &gt;= 0) {</span>
+<span class="fc" id="L1585">        State state = states.get(matchStateIndex);</span>
+<span class="fc" id="L1586">        int bid = state.bid;</span>
+<span class="fc" id="L1587">        BranchState bs = branchStates.getBranchState(bid);</span>
+<span class="pc bpc" id="L1588" title="1 of 2 branches missed.">        if (bs != null) {</span>
+<span class="fc" id="L1589">          branchStates.mergeBranchStates(bs);</span>
+<span class="fc" id="L1590">          Map&lt;Integer,MatchedGroup&gt; matchedGroups = bs.matchedGroups;</span>
+<span class="pc bpc" id="L1591" title="1 of 2 branches missed.">          if (matchedGroups != null) {</span>
+<span class="fc bfc" id="L1592" title="All 2 branches covered.">            for (int group:matchedGroups.keySet()) {</span>
+<span class="fc" id="L1593">              matcher.matchedGroups[group] = matchedGroups.get(group);</span>
+<span class="fc" id="L1594">            }</span>
+          }
+<span class="fc" id="L1596">          Map&lt;Integer,Object&gt; matchedResults = bs.matchedResults;</span>
+<span class="pc bpc" id="L1597" title="1 of 2 branches missed.">          if (matchedResults != null) {</span>
+<span class="nc bnc" id="L1598" title="All 2 branches missed.">            if (matcher.matchedResults == null) {</span>
+<span class="nc" id="L1599">              matcher.matchedResults = new Object[matcher.elements().size()];</span>
+            }
+<span class="nc bnc" id="L1601" title="All 2 branches missed.">            for (int index:matchedResults.keySet()) {</span>
+<span class="nc" id="L1602">              matcher.matchedResults[index] = matchedResults.get(index);</span>
+<span class="nc" id="L1603">            }</span>
+          }
+        }
+      }
+<span class="fc" id="L1607">    }</span>
+
+    private boolean isAllMatch()
+    {
+<span class="fc" id="L1611">      boolean allMatch = true;</span>
+<span class="pc bpc" id="L1612" title="1 of 2 branches missed.">      if (states.size() &gt; 0) {</span>
+<span class="pc bpc" id="L1613" title="1 of 2 branches missed.">        for (State state:states) {</span>
+<span class="pc bpc" id="L1614" title="1 of 2 branches missed.">          if (!state.tstate.equals(SequencePattern.MATCH_STATE)) {</span>
+<span class="fc" id="L1615">            allMatch = false;</span>
+<span class="fc" id="L1616">            break;</span>
+          }
+<span class="pc" id="L1618">        }</span>
+      } else {
+<span class="nc" id="L1620">        allMatch = false;</span>
+      }
+<span class="fc" id="L1622">      return allMatch;</span>
+    }
+
+    private boolean isMatch()
+    {
+<span class="fc" id="L1627">      int matchStateIndex = getMatchIndex();</span>
+<span class="fc bfc" id="L1628" title="All 2 branches covered.">      return (matchStateIndex &gt;= 0);</span>
+    }
+
+    protected void addStates(int bid, Collection&lt;SequencePattern.State&gt; newStates)
+    {
+<span class="fc" id="L1633">      int i = 0;</span>
+<span class="fc bfc" id="L1634" title="All 2 branches covered.">      for (SequencePattern.State s:newStates) {</span>
+<span class="fc" id="L1635">        i++;</span>
+<span class="fc" id="L1636">        int id = branchStates.getBranchId(bid, i, newStates.size());</span>
+<span class="fc" id="L1637">        states.add(new State(id, s));</span>
+<span class="fc" id="L1638">      }</span>
+<span class="fc" id="L1639">    }</span>
+
+    protected void addState(int bid, SequencePattern.State state)
+    {
+<span class="fc" id="L1643">      this.states.add(new State(bid, state));</span>
+<span class="fc" id="L1644">    }</span>
+
+    private void clean()
+    {
+<span class="fc" id="L1648">      branchStates.unlink(this);</span>
+<span class="fc" id="L1649">      branchStates = null;</span>
+<span class="fc" id="L1650">    }</span>
+
+    protected void setGroupStart(int bid, int captureGroupId)
+    {
+<span class="fc" id="L1654">      branchStates.setGroupStart(bid, captureGroupId, curPosition);</span>
+<span class="fc" id="L1655">    }</span>
+
+    protected void setGroupEnd(int bid, int captureGroupId, Object value)
+    {
+<span class="fc" id="L1659">      branchStates.setGroupEnd(bid, captureGroupId, curPosition, value);</span>
+<span class="fc" id="L1660">    }</span>
+
+    protected void setGroupEnd(int bid, int captureGroupId, int position, Object value)
+    {
+<span class="fc" id="L1664">      branchStates.setGroupEnd(bid, captureGroupId, position, value);</span>
+<span class="fc" id="L1665">    }</span>
+
+    protected void clearGroupStart(int bid, int captureGroupId)
+    {
+<span class="nc" id="L1669">      branchStates.clearGroupStart(bid, captureGroupId);</span>
+<span class="nc" id="L1670">    }</span>
+
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,889 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TokensRegexNERAnnotator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">TokensRegexNERAnnotator.java</span></div><h1>TokensRegexNERAnnotator.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.tokensregex.*;
+import edu.stanford.nlp.ling.tokensregex.matcher.TrieMap;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.util.*;
+import java.util.regex.Pattern;
+
+
+/**
+ * &lt;p&gt;
+ * TokensRegexNERAnnotator labels tokens with types based on a simple manual mapping from
+ * regular expressions to the types of the entities they are meant to describe.
+ * The user provides a file formatted as follows:
+ * &lt;pre&gt;
+ *    regex1    TYPE    overwritableType1,Type2...    priority
+ *    regex2    TYPE    overwritableType1,Type2...    priority
+ *    ...
+ * &lt;/pre&gt;
+ * where each argument is tab-separated, and the last two arguments are optional. Several regexes can be
+ * associated with a single type. In the case where multiple regexes match a phrase, the priority ranking
+ * (higher priority is favored) is used to choose between the possible types.
+ * When the priority is the same, then longer matches are favored.
+ *
+ * This annotator is designed to be used as part of a full
+ * NER system to label entities that don't fall into the usual NER categories. It only records the label
+ * if the token has not already been NER-annotated, or it has been annotated but the NER-type has been
+ * designated overwritable (the third argument).
+ *
+ * It is also possible to use this annotator to annotate fields other than the
+ * {@code NamedEntityTagAnnotation} field by
+ * and providing the header
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * The first column regex may follow one of two formats:
+ * &lt;ol&gt;
+ * &lt;li&gt; A TokensRegex expression (marked by starting with &quot;( &quot; and ending with &quot; )&quot;.
+ *      See {@link TokenSequencePattern} for TokensRegex syntax.
+ *    &lt;br/&gt;&lt;em&gt;Example&lt;/em&gt;: {@code ( /University/ /of/ [ {ner:LOCATION} ] )    SCHOOL}
+ * &lt;/li&gt;
+ * &lt;li&gt; a sequence of regex, each separated by whitespace (matching &quot;\s+&quot;).
+ *    &lt;br/&gt;&lt;em&gt;Example&lt;/em&gt;: {@code Stanford    SCHOOL}
+ *    &lt;br/&gt;
+ *    The regex will match if the successive regex match a sequence of tokens in the input.
+ *    Spaces can only be used to separate regular expression tokens; within tokens \s or similar non-space
+ *    representations need to be used instead.
+ *    &lt;br/&gt;
+ *    Notes: Following Java regex conventions, some characters in the file need to be escaped. Only a single
+ *    backslash should be used though, as these are not String literals. The input to RegexNER will have
+ *    already been tokenized.  So, for example, with our usual English tokenization, things like genitives
+ *    and commas at the end of words will be separated in the input and matched as a separate token.&lt;/li&gt;
+ * &lt;/ol&gt;
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * This annotator is similar to {@link RegexNERAnnotator} but uses TokensRegex as the underlying library for matching
+ * regular expressions.  This allows for more flexibility in the types of expressions matched as well as utilizing
+ * any optimization that is included in the TokensRegex library.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Main differences from {@link RegexNERAnnotator}:
+ * &lt;ul&gt;
+ *   &lt;li&gt;Supports annotation of fields other than the {@code NamedEntityTagAnnotation} field&lt;/li&gt;
+ *   &lt;li&gt;Supports both TokensRegex patterns and patterns over the text of the tokens&lt;/li&gt;
+ *   &lt;li&gt;When NER annotation can be overwritten based on the original NER labels.  The rules for when the new NER labels are used
+ *       are given below:
+ *       &lt;br/&gt;If the found expression overlaps with a previous NER phrase, then the NER labels are not replaced.
+ *       &lt;br/&gt;  &lt;em&gt;Example&lt;/em&gt;: Old NER phrase: {@code The ABC Company}, Found Phrase: {@code ABC =&gt; } Old NER labels are not replaced.
+ *       &lt;br/&gt;If the found expression has inconsistent NER tags among the tokens, then the NER labels are replaced.
+ *       &lt;br/&gt;  &lt;em&gt;Example&lt;/em&gt;: Old NER phrase: {@code The/O ABC/MISC Company/ORG =&gt; The/ORG ABC/ORG Company/ORG}
+ *   &lt;/li&gt;
+ *   &lt;li&gt;How {@code validpospattern} is handled for POS tags is specified by {@code PosMatchType}&lt;/li&gt;
+ *   &lt;li&gt;By default, there is no {@code validPosPattern}&lt;/li&gt;
+ *   &lt;li&gt;By default, both O and MISC is always replaced&lt;/li&gt;
+ * &lt;/ul&gt;
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *   Configuration:
+ * &lt;table&gt;
+ *   &lt;tr&gt;&lt;th&gt;Field&lt;/th&gt;&lt;th&gt;Description&lt;/th&gt;&lt;th&gt;Default&lt;/th&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code mapping}&lt;/td&gt;&lt;td&gt;Comma separated list of mapping files to use &lt;/td&gt;
+ *      &lt;td&gt;{@code edu/stanford/nlp/models/regexner/type_map_clean}&lt;/td&gt;
+ *   &lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code mapping.header}&lt;/td&gt;
+ *       &lt;td&gt;Comma separated list of header fields (or {@code true} if header is specified in the file)&lt;/td&gt;
+ *       &lt;td&gt;pattern,ner,overwrite,priority,group&lt;/td&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code mapping.field.&lt;fieldname&gt;}&lt;/td&gt;
+ *       &lt;td&gt;Class mapping for annotation fields other than ner&lt;/td&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code commonWords}&lt;/td&gt;
+ *       &lt;td&gt;Comma separated list of files for common words to not annotate (in case your mapping isn't very clean)&lt;/td&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code backgroundSymbol}&lt;/td&gt;&lt;td&gt;Comma separated list of NER labels to always replace&lt;/td&gt;
+ *      &lt;td&gt;{@code O,MISC}&lt;/td&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code posmatchtype}&lt;/td&gt;
+ *     &lt;td&gt;How should {@code validpospattern} be used to match the POS of the tokens.
+ *         {@code MATCH_ALL_TOKENS} - All tokens has to match.&lt;br/&gt;
+ *         {@code MATCH_AT_LEAST_ONE_TOKEN} - At least one token has to match.&lt;br/&gt;
+ *         {@code MATCH_ONE_TOKEN_PHRASE_ONLY} - Only has to match for one token phrases.&lt;br/&gt;
+ *      &lt;/td&gt;
+ *      &lt;td&gt;{@code MATCH_AT_LEAST_ONE_TOKEN}&lt;/td&gt;
+ *   &lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code validpospattern}&lt;/td&gt;&lt;td&gt;Regular expression pattern for matching POS tags.&lt;/td&gt;
+ *      &lt;td&gt;{@code}&lt;/td&gt;
+ *   &lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code noDefaultOverwriteLabels}&lt;/td&gt;
+ *      &lt;td&gt;Comma separated list of output types for which default NER labels are not overwritten.
+ *          For these types, only if the matched expression has NER type matching the
+ *          specified overwriteableType for the regex will the NER type be overwritten.&lt;/td&gt;
+ *      &lt;td&gt;{@code}&lt;/td&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code ignoreCase}&lt;/td&gt;&lt;td&gt;If true, case is ignored&lt;/td&gt;&lt;/td&gt;
+ *      &lt;td&gt;{@code false}&lt;/td&gt;&lt;/tr&gt;
+ *   &lt;tr&gt;&lt;td&gt;{@code verbose}&lt;/td&gt;&lt;td&gt;If true, turns on extra debugging messages.&lt;/td&gt;
+ *      &lt;td&gt;{@code false}&lt;/td&gt;&lt;/tr&gt;
+ * &lt;/table&gt;
+ * &lt;/p&gt;
+ *
+ * @author Angel Chang
+ */
+public class TokensRegexNERAnnotator implements Annotator  {
+
+  /** A logger for this class */
+<span class="nc" id="L132">  private static Redwood.RedwoodChannels log = Redwood.channels(TokensRegexNERAnnotator.class);</span>
+<span class="nc" id="L133">  protected static final Redwood.RedwoodChannels logger = Redwood.channels(&quot;TokenRegexNER&quot;);</span>
+  protected static final String PATTERN_FIELD = &quot;pattern&quot;;
+  protected static final String OVERWRITE_FIELD = &quot;overwrite&quot;;
+  protected static final String PRIORITY_FIELD = &quot;priority&quot;;
+  protected static final String WEIGHT_FIELD = &quot;weight&quot;;
+  protected static final String GROUP_FIELD = &quot;group&quot;;
+
+<span class="nc" id="L140">  protected static final Set&lt;String&gt; predefinedHeaderFields = CollectionUtils.asSet(PATTERN_FIELD, OVERWRITE_FIELD, PRIORITY_FIELD, WEIGHT_FIELD, GROUP_FIELD);</span>
+  protected static final String defaultHeader = &quot;pattern,ner,overwrite,priority,group&quot;;
+
+  private final boolean ignoreCase;
+  private final List&lt;Boolean&gt; ignoreCaseList;
+  private final Set&lt;String&gt; commonWords;
+  private final List&lt;Entry&gt; entries;
+  private final Map&lt;SequencePattern&lt;CoreMap&gt;,Entry&gt; patternToEntry;
+  private final MultiPatternMatcher&lt;CoreMap&gt;  multiPatternMatcher;
+  private final List&lt;Class&gt; annotationFields; // list of fields to annotate (default to just NamedEntityTag)
+
+  private final Set&lt;String&gt; myLabels;  // set of labels to always overwrite
+  private final Pattern validPosPattern;
+  private final List&lt;Pattern&gt; validPosPatternList;
+  private final boolean verbose;
+
+  private final Map&lt;Entry, Integer&gt; entryToMappingFileNumber;
+
+  // Labels for which we don't use the default overwrite types (mylabels)
+  private final Set&lt;String&gt; noDefaultOverwriteLabels;
+
+<span class="nc" id="L161">  enum PosMatchType {</span>
+    // all tokens must match the pos pattern
+<span class="nc" id="L163">    MATCH_ALL_TOKENS,</span>
+    // only one token must match the pos pattern
+<span class="nc" id="L165">    MATCH_AT_LEAST_ONE_TOKEN,</span>
+    // only single token phrases have to match the pos pattern
+<span class="nc" id="L167">    MATCH_ONE_TOKEN_PHRASE_ONLY }</span>
+  private final PosMatchType posMatchType;
+<span class="nc" id="L169">  public static final PosMatchType DEFAULT_POS_MATCH_TYPE = PosMatchType.MATCH_AT_LEAST_ONE_TOKEN;</span>
+  public static final String DEFAULT_BACKGROUND_SYMBOL = SeqClassifierFlags.DEFAULT_BACKGROUND_SYMBOL + &quot;,MISC&quot;;
+
+<span class="nc" id="L172">  public static PropertiesUtils.Property[] SUPPORTED_PROPERTIES = new PropertiesUtils.Property[]{</span>
+          new PropertiesUtils.Property(&quot;mapping&quot;, DefaultPaths.DEFAULT_REGEXNER_RULES, &quot;List of mapping files to use, separated by commas or semi-colons.&quot;),
+          new PropertiesUtils.Property(&quot;mapping.header&quot;, defaultHeader, &quot;Comma separated list specifying order of fields in the mapping file&quot;),
+          new PropertiesUtils.Property(&quot;mapping.field.&lt;fieldname&gt;&quot;, &quot;&quot;, &quot;Class mapping for annotation fields other than ner&quot;),
+          new PropertiesUtils.Property(&quot;commonWords&quot;, &quot;&quot;, &quot;Comma separated list of files for common words to not annotate (in case your mapping isn't very clean)&quot;),
+          new PropertiesUtils.Property(&quot;ignorecase&quot;, &quot;false&quot;, &quot;Whether to ignore case or not when matching patterns.&quot;),
+          new PropertiesUtils.Property(&quot;validpospattern&quot;, &quot;&quot;, &quot;Regular expression pattern for matching POS tags.&quot;),
+<span class="nc" id="L179">          new PropertiesUtils.Property(&quot;posmatchtype&quot;, DEFAULT_POS_MATCH_TYPE.name(), &quot;How should 'validpospattern' be used to match the POS of the tokens.&quot;),</span>
+          new PropertiesUtils.Property(&quot;noDefaultOverwriteLabels&quot;, &quot;&quot;, &quot;Comma separated list of output types for which default NER labels are not overwritten.\n&quot; +
+                  &quot; For these types, only if the matched expression has NER type matching the\n&quot; +
+                  &quot; specified overwriteableType for the regex will the NER type be overwritten.&quot;),
+          new PropertiesUtils.Property(&quot;backgroundSymbol&quot;, DEFAULT_BACKGROUND_SYMBOL, &quot;Comma separated list of NER labels to always replace.&quot;),
+          new PropertiesUtils.Property(&quot;verbose&quot;, &quot;false&quot;, &quot;&quot;),
+  };
+
+  /** Construct a new TokensRegexAnnotator.
+   *
+   *  @param mapping A comma-separated list of files, URLs, or classpath resources to load mappings from
+   */
+  public TokensRegexNERAnnotator(String mapping) {
+<span class="nc" id="L192">    this(mapping, false);</span>
+<span class="nc" id="L193">  }</span>
+
+  public TokensRegexNERAnnotator(String mapping, boolean ignoreCase) {
+<span class="nc" id="L196">    this(mapping, ignoreCase, null);</span>
+<span class="nc" id="L197">  }</span>
+
+  public TokensRegexNERAnnotator(String mapping, boolean ignoreCase, String validPosRegex) {
+<span class="nc" id="L200">    this(&quot;tokenregexner&quot;, getProperties(&quot;tokenregexner&quot;, mapping, ignoreCase, validPosRegex));</span>
+<span class="nc" id="L201">  }</span>
+
+  private static Properties getProperties(String name, String mapping, boolean ignoreCase, String validPosRegex) {
+<span class="nc bnc" id="L204" title="All 4 branches missed.">    String prefix = (name != null &amp;&amp; !name.isEmpty())? name + &quot;.&quot;:&quot;&quot;;</span>
+<span class="nc" id="L205">    Properties props = new Properties();</span>
+<span class="nc" id="L206">    props.setProperty(prefix + &quot;mapping&quot;, mapping);</span>
+<span class="nc" id="L207">    props.setProperty(prefix + &quot;ignorecase&quot;, String.valueOf(ignoreCase));</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">    if (validPosRegex != null) {</span>
+<span class="nc" id="L209">      props.setProperty(prefix + &quot;validpospattern&quot;, validPosRegex);</span>
+    }
+
+<span class="nc" id="L212">    return props;</span>
+  }
+
+<span class="nc" id="L215">  private static final Pattern FILE_DELIMITERS_PATTERN = Pattern.compile(&quot;\\s*[,;]\\s*&quot;);</span>
+<span class="nc" id="L216">  private static final Pattern COMMA_DELIMITERS_PATTERN = Pattern.compile(&quot;\\s*,\\s*&quot;);</span>
+<span class="nc" id="L217">  private static final Pattern SEMICOLON_DELIMITERS_PATTERN = Pattern.compile(&quot;\\s*;\\s*&quot;);</span>
+<span class="nc" id="L218">  private static final Pattern EQUALS_DELIMITERS_PATTERN = Pattern.compile(&quot;\\s*=\\s*&quot;);</span>
+
+<span class="nc" id="L220">  public TokensRegexNERAnnotator(String name, Properties properties) {</span>
+<span class="nc bnc" id="L221" title="All 4 branches missed.">    String prefix = (name != null &amp;&amp; !name.isEmpty())? name + &quot;.&quot;:&quot;&quot;;</span>
+<span class="nc" id="L222">    String backgroundSymbol = properties.getProperty(prefix + &quot;backgroundSymbol&quot;, DEFAULT_BACKGROUND_SYMBOL);</span>
+<span class="nc" id="L223">    String[] backgroundSymbols = COMMA_DELIMITERS_PATTERN.split(backgroundSymbol);</span>
+<span class="nc" id="L224">    String mappingFiles = properties.getProperty(prefix + &quot;mapping&quot;,</span>
+            DefaultPaths.DEFAULT_KBP_TOKENSREGEX_NER_SETTINGS);
+<span class="nc" id="L226">    String[] mappings = processListMappingFiles(mappingFiles);</span>
+<span class="nc" id="L227">    String validPosRegex = properties.getProperty(prefix + &quot;validpospattern&quot;);</span>
+<span class="nc" id="L228">    this.posMatchType = PosMatchType.valueOf(properties.getProperty(prefix + &quot;posmatchtype&quot;,</span>
+<span class="nc" id="L229">            DEFAULT_POS_MATCH_TYPE.name()));</span>
+<span class="nc" id="L230">    String commonWordsFile = properties.getProperty(prefix + &quot;commonWords&quot;);</span>
+<span class="nc" id="L231">    commonWords = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    if (commonWordsFile != null) {</span>
+      try {
+<span class="nc" id="L234">        BufferedReader reader = IOUtils.getBufferedFileReader(commonWordsFile);</span>
+        String line;
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        while ((line = reader.readLine()) != null) {</span>
+<span class="nc" id="L237">          commonWords.add(line);</span>
+        }
+<span class="nc" id="L239">        reader.close();</span>
+<span class="nc" id="L240">      } catch (IOException ex) {</span>
+<span class="nc" id="L241">        throw new RuntimeException(&quot;TokensRegexNERAnnotator &quot; + name</span>
+            + &quot;: Error opening the common words file: &quot; + commonWordsFile, ex);
+<span class="nc" id="L243">      }</span>
+    }
+
+<span class="nc" id="L246">    String headerProp = properties.getProperty(prefix + &quot;mapping.header&quot;, defaultHeader);</span>
+<span class="nc" id="L247">    boolean readHeaderFromFile = headerProp.equalsIgnoreCase(&quot;true&quot;);</span>
+<span class="nc" id="L248">    String[] annotationFieldnames = null;</span>
+<span class="nc" id="L249">    String[] headerFields = null;</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    if (readHeaderFromFile) {</span>
+      // Get header as first line from all files...
+      // TODO: support reading header from file
+<span class="nc" id="L253">      throw new UnsupportedOperationException(&quot;Reading header from file not yet supported!!!&quot;);</span>
+    } else {
+<span class="nc" id="L255">      headerFields = COMMA_DELIMITERS_PATTERN.split(headerProp);</span>
+      // Take header fields and remove known headers to get annotation field names
+<span class="nc" id="L257">      List&lt;String&gt; fieldNames = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L258">      List&lt;Class&gt; fieldClasses = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">      for (String field : headerFields) {</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (!predefinedHeaderFields.contains(field)) {</span>
+<span class="nc" id="L261">          Class fieldClass = EnvLookup.lookupAnnotationKeyWithClassname(null, field);</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">          if (fieldClass == null) {</span>
+            // check our properties
+<span class="nc" id="L264">            String classname = properties.getProperty(prefix + &quot;mapping.field.&quot; + field);</span>
+<span class="nc" id="L265">            fieldClass = EnvLookup.lookupAnnotationKeyWithClassname(null, classname);</span>
+          }
+<span class="nc bnc" id="L267" title="All 2 branches missed.">          if (fieldClass != null) {</span>
+<span class="nc" id="L268">            fieldNames.add(field);</span>
+<span class="nc" id="L269">            fieldClasses.add(fieldClass);</span>
+          } else {
+<span class="nc" id="L271">            logger.warn(&quot;TokensRegexNERAnnotator &quot; + name + &quot;: Unknown field: &quot; + field + &quot; cannot find suitable annotation class&quot;);</span>
+          }
+        }
+      }
+<span class="nc" id="L275">      annotationFieldnames = new String[fieldNames.size()];</span>
+<span class="nc" id="L276">      fieldNames.toArray(annotationFieldnames);</span>
+<span class="nc" id="L277">      annotationFields = fieldClasses;</span>
+    }
+
+<span class="nc" id="L280">    String noDefaultOverwriteLabelsProp = properties.getProperty(prefix + &quot;noDefaultOverwriteLabels&quot;, &quot;CITY&quot;);</span>
+<span class="nc" id="L281">    this.noDefaultOverwriteLabels = Collections.unmodifiableSet(CollectionUtils.asSet(noDefaultOverwriteLabelsProp.split(&quot;\\s*,\\s*&quot;)));</span>
+<span class="nc" id="L282">    this.ignoreCase = PropertiesUtils.getBool(properties, prefix + &quot;ignorecase&quot;, false);</span>
+<span class="nc" id="L283">    this.verbose = PropertiesUtils.getBool(properties, prefix + &quot;verbose&quot;, false);</span>
+
+<span class="nc bnc" id="L285" title="All 4 branches missed.">    if (validPosRegex != null &amp;&amp; !validPosRegex.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L286">      validPosPattern = Pattern.compile(validPosRegex);</span>
+    } else {
+<span class="nc" id="L288">      validPosPattern = null;</span>
+    }
+<span class="nc" id="L290">    validPosPatternList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L291">    ignoreCaseList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L292">    entryToMappingFileNumber = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L293">    processPerFileOptions(name, mappings, ignoreCaseList, validPosPatternList, ignoreCase, validPosPattern);</span>
+<span class="nc" id="L294">    entries = Collections.unmodifiableList(readEntries(name, noDefaultOverwriteLabels, ignoreCaseList, entryToMappingFileNumber, verbose, headerFields, annotationFieldnames, mappings));</span>
+<span class="nc" id="L295">    IdentityHashMap&lt;SequencePattern&lt;CoreMap&gt;, Entry&gt; patternToEntry = new IdentityHashMap&lt;&gt;();</span>
+<span class="nc" id="L296">    multiPatternMatcher = createPatternMatcher(patternToEntry);</span>
+<span class="nc" id="L297">    this.patternToEntry = Collections.unmodifiableMap(patternToEntry);</span>
+<span class="nc" id="L298">    Set&lt;String&gt; myLabels = Generics.newHashSet();</span>
+    // Can always override background or none.
+<span class="nc" id="L300">    Collections.addAll(myLabels, backgroundSymbols);</span>
+<span class="nc" id="L301">    myLabels.add(null);</span>
+    // Always overwrite labels
+<span class="nc bnc" id="L303" title="All 2 branches missed.">    for (Entry entry: entries) {</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">      for (String type:entry.types) {</span>
+<span class="nc" id="L305">        myLabels.add(type);</span>
+      }
+<span class="nc" id="L307">    }</span>
+<span class="nc" id="L308">    this.myLabels = Collections.unmodifiableSet(myLabels);</span>
+<span class="nc" id="L309">  }</span>
+
+  @Override
+  public void annotate(Annotation annotation) {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    if (verbose) {</span>
+<span class="nc" id="L314">      log.info(&quot;Adding TokensRegexNER annotations ... &quot;);</span>
+    }
+
+<span class="nc" id="L317">    List&lt;CoreMap&gt; sentences = annotation.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">    if (sentences != null) {</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">      for (CoreMap sentence : sentences) {</span>
+<span class="nc" id="L320">        List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L321">        annotateMatched(tokens);</span>
+<span class="nc" id="L322">      }</span>
+    } else {
+<span class="nc" id="L324">      List&lt;CoreLabel&gt; tokens = annotation.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">      if (tokens != null){</span>
+<span class="nc" id="L326">        annotateMatched(tokens);</span>
+      } else {
+<span class="nc" id="L328">        throw new RuntimeException(&quot;Unable to find sentences or tokens in &quot; + annotation);</span>
+      }
+    }
+
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (verbose)</span>
+<span class="nc" id="L333">      log.info(&quot;done.&quot;);</span>
+<span class="nc" id="L334">  }</span>
+
+  private MultiPatternMatcher&lt;CoreMap&gt; createPatternMatcher(Map&lt;SequencePattern&lt;CoreMap&gt;, Entry&gt; patternToEntry) {
+    // Convert to tokensregex pattern
+
+<span class="nc" id="L339">    List&lt;TokenSequencePattern&gt; patterns = new ArrayList&lt;&gt;(entries.size());</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">    for (Entry entry:entries) {</span>
+      TokenSequencePattern pattern;
+
+<span class="nc" id="L343">      Boolean ignoreCaseEntry = ignoreCaseList.get(entryToMappingFileNumber.get(entry));</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">      int patternFlags = ignoreCaseEntry? Pattern.CASE_INSENSITIVE:0;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">      int stringMatchFlags = ignoreCaseEntry? NodePattern.CASE_INSENSITIVE:0;</span>
+<span class="nc" id="L346">      Env env = TokenSequencePattern.getNewEnv();</span>
+<span class="nc" id="L347">      env.setDefaultStringPatternFlags(patternFlags);</span>
+<span class="nc" id="L348">      env.setDefaultStringMatchFlags(stringMatchFlags);</span>
+
+<span class="nc bnc" id="L350" title="All 4 branches missed.">      NodePattern&lt;String&gt; posTagPattern = (validPosPatternList.get(entryToMappingFileNumber.get(entry)) != null &amp;&amp; PosMatchType.MATCH_ALL_TOKENS.equals(posMatchType))?</span>
+<span class="nc" id="L351">              new CoreMapNodePattern.StringAnnotationRegexPattern(validPosPatternList.get(entryToMappingFileNumber.get(entry))):null;</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">      if (entry.tokensRegex != null) {</span>
+        // TODO: posTagPatterns...
+<span class="nc" id="L354">        pattern = TokenSequencePattern.compile(env, entry.tokensRegex);</span>
+      } else {
+<span class="nc" id="L356">        List&lt;SequencePattern.PatternExpr&gt; nodePatterns = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        for (String p:entry.regex) {</span>
+<span class="nc" id="L358">          CoreMapNodePattern c = CoreMapNodePattern.valueOf(p, patternFlags);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">          if (posTagPattern != null) {</span>
+<span class="nc" id="L360">            c.add(CoreAnnotations.PartOfSpeechAnnotation.class, posTagPattern);</span>
+          }
+<span class="nc" id="L362">          nodePatterns.add(new SequencePattern.NodePatternExpr(c));</span>
+        }
+<span class="nc" id="L364">        pattern = TokenSequencePattern.compile(</span>
+                new SequencePattern.SequencePatternExpr(nodePatterns));
+      }
+<span class="nc bnc" id="L367" title="All 4 branches missed.">      if (entry.annotateGroup &lt; 0 || entry.annotateGroup &gt; pattern.getTotalGroups()) {</span>
+<span class="nc" id="L368">        throw new RuntimeException(&quot;Invalid match group for entry &quot; + entry);</span>
+      }
+<span class="nc" id="L370">      pattern.setPriority(entry.priority);</span>
+<span class="nc" id="L371">      pattern.setWeight(entry.weight);</span>
+<span class="nc" id="L372">      patterns.add(pattern);</span>
+<span class="nc" id="L373">      patternToEntry.put(pattern, entry);</span>
+<span class="nc" id="L374">    }</span>
+<span class="nc" id="L375">    return TokenSequencePattern.getMultiPatternMatcher(patterns);</span>
+  }
+
+  private void annotateMatched(List&lt;CoreLabel&gt; tokens) {
+<span class="nc" id="L379">    List&lt;SequenceMatchResult&lt;CoreMap&gt;&gt; matched = multiPatternMatcher.findNonOverlapping(tokens);</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    for (SequenceMatchResult&lt;CoreMap&gt; m:matched) {</span>
+<span class="nc" id="L381">      Entry entry = patternToEntry.get(m.pattern());</span>
+
+      // Check if we will overwrite the existing annotation with this annotation
+<span class="nc" id="L384">      int g = entry.annotateGroup;</span>
+<span class="nc" id="L385">      int start = m.start(g);</span>
+<span class="nc" id="L386">      int end = m.end(g);</span>
+
+<span class="nc" id="L388">      String str = m.group(g);</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">      if (commonWords.contains(str)) {</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (verbose) {</span>
+<span class="nc" id="L391">          log.info(&quot;Not annotating (common word) '&quot; + str + &quot;': &quot; +</span>
+<span class="nc" id="L392">              StringUtils.joinFields(m.groupNodes(g), CoreAnnotations.NamedEntityTagAnnotation.class)</span>
+<span class="nc" id="L393">              + &quot; with &quot; + entry.getTypeDescription() + &quot;, sentence is '&quot; + StringUtils.joinWords(tokens, &quot; &quot;) + &quot;'&quot;);</span>
+        }
+        continue;
+      }
+
+<span class="nc" id="L398">      boolean overwriteOriginalNer = checkPosTags(tokens, start, end);</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">      if (overwriteOriginalNer) {</span>
+<span class="nc" id="L400">        overwriteOriginalNer = checkOrigNerTags(entry, tokens, start, end);</span>
+      }
+<span class="nc bnc" id="L402" title="All 2 branches missed.">      if (overwriteOriginalNer) {</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        for (int i = start; i &lt; end; i++) {</span>
+<span class="nc" id="L404">          CoreLabel token = tokens.get(i);</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">          for (int j = 0; j &lt; annotationFields.size(); j++) {</span>
+<span class="nc" id="L406">            token.set(annotationFields.get(j), entry.types[j]);</span>
+          }
+         // tokens.get(i).set(CoreAnnotations.NamedEntityTagAnnotation.class, entry.type);
+        }
+      } else {
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (verbose) {</span>
+<span class="nc" id="L412">          log.info(&quot;Not annotating  '&quot; + m.group(g) + &quot;': &quot; +</span>
+<span class="nc" id="L413">                  StringUtils.joinFields(m.groupNodes(g), CoreAnnotations.NamedEntityTagAnnotation.class)</span>
+<span class="nc" id="L414">                  + &quot; with &quot; + entry.getTypeDescription() + &quot;, sentence is '&quot; + StringUtils.joinWords(tokens, &quot; &quot;) + &quot;'&quot;);</span>
+        }
+      }
+<span class="nc" id="L417">    }</span>
+<span class="nc" id="L418">  }</span>
+
+  // TODO: roll check into tokens regex pattern?
+  // That allows for better matching because unmatched sequences will be eliminated at match time
+  private boolean checkPosTags(List&lt;CoreLabel&gt; tokens, int start, int end) {
+<span class="nc bnc" id="L423" title="All 4 branches missed.">    if (validPosPattern != null || atLeastOneValidPosPattern(validPosPatternList)) {</span>
+      // Need to check POS tag too...
+<span class="nc bnc" id="L425" title="All 4 branches missed.">      switch (posMatchType) {</span>
+        case MATCH_ONE_TOKEN_PHRASE_ONLY:
+<span class="nc bnc" id="L427" title="All 2 branches missed.">          if (tokens.size() &gt; 1) return true;</span>
+          // fall through
+        case MATCH_AT_LEAST_ONE_TOKEN:
+<span class="nc bnc" id="L430" title="All 2 branches missed.">          for (int i = start; i &lt; end; i++) {</span>
+<span class="nc" id="L431">            CoreLabel token = tokens.get(i);</span>
+<span class="nc" id="L432">            String pos = token.get(CoreAnnotations.PartOfSpeechAnnotation.class);</span>
+<span class="nc bnc" id="L433" title="All 6 branches missed.">            if (pos != null &amp;&amp; validPosPattern != null &amp;&amp; validPosPattern.matcher(pos).matches()) {</span>
+<span class="nc" id="L434">              return true;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            } else if (pos != null) {</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">              for (Pattern pattern : validPosPatternList) {</span>
+<span class="nc bnc" id="L437" title="All 4 branches missed.">                if (pattern != null &amp;&amp; pattern.matcher(pos).matches()) {</span>
+<span class="nc" id="L438">                  return true;</span>
+                }
+<span class="nc" id="L440">              }</span>
+            }
+          }
+<span class="nc" id="L443">          return false;</span>
+        case MATCH_ALL_TOKENS:
+          // Checked else where
+<span class="nc" id="L446">          return true;</span>
+        default:
+          // Don't know this match type....
+<span class="nc" id="L449">          return true;</span>
+      }
+    }
+<span class="nc" id="L452">    return true;</span>
+  }
+
+  private static boolean isLocationOrGpe(CoreLabel token) {
+<span class="nc bnc" id="L456" title="All 4 branches missed.">    return &quot;LOCATION&quot;.equals(token.ner()) || &quot;GPE&quot;.equals(token.ner());</span>
+  }
+
+  private boolean checkOrigNerTags(Entry entry, List&lt;CoreLabel&gt; tokens, int start, int end) {
+    // cdm Aug 2016: Add in a special hack for Chinese KBP 2016 -- always allow a sequence of GPE or LOCATION to overwrite
+<span class="nc" id="L461">    boolean specialCasePass = true;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">    for (int i = start; i &lt; end; i++) {</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">      if ( ! isLocationOrGpe(tokens.get(i))) {</span>
+<span class="nc" id="L464">        specialCasePass = false;</span>
+<span class="nc" id="L465">        break;</span>
+      }
+    }
+<span class="nc bnc" id="L468" title="All 2 branches missed.">    if (specialCasePass) {</span>
+<span class="nc" id="L469">      return true;</span>
+    }
+    // end special Chinese KBP 2016 code
+
+<span class="nc" id="L473">    int prevNerEndIndex = start-1;</span>
+<span class="nc" id="L474">    int nextNerStartIndex = end;</span>
+
+    // Check if we found a pattern that overlaps with existing ner labels
+    // tag1 tag1 x   x  tag2 tag2
+    //      tag tag tag tag
+    // Don't overwrite the old ner label if we overlap like this
+<span class="nc" id="L480">    String startNer = tokens.get(start).ner();</span>
+<span class="nc" id="L481">    String endNer = tokens.get(end-1).ner();</span>
+<span class="nc bnc" id="L482" title="All 4 branches missed.">    if (startNer != null &amp;&amp; !myLabels.contains(startNer)) {</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">      while (prevNerEndIndex &gt;= 0) {</span>
+        // go backwards to find different entity type
+<span class="nc" id="L485">        String ner = tokens.get(prevNerEndIndex).ner();</span>
+<span class="nc bnc" id="L486" title="All 4 branches missed.">        if (ner == null || !ner.equals(startNer)) {</span>
+<span class="nc" id="L487">          break;</span>
+        }
+<span class="nc" id="L489">        prevNerEndIndex--;</span>
+<span class="nc" id="L490">      }</span>
+    }
+<span class="nc bnc" id="L492" title="All 4 branches missed.">    if (endNer != null &amp;&amp; !myLabels.contains(endNer)) {</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">      while (nextNerStartIndex &lt; tokens.size()) {</span>
+        // go backwards to find different entity type
+<span class="nc" id="L495">        String ner = tokens.get(nextNerStartIndex).ner();</span>
+<span class="nc bnc" id="L496" title="All 4 branches missed.">        if (ner == null || !ner.equals(endNer)) {</span>
+<span class="nc" id="L497">          break;</span>
+        }
+<span class="nc" id="L499">        nextNerStartIndex++;</span>
+<span class="nc" id="L500">      }</span>
+    }
+<span class="nc" id="L502">    boolean overwriteOriginalNer = false;</span>
+    //noinspection StatementWithEmptyBody
+<span class="nc bnc" id="L504" title="All 4 branches missed.">    if (prevNerEndIndex != (start-1) || nextNerStartIndex != end) {</span>
+      // Cutting across already recognized NEs don't disturb
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    } else if (startNer == null) {</span>
+      // No old ner, okay to replace
+<span class="nc" id="L508">      overwriteOriginalNer = true;</span>
+    } else {
+      // Check if we have one consistent NER tag
+      // if not, overwrite
+      // if consistent, overwrite only if in our set of ner tags that we overwrite
+<span class="nc bnc" id="L513" title="All 2 branches missed.">      for (int i = start+1; i &lt; end; i++) {</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        if (!startNer.equals(tokens.get(i).ner())) {</span>
+<span class="nc" id="L515">          overwriteOriginalNer = true;</span>
+<span class="nc" id="L516">          break;</span>
+        }
+      }
+<span class="nc bnc" id="L519" title="All 2 branches missed.">      if (!overwriteOriginalNer) {</span>
+        // check if old ner type was one that was specified as explicitly overwritable by this entry
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (entry.overwritableTypes.contains(startNer)) {</span>
+<span class="nc" id="L522">          overwriteOriginalNer = true;</span>
+        } else {
+          // if this ner type doesn't belong to the labels for which we don't overwrite the default labels (noDefaultOverwriteLabels)
+          // we check mylabels to see if we can overwrite this entry
+<span class="nc bnc" id="L526" title="All 2 branches missed.">          if (/*entry.overwritableTypes.isEmpty() || */!hasNoOverwritableType(noDefaultOverwriteLabels, entry.types)) {</span>
+<span class="nc" id="L527">            overwriteOriginalNer = myLabels.contains(startNer);</span>
+          }
+        }
+
+      }
+    }
+<span class="nc" id="L533">    return overwriteOriginalNer;</span>
+  }
+
+  private static class Entry {
+    public final String tokensRegex;
+    public final String[] regex; // the regex, tokenized by splitting on white space
+    public final String[] types; // the associated types
+    public final Set&lt;String&gt; overwritableTypes; // what types can be overwritten by this entry
+    public final double priority;
+    public final double weight;
+    public final int annotateGroup;
+
+<span class="nc" id="L545">    public Entry(String tokensRegex, String[] regex, String[] types, Set&lt;String&gt; overwritableTypes, double priority, double weight, int annotateGroup) {</span>
+<span class="nc" id="L546">      this.tokensRegex = tokensRegex;</span>
+<span class="nc" id="L547">      this.regex = regex;</span>
+<span class="nc" id="L548">      this.types = new String[types.length];</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">      for (int i = 0; i &lt; types.length; i++) {</span>
+        // TODO: for some types, it doesn't make sense to be interning...
+<span class="nc" id="L551">        this.types[i] = types[i].intern();</span>
+      }
+<span class="nc" id="L553">      this.overwritableTypes = overwritableTypes;</span>
+<span class="nc" id="L554">      this.priority = priority;</span>
+<span class="nc" id="L555">      this.weight = weight;</span>
+<span class="nc" id="L556">      this.annotateGroup = annotateGroup;</span>
+<span class="nc" id="L557">    }</span>
+
+    public String getTypeDescription() {
+<span class="nc" id="L560">      return &quot;[&quot; + StringUtils.join(types, &quot;,&quot;) + &quot;]&quot;;</span>
+    }
+
+    public String toString() {
+<span class="nc bnc" id="L564" title="All 2 branches missed.">      return &quot;Entry{&quot; + ((tokensRegex != null) ? tokensRegex: StringUtils.join(regex)) + ' '</span>
+<span class="nc" id="L565">          + StringUtils.join(types) + ' ' + overwritableTypes + ' ' + priority + '}';</span>
+    }
+  }
+
+  /**
+   *  Creates a combined list of Entries using the provided mapping files.
+   *
+   *  @param mappings List of mapping files
+   *  @return list of Entries
+   */
+  private static List&lt;Entry&gt; readEntries(String annotatorName,
+                                         Set&lt;String&gt; noDefaultOverwriteLabels,
+                                         List&lt;Boolean&gt; ignoreCaseList, Map&lt;Entry, Integer&gt; entryToMappingFileNumber, boolean verbose,
+                                         String[] headerFields,
+                                         String[] annotationFieldnames,
+                                         String... mappings) {
+    // Unlike RegexNERClassifier, we don't bother sorting the entries
+    // We leave it to TokensRegex NER to sort out the priorities and matches
+    //   (typically after all the matches has been made since for some TokenRegex expression,
+    //       we don't know how many tokens are matched until after the matching is done)
+<span class="nc" id="L585">    List&lt;Entry&gt; entries = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L586">    TrieMap&lt;String,Entry&gt; seenRegexes = new TrieMap&lt;&gt;();</span>
+    //Arrays.sort(mappings);
+<span class="nc bnc" id="L588" title="All 2 branches missed.">    for (int mappingFileIndex = 0; mappingFileIndex &lt; mappings.length; mappingFileIndex++) {</span>
+<span class="nc" id="L589">      String mapping = mappings[mappingFileIndex];</span>
+<span class="nc" id="L590">      BufferedReader rd = null;</span>
+      try {
+<span class="nc" id="L592">        rd = IOUtils.readerFromString(mapping);</span>
+<span class="nc" id="L593">        readEntries(annotatorName, headerFields, annotationFieldnames, entries, seenRegexes, mapping, rd, noDefaultOverwriteLabels, ignoreCaseList.get(mappingFileIndex), mappingFileIndex, entryToMappingFileNumber, verbose);</span>
+<span class="nc" id="L594">      } catch (IOException e) {</span>
+<span class="nc" id="L595">        throw new RuntimeIOException(&quot;Couldn't read TokensRegexNER from &quot; + mapping, e);</span>
+      } finally {
+<span class="nc" id="L597">        IOUtils.closeIgnoringExceptions(rd);</span>
+<span class="nc" id="L598">      }</span>
+    }
+
+<span class="nc bnc" id="L601" title="All 2 branches missed.">    if (mappings.length != 1) {</span>
+<span class="nc" id="L602">      logger.log(&quot;TokensRegexNERAnnotator &quot; + annotatorName +</span>
+<span class="nc" id="L603">            &quot;: Read &quot; + entries.size() + &quot; unique entries from &quot; + mappings.length + &quot; files&quot;);</span>
+    }
+<span class="nc" id="L605">    return entries;</span>
+  }
+
+  private static Map&lt;String,Integer&gt; getHeaderIndexMap(String[] headerFields) {
+<span class="nc" id="L609">    Map&lt;String,Integer&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">    for (int i = 0; i &lt; headerFields.length; i++) {</span>
+<span class="nc" id="L611">      String field = headerFields[i];</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">      if (map.containsKey(field)) {</span>
+<span class="nc" id="L613">        throw new IllegalArgumentException(&quot;Duplicate header field: &quot; + field);</span>
+      }
+<span class="nc" id="L615">      map.put(field,i);</span>
+    }
+<span class="nc" id="L617">    return map;</span>
+  }
+
+
+  private static int getIndex(Map&lt;String,Integer&gt; map, String name) {
+<span class="nc" id="L622">    Integer index = map.get(name);</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">    if (index == null) return -1;</span>
+<span class="nc" id="L624">    else return index;</span>
+  }
+  /**
+   *  Reads a list of Entries from a mapping file and update the given entries.
+   *  Line numbers start from 1.
+   *
+   *  @return the updated list of Entries
+   */
+  private static List&lt;Entry&gt; readEntries(String annotatorName,
+                                         String[] headerFields,
+                                         String[] annotationFieldnames,
+                                         List&lt;Entry&gt; entries,
+                                         TrieMap&lt;String,Entry&gt; seenRegexes,
+                                         String mappingFilename,
+                                         BufferedReader mapping,
+                                         Set&lt;String&gt; noDefaultOverwriteLabels,
+                                         boolean ignoreCase, Integer mappingFileIndex,
+                                         Map&lt;Entry, Integer&gt; entryToMappingFileNumber, boolean verbose) throws IOException {
+<span class="nc" id="L642">    int origEntriesSize = entries.size();</span>
+<span class="nc" id="L643">    int isTokensRegex = 0;</span>
+<span class="nc" id="L644">    int lineCount = 0;</span>
+<span class="nc" id="L645">    Map&lt;String,Integer&gt; headerIndexMap = getHeaderIndexMap(headerFields);</span>
+<span class="nc" id="L646">    int iPattern = getIndex(headerIndexMap, PATTERN_FIELD);</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">    if (iPattern &lt; 0) {</span>
+<span class="nc" id="L648">      throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+<span class="nc" id="L649">        + &quot; ERROR: Header does not contain 'pattern': &quot; + StringUtils.join(headerFields));</span>
+    }
+<span class="nc" id="L651">    int iOverwrite = getIndex(headerIndexMap, OVERWRITE_FIELD);</span>
+<span class="nc" id="L652">    int iPriority = getIndex(headerIndexMap, PRIORITY_FIELD);</span>
+<span class="nc" id="L653">    int iWeight = getIndex(headerIndexMap, WEIGHT_FIELD);</span>
+<span class="nc" id="L654">    int iGroup = getIndex(headerIndexMap, GROUP_FIELD);</span>
+<span class="nc" id="L655">    int[] annotationCols = new int[annotationFieldnames.length];</span>
+<span class="nc" id="L656">    int iLastAnnotationField = -1;</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">    for (int i = 0; i &lt; annotationFieldnames.length; i++) {</span>
+<span class="nc" id="L658">      annotationCols[i] = getIndex(headerIndexMap, annotationFieldnames[i]);</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">      if (annotationCols[i] &lt; 0) {</span>
+<span class="nc" id="L660">        throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+<span class="nc" id="L661">            + &quot; ERROR: Header does not contain annotation field '&quot; + annotationFieldnames[i] + &quot;': &quot; + StringUtils.join(headerFields));</span>
+      }
+<span class="nc bnc" id="L663" title="All 2 branches missed.">      if (annotationCols[i] &gt; iLastAnnotationField) {</span>
+<span class="nc" id="L664">        iLastAnnotationField = annotationCols[i];</span>
+      }
+    }
+
+<span class="nc" id="L668">    int minFields = Math.min(iPattern, iLastAnnotationField);  // Take minimum of &quot;pattern&quot; and last annotation field</span>
+<span class="nc" id="L669">    int maxFields = headerFields.length;  // Take maximum number of headerFields</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">    for (String line; (line = mapping.readLine()) != null; ) {</span>
+<span class="nc" id="L671">      lineCount ++;</span>
+<span class="nc" id="L672">      String[] split = line.split(&quot;\t&quot;);</span>
+<span class="nc bnc" id="L673" title="All 4 branches missed.">      if (split.length &lt; minFields || split.length &gt; maxFields) {</span>
+<span class="nc" id="L674">        throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+            + &quot; ERROR: Provided mapping file is in wrong format. Line &quot; + lineCount + &quot; is bad: &quot; + line);
+      }
+<span class="nc" id="L677">      String regex = split[iPattern].trim();</span>
+<span class="nc" id="L678">      String tokensRegex = null;</span>
+<span class="nc" id="L679">      String[] regexes = null;</span>
+<span class="nc bnc" id="L680" title="All 4 branches missed.">      if (regex.startsWith(&quot;( &quot;) &amp;&amp; regex.endsWith(&quot; )&quot;)) {</span>
+        // Tokens regex (remove start and end parenthesis)
+<span class="nc" id="L682">        tokensRegex = regex.substring(1,regex.length()-1).trim();</span>
+      } else {
+<span class="nc" id="L684">        regexes = regex.split(&quot;\\s+&quot;);</span>
+      }
+<span class="nc bnc" id="L686" title="All 2 branches missed.">      String[] key = (regexes != null)? regexes: new String[] { tokensRegex };</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">      if (ignoreCase) {</span>
+<span class="nc" id="L688">        String[] norm = new String[key.length];</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">        for (int i = 0; i &lt; key.length; i++) {</span>
+<span class="nc" id="L690">          norm[i] = key[i].toLowerCase();</span>
+        }
+<span class="nc" id="L692">        key = norm;</span>
+      }
+<span class="nc" id="L694">      String[] types = new String[annotationCols.length];</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">      for (int i=0; i &lt; annotationCols.length; i++) {</span>
+<span class="nc" id="L696">        types[i] = split[annotationCols[i]].trim();</span>
+      }
+
+<span class="nc" id="L699">      Set&lt;String&gt; overwritableTypes = Generics.newHashSet();</span>
+<span class="nc" id="L700">      double priority = 0.0;</span>
+
+<span class="nc bnc" id="L702" title="All 4 branches missed.">      if (iOverwrite &gt;= 0 &amp;&amp; split.length &gt; iOverwrite) {</span>
+<span class="nc" id="L703">        overwritableTypes.addAll(Arrays.asList(split[iOverwrite].trim().split(&quot;\\s*,\\s*&quot;)));</span>
+      }
+<span class="nc bnc" id="L705" title="All 4 branches missed.">      if (iPriority &gt;= 0 &amp;&amp; split.length &gt; iPriority) {</span>
+        try {
+<span class="nc" id="L707">          priority = Double.parseDouble(split[iPriority].trim());</span>
+<span class="nc" id="L708">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L709">          throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+              + &quot; ERROR: Invalid priority in line &quot; + lineCount
+              + &quot; in regexner file &quot; + mappingFilename + &quot;: \&quot;&quot; + line + &quot;\&quot;!&quot;, e);
+<span class="nc" id="L712">        }</span>
+      }
+
+<span class="nc" id="L715">      double weight = 0.0;</span>
+<span class="nc bnc" id="L716" title="All 4 branches missed.">      if (iWeight &gt;= 0 &amp;&amp; split.length &gt; iWeight) {</span>
+        try {
+<span class="nc" id="L718">          weight = Double.parseDouble(split[iWeight].trim());</span>
+<span class="nc" id="L719">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L720">          throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+              + &quot; ERROR: Invalid weight in line &quot; + lineCount
+              + &quot; in regexner file &quot; + mappingFilename + &quot;: \&quot;&quot; + line + &quot;\&quot;!&quot;, e);
+<span class="nc" id="L723">        }</span>
+      }
+<span class="nc" id="L725">      int annotateGroup = 0;</span>
+      // Get annotate group from input....
+<span class="nc bnc" id="L727" title="All 4 branches missed.">      if (iGroup&gt;= 0 &amp;&amp; split.length &gt; iGroup) {</span>
+        // Which group to take (allow for context)
+<span class="nc" id="L729">        String context = split[iGroup].trim();</span>
+        try {
+<span class="nc" id="L731">          annotateGroup = Integer.parseInt(context);</span>
+<span class="nc" id="L732">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L733">          throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+              + &quot; ERROR: Invalid group in line &quot; + lineCount
+              + &quot; in regexner file &quot; + mappingFilename + &quot;: \&quot;&quot; + line + &quot;\&quot;!&quot;, e);
+<span class="nc" id="L736">        }</span>
+      }
+
+      // Print some warnings about the type
+<span class="nc bnc" id="L740" title="All 2 branches missed.">      for (int i = 0; i &lt; types.length; i++) {</span>
+<span class="nc" id="L741">        String type = types[i];</span>
+        // TODO: Have option to allow commas in types
+<span class="nc" id="L743">        int commaPos = type.indexOf(',');</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        if (commaPos &gt; 0) {</span>
+          // Strip the &quot;,&quot; and just take first type
+<span class="nc" id="L746">          String newType = type.substring(0, commaPos).trim();</span>
+<span class="nc" id="L747">          logger.warn(&quot;TokensRegexNERAnnotator &quot; + annotatorName +</span>
+                  &quot;: Entry has multiple types for &quot; + annotationFieldnames[i] + &quot;: &quot; + line + &quot;.  Taking type to be &quot; + newType);
+<span class="nc" id="L749">          types[i] = newType;</span>
+        }
+      }
+
+<span class="nc" id="L753">      Entry entry = new Entry(tokensRegex, regexes, types, overwritableTypes, priority, weight, annotateGroup);</span>
+
+<span class="nc bnc" id="L755" title="All 2 branches missed.">      if (seenRegexes.containsKey(key)) {</span>
+<span class="nc" id="L756">        Entry oldEntry = seenRegexes.get(key);</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">        if (priority &gt; oldEntry.priority) {</span>
+<span class="nc" id="L758">          logger.warn(&quot;TokensRegexNERAnnotator &quot; + annotatorName +</span>
+                  &quot;: Replace duplicate entry (higher priority): old=&quot; + oldEntry + &quot;, new=&quot; + entry);
+        } else {
+<span class="nc" id="L761">          String oldTypeDesc = oldEntry.getTypeDescription();</span>
+<span class="nc" id="L762">          String newTypeDesc = entry.getTypeDescription();</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">          if (!oldTypeDesc.equals(newTypeDesc)) {</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">            if (verbose) {</span>
+<span class="nc" id="L765">              logger.warn(&quot;TokensRegexNERAnnotator &quot; + annotatorName +</span>
+                      &quot;: Ignoring duplicate entry: &quot; + split[0] + &quot;, old type = &quot; + oldTypeDesc + &quot;, new type = &quot; + newTypeDesc);
+            }
+          // } else {
+          //   if (verbose) {
+          //     logger.warn(&quot;TokensRegexNERAnnotator &quot; + annotatorName +
+          //             &quot;: Duplicate entry [ignored]: &quot; + split[0] + &quot;, old type = &quot; + oldEntry.type + &quot;, new type = &quot; + type);
+          //   }
+          }
+          continue;
+        }
+      }
+
+      // Print some warning if label belongs to noDefaultOverwriteLabels but there is no overwritable types
+<span class="nc bnc" id="L779" title="All 4 branches missed.">      if (entry.overwritableTypes.isEmpty() &amp;&amp; hasNoOverwritableType(noDefaultOverwriteLabels, entry.types)) {</span>
+<span class="nc" id="L780">        logger.warn(&quot;TokensRegexNERAnnotator &quot; + annotatorName +</span>
+                &quot;: Entry doesn't have overwriteable types &quot; + entry + &quot;, but entry type is in noDefaultOverwriteLabels&quot;);
+      }
+
+<span class="nc" id="L784">      entries.add(entry);</span>
+<span class="nc" id="L785">      entryToMappingFileNumber.put(entry, mappingFileIndex);</span>
+<span class="nc" id="L786">      seenRegexes.put(key, entry);</span>
+<span class="nc bnc" id="L787" title="All 2 branches missed.">      if (entry.tokensRegex != null) isTokensRegex++;</span>
+<span class="nc" id="L788">    }</span>
+
+<span class="nc" id="L790">    logger.log(&quot;TokensRegexNERAnnotator &quot; + annotatorName +</span>
+<span class="nc" id="L791">            &quot;: Read &quot; + (entries.size() - origEntriesSize) + &quot; unique entries out of &quot; + lineCount + &quot; from &quot; + mappingFilename</span>
+       + &quot;, &quot; + isTokensRegex + &quot; TokensRegex patterns.&quot;);
+<span class="nc" id="L793">    return entries;</span>
+  }
+
+  private static boolean hasNoOverwritableType(Set&lt;String&gt; noDefaultOverwriteLabels, String[] types) {
+<span class="nc bnc" id="L797" title="All 2 branches missed.">    for (String type:types) {</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">      if (noDefaultOverwriteLabels.contains(type)) return true;</span>
+    }
+<span class="nc" id="L800">    return false;</span>
+  }
+
+  // todo [cdm 2016]: This logic seems wrong. If you have semi-colons only between files, it doesn't work!
+  private static String[] processListMappingFiles(String mappingFiles) {
+<span class="nc bnc" id="L805" title="All 4 branches missed.">    if (mappingFiles.contains(&quot;;&quot;) &amp;&amp; mappingFiles.contains(&quot;,&quot;)) {</span>
+<span class="nc" id="L806">      return SEMICOLON_DELIMITERS_PATTERN.split(mappingFiles);</span>
+      //Semicolons separate the files and for each file, commas separate the options - options handled later
+<span class="nc bnc" id="L808" title="All 2 branches missed.">    } else if (mappingFiles.contains(&quot;,&quot;)) {</span>
+<span class="nc" id="L809">      return COMMA_DELIMITERS_PATTERN.split(mappingFiles);</span>
+      //No per-file options, commas separate the files
+    } else {
+      //Semicolons separate the files
+<span class="nc" id="L813">      return SEMICOLON_DELIMITERS_PATTERN.split(mappingFiles);</span>
+    }
+  }
+
+  private static void processPerFileOptions(String annotatorName, String[] mappings, List&lt;Boolean&gt; ignoreCaseList, List&lt;Pattern&gt; validPosPatternList, boolean ignoreCase, Pattern validPosPattern) {
+<span class="nc" id="L818">    Integer numMappingFiles = mappings.length;</span>
+<span class="nc bnc" id="L819" title="All 2 branches missed.">    for (int index = 0; index &lt; numMappingFiles; index++) {</span>
+<span class="nc" id="L820">      boolean ignoreCaseSet = false;</span>
+<span class="nc" id="L821">      boolean validPosPatternSet = false;</span>
+<span class="nc" id="L822">      String[] allOptions = COMMA_DELIMITERS_PATTERN.split(mappings[index].trim());</span>
+<span class="nc" id="L823">      Integer numOptions = allOptions.length;</span>
+<span class="nc bnc" id="L824" title="All 2 branches missed.">      if (numOptions &gt; 1) { // there are some per file options here</span>
+<span class="nc bnc" id="L825" title="All 2 branches missed.">        for (int i = 0; i &lt; numOptions-1; i++) {</span>
+<span class="nc" id="L826">          String[] optionAndValue = EQUALS_DELIMITERS_PATTERN.split(allOptions[i].trim());</span>
+<span class="nc bnc" id="L827" title="All 2 branches missed.">          if (optionAndValue.length != 2) {</span>
+<span class="nc" id="L828">            throw new IllegalArgumentException(&quot;TokensRegexNERAnnotator &quot; + annotatorName</span>
+<span class="nc" id="L829">                    + &quot; ERROR: Incorrectly specified options for mapping file &quot; + mappings[index].trim());</span>
+          } else {
+<span class="nc bnc" id="L831" title="All 10 branches missed.">            switch (optionAndValue[0].trim().toLowerCase()) {</span>
+              case &quot;ignorecase&quot;:
+<span class="nc" id="L833">                ignoreCaseList.add(Boolean.parseBoolean(optionAndValue[1].trim()));</span>
+<span class="nc" id="L834">                ignoreCaseSet = true;</span>
+<span class="nc" id="L835">                break;</span>
+              case &quot;validpospattern&quot;:
+<span class="nc" id="L837">                String validPosRegex = optionAndValue[1].trim();</span>
+<span class="nc bnc" id="L838" title="All 4 branches missed.">                if (validPosRegex != null &amp;&amp; !validPosRegex.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L839">                  validPosPatternList.add(Pattern.compile(validPosRegex));</span>
+                } else {
+<span class="nc" id="L841">                  validPosPatternList.add(validPosPattern);</span>
+                }
+<span class="nc" id="L843">                validPosPatternSet = true;</span>
+<span class="nc" id="L844">                break;</span>
+              default:
+                break;
+            }
+          }
+        }
+<span class="nc" id="L850">        mappings[index] = allOptions[numOptions-1];</span>
+      }
+
+<span class="nc bnc" id="L853" title="All 2 branches missed.">      if (!ignoreCaseSet) {</span>
+<span class="nc" id="L854">        ignoreCaseList.add(ignoreCase);</span>
+      }
+
+<span class="nc bnc" id="L857" title="All 2 branches missed.">      if (!validPosPatternSet) {</span>
+<span class="nc" id="L858">        validPosPatternList.add(validPosPattern);</span>
+      }
+    }
+<span class="nc" id="L861">  }</span>
+
+  private static boolean atLeastOneValidPosPattern(List&lt;Pattern&gt; validPosPatternList) {
+<span class="nc bnc" id="L864" title="All 2 branches missed.">    for (Pattern pattern : validPosPatternList) {</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">      if (pattern != null) return true;</span>
+<span class="nc" id="L866">    }</span>
+<span class="nc" id="L867">    return false;</span>
+  }
+
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requires() {
+<span class="nc" id="L872">    return Collections.unmodifiableSet(new ArraySet&lt;&gt;(Arrays.asList(</span>
+        CoreAnnotations.TextAnnotation.class,
+        CoreAnnotations.TokensAnnotation.class,
+        CoreAnnotations.CharacterOffsetBeginAnnotation.class,
+        CoreAnnotations.CharacterOffsetEndAnnotation.class,
+        CoreAnnotations.SentencesAnnotation.class
+    )));
+  }
+
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirementsSatisfied() {
+    // TODO: we might want to allow for different RegexNER annotators
+    // to satisfy different requirements
+<span class="nc" id="L885">    return Collections.emptySet();</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

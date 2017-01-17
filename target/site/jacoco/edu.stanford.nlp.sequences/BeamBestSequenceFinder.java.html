@@ -1,0 +1,416 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BeamBestSequenceFinder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.sequences</a> &gt; <span class="el_source">BeamBestSequenceFinder.java</span></div><h1>BeamBestSequenceFinder.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.sequences; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.util.Beam;
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+import edu.stanford.nlp.util.Scored;
+import edu.stanford.nlp.util.ScoredComparator;
+
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+/**
+ * A class capable of computing the best sequence given a SequenceModel.
+ * Uses beam search.
+ *
+ * @author Dan Klein
+ * @author Teg Grenager (grenager@stanford.edu)
+ */
+public class BeamBestSequenceFinder implements BestSequenceFinder  {
+
+  /** A logger for this class */
+<span class="fc" id="L22">  private static Redwood.RedwoodChannels log = Redwood.channels(BeamBestSequenceFinder.class);</span>
+
+  // todo [CDM 2013]: AFAICS, this class doesn't actually work correctly AND gives nondeterministic answers. See the commented out test in BestSequenceFinderTest
+
+<span class="fc" id="L26">  private static int[] tmp = null;</span>
+
+<span class="fc" id="L28">  private static class TagSeq implements Scored {</span>
+
+<span class="fc" id="L30">    private static class TagList {</span>
+<span class="fc" id="L31">      int tag = -1;</span>
+<span class="fc" id="L32">      TagList last = null;</span>
+    }
+
+<span class="fc" id="L35">    private double score = 0.0;</span>
+
+    public double score() {
+<span class="fc" id="L38">      return score;</span>
+    }
+
+<span class="fc" id="L41">    private int size = 0;</span>
+
+    public int size() {
+<span class="fc" id="L44">      return size;</span>
+    }
+
+<span class="fc" id="L47">    private TagList info = null;</span>
+
+    public int[] tmpTags(int count, int s) {
+<span class="pc bpc" id="L50" title="1 of 4 branches missed.">      if (tmp == null || tmp.length &lt; s) {</span>
+        //tmp = new int[1024*128];
+<span class="fc" id="L52">        tmp = new int[s];</span>
+      }
+<span class="fc" id="L54">      TagList tl = info;</span>
+<span class="fc" id="L55">      int i = size() - 1;</span>
+<span class="fc bfc" id="L56" title="All 4 branches covered.">      while (tl != null &amp;&amp; count &gt;= 0) {</span>
+<span class="fc" id="L57">        tmp[i] = tl.tag;</span>
+<span class="fc" id="L58">        i--;</span>
+<span class="fc" id="L59">        count--;</span>
+<span class="fc" id="L60">        tl = tl.last;</span>
+      }
+<span class="fc" id="L62">      return tmp;</span>
+    }
+
+    public int[] tags() {
+<span class="fc" id="L66">      int[] t = new int[size()];</span>
+<span class="fc" id="L67">      int i = size() - 1;</span>
+<span class="fc bfc" id="L68" title="All 2 branches covered.">      for (TagList tl = info; tl != null; tl = tl.last) {</span>
+<span class="fc" id="L69">        t[i] = tl.tag;</span>
+<span class="fc" id="L70">        i--;</span>
+      }
+<span class="fc" id="L72">      return t;</span>
+    }
+
+    public void extendWith(int tag) {
+<span class="fc" id="L76">      TagList last = info;</span>
+<span class="fc" id="L77">      info = new TagList();</span>
+<span class="fc" id="L78">      info.tag = tag;</span>
+<span class="fc" id="L79">      info.last = last;</span>
+<span class="fc" id="L80">      size++;</span>
+<span class="fc" id="L81">    }</span>
+
+    public void extendWith(int tag, SequenceModel ts, int s) {
+<span class="fc" id="L84">      extendWith(tag);</span>
+<span class="fc" id="L85">      int[] tags = tmpTags(ts.leftWindow() + 1 + ts.rightWindow(), s);</span>
+<span class="fc" id="L86">      score += ts.scoreOf(tags, size() - ts.rightWindow() - 1);</span>
+
+      //for (int i=0; i&lt;tags.length; i++)
+      //System.out.print(tags[i]+&quot; &quot;);
+      //System.out.println(&quot;\nWith &quot;+tag+&quot; score was &quot;+score);
+<span class="fc" id="L91">    }</span>
+
+    public TagSeq tclone() {
+<span class="fc" id="L94">      TagSeq o = new TagSeq();</span>
+<span class="fc" id="L95">      o.info = info;</span>
+<span class="fc" id="L96">      o.size = size;</span>
+<span class="fc" id="L97">      o.score = score;</span>
+<span class="fc" id="L98">      return o;</span>
+    }
+
+  } // end class TagSeq
+
+
+  private int beamSize;
+  private boolean exhaustiveStart;
+<span class="fc" id="L106">  private boolean recenter = true;</span>
+
+  public int[] bestSequence(SequenceModel ts) {
+<span class="fc" id="L109">    return bestSequence(ts, (1024 * 128));</span>
+  }
+
+  public int[] bestSequence(SequenceModel ts, int size) {
+
+    // Set up tag options
+<span class="fc" id="L115">    int length = ts.length();</span>
+<span class="fc" id="L116">    int leftWindow = ts.leftWindow();</span>
+<span class="fc" id="L117">    int rightWindow = ts.rightWindow();</span>
+<span class="fc" id="L118">    int padLength = length + leftWindow + rightWindow;</span>
+<span class="fc" id="L119">    int[][] tags = new int[padLength][];</span>
+<span class="fc" id="L120">    int[] tagNum = new int[padLength];</span>
+<span class="fc bfc" id="L121" title="All 2 branches covered.">    for (int pos = 0; pos &lt; padLength; pos++) {</span>
+<span class="fc" id="L122">      tags[pos] = ts.getPossibleValues(pos);</span>
+<span class="fc" id="L123">      tagNum[pos] = tags[pos].length;</span>
+    }
+
+<span class="fc" id="L126">    Beam newBeam = new Beam(beamSize, ScoredComparator.ASCENDING_COMPARATOR);</span>
+<span class="fc" id="L127">    TagSeq initSeq = new TagSeq();</span>
+<span class="fc" id="L128">    newBeam.add(initSeq);</span>
+<span class="fc bfc" id="L129" title="All 2 branches covered.">    for (int pos = 0; pos &lt; padLength; pos++) {</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">      if (Thread.interrupted()) {  // Allow interrupting</span>
+<span class="nc" id="L131">        throw new RuntimeInterruptedException();</span>
+      }
+      //System.out.println(&quot;scoring word &quot; + pos + &quot; / &quot; + (leftWindow + length) + &quot;, tagNum = &quot; + tagNum[pos] + &quot;...&quot;);
+      //System.out.flush();
+
+<span class="fc" id="L136">      Beam oldBeam = newBeam;</span>
+<span class="pc bpc" id="L137" title="1 of 4 branches missed.">      if (pos &lt; leftWindow + rightWindow &amp;&amp; exhaustiveStart) {</span>
+<span class="fc" id="L138">        newBeam = new Beam(100000, ScoredComparator.ASCENDING_COMPARATOR);</span>
+      } else {
+<span class="fc" id="L140">        newBeam = new Beam(beamSize, ScoredComparator.ASCENDING_COMPARATOR);</span>
+      }
+      // each hypothesis gets extended and beamed
+<span class="fc bfc" id="L143" title="All 2 branches covered.">      for (Object anOldBeam : oldBeam) {</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">        if (Thread.interrupted()) {  // Allow interrupting</span>
+<span class="nc" id="L145">          throw new RuntimeInterruptedException();</span>
+        }
+        // System.out.print(&quot;#&quot;); System.out.flush();
+<span class="fc" id="L148">        TagSeq tagSeq = (TagSeq) anOldBeam;</span>
+<span class="fc bfc" id="L149" title="All 2 branches covered.">        for (int nextTagNum = 0; nextTagNum &lt; tagNum[pos]; nextTagNum++) {</span>
+<span class="fc" id="L150">          TagSeq nextSeq = tagSeq.tclone();</span>
+
+<span class="fc bfc" id="L152" title="All 2 branches covered.">          if (pos &gt;= leftWindow + rightWindow) {</span>
+<span class="fc" id="L153">            nextSeq.extendWith(tags[pos][nextTagNum], ts, size);</span>
+          } else {
+<span class="fc" id="L155">            nextSeq.extendWith(tags[pos][nextTagNum]);</span>
+          }
+
+          //System.out.println(&quot;Created: &quot;+nextSeq.score()+&quot; %% &quot;+arrayToString(nextSeq.tags(), nextSeq.size()));
+<span class="fc" id="L159">          newBeam.add(nextSeq);</span>
+          //		System.out.println(&quot;Beam size: &quot;+newBeam.size()+&quot; of &quot;+beamSize);
+          //System.out.println(&quot;Best is: &quot;+((Scored)newBeam.iterator().next()).score());
+        }
+<span class="fc" id="L163">      }</span>
+      // System.out.println(&quot; done&quot;);
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">      if (recenter) {</span>
+<span class="nc" id="L166">        double max = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        for (Object aNewBeam1 : newBeam) {</span>
+<span class="nc" id="L168">          TagSeq tagSeq = (TagSeq) aNewBeam1;</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">          if (tagSeq.score &gt; max) {</span>
+<span class="nc" id="L170">            max = tagSeq.score;</span>
+          }
+<span class="nc" id="L172">        }</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        for (Object aNewBeam : newBeam) {</span>
+<span class="nc" id="L174">          TagSeq tagSeq = (TagSeq) aNewBeam;</span>
+<span class="nc" id="L175">          tagSeq.score -= max;</span>
+<span class="nc" id="L176">        }</span>
+      }
+    }
+    try {
+<span class="fc" id="L180">      TagSeq bestSeq = (TagSeq) newBeam.iterator().next();</span>
+<span class="fc" id="L181">      int[] seq = bestSeq.tags();</span>
+<span class="fc" id="L182">      return seq;</span>
+<span class="nc" id="L183">    } catch (NoSuchElementException e) {</span>
+<span class="nc" id="L184">      log.info(&quot;Beam empty -- no best sequence.&quot;);</span>
+<span class="nc" id="L185">      return null;</span>
+    }
+
+    /*
+    int[] tempTags = new int[padLength];
+
+    // Set up product space sizes
+    int[] productSizes = new int[padLength];
+
+    int curProduct = 1;
+    for (int i=0; i&lt;leftWindow+rightWindow; i++)
+      curProduct *= tagNum[i];
+    for (int pos = leftWindow+rightWindow; pos &lt; padLength; pos++) {
+      if (pos &gt; leftWindow+rightWindow)
+	curProduct /= tagNum[pos-leftWindow-rightWindow-1]; // shift off
+      curProduct *= tagNum[pos]; // shift on
+      productSizes[pos-rightWindow] = curProduct;
+    }
+
+    // Score all of each window's options
+    double[][] windowScore = new double[padLength][];
+    for (int pos=leftWindow; pos&lt;leftWindow+length; pos++) {
+      windowScore[pos] = new double[productSizes[pos]];
+      Arrays.fill(tempTags,tags[0][0]);
+      for (int product=0; product&lt;productSizes[pos]; product++) {
+	int p = product;
+	int shift = 1;
+	for (int curPos = pos+rightWindow; curPos &gt;= pos-leftWindow; curPos--) {
+	  tempTags[curPos] = tags[curPos][p % tagNum[curPos]];
+	  p /= tagNum[curPos];
+	  if (curPos &gt; pos)
+	    shift *= tagNum[curPos];
+	}
+	if (tempTags[pos] == tags[pos][0]) {
+	  // get all tags at once
+	  double[] scores = ts.scoresOf(tempTags, pos);
+	  // fill in the relevant windowScores
+	  for (int t = 0; t &lt; tagNum[pos]; t++) {
+	    windowScore[pos][product+t*shift] = scores[t];
+	  }
+	}
+      }
+    }
+
+
+    // Set up score and backtrace arrays
+    double[][] score = new double[padLength][];
+    int[][] trace = new int[padLength][];
+    for (int pos=0; pos&lt;padLength; pos++) {
+      score[pos] = new double[productSizes[pos]];
+      trace[pos] = new int[productSizes[pos]];
+    }
+
+    // Do forward Viterbi algorithm
+
+    // loop over the classification spot
+    //log.info();
+    for (int pos=leftWindow; pos&lt;length+leftWindow; pos++) {
+      //log.info(&quot;.&quot;);
+      // loop over window product types
+      for (int product=0; product&lt;productSizes[pos]; product++) {
+	// check for initial spot
+	if (pos==leftWindow) {
+	  // no predecessor type
+	  score[pos][product] = windowScore[pos][product];
+	  trace[pos][product] = -1;
+	} else {
+	  // loop over possible predecessor types
+	  score[pos][product] = Double.NEGATIVE_INFINITY;
+	  trace[pos][product] = -1;
+	  int sharedProduct = product / tagNum[pos+rightWindow];
+	  int factor = productSizes[pos] / tagNum[pos+rightWindow];
+	  for (int newTagNum=0; newTagNum&lt;tagNum[pos-leftWindow-1]; newTagNum++) {
+	    int predProduct = newTagNum*factor+sharedProduct;
+	    double predScore = score[pos-1][predProduct]+windowScore[pos][product];
+	    if (predScore &gt; score[pos][product]) {
+	      score[pos][product] = predScore;
+	      trace[pos][product] = predProduct;
+	    }
+	  }
+	}
+      }
+    }
+
+    // Project the actual tag sequence
+    double bestFinalScore = Double.NEGATIVE_INFINITY;
+    int bestCurrentProduct = -1;
+    for (int product=0; product&lt;productSizes[leftWindow+length-1]; product++) {
+      if (score[leftWindow+length-1][product] &gt; bestFinalScore) {
+	bestCurrentProduct = product;
+	bestFinalScore = score[leftWindow+length-1][product];
+      }
+    }
+    int lastProduct = bestCurrentProduct;
+    for (int last=padLength-1; last&gt;=length-1; last--) {
+      tempTags[last] = tags[last][lastProduct % tagNum[last]];
+      lastProduct /= tagNum[last];
+    }
+    for (int pos=leftWindow+length-2; pos&gt;=leftWindow; pos--) {
+      int bestNextProduct = bestCurrentProduct;
+      bestCurrentProduct = trace[pos+1][bestNextProduct];
+      tempTags[pos-leftWindow] = tags[pos-leftWindow][bestCurrentProduct / (productSizes[pos]/tagNum[pos-leftWindow])];
+    }
+    return tempTags;
+    */
+  }
+
+  /*
+  public int[] bestSequenceOld(TagScorer ts) {
+
+    // Set up tag options
+    int length = ts.length();
+    int leftWindow = ts.leftWindow();
+    int rightWindow = ts.rightWindow();
+    int padLength = length+leftWindow+rightWindow;
+    int[][] tags = new int[padLength][];
+    int[] tagNum = new int[padLength];
+    for (int pos = 0; pos &lt; padLength; pos++) {
+      tags[pos] = ts.tagsAt(pos);
+      tagNum[pos] = tags[pos].length;
+    }
+
+    int[] tempTags = new int[padLength];
+
+    // Set up product space sizes
+    int[] productSizes = new int[padLength];
+
+    int curProduct = 1;
+    for (int i=0; i&lt;leftWindow+rightWindow; i++)
+      curProduct *= tagNum[i];
+    for (int pos = leftWindow+rightWindow; pos &lt; padLength; pos++) {
+      if (pos &gt; leftWindow+rightWindow)
+	curProduct /= tagNum[pos-leftWindow-rightWindow-1]; // shift off
+      curProduct *= tagNum[pos]; // shift on
+      productSizes[pos-rightWindow] = curProduct;
+    }
+
+    // Score all of each window's options
+    double[][] windowScore = new double[padLength][];
+    for (int pos=leftWindow; pos&lt;leftWindow+length; pos++) {
+      windowScore[pos] = new double[productSizes[pos]];
+      Arrays.fill(tempTags,tags[0][0]);
+      for (int product=0; product&lt;productSizes[pos]; product++) {
+	int p = product;
+	for (int curPos = pos+rightWindow; curPos &gt;= pos-leftWindow; curPos--) {
+	  tempTags[curPos] = tags[curPos][p % tagNum[curPos]];
+	  p /= tagNum[curPos];
+	}
+	windowScore[pos][product] = ts.scoreOf(tempTags, pos);
+      }
+    }
+
+
+    // Set up score and backtrace arrays
+    double[][] score = new double[padLength][];
+    int[][] trace = new int[padLength][];
+    for (int pos=0; pos&lt;padLength; pos++) {
+      score[pos] = new double[productSizes[pos]];
+      trace[pos] = new int[productSizes[pos]];
+    }
+
+    // Do forward Viterbi algorithm
+
+    // loop over the classification spot
+    //log.info();
+    for (int pos=leftWindow; pos&lt;length+leftWindow; pos++) {
+      //log.info(&quot;.&quot;);
+      // loop over window product types
+      for (int product=0; product&lt;productSizes[pos]; product++) {
+	// check for initial spot
+	if (pos==leftWindow) {
+	  // no predecessor type
+	  score[pos][product] = windowScore[pos][product];
+	  trace[pos][product] = -1;
+	} else {
+	  // loop over possible predecessor types
+	  score[pos][product] = Double.NEGATIVE_INFINITY;
+	  trace[pos][product] = -1;
+	  int sharedProduct = product / tagNum[pos+rightWindow];
+	  int factor = productSizes[pos] / tagNum[pos+rightWindow];
+	  for (int newTagNum=0; newTagNum&lt;tagNum[pos-leftWindow-1]; newTagNum++) {
+	    int predProduct = newTagNum*factor+sharedProduct;
+	    double predScore = score[pos-1][predProduct]+windowScore[pos][product];
+	    if (predScore &gt; score[pos][product]) {
+	      score[pos][product] = predScore;
+	      trace[pos][product] = predProduct;
+	    }
+	  }
+	}
+      }
+    }
+
+    // Project the actual tag sequence
+    double bestFinalScore = Double.NEGATIVE_INFINITY;
+    int bestCurrentProduct = -1;
+    for (int product=0; product&lt;productSizes[leftWindow+length-1]; product++) {
+      if (score[leftWindow+length-1][product] &gt; bestFinalScore) {
+	bestCurrentProduct = product;
+	bestFinalScore = score[leftWindow+length-1][product];
+      }
+    }
+    int lastProduct = bestCurrentProduct;
+    for (int last=padLength-1; last&gt;=length-1; last--) {
+      tempTags[last] = tags[last][lastProduct % tagNum[last]];
+      lastProduct /= tagNum[last];
+    }
+    for (int pos=leftWindow+length-2; pos&gt;=leftWindow; pos--) {
+      int bestNextProduct = bestCurrentProduct;
+      bestCurrentProduct = trace[pos+1][bestNextProduct];
+      tempTags[pos-leftWindow] = tags[pos-leftWindow][bestCurrentProduct / (productSizes[pos]/tagNum[pos-leftWindow])];
+    }
+    return tempTags;
+  }
+  */
+
+
+  public BeamBestSequenceFinder(int beamSize) {
+<span class="nc" id="L402">    this(beamSize, false, false);</span>
+<span class="nc" id="L403">  }</span>
+
+  public BeamBestSequenceFinder(int beamSize, boolean exhaustiveStart) {
+<span class="fc" id="L406">    this(beamSize, exhaustiveStart, false);</span>
+<span class="fc" id="L407">  }</span>
+
+<span class="fc" id="L409">  public BeamBestSequenceFinder(int beamSize, boolean exhaustiveStart, boolean recenter) {</span>
+<span class="fc" id="L410">    this.exhaustiveStart = exhaustiveStart;</span>
+<span class="fc" id="L411">    this.beamSize = beamSize;</span>
+<span class="fc" id="L412">    this.recenter = recenter;</span>
+<span class="fc" id="L413">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

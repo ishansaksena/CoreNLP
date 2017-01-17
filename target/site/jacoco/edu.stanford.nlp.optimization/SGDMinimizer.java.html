@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SGDMinimizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">SGDMinimizer.java</span></div><h1>SGDMinimizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization;
+
+import edu.stanford.nlp.classify.LogPrior;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.Random;
+
+/**
+ * In place Stochastic Gradient Descent Minimizer.
+ * &lt;ul&gt;
+ * &lt;li&gt; Follows weight decay and tuning of learning parameter of crfsgd of
+ *   Leon Bottou: http://leon.bottou.org/projects/sgd
+ * &lt;li&gt; Only supports L2 regularization (QUADRATIC)
+ * &lt;li&gt; Requires objective function to be an AbstractStochasticCachingDiffUpdateFunction.
+ * &lt;/ul&gt;
+ * NOTE: unlike other minimizers, regularization is done in the minimizer, not the objective function.
+ *
+ * This class was previously called StochasticInPlaceMinimizer. This is now SGDMinimizer, and the old SGDMinimizer is now InefficientSGDMinimizer.
+ *
+ * @author Angel Chang
+ */
+public class SGDMinimizer&lt;T extends Function&gt; implements Minimizer&lt;T&gt;, HasEvaluators  {
+
+  /** A logger for this class */
+<span class="nc" id="L29">  private static final Redwood.RedwoodChannels log = Redwood.channels(SGDMinimizer.class);</span>
+
+  protected double xscale, xnorm;
+  protected double[] x;
+  protected int t0;  // Initial stochastic iteration count
+  protected final double sigma;
+  protected double lambda;
+<span class="nc" id="L36">  protected boolean quiet = false;</span>
+  private static final int DEFAULT_NUM_PASSES = 50;
+  protected final int numPasses; //-1;
+<span class="nc" id="L39">  protected int bSize = 1;  // NOTE: If bSize does not divide evenly into total number of samples,</span>
+                            // some samples may get accounted for twice in one pass
+  private static final int DEFAULT_TUNING_SAMPLES = 1000;
+  protected final int tuningSamples;
+
+<span class="nc" id="L44">  protected Random gen = new Random(1);</span>
+<span class="nc" id="L45">  protected long maxTime = Long.MAX_VALUE;</span>
+
+<span class="nc" id="L47">  private int evaluateIters = 0;    // Evaluate every x iterations (0 = no evaluation)</span>
+  private Evaluator[] evaluators;  // separate set of evaluators to check how optimization is going
+
+
+  public SGDMinimizer(double sigma, int numPasses)
+  {
+<span class="nc" id="L53">    this(sigma, numPasses, -1, 1);</span>
+<span class="nc" id="L54">  }</span>
+
+  public SGDMinimizer(double sigma, int numPasses, int tuningSamples) {
+<span class="nc" id="L57">    this(sigma, numPasses, tuningSamples, 1);</span>
+<span class="nc" id="L58">  }</span>
+
+<span class="nc" id="L60">  public SGDMinimizer(double sigma, int numPasses, int tuningSamples, int batchSize) {</span>
+<span class="nc" id="L61">    this.bSize = batchSize;</span>
+<span class="nc" id="L62">    this.sigma = sigma;</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">    if (numPasses &gt;= 0) {</span>
+<span class="nc" id="L64">      this.numPasses = numPasses;</span>
+    } else {
+<span class="nc" id="L66">      this.numPasses = DEFAULT_NUM_PASSES;</span>
+<span class="nc" id="L67">      sayln(&quot;  SGDMinimizer: numPasses=&quot; + numPasses + &quot;, defaulting to &quot; + this.numPasses);</span>
+    }
+<span class="nc bnc" id="L69" title="All 2 branches missed.">    if (tuningSamples &gt; 0) {</span>
+<span class="nc" id="L70">      this.tuningSamples = tuningSamples;</span>
+    } else {
+<span class="nc" id="L72">      this.tuningSamples = DEFAULT_TUNING_SAMPLES;</span>
+<span class="nc" id="L73">      sayln(&quot;  SGDMinimizer: tuneSampleSize=&quot; + tuningSamples + &quot;, defaulting to &quot; + this.tuningSamples);</span>
+    }
+<span class="nc" id="L75">  }</span>
+
+<span class="nc" id="L77">  public SGDMinimizer(LogPrior prior, int numPasses, int batchSize, int tuningSamples) {</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">    if (LogPrior.LogPriorType.QUADRATIC == prior.getType()) {</span>
+<span class="nc" id="L79">      sigma = prior.getSigma();</span>
+    } else {
+<span class="nc" id="L81">      throw new RuntimeException(&quot;Unsupported prior type &quot; + prior.getType());</span>
+    }
+<span class="nc bnc" id="L83" title="All 2 branches missed.">    if (numPasses &gt;= 0) {</span>
+<span class="nc" id="L84">      this.numPasses = numPasses;</span>
+    } else {
+<span class="nc" id="L86">      this.numPasses = DEFAULT_NUM_PASSES;</span>
+<span class="nc" id="L87">      sayln(&quot;  SGDMinimizer: numPasses=&quot; + numPasses + &quot;, defaulting to &quot; + this.numPasses);</span>
+    }
+<span class="nc" id="L89">    this.bSize = batchSize;</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">    if (tuningSamples &gt; 0) {</span>
+<span class="nc" id="L91">      this.tuningSamples = tuningSamples;</span>
+    } else {
+<span class="nc" id="L93">      this.tuningSamples = DEFAULT_TUNING_SAMPLES;</span>
+<span class="nc" id="L94">      sayln(&quot;  SGDMinimizer: tuneSampleSize=&quot; + tuningSamples + &quot;, defaulting to &quot; + this.tuningSamples);</span>
+    }
+<span class="nc" id="L96">  }</span>
+
+
+  public void shutUp() {
+<span class="nc" id="L100">    this.quiet = true;</span>
+<span class="nc" id="L101">  }</span>
+
+<span class="nc" id="L103">  private static final NumberFormat nf = new DecimalFormat(&quot;0.000E0&quot;);</span>
+
+  protected String getName() {
+<span class="nc" id="L106">    return &quot;SGD_InPlace_b&quot; + bSize + &quot;_lambda&quot; + nf.format(lambda);</span>
+  }
+
+  @Override
+  public void setEvaluators(int iters, Evaluator[] evaluators) {
+<span class="nc" id="L111">    this.evaluateIters = iters;</span>
+<span class="nc" id="L112">    this.evaluators = evaluators;</span>
+<span class="nc" id="L113">  }</span>
+
+
+  //This can be filled if an extending class needs to initialize things.
+  @SuppressWarnings(&quot;UnusedParameters&quot;)
+<span class="nc" id="L118">  protected void init(AbstractStochasticCachingDiffUpdateFunction func) { }</span>
+
+  public double getObjective(AbstractStochasticCachingDiffUpdateFunction function, double[] w, double wscale, int[] sample) {
+<span class="nc" id="L121">    double wnorm = getNorm(w) * wscale*wscale;</span>
+<span class="nc" id="L122">    double obj = function.valueAt(w, wscale, sample);</span>
+    // Calculate objective with L2 regularization
+<span class="nc" id="L124">    return obj + 0.5*sample.length*lambda*wnorm;</span>
+  }
+
+  public double tryEta(AbstractStochasticCachingDiffUpdateFunction function, double[] initial, int[] sample, double eta) {
+<span class="nc" id="L128">    int numBatches =  sample.length / bSize;</span>
+<span class="nc" id="L129">    double[] w = new double[initial.length];</span>
+<span class="nc" id="L130">    double wscale = 1;</span>
+<span class="nc" id="L131">    System.arraycopy(initial, 0, w, 0, w.length);</span>
+<span class="nc" id="L132">    int[] sampleBatch = new int[bSize];</span>
+<span class="nc" id="L133">    int sampleIndex = 0;</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">    for (int batch = 0; batch &lt; numBatches; batch++) {</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">      for (int i = 0; i &lt; bSize; i++) {</span>
+<span class="nc" id="L136">        sampleBatch[i] = sample[(sampleIndex + i) % sample.length];</span>
+      }
+<span class="nc" id="L138">      sampleIndex += bSize;</span>
+<span class="nc" id="L139">      double gain = eta/wscale;</span>
+<span class="nc" id="L140">      function.calculateStochasticUpdate(w, wscale, sampleBatch, gain);</span>
+<span class="nc" id="L141">      wscale *= (1 - eta * lambda*bSize);</span>
+    }
+<span class="nc" id="L143">    double obj = getObjective(function, w, wscale, sample);</span>
+<span class="nc" id="L144">    return obj;</span>
+  }
+
+  /**
+   * Finds a good learning rate to start with.
+   * eta = 1/(lambda*(t0+t)) - we find good t0
+   * @param function
+   * @param initial
+   * @param sampleSize
+   * @param seta
+   */
+  public double tune(AbstractStochasticCachingDiffUpdateFunction function, double[] initial, int sampleSize, double seta) {
+<span class="nc" id="L156">    Timing timer = new Timing();</span>
+<span class="nc" id="L157">    int[] sample = function.getSample(sampleSize);</span>
+<span class="nc" id="L158">    double sobj = getObjective(function, initial, 1, sample);</span>
+<span class="nc" id="L159">    double besteta = 1;</span>
+<span class="nc" id="L160">    double bestobj = sobj;</span>
+<span class="nc" id="L161">    double eta = seta;</span>
+<span class="nc" id="L162">    int totest = 10;</span>
+<span class="nc" id="L163">    double factor = 2;</span>
+<span class="nc" id="L164">    boolean phase2 = false;</span>
+<span class="nc bnc" id="L165" title="All 4 branches missed.">    while (totest &gt; 0 || !phase2)</span>
+    {
+<span class="nc" id="L167">      double obj = tryEta(function, initial, sample, eta);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      boolean okay = (obj &lt; sobj);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">      sayln(&quot;  Trying eta=&quot; + eta + &quot;  obj=&quot; + obj + ((okay)? &quot;(possible)&quot;:&quot;(too large)&quot;));</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">      if (okay)</span>
+      {
+<span class="nc" id="L172">        totest -= 1;</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (obj &lt; bestobj) {</span>
+<span class="nc" id="L174">          bestobj = obj;</span>
+<span class="nc" id="L175">          besteta = eta;</span>
+        }
+      }
+<span class="nc bnc" id="L178" title="All 2 branches missed.">      if (! phase2)</span>
+      {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        if (okay) {</span>
+<span class="nc" id="L181">          eta = eta * factor;</span>
+        } else {
+<span class="nc" id="L183">          phase2 = true;</span>
+<span class="nc" id="L184">          eta = seta;</span>
+        }
+      }
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      if (phase2) {</span>
+<span class="nc" id="L188">        eta = eta / factor;</span>
+      }
+<span class="nc" id="L190">    }</span>
+    // take it on the safe side (implicit regularization)
+<span class="nc" id="L192">    besteta /= factor;</span>
+    // determine t
+<span class="nc" id="L194">    t0 = (int) (1 / (besteta * lambda));</span>
+<span class="nc" id="L195">    sayln(&quot;  Taking eta=&quot; + besteta + &quot; t0=&quot; + t0);</span>
+<span class="nc" id="L196">    sayln(&quot;  Tuning completed in: &quot; + Timing.toSecondsString(timer.report()) + &quot; s&quot;);</span>
+<span class="nc" id="L197">    return besteta;</span>
+  }
+
+  // really this is the square of the L2 norm....
+  private static double getNorm(double[] w)
+  {
+<span class="nc" id="L203">    double norm = 0;</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">    for (double aW : w) {</span>
+<span class="nc" id="L205">      norm += aW * aW;</span>
+    }
+<span class="nc" id="L207">    return norm;</span>
+  }
+
+  private void rescale()
+  {
+<span class="nc bnc" id="L212" title="All 2 branches missed.">    if (xscale == 1) return;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L214">      x[i] *= xscale;</span>
+    }
+<span class="nc" id="L216">    xscale = 1;</span>
+<span class="nc" id="L217">  }</span>
+
+  private void doEvaluation(double[] x) {
+    // Evaluate solution
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    if (evaluators == null) return;</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">    for (Evaluator eval:evaluators) {</span>
+<span class="nc" id="L223">      sayln(&quot;  Evaluating: &quot; + eval.toString());</span>
+<span class="nc" id="L224">      eval.evaluate(x);</span>
+    }
+<span class="nc" id="L226">  }</span>
+
+  @Override
+  public double[] minimize(Function function, double functionTolerance, double[] initial) {
+<span class="nc" id="L230">    return minimize(function, functionTolerance, initial, -1);</span>
+  }
+
+  @Override
+  public double[] minimize(Function f, double functionTolerance, double[] initial, int maxIterations) {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">    if (!(f instanceof AbstractStochasticCachingDiffUpdateFunction)) {</span>
+<span class="nc" id="L236">      throw new UnsupportedOperationException();</span>
+    }
+<span class="nc" id="L238">    AbstractStochasticCachingDiffUpdateFunction function = (AbstractStochasticCachingDiffUpdateFunction) f;</span>
+<span class="nc" id="L239">    int totalSamples = function.dataDimension();</span>
+<span class="nc" id="L240">    int tuneSampleSize = Math.min(totalSamples, tuningSamples);</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">    if (tuneSampleSize &lt; tuningSamples) {</span>
+<span class="nc" id="L242">      log.info(&quot;WARNING: Total number of samples=&quot; + totalSamples +</span>
+              &quot; is smaller than requested tuning sample size=&quot; + tuningSamples + &quot;!!!&quot;);
+    }
+<span class="nc" id="L245">    lambda = 1.0/(sigma*totalSamples);</span>
+<span class="nc" id="L246">    sayln(&quot;Using sigma=&quot; + sigma + &quot; lambda=&quot; + lambda + &quot; tuning sample size &quot; + tuneSampleSize);</span>
+    // tune(function, initial, tuneSampleSize, 0.1);
+<span class="nc" id="L248">    t0 = (int) (1 / (0.1 * lambda));</span>
+
+<span class="nc" id="L250">    x = new double[initial.length];</span>
+<span class="nc" id="L251">    System.arraycopy(initial, 0, x, 0, x.length);</span>
+<span class="nc" id="L252">    xscale = 1;</span>
+<span class="nc" id="L253">    xnorm = getNorm(x);</span>
+<span class="nc" id="L254">    int numBatches =  totalSamples/ bSize;</span>
+
+<span class="nc" id="L256">    init(function);</span>
+
+<span class="nc bnc" id="L258" title="All 4 branches missed.">    boolean have_max = (maxIterations &gt; 0 || numPasses &gt; 0);</span>
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">    if (!have_max){</span>
+<span class="nc" id="L261">      throw new UnsupportedOperationException(&quot;No maximum number of iterations has been specified.&quot;);</span>
+    } else{
+<span class="nc" id="L263">      maxIterations = Math.max(maxIterations, numPasses)*numBatches;</span>
+    }
+
+<span class="nc" id="L266">    sayln(&quot;       Batch size of: &quot; + bSize);</span>
+<span class="nc" id="L267">    sayln(&quot;       Data dimension of: &quot; + totalSamples );</span>
+<span class="nc" id="L268">    sayln(&quot;       Batches per pass through data:  &quot; + numBatches );</span>
+<span class="nc" id="L269">    sayln(&quot;       Number of passes is = &quot; + numPasses);</span>
+<span class="nc" id="L270">    sayln(&quot;       Max iterations is = &quot; + maxIterations);</span>
+
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //            Loop
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+<span class="nc" id="L278">    Timing total = new Timing();</span>
+<span class="nc" id="L279">    Timing current = new Timing();</span>
+<span class="nc" id="L280">    int t = t0;</span>
+<span class="nc" id="L281">    int iters = 0;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">    for (int pass = 0; pass &lt; numPasses; pass++)  {</span>
+<span class="nc bnc" id="L283" title="All 6 branches missed.">      boolean doEval = (pass &gt; 0 &amp;&amp; evaluateIters &gt; 0 &amp;&amp; pass % evaluateIters == 0);</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">      if (doEval) {</span>
+<span class="nc" id="L285">        rescale();</span>
+<span class="nc" id="L286">        doEvaluation(x);</span>
+      }
+
+<span class="nc" id="L289">      double totalValue = 0;</span>
+<span class="nc" id="L290">      double lastValue = 0;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      for (int batch = 0; batch &lt; numBatches; batch++) {</span>
+<span class="nc" id="L292">        iters++;</span>
+
+        //Get the next X
+<span class="nc" id="L295">        double eta = 1/(lambda*t);</span>
+<span class="nc" id="L296">        double gain = eta/xscale;</span>
+<span class="nc" id="L297">        lastValue = function.calculateStochasticUpdate(x, xscale, bSize, gain);</span>
+<span class="nc" id="L298">        totalValue += lastValue;</span>
+        // weight decay (for L2 regularization)
+<span class="nc" id="L300">        xscale *= (1 - eta * lambda*bSize);</span>
+<span class="nc" id="L301">        t+=bSize;</span>
+      }
+<span class="nc bnc" id="L303" title="All 2 branches missed.">      if (xscale &lt; 1e-6) {</span>
+<span class="nc" id="L304">        rescale();</span>
+      }
+      try {
+<span class="nc" id="L307">        ArrayMath.assertFinite(x,&quot;x&quot;);</span>
+<span class="nc" id="L308">      } catch (ArrayMath.InvalidElementException e) {</span>
+<span class="nc" id="L309">        log.info(e.toString());</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        for(int i=0;i&lt;x.length;i++){ x[i]=Double.NaN; }</span>
+<span class="nc" id="L311">        break;</span>
+<span class="nc" id="L312">      }</span>
+<span class="nc" id="L313">      xnorm = getNorm(x)*xscale*xscale;</span>
+      // Calculate loss based on L2 regularization
+<span class="nc" id="L315">      double loss = totalValue + 0.5 * xnorm * lambda * totalSamples;</span>
+<span class="nc" id="L316">      sayln(&quot;Iter: &quot; + iters + &quot; pass &quot; + pass + &quot; batch 1 ... &quot; + String.valueOf(numBatches) +</span>
+<span class="nc" id="L317">              &quot; [&quot; + ( total.report() )/1000.0 + &quot; s &quot; +</span>
+<span class="nc" id="L318">              &quot; {&quot; + (current.restart()/1000.0) + &quot; s}] &quot; +</span>
+              lastValue + &quot; &quot; + totalValue + &quot; &quot; + loss);
+
+<span class="nc bnc" id="L321" title="All 2 branches missed.">      if (iters &gt;= maxIterations) {</span>
+<span class="nc" id="L322">        sayln(&quot;Stochastic Optimization complete.  Stopped after max iterations&quot;);</span>
+<span class="nc" id="L323">        break;</span>
+      }
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">      if (total.report() &gt;= maxTime){</span>
+<span class="nc" id="L327">        sayln(&quot;Stochastic Optimization complete.  Stopped after max time&quot;);</span>
+<span class="nc" id="L328">        break;</span>
+      }
+
+    }
+<span class="nc" id="L332">    rescale();</span>
+
+<span class="nc bnc" id="L334" title="All 2 branches missed.">    if (evaluateIters &gt; 0) {</span>
+      // do final evaluation
+<span class="nc" id="L336">      doEvaluation(x);</span>
+    }
+
+<span class="nc" id="L339">    sayln(&quot;Completed in: &quot; + Timing.toSecondsString(total.report()) + &quot; s&quot;);</span>
+
+<span class="nc" id="L341">    return x;</span>
+  }
+
+  protected void sayln(String s) {
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    if (!quiet) {</span>
+<span class="nc" id="L346">      log.info(s);</span>
+    }
+<span class="nc" id="L348">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,506 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KBPAnnotator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">KBPAnnotator.java</span></div><h1>KBPAnnotator.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline;
+
+import edu.stanford.nlp.classify.Classifier;
+import edu.stanford.nlp.classify.LinearClassifier;
+import edu.stanford.nlp.coref.data.WordLists;
+import edu.stanford.nlp.ie.*;
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.ie.util.RelationTriple;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.simple.Document;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import edu.stanford.nlp.coref.CorefCoreAnnotations;
+
+import edu.stanford.nlp.coref.data.CorefChain;
+
+/**
+ * An annotator which takes as input sentences, and produces KBP relation annotations.
+ *
+ * @author Gabor Angeli
+ */
+@SuppressWarnings(&quot;FieldCanBeLocal&quot;)
+public class KBPAnnotator implements Annotator {
+
+<span class="nc" id="L36">  private String NOT_PROVIDED = &quot;none&quot;;</span>
+
+  private Properties kbpProperties;
+
+  /** A logger for this class */
+<span class="nc" id="L41">  private static Redwood.RedwoodChannels log = Redwood.channels(KBPAnnotator.class);</span>
+
+  //@ArgumentParser.Option(name=&quot;kbp.language&quot;, gloss=&quot;language for kbp&quot;)
+  //private String language = &quot;english&quot;;
+
+<span class="nc" id="L46">  @ArgumentParser.Option(name=&quot;kbp.model&quot;, gloss=&quot;The path to the model, set to \&quot;none\&quot; for no model&quot;)</span>
+  private String model = DefaultPaths.DEFAULT_KBP_CLASSIFIER;
+
+<span class="nc" id="L49">  @ArgumentParser.Option(name=&quot;kbp.semgrex&quot;, gloss=&quot;Semgrex patterns directory, set to \&quot;none\&quot; to not use semgrex&quot;)</span>
+  private String semgrexdir = DefaultPaths.DEFAULT_KBP_SEMGREX_DIR;
+
+<span class="nc" id="L52">  @ArgumentParser.Option(name=&quot;kbp.tokensregex&quot;, gloss=&quot;Tokensregex patterns directory, set to \&quot;none\&quot; to not use tokensregex&quot;)</span>
+  private String tokensregexdir = DefaultPaths.DEFAULT_KBP_TOKENSREGEX_DIR;
+
+<span class="nc" id="L55">  @ArgumentParser.Option(name=&quot;kbp.verbose&quot;, gloss=&quot;Print out KBP logging info&quot;)</span>
+  private boolean VERBOSE = false;
+
+  // @ArgumentParser.Option(name=&quot;regexner.cased&quot;, gloss=&quot;The tokensregexner cased path&quot;)
+  // private String regexnerCasedPath = DefaultPaths.DEFAULT_KBP_REGEXNER_CASED;
+  //
+  // @ArgumentParser.Option(name=&quot;regexner.caseless&quot;, gloss=&quot;The tokensregexner caseless path&quot;)
+  // private String regexnerCaselessPath = DefaultPaths.DEFAULT_KBP_REGEXNER_CASELESS;
+
+  /**
+   * The extractor implementation.
+   */
+  public final KBPRelationExtractor extractor;
+
+  /**
+   * A serializer to convert to the Simple CoreNLP representation.
+   */
+<span class="nc" id="L72">  private final ProtobufAnnotationSerializer serializer = new ProtobufAnnotationSerializer(false);</span>
+
+  /**
+   * An entity mention annotator to run after KBP-specific NER.
+   */
+  private final EntityMentionsAnnotator entityMentionAnnotator;
+
+  /*
+   * A TokensRegexNER annotator for the special KBP NER types (case-sensitive).
+   */
+  //private final TokensRegexNERAnnotator casedNER;
+
+  /*
+   * A TokensRegexNER annotator for the special KBP NER types (case insensitive).
+   */
+  //private final TokensRegexNERAnnotator caselessNER;
+
+  /** maximum length sentence to run on **/
+  private final int maxLength;
+
+
+  /**
+   * Create a new KBP annotator from the given properties.
+   *
+   * @param props The properties to use when creating this extractor.
+   */
+<span class="nc" id="L98">  public KBPAnnotator(String name, Properties props) {</span>
+    // Parse standard properties
+<span class="nc" id="L100">    ArgumentParser.fillOptions(this, name, props);</span>
+    //Locale kbpLanguage =
+            //(language.toLowerCase().equals(&quot;zh&quot;) || language.toLowerCase().equals(&quot;chinese&quot;)) ?
+                    //Locale.CHINESE : Locale.ENGLISH ;
+<span class="nc" id="L104">    kbpProperties = props;</span>
+    try {
+<span class="nc" id="L106">      ArrayList&lt;KBPRelationExtractor&gt; extractors = new ArrayList&lt;KBPRelationExtractor&gt;();</span>
+      // add tokensregex rules
+<span class="nc bnc" id="L108" title="All 2 branches missed.">      if (!tokensregexdir.equals(NOT_PROVIDED))</span>
+<span class="nc" id="L109">        extractors.add(new KBPTokensregexExtractor(tokensregexdir, VERBOSE));</span>
+      // add semgrex rules
+<span class="nc bnc" id="L111" title="All 2 branches missed.">      if (!semgrexdir.equals(NOT_PROVIDED))</span>
+<span class="nc" id="L112">        extractors.add(new KBPSemgrexExtractor(semgrexdir,VERBOSE));</span>
+      // attempt to add statistical model
+<span class="nc bnc" id="L114" title="All 2 branches missed.">      if (!model.equals(NOT_PROVIDED)) {</span>
+<span class="nc" id="L115">        log.info(&quot;Loading KBP classifier from: &quot; + model);</span>
+<span class="nc" id="L116">        Object object = IOUtils.readObjectFromURLOrClasspathOrFileSystem(model);</span>
+        KBPRelationExtractor statisticalExtractor;
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (object instanceof LinearClassifier) {</span>
+          //noinspection unchecked
+<span class="nc" id="L120">          statisticalExtractor = new KBPStatisticalExtractor((Classifier&lt;String, String&gt;) object);</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        } else if (object instanceof KBPStatisticalExtractor) {</span>
+<span class="nc" id="L122">          statisticalExtractor = (KBPStatisticalExtractor) object;</span>
+        } else {
+<span class="nc" id="L124">          throw new ClassCastException(object.getClass() + &quot; cannot be cast into a &quot; + KBPStatisticalExtractor.class);</span>
+        }
+<span class="nc" id="L126">        extractors.add(statisticalExtractor);</span>
+      }
+      // build extractor
+<span class="nc" id="L129">      this.extractor =</span>
+<span class="nc" id="L130">              new KBPEnsembleExtractor(extractors.toArray(</span>
+<span class="nc" id="L131">                      new KBPRelationExtractor[extractors.size()]));</span>
+      // set maximum length of sentence to operate on
+<span class="nc" id="L133">      maxLength = Integer.parseInt(props.getProperty(&quot;kbp.maxlen&quot;, &quot;-1&quot;));</span>
+<span class="nc" id="L134">    } catch (IOException | ClassNotFoundException e) {</span>
+<span class="nc" id="L135">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L136">    }</span>
+
+    // Load TokensRegexNER
+    /*this.casedNER = new TokensRegexNERAnnotator(
+        regexnerCasedPath,
+        false);
+    this.caselessNER = new TokensRegexNERAnnotator(
+        regexnerCaselessPath,
+        true,
+        &quot;^(NN|JJ).*&quot;);*/
+
+    // Create entity mention annotator
+<span class="nc" id="L148">    this.entityMentionAnnotator = new EntityMentionsAnnotator(&quot;kbp.entitymention&quot;,</span>
+<span class="nc" id="L149">            PropertiesUtils.asProperties(&quot;kbp.entitymention.acronyms&quot;, &quot;true&quot;,</span>
+                                         &quot;acronyms&quot;, &quot;true&quot;));
+<span class="nc" id="L151">  }</span>
+
+
+  /** @see KBPAnnotator#KBPAnnotator(String, Properties) */
+  @SuppressWarnings(&quot;unused&quot;)
+  public KBPAnnotator(Properties properties) {
+<span class="nc" id="L157">    this(STANFORD_KBP, properties);</span>
+
+<span class="nc" id="L159">  }</span>
+
+
+  /**
+   * Returns whether the given token counts as a valid pronominal mention for KBP.
+   * This method (at present) works for either Chinese or English.
+   *
+   * @param word The token to classify.
+   * @return true if this token is a pronoun that KBP should recognize.
+   */
+  private static boolean kbpIsPronominalMention(CoreLabel word) {
+<span class="nc" id="L170">    return WordLists.isKbpPronominalMention(word.word());</span>
+  }
+
+
+  /**
+   * Annotate all the pronominal mentions in the document.
+   * @param ann The document.
+   * @return The list of pronominal mentions in the document.
+   */
+  private static List&lt;CoreMap&gt; annotatePronominalMentions(Annotation ann) {
+<span class="nc" id="L180">    List&lt;CoreMap&gt; pronouns = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L181">    List&lt;CoreMap&gt; sentences = ann.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">    for (int sentenceIndex = 0; sentenceIndex &lt; sentences.size(); sentenceIndex++) {</span>
+<span class="nc" id="L183">      CoreMap sentence = sentences.get(sentenceIndex);</span>
+<span class="nc" id="L184">      Integer annoTokenBegin = sentence.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">      if (annoTokenBegin == null) {</span>
+<span class="nc" id="L186">        annoTokenBegin = 0;</span>
+      }
+
+<span class="nc" id="L189">      List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">      for (int tokenIndex = 0; tokenIndex &lt; tokens.size(); tokenIndex++) {</span>
+<span class="nc" id="L191">        CoreLabel token = tokens.get(tokenIndex);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        if (kbpIsPronominalMention(token)) {</span>
+<span class="nc" id="L193">          CoreMap pronoun = ChunkAnnotationUtils.getAnnotatedChunk(tokens, tokenIndex, tokenIndex + 1,</span>
+<span class="nc" id="L194">              annoTokenBegin, null, CoreAnnotations.TextAnnotation.class, null);</span>
+<span class="nc" id="L195">          pronoun.set(CoreAnnotations.SentenceIndexAnnotation.class, sentenceIndex);</span>
+<span class="nc" id="L196">          sentence.get(CoreAnnotations.MentionsAnnotation.class).add(pronoun);</span>
+<span class="nc" id="L197">          pronouns.add(pronoun);</span>
+        }
+      }
+    }
+
+<span class="nc" id="L202">    return pronouns;</span>
+  }
+
+
+  /**
+   * Augment the coreferent mention map with acronym matches.
+   */
+  private static void acronymMatch(List&lt;CoreMap&gt; mentions, Map&lt;CoreMap, Set&lt;CoreMap&gt;&gt; mentionsMap) {
+<span class="nc" id="L210">    int ticks = 0;</span>
+
+    // Get all the candidate antecedents
+<span class="nc" id="L213">    Map&lt;List&lt;String&gt;, CoreMap&gt; textToMention = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    for (CoreMap mention : mentions) {</span>
+<span class="nc" id="L215">      String nerTag = mention.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L216" title="All 4 branches missed.">      if (nerTag != null &amp;&amp; (nerTag.equals(KBPRelationExtractor.NERTag.ORGANIZATION.name)</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">          || nerTag.equals(KBPRelationExtractor.NERTag.LOCATION.name))) {</span>
+<span class="nc" id="L218">        List&lt;String&gt; tokens = mention.get(CoreAnnotations.TokensAnnotation.class).stream().map(CoreLabel::word).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (tokens.size() &gt; 1) {</span>
+<span class="nc" id="L220">          textToMention.put(tokens, mention);</span>
+        }
+      }
+<span class="nc" id="L223">    }</span>
+
+    // Look for candidate acronyms
+<span class="nc bnc" id="L226" title="All 2 branches missed.">    for (CoreMap acronym : mentions) {</span>
+<span class="nc" id="L227">      String nerTag = acronym.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L228" title="All 4 branches missed.">      if (nerTag != null &amp;&amp; (nerTag.equals(KBPRelationExtractor.NERTag.ORGANIZATION.name)</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">          || nerTag.equals(KBPRelationExtractor.NERTag.LOCATION.name))) {</span>
+<span class="nc" id="L230">        String text = acronym.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if (!text.contains(&quot; &quot;)) {</span>
+          // Candidate acronym
+<span class="nc" id="L233">          Set&lt;CoreMap&gt; acronymCluster = mentionsMap.get(acronym);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">          if (acronymCluster == null) {</span>
+<span class="nc" id="L235">            acronymCluster = new LinkedHashSet&lt;&gt;();</span>
+<span class="nc" id="L236">            acronymCluster.add(acronym);</span>
+          }
+          // Try to match it to an antecedent
+<span class="nc bnc" id="L239" title="All 2 branches missed.">          for (Map.Entry&lt;List&lt;String&gt;, CoreMap&gt; entry : textToMention.entrySet()) {</span>
+            // Time out if we take too long in this loop.
+<span class="nc" id="L241">            ticks += 1;</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if (ticks &gt; 1000) {</span>
+<span class="nc" id="L243">              return;</span>
+            }
+            // Check if the pair is an acronym
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            if (AcronymMatcher.isAcronym(text, entry.getKey())) {</span>
+              // Case: found a coreferent pair
+<span class="nc" id="L248">              CoreMap coreferent = entry.getValue();</span>
+<span class="nc" id="L249">              Set&lt;CoreMap&gt; coreferentCluster = mentionsMap.get(coreferent);</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">              if (coreferentCluster == null) {</span>
+<span class="nc" id="L251">                coreferentCluster = new LinkedHashSet&lt;&gt;();</span>
+<span class="nc" id="L252">                coreferentCluster.add(coreferent);</span>
+              }
+              // Create a new coreference cluster
+<span class="nc" id="L255">              Set&lt;CoreMap&gt; newCluster = new LinkedHashSet&lt;&gt;();</span>
+<span class="nc" id="L256">              newCluster.addAll(acronymCluster);</span>
+<span class="nc" id="L257">              newCluster.addAll(coreferentCluster);</span>
+              // Set the new cluster
+<span class="nc bnc" id="L259" title="All 2 branches missed.">              for (CoreMap key : newCluster) {</span>
+<span class="nc" id="L260">                mentionsMap.put(key, newCluster);</span>
+<span class="nc" id="L261">              }</span>
+            }
+<span class="nc" id="L263">          }</span>
+        }
+      }
+<span class="nc" id="L266">    }</span>
+<span class="nc" id="L267">  }</span>
+
+  /**
+   * Annotate this document for KBP relations.
+   * @param annotation The document to annotate.
+   */
+  @Override
+  public void annotate(Annotation annotation) {
+<span class="nc" id="L275">    List&lt;CoreMap&gt; sentences = annotation.get(CoreAnnotations.SentencesAnnotation.class);</span>
+
+    // Annotate with NER
+    //casedNER.annotate(annotation);
+    //caselessNER.annotate(annotation);
+    // Annotate with Mentions
+<span class="nc" id="L281">    entityMentionAnnotator.annotate(annotation);</span>
+
+    // Create simple document
+<span class="nc" id="L284">    Document doc = new Document(kbpProperties,serializer.toProto(annotation));</span>
+
+    // Get the mentions in the document
+<span class="nc" id="L287">    List&lt;CoreMap&gt; mentions = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    for (CoreMap sentence : sentences) {</span>
+<span class="nc" id="L289">      mentions.addAll(sentence.get(CoreAnnotations.MentionsAnnotation.class));</span>
+<span class="nc" id="L290">    }</span>
+<span class="nc" id="L291">    List&lt;CoreMap&gt; pronounMentions = annotatePronominalMentions(annotation);</span>
+<span class="nc" id="L292">    mentions.addAll(pronounMentions);</span>
+
+    // Compute coreferent clusters
+    // (map an index to a KBP mention)
+<span class="nc" id="L296">    Map&lt;Pair&lt;Integer, Integer&gt;, CoreMap&gt; mentionByStartIndex = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">    for (CoreMap mention : mentions) {</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      for (CoreLabel token : mention.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+<span class="nc" id="L299">        mentionByStartIndex.put(Pair.makePair(token.sentIndex(), token.index()), mention);</span>
+<span class="nc" id="L300">      }</span>
+<span class="nc" id="L301">    }</span>
+    // (collect coreferent KBP mentions)
+<span class="nc" id="L303">    Map&lt;CoreMap, Set&lt;CoreMap&gt;&gt; mentionsMap = new HashMap&lt;&gt;();  // map from canonical mention -&gt; other mentions</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">    if (annotation.get(CorefCoreAnnotations.CorefChainAnnotation.class) != null) {</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">      for (Map.Entry&lt;Integer, CorefChain&gt; chain : annotation.get(CorefCoreAnnotations.CorefChainAnnotation.class).entrySet()) {</span>
+<span class="nc" id="L306">        CoreMap firstMention = null;</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        for (CorefChain.CorefMention mention : chain.getValue().getMentionsInTextualOrder()) {</span>
+<span class="nc" id="L308">          CoreMap kbpMention = null;</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">          for (int i = mention.startIndex; i &lt; mention.endIndex; ++i) {</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">            if (mentionByStartIndex.containsKey(Pair.makePair(mention.sentNum - 1, i))) {</span>
+<span class="nc" id="L311">              kbpMention = mentionByStartIndex.get(Pair.makePair(mention.sentNum - 1, i));</span>
+<span class="nc" id="L312">              break;</span>
+            }
+          }
+<span class="nc bnc" id="L315" title="All 2 branches missed.">          if (firstMention == null) {</span>
+<span class="nc" id="L316">            firstMention = kbpMention;</span>
+          }
+<span class="nc bnc" id="L318" title="All 2 branches missed.">          if (kbpMention != null) {</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (!mentionsMap.containsKey(firstMention)) {</span>
+<span class="nc" id="L320">              mentionsMap.put(firstMention, new LinkedHashSet&lt;&gt;());</span>
+            }
+<span class="nc" id="L322">            mentionsMap.get(firstMention).add(kbpMention);</span>
+          }
+<span class="nc" id="L324">        }</span>
+<span class="nc" id="L325">      }</span>
+    }
+    // (coreference acronyms)
+<span class="nc" id="L328">    acronymMatch(mentions, mentionsMap);</span>
+    // (ensure valid NER tag for canonical mention)
+<span class="nc bnc" id="L330" title="All 2 branches missed.">    for (CoreMap key : new HashSet&lt;&gt;(mentionsMap.keySet())) {</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">      if (key.get(CoreAnnotations.NamedEntityTagAnnotation.class) == null) {</span>
+<span class="nc" id="L332">        CoreMap newKey = null;</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        for (CoreMap candidate : mentionsMap.get(key)) {</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">          if (candidate.get(CoreAnnotations.NamedEntityTagAnnotation.class) != null) {</span>
+<span class="nc" id="L335">            newKey = candidate;</span>
+<span class="nc" id="L336">            break;</span>
+          }
+<span class="nc" id="L338">        }</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (newKey != null) {</span>
+<span class="nc" id="L340">          mentionsMap.put(newKey, mentionsMap.remove(key));</span>
+        } else {
+<span class="nc" id="L342">          mentionsMap.remove(key);  // case: no mention in this chain has an NER tag.</span>
+        }
+      }
+<span class="nc" id="L345">    }</span>
+
+    // Propagate Entity Link
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    for (Map.Entry&lt;CoreMap, Set&lt;CoreMap&gt;&gt; entry : mentionsMap.entrySet()) {</span>
+<span class="nc" id="L349">      String entityLink = entry.getKey().get(CoreAnnotations.WikipediaEntityAnnotation.class);</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">      for (CoreMap mention : entry.getValue()) {</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        for (CoreLabel token : mention.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+<span class="nc" id="L352">          token.set(CoreAnnotations.WikipediaEntityAnnotation.class, entityLink);</span>
+<span class="nc" id="L353">        }</span>
+<span class="nc" id="L354">      }</span>
+<span class="nc" id="L355">    }</span>
+
+    // Create a canonical mention map
+<span class="nc" id="L358">    Map&lt;CoreMap, CoreMap&gt; mentionToCanonicalMention = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">    for (Map.Entry&lt;CoreMap, Set&lt;CoreMap&gt;&gt; entry : mentionsMap.entrySet()) {</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">      for (CoreMap mention : entry.getValue()) {</span>
+        // (set the NER tag + link to be axiomatically that of the canonical mention)
+<span class="nc" id="L362">        mention.set(CoreAnnotations.NamedEntityTagAnnotation.class, entry.getKey().get(CoreAnnotations.NamedEntityTagAnnotation.class));</span>
+<span class="nc" id="L363">        mention.set(CoreAnnotations.WikipediaEntityAnnotation.class, entry.getKey().get(CoreAnnotations.WikipediaEntityAnnotation.class));</span>
+        // (add the mention (note: this must come after we set the NER!)
+<span class="nc" id="L365">        mentionToCanonicalMention.put(mention, entry.getKey());</span>
+<span class="nc" id="L366">      }</span>
+<span class="nc" id="L367">    }</span>
+    // (add missing mentions)
+<span class="nc bnc" id="L369" title="All 2 branches missed.">    mentions.stream().filter(mention -&gt; mentionToCanonicalMention.get(mention) == null)</span>
+<span class="nc" id="L370">        .forEach(mention -&gt; mentionToCanonicalMention.put(mention, mention));</span>
+
+
+    // Cluster mentions by sentence
+<span class="nc" id="L374">    @SuppressWarnings(&quot;unchecked&quot;) List&lt;CoreMap&gt;[] mentionsBySentence = new List[annotation.get(CoreAnnotations.SentencesAnnotation.class).size()];</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">    for (int i = 0; i &lt; mentionsBySentence.length; ++i) {</span>
+<span class="nc" id="L376">      mentionsBySentence[i] = new ArrayList&lt;&gt;();</span>
+    }
+<span class="nc bnc" id="L378" title="All 2 branches missed.">    for (CoreMap mention : mentionToCanonicalMention.keySet()) {</span>
+<span class="nc" id="L379">      mentionsBySentence[mention.get(CoreAnnotations.SentenceIndexAnnotation.class)].add(mention);</span>
+<span class="nc" id="L380">    }</span>
+
+    // Classify
+<span class="nc bnc" id="L383" title="All 2 branches missed.">    for (int sentenceI = 0; sentenceI &lt; mentionsBySentence.length; ++sentenceI) {</span>
+<span class="nc" id="L384">      List&lt;RelationTriple&gt; triples = new ArrayList&lt;&gt;();  // the annotations</span>
+<span class="nc" id="L385">      List&lt;CoreMap&gt; candidates = mentionsBySentence[sentenceI];</span>
+      // determine sentence length
+<span class="nc" id="L387">      int sentenceLength =</span>
+<span class="nc" id="L388">              annotation.get(CoreAnnotations.SentencesAnnotation.class)</span>
+<span class="nc" id="L389">                      .get(sentenceI).get(CoreAnnotations.TokensAnnotation.class).size();</span>
+      // check if sentence is too long, if it's too long don't run kbp
+<span class="nc bnc" id="L391" title="All 4 branches missed.">      if (maxLength != -1 &amp;&amp; sentenceLength &gt; maxLength) {</span>
+        // set the triples annotation to an empty list of RelationTriples
+<span class="nc" id="L393">        annotation.get(</span>
+<span class="nc" id="L394">                CoreAnnotations.SentencesAnnotation.class).get(sentenceI).set(</span>
+                CoreAnnotations.KBPTriplesAnnotation.class, triples);
+        // continue to next sentence
+<span class="nc" id="L397">        continue;</span>
+      }
+      // sentence isn't too long, so continue processing this sentence
+<span class="nc bnc" id="L400" title="All 2 branches missed.">      for (int subjI = 0; subjI &lt; candidates.size(); ++subjI) {</span>
+<span class="nc" id="L401">        CoreMap subj = candidates.get(subjI);</span>
+<span class="nc" id="L402">        int subjBegin = subj.get(CoreAnnotations.TokensAnnotation.class).get(0).index() - 1;</span>
+<span class="nc" id="L403">        int subjEnd = subj.get(CoreAnnotations.TokensAnnotation.class).get(subj.get(CoreAnnotations.TokensAnnotation.class).size() - 1).index();</span>
+<span class="nc" id="L404">        Optional&lt;KBPRelationExtractor.NERTag&gt; subjNER = KBPRelationExtractor.NERTag.fromString(subj.get(CoreAnnotations.NamedEntityTagAnnotation.class));</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (subjNER.isPresent()) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">          for (int objI = 0; objI &lt; candidates.size(); ++objI) {</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            if (subjI == objI) {</span>
+<span class="nc" id="L408">              continue;</span>
+            }
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            if (Thread.interrupted()) {</span>
+<span class="nc" id="L411">              throw new RuntimeInterruptedException();</span>
+            }
+<span class="nc" id="L413">            CoreMap obj = candidates.get(objI);</span>
+<span class="nc" id="L414">            int objBegin = obj.get(CoreAnnotations.TokensAnnotation.class).get(0).index() - 1;</span>
+<span class="nc" id="L415">            int objEnd = obj.get(CoreAnnotations.TokensAnnotation.class).get(obj.get(CoreAnnotations.TokensAnnotation.class).size() - 1).index();</span>
+<span class="nc" id="L416">            Optional&lt;KBPRelationExtractor.NERTag&gt; objNER = KBPRelationExtractor.NERTag.fromString(obj.get(CoreAnnotations.NamedEntityTagAnnotation.class));</span>
+
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            if (objNER.isPresent() &amp;&amp;</span>
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                KBPRelationExtractor.RelationType.plausiblyHasRelation(subjNER.get(), objNER.get())) {  // type check</span>
+<span class="nc" id="L420">              KBPRelationExtractor.KBPInput input = new KBPRelationExtractor.KBPInput(</span>
+                  new Span(subjBegin, subjEnd),
+                  new Span(objBegin, objEnd),
+<span class="nc" id="L423">                  subjNER.get(),</span>
+<span class="nc" id="L424">                  objNER.get(),</span>
+<span class="nc" id="L425">                  doc.sentence(sentenceI)</span>
+              );
+
+              //  -- BEGIN Classify
+<span class="nc" id="L429">              Pair&lt;String, Double&gt; prediction = extractor.classify(input);</span>
+              //  -- END Classify
+
+              // Handle the classifier output
+<span class="nc bnc" id="L433" title="All 2 branches missed.">              if (!KBPStatisticalExtractor.NO_RELATION.equals(prediction.first)) {</span>
+<span class="nc" id="L434">                RelationTriple triple = new RelationTriple.WithLink(</span>
+<span class="nc" id="L435">                    subj.get(CoreAnnotations.TokensAnnotation.class),</span>
+<span class="nc" id="L436">                    mentionToCanonicalMention.get(subj).get(CoreAnnotations.TokensAnnotation.class),</span>
+<span class="nc" id="L437">                    Collections.singletonList(new CoreLabel(new Word(prediction.first))),</span>
+<span class="nc" id="L438">                    obj.get(CoreAnnotations.TokensAnnotation.class),</span>
+<span class="nc" id="L439">                    mentionToCanonicalMention.get(obj).get(CoreAnnotations.TokensAnnotation.class),</span>
+<span class="nc" id="L440">                    prediction.second,</span>
+<span class="nc" id="L441">                    sentences.get(sentenceI).get(SemanticGraphCoreAnnotations.CollapsedCCProcessedDependenciesAnnotation.class),</span>
+<span class="nc" id="L442">                    subj.get(CoreAnnotations.WikipediaEntityAnnotation.class),</span>
+<span class="nc" id="L443">                    obj.get(CoreAnnotations.WikipediaEntityAnnotation.class)</span>
+                    );
+<span class="nc" id="L445">                triples.add(triple);</span>
+              }
+            }
+          }
+        }
+      }
+
+      // Set triples
+<span class="nc" id="L453">      annotation.get(CoreAnnotations.SentencesAnnotation.class).get(sentenceI).set(CoreAnnotations.KBPTriplesAnnotation.class, triples);</span>
+    }
+<span class="nc" id="L455">  }</span>
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirementsSatisfied() {
+<span class="nc" id="L460">    Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirements = new HashSet&lt;&gt;(Arrays.asList(</span>
+        CoreAnnotations.MentionsAnnotation.class,
+        CoreAnnotations.KBPTriplesAnnotation.class
+    ));
+<span class="nc" id="L464">    return Collections.unmodifiableSet(requirements);</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requires() {
+<span class="nc" id="L470">    Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirements = new HashSet&lt;&gt;(Arrays.asList(</span>
+        CoreAnnotations.TextAnnotation.class,
+        CoreAnnotations.TokensAnnotation.class,
+        CoreAnnotations.IndexAnnotation.class,
+        CoreAnnotations.SentencesAnnotation.class,
+        CoreAnnotations.SentenceIndexAnnotation.class,
+        CoreAnnotations.PartOfSpeechAnnotation.class,
+        CoreAnnotations.LemmaAnnotation.class,
+        SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class,
+        SemanticGraphCoreAnnotations.CollapsedDependenciesAnnotation.class,
+        SemanticGraphCoreAnnotations.CollapsedCCProcessedDependenciesAnnotation.class,
+        CoreAnnotations.OriginalTextAnnotation.class
+    ));
+<span class="nc" id="L483">    return Collections.unmodifiableSet(requirements);</span>
+  }
+
+  /**
+   * A debugging method to try relation extraction from the console.
+   * @throws IOException If any IO problem
+   */
+  public static void main(String[] args) throws IOException {
+<span class="nc" id="L491">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L492">    props.setProperty(&quot;annotators&quot;, &quot;tokenize,ssplit,pos,lemma,ner,regexner,parse,mention,coref,kbp&quot;);</span>
+<span class="nc" id="L493">    props.setProperty(&quot;regexner.mapping&quot;, &quot;ignorecase=true,validpospattern=^(NN|JJ).*,edu/stanford/nlp/models/kbp/regexner_caseless.tab;edu/stanford/nlp/models/kbp/regexner_cased.tab&quot;);</span>
+
+<span class="nc" id="L495">    StanfordCoreNLP pipeline = new StanfordCoreNLP(props);</span>
+<span class="nc" id="L496">    IOUtils.console(&quot;sentence&gt; &quot;, line -&gt; {</span>
+<span class="nc" id="L497">      Annotation ann = new Annotation(line);</span>
+<span class="nc" id="L498">      pipeline.annotate(ann);</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">      for (CoreMap sentence : ann.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L500">        sentence.get(CoreAnnotations.KBPTriplesAnnotation.class).forEach(System.err::println);</span>
+<span class="nc" id="L501">      }</span>
+<span class="nc" id="L502">    });</span>
+<span class="nc" id="L503">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

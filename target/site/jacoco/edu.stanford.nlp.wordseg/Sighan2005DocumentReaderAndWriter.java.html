@@ -1,0 +1,452 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Sighan2005DocumentReaderAndWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.wordseg</a> &gt; <span class="el_source">Sighan2005DocumentReaderAndWriter.java</span></div><h1>Sighan2005DocumentReaderAndWriter.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.wordseg;
+
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.Reader;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.fsm.DFSA;
+import edu.stanford.nlp.fsm.DFSAState;
+import edu.stanford.nlp.fsm.DFSATransition;
+import edu.stanford.nlp.io.EncodingPrintWriter;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.objectbank.IteratorFromReaderFactory;
+import edu.stanford.nlp.objectbank.LineIterator;
+import edu.stanford.nlp.process.ChineseDocumentToSentenceProcessor;
+import edu.stanford.nlp.sequences.DocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.LatticeWriter;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseUtils;
+import edu.stanford.nlp.util.Characters;
+
+import java.util.function.Function;
+
+
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.MutableInteger;
+import edu.stanford.nlp.util.StringUtils;
+
+/**
+ * DocumentReader for Chinese segmentation task. (Sighan bakeoff 2005)
+ * Reads in characters and labels them as 1 or 0 (word START or NONSTART).
+ *
+ * Note: maybe this can do less interning, since some is done in
+ * ObjectBankWrapper, but this also calls trim() as it works....
+ *
+ * @author Pi-Chuan Chang
+ * @author Michel Galley (Viterbi seearch graph printing)
+ */
+<span class="nc bnc" id="L49" title="All 2 branches missed.">public class Sighan2005DocumentReaderAndWriter implements DocumentReaderAndWriter&lt;CoreLabel&gt;, LatticeWriter&lt;CoreLabel, String, Integer&gt; /* Serializable */ {</span>
+
+  private static final long serialVersionUID = 3260295150250263237L;
+
+<span class="nc" id="L53">  private static Redwood.RedwoodChannels logger = Redwood.channels(Sighan2005DocumentReaderAndWriter.class);</span>
+
+  private static final boolean DEBUG = false;
+  private static final boolean DEBUG_MORE = false;
+
+  // year, month, day chars.  Sometime try adding \u53f7 and see if it helps...
+<span class="nc" id="L59">  private static final Pattern dateChars = Pattern.compile(&quot;[\u5E74\u6708\u65E5]&quot;);</span>
+  // year, month, day chars.  Adding \u53F7 and seeing if it helps...
+<span class="nc" id="L61">  private static final Pattern dateCharsPlus = Pattern.compile(&quot;[\u5E74\u6708\u65E5\u53f7]&quot;);</span>
+  // number chars (Chinese and Western).
+  // You get U+25CB circle masquerading as zero in mt data - or even in Sighan 2003 ctb
+  // add U+25EF for good measure (larger geometric circle)
+<span class="nc" id="L65">  private static final Pattern numberChars = Pattern.compile(&quot;[0-9\uff10-\uff19&quot; +</span>
+        &quot;\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4E5D\u5341&quot; +
+        &quot;\u96F6\u3007\u767E\u5343\u4E07\u4ebf\u5169\u25cb\u25ef\u3021-\u3029\u3038-\u303A]&quot;);
+  // A-Za-z, narrow and full width
+<span class="nc" id="L69">  private static final Pattern letterChars = Pattern.compile(&quot;[A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]&quot;);</span>
+<span class="nc" id="L70">  private static final Pattern periodChars = Pattern.compile(&quot;[\ufe52\u2027\uff0e.\u70B9]&quot;);</span>
+
+  // two punctuation classes for Low and Ng style features.
+<span class="nc" id="L73">  private final Pattern separatingPuncChars = Pattern.compile(&quot;[]!\&quot;(),;:&lt;=&gt;?\\[\\\\`{|}~^\u3001-\u3003\u3008-\u3011\u3014-\u301F\u3030&quot; +</span>
+        &quot;\uff3d\uff01\uff02\uff08\uff09\uff0c\uff1b\uff1a\uff1c\uff1d\uff1e\uff1f&quot; +
+        &quot;\uff3b\uff3c\uff40\uff5b\uff5c\uff5d\uff5e\uff3e]&quot;);
+<span class="nc" id="L76">  private final Pattern ambiguousPuncChars = Pattern.compile(&quot;[-#$%&amp;'*+/@_\uff0d\uff03\uff04\uff05\uff06\uff07\uff0a\uff0b\uff0f\uff20\uff3f]&quot;);</span>
+<span class="nc" id="L77">  private final Pattern midDotPattern = Pattern.compile(ChineseUtils.MID_DOT_REGEX_STR);</span>
+
+  private ChineseDocumentToSentenceProcessor cdtos;
+  private ChineseDictionary cdict, cdict2;
+  private SeqClassifierFlags flags;
+  private IteratorFromReaderFactory&lt;List&lt;CoreLabel&gt;&gt; factory;
+
+  @Override
+  public Iterator&lt;List&lt;CoreLabel&gt;&gt; getIterator(Reader r) {
+<span class="nc" id="L86">    return factory.getIterator(r);</span>
+  }
+
+  @Override
+  public void init(SeqClassifierFlags flags) {
+<span class="nc" id="L91">    this.flags = flags;</span>
+<span class="nc" id="L92">    factory = LineIterator.getFactory(new CTBDocumentParser());</span>
+    if (DEBUG) EncodingPrintWriter.err.println(&quot;Sighan2005DocRandW: using normalization file &quot; + flags.normalizationTable, &quot;UTF-8&quot;);
+    // pichuan : flags.normalizationTable is null --&gt; i believe this is replaced by some java class??
+    // (Thu Apr 24 11:10:42 2008)
+<span class="nc" id="L96">    cdtos = new ChineseDocumentToSentenceProcessor(flags.normalizationTable);</span>
+
+<span class="nc bnc" id="L98" title="All 2 branches missed.">    if (flags.dictionary != null) {</span>
+<span class="nc" id="L99">      String[] dicts = flags.dictionary.split(&quot;,&quot;);</span>
+<span class="nc" id="L100">      cdict = new ChineseDictionary(dicts, cdtos, flags.expandMidDot);</span>
+    }
+<span class="nc bnc" id="L102" title="All 2 branches missed.">    if (flags.serializedDictionary != null) {</span>
+<span class="nc" id="L103">      String dict = flags.serializedDictionary;</span>
+<span class="nc" id="L104">      cdict = new ChineseDictionary(dict, cdtos, flags.expandMidDot);</span>
+    }
+
+<span class="nc bnc" id="L107" title="All 2 branches missed.">    if (flags.dictionary2 != null) {</span>
+<span class="nc" id="L108">      String[] dicts2 = flags.dictionary2.split(&quot;,&quot;);</span>
+<span class="nc" id="L109">      cdict2 = new ChineseDictionary(dicts2, cdtos, flags.expandMidDot);</span>
+    }
+<span class="nc" id="L111">  }</span>
+
+
+<span class="nc" id="L114">  class CTBDocumentParser implements Function&lt;String,List&lt;CoreLabel&gt;&gt;, Serializable {</span>
+    private static final long serialVersionUID = 3260297180259462337L;
+
+<span class="nc" id="L117">    private String defaultMap = &quot;char=0,answer=1&quot;;</span>
+<span class="nc" id="L118">    public String[] map = StringUtils.mapStringToArray(defaultMap);</span>
+
+
+    @Override
+    public List&lt;CoreLabel&gt; apply(String line) {
+<span class="nc bnc" id="L123" title="All 2 branches missed.">      if (line == null) {</span>
+<span class="nc" id="L124">        return null;</span>
+      }
+
+      // logger.info(&quot;input: &quot; + line);
+
+      //Matcher tagMatcher = tagPattern.matcher(line);
+      //line = tagMatcher.replaceAll(&quot;&quot;);
+<span class="nc" id="L131">      line = line.trim();</span>
+
+<span class="nc" id="L133">      List&lt;CoreLabel&gt; lwi = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L134">      String origLine = line;</span>
+      if (DEBUG) EncodingPrintWriter.err.println(&quot;ORIG: &quot; + line, &quot;UTF-8&quot;);
+<span class="nc" id="L136">      line = cdtos.normalization(origLine);</span>
+      if (DEBUG) EncodingPrintWriter.err.println(&quot;NORM: &quot; + line, &quot;UTF-8&quot;);
+<span class="nc" id="L138">      int origIndex = 0;</span>
+<span class="nc" id="L139">      int position = 0;</span>
+
+<span class="nc" id="L141">      StringBuilder nonspaceLineSB = new StringBuilder();</span>
+
+<span class="nc bnc" id="L143" title="All 2 branches missed.">      for (int index = 0, len = line.length(); index &lt; len; index++) {</span>
+<span class="nc" id="L144">        char ch = line.charAt(index);</span>
+<span class="nc" id="L145">        CoreLabel wi = new CoreLabel();</span>
+<span class="nc bnc" id="L146" title="All 4 branches missed.">        if ( ! Character.isWhitespace(ch) &amp;&amp; ! Character.isISOControl(ch)) {</span>
+<span class="nc" id="L147">          String wordString = Character.toString(ch);</span>
+<span class="nc" id="L148">          wi.set(CoreAnnotations.CharAnnotation.class, intern(wordString));</span>
+<span class="nc" id="L149">          nonspaceLineSB.append(wordString);</span>
+
+          // non-breaking space is skipped as well
+<span class="nc bnc" id="L152" title="All 6 branches missed.">          while (Character.isWhitespace(origLine.charAt(origIndex)) || Character.isISOControl(origLine.charAt(origIndex)) || (origLine.charAt(origIndex) == '\u00A0')) {</span>
+<span class="nc" id="L153">            origIndex++;</span>
+          }
+
+<span class="nc" id="L156">          wordString = Character.toString(origLine.charAt(origIndex));</span>
+<span class="nc" id="L157">          wi.set(CoreAnnotations.OriginalCharAnnotation.class, intern(wordString));</span>
+
+          // put in a word shape
+<span class="nc bnc" id="L160" title="All 2 branches missed.">          if (flags.useShapeStrings) {</span>
+<span class="nc" id="L161">            wi.set(CoreAnnotations.ShapeAnnotation.class, shapeOf(wordString));</span>
+          }
+<span class="nc bnc" id="L163" title="All 6 branches missed.">          if (flags.useUnicodeType || flags.useUnicodeType4gram || flags.useUnicodeType5gram) {</span>
+<span class="nc" id="L164">            wi.set(CoreAnnotations.UTypeAnnotation.class, Character.getType(ch));</span>
+          }
+<span class="nc bnc" id="L166" title="All 2 branches missed.">          if (flags.useUnicodeBlock) {</span>
+<span class="nc" id="L167">            wi.set(CoreAnnotations.UBlockAnnotation.class, Characters.unicodeBlockStringOf(ch));</span>
+          }
+
+<span class="nc" id="L170">          origIndex++;</span>
+
+<span class="nc bnc" id="L172" title="All 2 branches missed.">          if (index == 0) { // first character of a sentence (a line)</span>
+<span class="nc" id="L173">            wi.set(CoreAnnotations.AnswerAnnotation.class, &quot;1&quot;);</span>
+<span class="nc" id="L174">            wi.set(CoreAnnotations.SpaceBeforeAnnotation.class, &quot;1&quot;);</span>
+<span class="nc" id="L175">            wi.set(CoreAnnotations.GoldAnswerAnnotation.class, &quot;1&quot;);</span>
+<span class="nc bnc" id="L176" title="All 4 branches missed.">          } else if (Character.isWhitespace(line.charAt(index - 1)) || Character.isISOControl(line.charAt(index - 1))) {</span>
+<span class="nc" id="L177">            wi.set(CoreAnnotations.AnswerAnnotation.class, &quot;1&quot;);</span>
+<span class="nc" id="L178">            wi.set(CoreAnnotations.SpaceBeforeAnnotation.class, &quot;1&quot;);</span>
+<span class="nc" id="L179">            wi.set(CoreAnnotations.GoldAnswerAnnotation.class, &quot;1&quot;);</span>
+          } else {
+<span class="nc" id="L181">            wi.set(CoreAnnotations.AnswerAnnotation.class, &quot;0&quot;);</span>
+<span class="nc" id="L182">            wi.set(CoreAnnotations.SpaceBeforeAnnotation.class, &quot;0&quot;);</span>
+<span class="nc" id="L183">            wi.set(CoreAnnotations.GoldAnswerAnnotation.class, &quot;0&quot;);</span>
+          }
+<span class="nc" id="L185">          wi.set(CoreAnnotations.PositionAnnotation.class, intern(String.valueOf((position))));</span>
+<span class="nc" id="L186">          position++;</span>
+          if (DEBUG_MORE) EncodingPrintWriter.err.println(wi.toString(), &quot;UTF-8&quot;);
+<span class="nc" id="L188">          lwi.add(wi);</span>
+        }
+      }
+<span class="nc bnc" id="L191" title="All 4 branches missed.">      if (flags.dictionary != null || flags.serializedDictionary != null) {</span>
+<span class="nc" id="L192">        String nonspaceLine = nonspaceLineSB.toString();</span>
+<span class="nc" id="L193">        addDictionaryFeatures(cdict, CoreAnnotations.LBeginAnnotation.class, CoreAnnotations.LMiddleAnnotation.class, CoreAnnotations.LEndAnnotation.class, nonspaceLine, lwi);</span>
+      }
+
+<span class="nc bnc" id="L196" title="All 2 branches missed.">      if (flags.dictionary2 != null) {</span>
+<span class="nc" id="L197">        String nonspaceLine = nonspaceLineSB.toString();</span>
+<span class="nc" id="L198">        addDictionaryFeatures(cdict2, CoreAnnotations.D2_LBeginAnnotation.class, CoreAnnotations.D2_LMiddleAnnotation.class, CoreAnnotations.D2_LEndAnnotation.class, nonspaceLine, lwi);</span>
+      }
+      // logger.info(&quot;output: &quot; + lwi.size());
+<span class="nc" id="L201">      return lwi;</span>
+    }
+  }
+
+  /** Calculates a character shape for Chinese. */
+  private String shapeOf(String input) {
+    String shape;
+<span class="nc bnc" id="L208" title="All 4 branches missed.">    if (flags.augmentedDateChars &amp;&amp; Sighan2005DocumentReaderAndWriter.dateCharsPlus.matcher(input).matches()) {</span>
+<span class="nc" id="L209">      shape = &quot;D&quot;;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">    } else if (Sighan2005DocumentReaderAndWriter.dateChars.matcher(input).matches()) {</span>
+<span class="nc" id="L211">      shape = &quot;D&quot;;</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">    } else if (Sighan2005DocumentReaderAndWriter.numberChars.matcher(input).matches()) {</span>
+<span class="nc" id="L213">      shape = &quot;N&quot;;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    } else if (Sighan2005DocumentReaderAndWriter.letterChars.matcher(input).matches()) {</span>
+<span class="nc" id="L215">      shape = &quot;L&quot;;</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">    } else if (Sighan2005DocumentReaderAndWriter.periodChars.matcher(input).matches()) {</span>
+<span class="nc" id="L217">      shape = &quot;P&quot;;</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">    } else if (separatingPuncChars.matcher(input).matches()) {</span>
+<span class="nc" id="L219">      shape = &quot;S&quot;;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">    } else if (ambiguousPuncChars.matcher(input).matches()) {</span>
+<span class="nc" id="L221">      shape = &quot;A&quot;;</span>
+<span class="nc bnc" id="L222" title="All 4 branches missed.">    } else if (flags.useMidDotShape &amp;&amp; midDotPattern.matcher(input).matches()) {</span>
+<span class="nc" id="L223">      shape = &quot;M&quot;;</span>
+    } else {
+<span class="nc" id="L225">      shape = &quot;C&quot;;</span>
+    }
+<span class="nc" id="L227">    return shape;</span>
+  }
+
+
+  private static void addDictionaryFeatures(ChineseDictionary dict, Class&lt;? extends CoreAnnotation&lt;String&gt;&gt; lbeginFieldName, Class&lt;? extends CoreAnnotation&lt;String&gt;&gt; lmiddleFieldName, Class&lt;? extends CoreAnnotation&lt;String&gt;&gt; lendFieldName, String nonspaceLine, List&lt;CoreLabel&gt; lwi) {
+<span class="nc" id="L232">    int lwiSize = lwi.size();</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">    if (lwiSize != nonspaceLine.length()) { throw new RuntimeException(); }</span>
+<span class="nc" id="L234">    int[] lbegin = new int[lwiSize];</span>
+<span class="nc" id="L235">    int[] lmiddle = new int[lwiSize];</span>
+<span class="nc" id="L236">    int[] lend = new int[lwiSize];</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">    for (int i = 0; i &lt; lwiSize; i++) {</span>
+<span class="nc" id="L238">      lbegin[i] = lmiddle[i] = lend[i] = 0;</span>
+    }
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    for (int i = 0; i &lt; lwiSize; i++) {</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">      for (int leng = ChineseDictionary.MAX_LEXICON_LENGTH; leng &gt;= 1; leng--) {</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (i+leng-1 &lt; lwiSize) {</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">          if (dict.contains(nonspaceLine.substring(i, i+leng))) {</span>
+            // lbegin
+<span class="nc bnc" id="L245" title="All 2 branches missed.">            if (leng &gt; lbegin[i]) {</span>
+<span class="nc" id="L246">              lbegin[i] = leng;</span>
+            }
+            // lmid
+<span class="nc" id="L249">            int last = i+leng-1;</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            if (leng==ChineseDictionary.MAX_LEXICON_LENGTH) { last+=1; }</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            for (int mid = i+1; mid &lt; last; mid++) {</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">              if (leng &gt; lmiddle[mid]) {</span>
+<span class="nc" id="L253">                lmiddle[mid] = leng;</span>
+              }
+            }
+            // lend
+<span class="nc bnc" id="L257" title="All 2 branches missed.">            if (leng&lt;ChineseDictionary.MAX_LEXICON_LENGTH) {</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">              if (leng &gt; lend[i+leng-1]) {</span>
+<span class="nc" id="L259">                lend[i+leng-1] = leng;</span>
+              }
+            }
+          }
+        }
+      }
+    }
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    for (int i = 0; i &lt; lwiSize; i++) {</span>
+<span class="nc" id="L267">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L268">      sb.append(lbegin[i]);</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">      if (lbegin[i]==ChineseDictionary.MAX_LEXICON_LENGTH) {</span>
+<span class="nc" id="L270">        sb.append(&quot;+&quot;);</span>
+      }
+<span class="nc" id="L272">      lwi.get(i).set(lbeginFieldName, sb.toString());</span>
+
+<span class="nc" id="L274">      sb = new StringBuilder();</span>
+<span class="nc" id="L275">      sb.append(lmiddle[i]);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">      if (lmiddle[i]==ChineseDictionary.MAX_LEXICON_LENGTH) {</span>
+<span class="nc" id="L277">        sb.append(&quot;+&quot;);</span>
+      }
+<span class="nc" id="L279">      lwi.get(i).set(lmiddleFieldName, sb.toString());</span>
+
+<span class="nc" id="L281">      sb = new StringBuilder();</span>
+<span class="nc" id="L282">      sb.append(lend[i]);</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">      if (lend[i]==ChineseDictionary.MAX_LEXICON_LENGTH) {</span>
+<span class="nc" id="L284">        sb.append(&quot;+&quot;);</span>
+      }
+<span class="nc" id="L286">      lwi.get(i).set(lendFieldName, sb.toString());</span>
+
+      //logger.info(lwi.get(i));
+    }
+<span class="nc" id="L290">  }</span>
+
+  @Override
+  public void printAnswers(List&lt;CoreLabel&gt; doc, PrintWriter pw) {
+<span class="nc" id="L294">    String ansStr = ChineseStringUtils.combineSegmentedSentence(doc, flags);</span>
+<span class="nc" id="L295">    pw.print(ansStr);</span>
+<span class="nc" id="L296">    pw.println();</span>
+<span class="nc" id="L297">  }</span>
+
+
+  private static String intern(String s) {
+<span class="nc" id="L301">    return s.trim().intern();</span>
+  }
+
+  @Override
+  public void printLattice(DFSA&lt;String, Integer&gt; tagLattice, List&lt;CoreLabel&gt; doc, PrintWriter out) {
+<span class="nc" id="L306">    CoreLabel[] docArray = doc.toArray(new CoreLabel[doc.size()]);</span>
+    // Create answer lattice:
+<span class="nc" id="L308">    MutableInteger nodeId = new MutableInteger(0);</span>
+<span class="nc" id="L309">    DFSA&lt;String, Integer&gt; answerLattice = new DFSA&lt;&gt;(null);</span>
+<span class="nc" id="L310">    DFSAState&lt;String, Integer&gt; aInitState = new DFSAState&lt;&gt;(nodeId.intValue(), answerLattice);</span>
+<span class="nc" id="L311">    answerLattice.setInitialState(aInitState);</span>
+<span class="nc" id="L312">    Map&lt;DFSAState&lt;String, Integer&gt;,DFSAState&lt;String, Integer&gt;&gt; stateLinks = Generics.newHashMap();</span>
+    // Convert binary lattice into word lattice:
+<span class="nc" id="L314">    tagLatticeToAnswerLattice</span>
+<span class="nc" id="L315">      (tagLattice.initialState(), aInitState, new StringBuilder(&quot;&quot;), nodeId, 0, 0.0, stateLinks, answerLattice, docArray);</span>
+    try {
+<span class="nc" id="L317">      answerLattice.printAttFsmFormat(out);</span>
+<span class="nc" id="L318">    } catch(IOException e) {</span>
+<span class="nc" id="L319">      throw new RuntimeException(e);</span>
+<span class="nc" id="L320">    }</span>
+<span class="nc" id="L321">  }</span>
+
+  /**
+   * Recursively builds an answer lattice (Chinese words) from a Viterbi search graph
+   * of binary predictions. This function does a limited amount of post-processing:
+   * preserve white spaces of the input, and not segment between two latin characters or
+   * between two digits. Consequently, the probabilities of all paths in answerLattice
+   * may not sum to 1 (they do sum to 1 if no post processing applies).
+   *
+   * @param tSource Current node in Viterbi search graph.
+   * @param aSource Current node in answer lattice.
+   * @param answer Partial word starting at aSource.
+   * @param nodeId Currently unused node identifier for answer graph.
+   * @param pos Current position in docArray.
+   * @param cost Current cost of answer.
+   * @param stateLinks Maps nodes of the search graph to nodes in answer lattice
+   * (when paths of the search graph are recombined, paths of the answer lattice should be
+   *  recombined as well, if at word boundary).
+   */
+  private void tagLatticeToAnswerLattice
+         (DFSAState&lt;String, Integer&gt; tSource, DFSAState&lt;String, Integer&gt; aSource, StringBuilder answer,
+          MutableInteger nodeId, int pos, double cost,
+          Map&lt;DFSAState&lt;String, Integer&gt;,DFSAState&lt;String, Integer&gt;&gt; stateLinks,
+          DFSA&lt;String, Integer&gt; answerLattice, CoreLabel[] docArray) {
+    // Add &quot;1&quot; prediction after the end of the sentence, if applicable:
+<span class="nc bnc" id="L346" title="All 4 branches missed.">    if(tSource.isAccepting() &amp;&amp; tSource.continuingInputs().isEmpty()) {</span>
+<span class="nc" id="L347">      tSource.addTransition</span>
+<span class="nc" id="L348">        (new DFSATransition&lt;&gt;(&quot;&quot;, tSource, new DFSAState&lt;&gt;(-1, null), &quot;1&quot;, &quot;&quot;, 0));</span>
+    }
+    // Get current label, character, and prediction:
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    CoreLabel curLabel = (pos &lt; docArray.length) ? docArray[pos] : null;</span>
+<span class="nc" id="L352">    String curChr = null, origSpace = null;</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    if(curLabel != null) {</span>
+<span class="nc" id="L354">      curChr = curLabel.get(CoreAnnotations.OriginalCharAnnotation.class);</span>
+<span class="nc bnc" id="L355" title="All 4 branches missed.">      assert(curChr.length() == 1);</span>
+<span class="nc" id="L356">      origSpace = curLabel.get(CoreAnnotations.SpaceBeforeAnnotation.class);</span>
+    }
+    // Get set of successors in search graph:
+<span class="nc" id="L359">    Set&lt;String&gt; inputs = tSource.continuingInputs();</span>
+    // Only keep most probable transition out of initial state:
+<span class="nc" id="L361">    String answerConstraint = null;</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    if(pos == 0) {</span>
+<span class="nc" id="L363">      double minCost = Double.POSITIVE_INFINITY;</span>
+      // DFSATransition&lt;String, Integer&gt; bestTransition = null;
+<span class="nc bnc" id="L365" title="All 2 branches missed.">      for (String predictSpace : inputs) {</span>
+<span class="nc" id="L366">        DFSATransition&lt;String, Integer&gt; transition = tSource.transition(predictSpace);</span>
+<span class="nc" id="L367">        double transitionCost = transition.score();</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (transitionCost &lt; minCost) {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">          if (predictSpace != null) {</span>
+<span class="nc" id="L370">            logger.info(String.format(&quot;mincost (%s): %e -&gt; %e%n&quot;, predictSpace, minCost, transitionCost));</span>
+<span class="nc" id="L371">            minCost = transitionCost;</span>
+<span class="nc" id="L372">            answerConstraint = predictSpace;</span>
+          }
+        }
+<span class="nc" id="L375">      }</span>
+    }
+    // Follow along each transition:
+<span class="nc bnc" id="L378" title="All 2 branches missed.">    for (String predictSpace : inputs) {</span>
+<span class="nc" id="L379">      DFSATransition&lt;String, Integer&gt; transition = tSource.transition(predictSpace);</span>
+<span class="nc" id="L380">      DFSAState&lt;String, Integer&gt; tDest = transition.target();</span>
+<span class="nc" id="L381">      DFSAState&lt;String, Integer&gt; newASource = aSource;</span>
+      //logger.info(String.format(&quot;tsource=%s tdest=%s asource=%s pos=%d predictSpace=%s%n&quot;, tSource, tDest, newASource, pos, predictSpace));
+<span class="nc" id="L383">      StringBuilder newAnswer = new StringBuilder(answer.toString());</span>
+<span class="nc" id="L384">      int answerLen = newAnswer.length();</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">      String prevChr = (answerLen &gt; 0) ? newAnswer.substring(answerLen-1) : null;</span>
+<span class="nc" id="L386">      double newCost = cost;</span>
+      // Ignore paths starting with zero:
+<span class="nc bnc" id="L388" title="All 4 branches missed.">      if(answerConstraint != null &amp;&amp; !answerConstraint.equals(predictSpace)) {</span>
+<span class="nc" id="L389">        logger.info(String.format(&quot;Skipping transition %s at pos 0.%n&quot;, predictSpace));</span>
+<span class="nc" id="L390">        continue;</span>
+      }
+      // Ignore paths not consistent with input segmentation:
+<span class="nc bnc" id="L393" title="All 6 branches missed.">      if(flags.keepAllWhitespaces &amp;&amp; &quot;0&quot;.equals(predictSpace) &amp;&amp; &quot;1&quot;.equals(origSpace)) {</span>
+<span class="nc" id="L394">          logger.info(String.format(&quot;Skipping non-boundary at pos %d, since space in the input.%n&quot;,pos));</span>
+<span class="nc" id="L395">          continue;</span>
+      }
+      // Ignore paths adding segment boundaries between two latin characters, or between two digits:
+      // (unless already present in original input)
+<span class="nc bnc" id="L399" title="All 8 branches missed.">      if(&quot;1&quot;.equals(predictSpace) &amp;&amp; &quot;0&quot;.equals(origSpace) &amp;&amp; prevChr != null &amp;&amp; curChr != null) {</span>
+<span class="nc" id="L400">        char p = prevChr.charAt(0), c = curChr.charAt(0);</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (ChineseStringUtils.isLetterASCII(p) &amp;&amp;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            ChineseStringUtils.isLetterASCII(c)) {</span>
+<span class="nc" id="L403">          logger.info(String.format(&quot;Not hypothesizing a boundary at pos %d, since between two ASCII letters (%s and %s).%n&quot;,</span>
+<span class="nc" id="L404">            pos,prevChr,curChr));</span>
+<span class="nc" id="L405">          continue;</span>
+        }
+<span class="nc bnc" id="L407" title="All 4 branches missed.">        if(ChineseUtils.isNumber(p) &amp;&amp; ChineseUtils.isNumber(c)) {</span>
+<span class="nc" id="L408">          logger.info(String.format(&quot;Not hypothesizing a boundary at pos %d, since between two numeral characters (%s and %s).%n&quot;,</span>
+<span class="nc" id="L409">            pos,prevChr,curChr));</span>
+<span class="nc" id="L410">          continue;</span>
+        }
+      }
+      // If predictSpace==1, create a new transition in answer search graph:
+<span class="nc bnc" id="L414" title="All 2 branches missed.">      if (&quot;1&quot;.equals(predictSpace)) {</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        if (newAnswer.toString().length() &gt; 0) {</span>
+          // If answer destination node visited before, create a new edge and leave:
+<span class="nc bnc" id="L417" title="All 2 branches missed.">          if(stateLinks.containsKey(tSource)) {</span>
+<span class="nc" id="L418">            DFSAState&lt;String, Integer&gt; aDest = stateLinks.get(tSource);</span>
+<span class="nc" id="L419">            newASource.addTransition</span>
+<span class="nc" id="L420">              (new DFSATransition&lt;&gt;(&quot;&quot;, newASource, aDest, newAnswer.toString(), &quot;&quot;, newCost));</span>
+            //logger.info(String.format(&quot;new transition: asource=%s adest=%s edge=%s%n&quot;, newASource, aDest, newAnswer));
+<span class="nc" id="L422">            continue;</span>
+          }
+          // If answer destination node not visited before, create it + new edge:
+<span class="nc" id="L425">          nodeId.incValue(1);</span>
+<span class="nc" id="L426">          DFSAState&lt;String, Integer&gt; aDest = new DFSAState&lt;&gt;(nodeId.intValue(), answerLattice, 0.0);</span>
+<span class="nc" id="L427">          stateLinks.put(tSource,aDest);</span>
+<span class="nc" id="L428">          newASource.addTransition(new DFSATransition&lt;&gt;(&quot;&quot;, newASource, aDest, newAnswer.toString(), &quot;&quot;, newCost));</span>
+          //logger.info(String.format(&quot;new edge: adest=%s%n&quot;, newASource, aDest, newAnswer));
+          //logger.info(String.format(&quot;new transition: asource=%s adest=%s edge=%s%n%n%n&quot;, newASource, aDest, newAnswer));
+          // Reached an accepting state:
+<span class="nc bnc" id="L432" title="All 2 branches missed.">          if(tSource.isAccepting()) {</span>
+<span class="nc" id="L433">            aDest.setAccepting(true);</span>
+<span class="nc" id="L434">            continue;</span>
+          }
+          // Start new answer edge:
+<span class="nc" id="L437">          newASource = aDest;</span>
+<span class="nc" id="L438">          newAnswer = new StringBuilder();</span>
+<span class="nc" id="L439">          newCost = 0.0;</span>
+        }
+      }
+<span class="nc bnc" id="L442" title="All 4 branches missed.">      assert(curChr != null);</span>
+<span class="nc" id="L443">      newAnswer.append(curChr);</span>
+<span class="nc" id="L444">      newCost += transition.score();</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">      if (newCost &lt; flags.searchGraphPrune ||</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">          ChineseStringUtils.isLetterASCII(curChr.charAt(0)))</span>
+<span class="nc" id="L447">        tagLatticeToAnswerLattice(tDest, newASource, newAnswer, nodeId, pos+1, newCost, stateLinks, answerLattice, docArray);</span>
+<span class="nc" id="L448">    }</span>
+<span class="nc" id="L449">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

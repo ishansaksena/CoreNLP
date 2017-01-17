@@ -1,0 +1,1771 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SieveCoreferenceSystem.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.dcoref</a> &gt; <span class="el_source">SieveCoreferenceSystem.java</span></div><h1>SieveCoreferenceSystem.java</h1><pre class="source lang-java linenums">//
+// StanfordCoreNLP -- a suite of NLP tools
+// Copyright (c) 2009-2011 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//
+
+package edu.stanford.nlp.dcoref;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.TreeSet;
+import java.util.logging.FileHandler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.pipeline.DefaultPaths;
+import edu.stanford.nlp.classify.LogisticClassifier;
+import edu.stanford.nlp.dcoref.CorefChain.CorefMention;
+import edu.stanford.nlp.dcoref.Dictionaries.MentionType;
+import edu.stanford.nlp.dcoref.ScorerBCubed.BCubedType;
+import edu.stanford.nlp.dcoref.sievepasses.DeterministicCorefSieve;
+import edu.stanford.nlp.dcoref.sievepasses.ExactStringMatch;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.io.StringOutputStream;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.NewlineLogFormatter;
+
+
+/**
+ * Multi-pass Sieve coreference resolution system (see EMNLP 2010 paper).
+ * &lt;p&gt;
+ * The main entry point for API is coref(Document document).
+ * The output is a map from CorefChain ID to corresponding CorefChain.
+ *
+ * @author Jenny Finkel
+ * @author Mihai Surdeanu
+ * @author Karthik Raghunathan
+ * @author Heeyoung Lee
+ * @author Sudarshan Rangarajan
+ */
+<span class="nc bnc" id="L90" title="All 2 branches missed.">public class SieveCoreferenceSystem  {</span>
+
+  /** A logger for this class. Still uses j.u.l currently. */
+<span class="nc" id="L93">  public static final Logger logger = Logger.getLogger(SieveCoreferenceSystem.class.getName());</span>
+
+  /**
+   * If true, we score the output of the given test document
+   * Assumes gold annotations are available
+   */
+  private final boolean doScore;
+
+  /**
+   * If true, we do post processing.
+   */
+  private final boolean doPostProcessing;
+
+  /**
+   * maximum sentence distance between two mentions for resolution (-1: no constraint on distance)
+   */
+  private final int maxSentDist;
+
+  /**
+   * automatically set by looking at sieves
+   */
+  private final boolean useSemantics;
+
+  /**
+   * Singleton predictor from Recasens, de Marneffe, and Potts (NAACL 2013)
+   */
+  private final boolean useSingletonPredictor;
+
+  /** flag for replicating CoNLL result */
+  private final boolean replicateCoNLL;
+
+  /** Path for the official CoNLL scorer  */
+  public final String conllMentionEvalScript;
+
+  /** flag for optimizing ordering of sieves */
+  private final boolean optimizeSieves;
+  /** Constraints on sieve order */
+  private List&lt;Pair&lt;Integer,Integer&gt;&gt; sievesKeepOrder;
+
+  /** Final score to use for sieve optimization (default is pairwise.Precision) */
+  private final String optimizeScoreType;
+  /** More useful break down of optimizeScoreType */
+  private final boolean optimizeConllScore;
+  private final String optimizeMetricType;
+  private final CorefScorer.SubScoreType optimizeSubScoreType;
+
+  /**
+   * Array of sieve passes to be used in the system
+   * Ordered from highest precision to lowest!
+   */
+  /** Not final because may change when running optimize sieve ordering but otherwise should stay fixed */
+  private /*final */DeterministicCorefSieve [] sieves;
+  private /*final*/ String [] sieveClassNames;
+
+  /**
+   * Dictionaries of all the useful goodies (gender, animacy, number etc. lists)
+   */
+  private final Dictionaries dictionaries;
+
+  /**
+   * Semantic knowledge: WordNet
+   */
+  private final Semantics semantics;
+
+  private LogisticClassifier&lt;String, String&gt; singletonPredictor;
+
+  // Below are member variables used for scoring (not thread safe)
+
+  /** Current sieve index */
+  private int currentSieve;
+
+  /** counter for links in passes ({@code Pair&lt;correct links, total links&gt;})  */
+  private List&lt;Pair&lt;Integer, Integer&gt;&gt; linksCountInPass;
+
+  /** Scores for each pass */
+  private List&lt;CorefScorer&gt; scorePairwise;
+  private List&lt;CorefScorer&gt; scoreBcubed;
+  private List&lt;CorefScorer&gt; scoreMUC;
+
+  private List&lt;CorefScorer&gt; scoreSingleDoc;
+
+  /** Additional scoring stats */
+  private int additionalCorrectLinksCount;
+  private int additionalLinksCount;
+
+<span class="nc" id="L178">  public SieveCoreferenceSystem(Properties props) throws Exception {</span>
+    // initialize required fields
+<span class="nc" id="L180">    currentSieve = -1;</span>
+
+    //
+    // construct the sieve passes
+    //
+<span class="nc" id="L185">    String sievePasses = props.getProperty(Constants.SIEVES_PROP, Constants.SIEVEPASSES);</span>
+<span class="nc" id="L186">    sieveClassNames = sievePasses.trim().split(&quot;,\\s*&quot;);</span>
+<span class="nc" id="L187">    sieves = new DeterministicCorefSieve[sieveClassNames.length];</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">    for(int i = 0; i &lt; sieveClassNames.length; i ++){</span>
+<span class="nc" id="L189">      sieves[i] = (DeterministicCorefSieve) Class.forName(&quot;edu.stanford.nlp.dcoref.sievepasses.&quot;+sieveClassNames[i]).getConstructor().newInstance();</span>
+<span class="nc" id="L190">      sieves[i].init(props);</span>
+    }
+
+    //
+    // create scoring framework
+    //
+<span class="nc" id="L196">    doScore = Boolean.parseBoolean(props.getProperty(Constants.SCORE_PROP, &quot;false&quot;));</span>
+
+    //
+    // setting post processing
+    //
+<span class="nc" id="L201">    doPostProcessing = Boolean.parseBoolean(props.getProperty(Constants.POSTPROCESSING_PROP, &quot;false&quot;));</span>
+
+    //
+    // setting singleton predictor
+    //
+<span class="nc" id="L206">    useSingletonPredictor = Boolean.parseBoolean(props.getProperty(Constants.SINGLETON_PROP, &quot;true&quot;));</span>
+
+    //
+    // setting maximum sentence distance between two mentions for resolution (-1: no constraint on distance)
+    //
+<span class="nc" id="L211">    maxSentDist = Integer.parseInt(props.getProperty(Constants.MAXDIST_PROP, &quot;-1&quot;));</span>
+
+    //
+    // set useWordNet
+    //
+<span class="nc bnc" id="L216" title="All 4 branches missed.">    useSemantics = sievePasses.contains(&quot;AliasMatch&quot;) || sievePasses.contains(&quot;LexicalChainMatch&quot;);</span>
+
+    // flag for replicating CoNLL result
+<span class="nc" id="L219">    replicateCoNLL = Boolean.parseBoolean(props.getProperty(Constants.REPLICATECONLL_PROP, &quot;false&quot;));</span>
+<span class="nc" id="L220">    conllMentionEvalScript = props.getProperty(Constants.CONLL_SCORER, Constants.conllMentionEvalScript);</span>
+
+    // flag for optimizing sieve ordering
+<span class="nc" id="L223">    optimizeSieves = Boolean.parseBoolean(props.getProperty(Constants.OPTIMIZE_SIEVES_PROP, &quot;false&quot;));</span>
+<span class="nc" id="L224">    optimizeScoreType = props.getProperty(Constants.OPTIMIZE_SIEVES_SCORE_PROP, &quot;pairwise.Precision&quot;);</span>
+
+    // Break down of the optimize score type
+<span class="nc" id="L227">    String[] validMetricTypes = { &quot;muc&quot;, &quot;pairwise&quot;, &quot;bcub&quot;, &quot;ceafe&quot;, &quot;ceafm&quot;, &quot;combined&quot; };</span>
+<span class="nc" id="L228">    String[] parts = optimizeScoreType.split(&quot;\\.&quot;);</span>
+<span class="nc bnc" id="L229" title="All 4 branches missed.">    optimizeConllScore = parts.length &gt; 2 &amp;&amp; &quot;conll&quot;.equalsIgnoreCase(parts[2]);</span>
+<span class="nc" id="L230">    optimizeMetricType = parts[0];</span>
+<span class="nc" id="L231">    boolean optimizeMetricTypeOk = false;</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    for (String validMetricType : validMetricTypes) {</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">      if (validMetricType.equalsIgnoreCase(optimizeMetricType)) {</span>
+<span class="nc" id="L234">        optimizeMetricTypeOk = true;</span>
+<span class="nc" id="L235">        break;</span>
+      }
+    }
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (!optimizeMetricTypeOk) {</span>
+<span class="nc" id="L239">      throw new IllegalArgumentException(&quot;Invalid metric type for &quot; +</span>
+              Constants.OPTIMIZE_SIEVES_SCORE_PROP + &quot; property: &quot; + optimizeScoreType);
+    }
+<span class="nc" id="L242">    optimizeSubScoreType = CorefScorer.SubScoreType.valueOf(parts[1]);</span>
+
+<span class="nc bnc" id="L244" title="All 2 branches missed.">    if (optimizeSieves) {</span>
+<span class="nc" id="L245">      String keepSieveOrder = props.getProperty(Constants.OPTIMIZE_SIEVES_KEEP_ORDER_PROP);</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">      if (keepSieveOrder != null) {</span>
+<span class="nc" id="L247">        String[] orderings = keepSieveOrder.split(&quot;\\s*,\\s*&quot;);</span>
+<span class="nc" id="L248">        sievesKeepOrder = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L249">        String firstSieveConstraint = null;</span>
+<span class="nc" id="L250">        String lastSieveConstraint = null;</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        for (String ordering:orderings) {</span>
+          // Convert ordering constraints from string
+<span class="nc" id="L253">          Pair&lt;Integer,Integer&gt; p = fromSieveOrderConstraintString(ordering, sieveClassNames);</span>
+          // Do initial check of sieves order, can only have one where the first is ANY (&lt; 0), and one where second is ANY (&lt; 0)
+<span class="nc bnc" id="L255" title="All 4 branches missed.">          if (p.first() &lt; 0 &amp;&amp; p.second() &lt; 0) {</span>
+<span class="nc" id="L256">            throw new IllegalArgumentException(&quot;Invalid ordering constraint: &quot; + ordering);</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">          } else if (p.first() &lt; 0) {</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (lastSieveConstraint != null) {</span>
+<span class="nc" id="L259">              throw new IllegalArgumentException(&quot;Cannot have these two ordering constraints: &quot; + lastSieveConstraint + &quot;,&quot; + ordering);</span>
+            }
+<span class="nc" id="L261">            lastSieveConstraint = ordering;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">          } else if (p.second() &lt; 0) {</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            if (firstSieveConstraint != null) {</span>
+<span class="nc" id="L264">              throw new IllegalArgumentException(&quot;Cannot have these two ordering constraints: &quot; + firstSieveConstraint + &quot;,&quot; + ordering);</span>
+            }
+<span class="nc" id="L266">            firstSieveConstraint = ordering;</span>
+          }
+<span class="nc" id="L268">          sievesKeepOrder.add(p);</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    if(doScore){</span>
+<span class="nc" id="L274">      initScorers();</span>
+    }
+
+    //
+    // load all dictionaries
+    //
+<span class="nc" id="L280">    dictionaries = new Dictionaries(props);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">    semantics = (useSemantics)? new Semantics(dictionaries) : null;</span>
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">    if(useSingletonPredictor){</span>
+<span class="nc" id="L284">      singletonPredictor = getSingletonPredictorFromSerializedFile(props.getProperty(Constants.SINGLETON_MODEL_PROP, DefaultPaths.DEFAULT_DCOREF_SINGLETON_MODEL));</span>
+    }
+<span class="nc" id="L286">  }</span>
+
+  public void initScorers() {
+<span class="nc" id="L289">    linksCountInPass = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L290">    scorePairwise = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L291">    scoreBcubed = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L292">    scoreMUC = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">    for (String sieveClassName : sieveClassNames) {</span>
+<span class="nc" id="L294">      scorePairwise.add(new ScorerPairwise());</span>
+<span class="nc" id="L295">      scoreBcubed.add(new ScorerBCubed(BCubedType.Bconll));</span>
+<span class="nc" id="L296">      scoreMUC.add(new ScorerMUC());</span>
+<span class="nc" id="L297">      linksCountInPass.add(new Pair&lt;&gt;(0, 0));</span>
+    }
+<span class="nc" id="L299">  }</span>
+
+<span class="nc" id="L301">  public boolean doScore() { return doScore; }</span>
+<span class="nc" id="L302">  public Dictionaries dictionaries() { return dictionaries; }</span>
+<span class="nc" id="L303">  public Semantics semantics() { return semantics; }</span>
+  public String sieveClassName(int sieveIndex)  {
+<span class="nc bnc" id="L305" title="All 4 branches missed.">    return (sieveIndex &gt;= 0 &amp;&amp; sieveIndex &lt; sieveClassNames.length)? sieveClassNames[sieveIndex]:null; }</span>
+
+  /**
+   * Needs the following properties:
+   *  -props 'Location of coref.properties'
+   * @throws Exception
+   */
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L313">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L314">    initializeAndRunCoref(props);</span>
+<span class="nc" id="L315">  }</span>
+
+  /** Returns the name of the log file that this method writes. */
+  public static String initializeAndRunCoref(Properties props) throws Exception {
+<span class="nc" id="L319">    String timeStamp = Calendar.getInstance().getTime().toString().replaceAll(&quot;\\s&quot;, &quot;-&quot;).replaceAll(&quot;:&quot;, &quot;-&quot;);</span>
+
+    //
+    // initialize logger
+    //
+<span class="nc" id="L324">    String logFileName = props.getProperty(Constants.LOG_PROP, &quot;log.txt&quot;);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    if (logFileName.endsWith(&quot;.txt&quot;)) {</span>
+<span class="nc" id="L326">      logFileName = logFileName.substring(0, logFileName.length()-4) +&quot;_&quot;+ timeStamp+&quot;.txt&quot;;</span>
+    } else {
+<span class="nc" id="L328">      logFileName = logFileName + &quot;_&quot;+ timeStamp+&quot;.txt&quot;;</span>
+    }
+    try {
+<span class="nc" id="L331">      FileHandler fh = new FileHandler(logFileName, false);</span>
+<span class="nc" id="L332">      logger.addHandler(fh);</span>
+<span class="nc" id="L333">      logger.setLevel(Level.FINE);</span>
+<span class="nc" id="L334">      fh.setFormatter(new NewlineLogFormatter());</span>
+<span class="nc" id="L335">    } catch (SecurityException | IOException e) {</span>
+<span class="nc" id="L336">      throw new RuntimeException(&quot;Cannot initialize logger!&quot;, e);</span>
+<span class="nc" id="L337">    }</span>
+
+<span class="nc" id="L339">    logger.fine(timeStamp);</span>
+<span class="nc" id="L340">    logger.fine(props.toString());</span>
+<span class="nc" id="L341">    Constants.printConstants(logger);</span>
+
+    // initialize coref system
+<span class="nc" id="L344">    SieveCoreferenceSystem corefSystem = new SieveCoreferenceSystem(props);</span>
+
+    // MentionExtractor extracts MUC, ACE, or CoNLL documents
+    MentionExtractor mentionExtractor;
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    if (props.containsKey(Constants.MUC_PROP)){</span>
+<span class="nc" id="L349">      mentionExtractor = new MUCMentionExtractor(corefSystem.dictionaries, props,</span>
+          corefSystem.semantics, corefSystem.singletonPredictor);
+<span class="nc bnc" id="L351" title="All 4 branches missed.">    } else if(props.containsKey(Constants.ACE2004_PROP) || props.containsKey(Constants.ACE2005_PROP)) {</span>
+<span class="nc" id="L352">      mentionExtractor = new ACEMentionExtractor(corefSystem.dictionaries, props,</span>
+          corefSystem.semantics, corefSystem.singletonPredictor);
+<span class="nc bnc" id="L354" title="All 2 branches missed.">    } else if (props.containsKey(Constants.CONLL2011_PROP)) {</span>
+<span class="nc" id="L355">      mentionExtractor = new CoNLLMentionExtractor(corefSystem.dictionaries, props,</span>
+          corefSystem.semantics, corefSystem.singletonPredictor);
+    } else {
+<span class="nc" id="L358">      throw new RuntimeException(&quot;No input file specified!&quot;);</span>
+    }
+
+    if (!Constants.USE_GOLD_MENTIONS) {
+      // Set mention finder
+<span class="nc" id="L363">      String mentionFinderClass = props.getProperty(Constants.MENTION_FINDER_PROP);</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">      if (mentionFinderClass != null) {</span>
+<span class="nc" id="L365">        String mentionFinderPropFilename = props.getProperty(Constants.MENTION_FINDER_PROPFILE_PROP);</span>
+        CorefMentionFinder mentionFinder;
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if (mentionFinderPropFilename != null) {</span>
+<span class="nc" id="L368">          Properties mentionFinderProps = new Properties();</span>
+<span class="nc" id="L369">          FileInputStream fis = new FileInputStream(mentionFinderPropFilename);</span>
+<span class="nc" id="L370">          mentionFinderProps.load(fis);</span>
+<span class="nc" id="L371">          fis.close();</span>
+<span class="nc" id="L372">          mentionFinder = (CorefMentionFinder) Class.forName(mentionFinderClass).getConstructor(Properties.class).newInstance(mentionFinderProps);</span>
+<span class="nc" id="L373">        } else {</span>
+<span class="nc" id="L374">          mentionFinder = (CorefMentionFinder) Class.forName(mentionFinderClass).newInstance();</span>
+        }
+<span class="nc" id="L376">        mentionExtractor.setMentionFinder(mentionFinder);</span>
+      }
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      if (mentionExtractor.mentionFinder == null) {</span>
+<span class="nc" id="L379">        logger.warning(&quot;No mention finder specified, but not using gold mentions&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L383" title="All 4 branches missed.">    if (corefSystem.optimizeSieves &amp;&amp; corefSystem.sieves.length &gt; 1) {</span>
+<span class="nc" id="L384">      corefSystem.optimizeSieveOrdering(mentionExtractor, props, timeStamp);</span>
+    }
+
+    try {
+<span class="nc" id="L388">      runAndScoreCoref(corefSystem, mentionExtractor, props, timeStamp);</span>
+<span class="nc" id="L389">    } catch (Exception ex) {</span>
+<span class="nc" id="L390">      logger.log(Level.SEVERE, &quot;ERROR in running coreference&quot;, ex);</span>
+<span class="nc" id="L391">    }</span>
+<span class="nc" id="L392">    logger.info(&quot;done&quot;);</span>
+<span class="nc" id="L393">    String endTimeStamp = Calendar.getInstance().getTime().toString().replaceAll(&quot;\\s&quot;, &quot;-&quot;);</span>
+<span class="nc" id="L394">    logger.fine(endTimeStamp);</span>
+
+<span class="nc" id="L396">    return logFileName;</span>
+  }
+
+  public static double runAndScoreCoref(SieveCoreferenceSystem corefSystem,
+                                        MentionExtractor mentionExtractor,
+                                        Properties props,
+                                        String timeStamp) throws Exception
+  {
+    // prepare conll output
+<span class="nc" id="L405">    PrintWriter writerGold = null;</span>
+<span class="nc" id="L406">    PrintWriter writerPredicted = null;</span>
+<span class="nc" id="L407">    PrintWriter writerPredictedCoref = null;</span>
+
+<span class="nc" id="L409">    String conllOutputMentionGoldFile = null;</span>
+<span class="nc" id="L410">    String conllOutputMentionPredictedFile = null;</span>
+<span class="nc" id="L411">    String conllOutputMentionCorefPredictedFile = null;</span>
+<span class="nc" id="L412">    String conllMentionEvalFile = null;</span>
+<span class="nc" id="L413">    String conllMentionEvalErrFile = null;</span>
+<span class="nc" id="L414">    String conllMentionCorefEvalFile = null;</span>
+<span class="nc" id="L415">    String conllMentionCorefEvalErrFile = null;</span>
+
+<span class="nc bnc" id="L417" title="All 2 branches missed.">    if(Constants.PRINT_CONLL_OUTPUT || corefSystem.replicateCoNLL) {</span>
+<span class="nc" id="L418">      String conllOutput = props.getProperty(Constants.CONLL_OUTPUT_PROP, &quot;conlloutput&quot;);</span>
+<span class="nc" id="L419">      conllOutputMentionGoldFile = conllOutput + &quot;-&quot;+timeStamp+&quot;.gold.txt&quot;;</span>
+<span class="nc" id="L420">      conllOutputMentionPredictedFile = conllOutput +&quot;-&quot;+timeStamp+ &quot;.predicted.txt&quot;;</span>
+<span class="nc" id="L421">      conllOutputMentionCorefPredictedFile = conllOutput +&quot;-&quot;+timeStamp+ &quot;.coref.predicted.txt&quot;;</span>
+<span class="nc" id="L422">      conllMentionEvalFile = conllOutput +&quot;-&quot;+timeStamp+ &quot;.eval.txt&quot;;</span>
+<span class="nc" id="L423">      conllMentionEvalErrFile = conllOutput +&quot;-&quot;+timeStamp+ &quot;.eval.err.txt&quot;;</span>
+<span class="nc" id="L424">      conllMentionCorefEvalFile = conllOutput +&quot;-&quot;+timeStamp+ &quot;.coref.eval.txt&quot;;</span>
+<span class="nc" id="L425">      conllMentionCorefEvalErrFile = conllOutput +&quot;-&quot;+timeStamp+ &quot;.coref.eval.err.txt&quot;;</span>
+<span class="nc" id="L426">      logger.info(&quot;CONLL MENTION GOLD FILE: &quot; + conllOutputMentionGoldFile);</span>
+<span class="nc" id="L427">      logger.info(&quot;CONLL MENTION PREDICTED FILE: &quot; + conllOutputMentionPredictedFile);</span>
+<span class="nc" id="L428">      logger.info(&quot;CONLL MENTION EVAL FILE: &quot; + conllMentionEvalFile);</span>
+      if (!Constants.SKIP_COREF) {
+<span class="nc" id="L430">        logger.info(&quot;CONLL MENTION PREDICTED WITH COREF FILE: &quot; + conllOutputMentionCorefPredictedFile);</span>
+<span class="nc" id="L431">        logger.info(&quot;CONLL MENTION WITH COREF EVAL FILE: &quot; + conllMentionCorefEvalFile);</span>
+      }
+<span class="nc" id="L433">      writerGold = new PrintWriter(new FileOutputStream(conllOutputMentionGoldFile));</span>
+<span class="nc" id="L434">      writerPredicted = new PrintWriter(new FileOutputStream(conllOutputMentionPredictedFile));</span>
+<span class="nc" id="L435">      writerPredictedCoref = new PrintWriter(new FileOutputStream(conllOutputMentionCorefPredictedFile));</span>
+    }
+
+<span class="nc" id="L438">    mentionExtractor.resetDocs();</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">    if (corefSystem.doScore()) {</span>
+<span class="nc" id="L440">      corefSystem.initScorers();</span>
+    }
+
+    //
+    // Parse one document at a time, and do single-doc coreference resolution in each.
+    //
+    // In one iteration, orderedMentionsBySentence contains a list of all
+    // mentions in one document. Each mention has properties (annotations):
+    // its surface form (Word), NER Tag, POS Tag, Index, etc.
+    //
+
+    while(true) {
+
+<span class="nc" id="L453">      Document document = mentionExtractor.nextDoc();</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">      if(document==null) break;</span>
+
+<span class="nc bnc" id="L456" title="All 2 branches missed.">      if(!props.containsKey(Constants.MUC_PROP)) {</span>
+<span class="nc" id="L457">        printRawDoc(document, true);</span>
+<span class="nc" id="L458">        printRawDoc(document, false);</span>
+      }
+<span class="nc" id="L460">      printDiscourseStructure(document);</span>
+
+<span class="nc bnc" id="L462" title="All 2 branches missed.">      if(corefSystem.doScore()){</span>
+<span class="nc" id="L463">        document.extractGoldCorefClusters();</span>
+      }
+
+<span class="nc bnc" id="L466" title="All 2 branches missed.">      if(Constants.PRINT_CONLL_OUTPUT || corefSystem.replicateCoNLL) {</span>
+        // Not doing coref - print conll output here
+<span class="nc" id="L468">        printConllOutput(document, writerGold, true);</span>
+<span class="nc" id="L469">        printConllOutput(document, writerPredicted, false);</span>
+      }
+
+      // run mention detection only
+      if(Constants.SKIP_COREF) {
+        continue;
+      }
+
+<span class="nc" id="L477">      corefSystem.coref(document);  // Do Coreference Resolution</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">      if(corefSystem.doScore()){</span>
+        //Identifying possible coreferring mentions in the corpus along with any recall/precision errors with gold corpus
+<span class="nc" id="L481">        corefSystem.printTopK(logger, document, corefSystem.semantics);</span>
+
+<span class="nc" id="L483">        logger.fine(&quot;pairwise score for this doc: &quot;);</span>
+<span class="nc" id="L484">        corefSystem.scoreSingleDoc.get(corefSystem.sieves.length-1).printF1(logger);</span>
+<span class="nc" id="L485">        logger.fine(&quot;accumulated score: &quot;);</span>
+<span class="nc" id="L486">        corefSystem.printF1(true);</span>
+<span class="nc" id="L487">        logger.fine(&quot;\n&quot;);</span>
+      }
+<span class="nc bnc" id="L489" title="All 2 branches missed.">      if(Constants.PRINT_CONLL_OUTPUT || corefSystem.replicateCoNLL){</span>
+<span class="nc" id="L490">        printConllOutput(document, writerPredictedCoref, false, true);</span>
+      }
+<span class="nc" id="L492">    }</span>
+
+<span class="nc" id="L494">    double finalScore = 0;</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">    if(Constants.PRINT_CONLL_OUTPUT || corefSystem.replicateCoNLL) {</span>
+<span class="nc" id="L496">      writerGold.close();</span>
+<span class="nc" id="L497">      writerPredicted.close();</span>
+<span class="nc" id="L498">      writerPredictedCoref.close();</span>
+
+      //if(props.containsKey(Constants.CONLL_SCORER)) {
+<span class="nc bnc" id="L501" title="All 2 branches missed.">      if (corefSystem.conllMentionEvalScript != null) {</span>
+        //        runConllEval(corefSystem.conllMentionEvalScript, conllOutputMentionGoldFile, conllOutputMentionPredictedFile, conllMentionEvalFile, conllMentionEvalErrFile);
+
+<span class="nc" id="L504">        String summary = getConllEvalSummary(corefSystem.conllMentionEvalScript, conllOutputMentionGoldFile, conllOutputMentionPredictedFile);</span>
+<span class="nc" id="L505">        logger.info(&quot;\nCONLL EVAL SUMMARY (Before COREF)&quot;);</span>
+<span class="nc" id="L506">        printScoreSummary(summary, logger, false);</span>
+
+        if (!Constants.SKIP_COREF) {
+          //          runConllEval(corefSystem.conllMentionEvalScript, conllOutputMentionGoldFile, conllOutputMentionCorefPredictedFile, conllMentionCorefEvalFile, conllMentionCorefEvalErrFile);
+<span class="nc" id="L510">          summary = getConllEvalSummary(corefSystem.conllMentionEvalScript, conllOutputMentionGoldFile, conllOutputMentionCorefPredictedFile);</span>
+<span class="nc" id="L511">          logger.info(&quot;\nCONLL EVAL SUMMARY (After COREF)&quot;);</span>
+<span class="nc" id="L512">          printScoreSummary(summary, logger, true);</span>
+<span class="nc" id="L513">          printFinalConllScore(summary);</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">          if (corefSystem.optimizeConllScore) {</span>
+<span class="nc" id="L515">            finalScore = getFinalConllScore(summary, corefSystem.optimizeMetricType, corefSystem.optimizeSubScoreType.toString());</span>
+          }
+        }
+      }
+    }
+
+<span class="nc bnc" id="L521" title="All 4 branches missed.">    if (!corefSystem.optimizeConllScore &amp;&amp; corefSystem.doScore()) {</span>
+<span class="nc" id="L522">      finalScore = corefSystem.getFinalScore(corefSystem.optimizeMetricType, corefSystem.optimizeSubScoreType);</span>
+    }
+<span class="nc" id="L524">    String scoresFile = props.getProperty(Constants.SCORE_FILE_PROP);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    if (scoresFile != null) {</span>
+<span class="nc" id="L526">      PrintWriter pw = IOUtils.getPrintWriter(scoresFile);</span>
+<span class="nc" id="L527">      pw.println((new DecimalFormat(&quot;#.##&quot;)).format(finalScore));</span>
+<span class="nc" id="L528">      pw.close();</span>
+    }
+
+<span class="nc bnc" id="L531" title="All 2 branches missed.">    if (corefSystem.optimizeSieves) {</span>
+<span class="nc" id="L532">      logger.info(&quot;Final reported score for sieve optimization &quot; + corefSystem.optimizeScoreType + &quot; : &quot; + finalScore);</span>
+    }
+<span class="nc" id="L534">    return finalScore;</span>
+  }
+
+  /** Run and score coref distributed */
+  public static void runAndScoreCorefDist(String runDistCmd, Properties props, String propsFile) throws Exception {
+<span class="nc" id="L539">    PrintWriter pw = IOUtils.getPrintWriter(propsFile);</span>
+<span class="nc" id="L540">    props.store(pw, null);</span>
+<span class="nc" id="L541">    pw.close();</span>
+    /* Run coref job in a distributed manner, score is written to file */
+<span class="nc" id="L543">    List&lt;String&gt; cmd = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L544">    cmd.addAll(Arrays.asList(runDistCmd.split(&quot;\\s+&quot;)));</span>
+<span class="nc" id="L545">    cmd.add(&quot;-props&quot;);</span>
+<span class="nc" id="L546">    cmd.add(propsFile);</span>
+<span class="nc" id="L547">    ProcessBuilder pb = new ProcessBuilder(cmd);</span>
+    // Copy environment variables over
+<span class="nc" id="L549">    Map&lt;String,String&gt; curEnv = System.getenv();</span>
+<span class="nc" id="L550">    Map&lt;String,String&gt; pbEnv = pb.environment();</span>
+<span class="nc" id="L551">    pbEnv.putAll(curEnv);</span>
+
+<span class="nc" id="L553">    logger.info(&quot;Running distributed coref:&quot; + StringUtils.join(pb.command(), &quot; &quot;));</span>
+<span class="nc" id="L554">    StringWriter outSos = new StringWriter();</span>
+<span class="nc" id="L555">    StringWriter errSos = new StringWriter();</span>
+<span class="nc" id="L556">    PrintWriter out = new PrintWriter(new BufferedWriter(outSos));</span>
+<span class="nc" id="L557">    PrintWriter err = new PrintWriter(new BufferedWriter(errSos));</span>
+<span class="nc" id="L558">    SystemUtils.run(pb, out, err);</span>
+<span class="nc" id="L559">    out.close();</span>
+<span class="nc" id="L560">    err.close();</span>
+<span class="nc" id="L561">    String outStr = outSos.toString();</span>
+<span class="nc" id="L562">    String errStr = errSos.toString();</span>
+<span class="nc" id="L563">    logger.info(&quot;Finished distributed coref: &quot; + runDistCmd + &quot;, props=&quot; + propsFile);</span>
+<span class="nc" id="L564">    logger.info(&quot;Output: &quot; + outStr);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">    if (errStr.length() &gt; 0) {</span>
+<span class="nc" id="L566">      logger.info(&quot;Error: &quot; + errStr);</span>
+    }
+<span class="nc" id="L568">  }</span>
+
+  static boolean waitForFiles(File workDir, FileFilter fileFilter, int howMany) throws InterruptedException {
+<span class="nc" id="L571">    logger.info(&quot;Waiting until we see &quot; + howMany + &quot; &quot; + fileFilter + &quot; files in directory &quot; + workDir + &quot;...&quot;);</span>
+<span class="nc" id="L572">    int seconds = 0;</span>
+    while (true) {
+<span class="nc" id="L574">      File[] checkFiles = workDir.listFiles(fileFilter);</span>
+
+      // we found the required number of .check files
+<span class="nc bnc" id="L577" title="All 4 branches missed.">      if (checkFiles != null &amp;&amp; checkFiles.length &gt;= howMany) {</span>
+<span class="nc" id="L578">        logger.info(&quot;Found &quot; + checkFiles.length  + &quot; &quot; + fileFilter + &quot; files. Continuing execution.&quot;);</span>
+<span class="nc" id="L579">        break;</span>
+      }
+
+      // sleep for while before the next check
+<span class="nc" id="L583">      Thread.sleep(Constants.MONITOR_DIST_CMD_FINISHED_WAIT_MILLIS);</span>
+<span class="nc" id="L584">      seconds += Constants.MONITOR_DIST_CMD_FINISHED_WAIT_MILLIS / 1000;</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">      if (seconds % 600 == 0) {</span>
+<span class="nc" id="L586">        double minutes = seconds / 60;</span>
+<span class="nc" id="L587">        logger.info(&quot;Still waiting... &quot; + minutes + &quot; minutes have passed.&quot;);</span>
+      }
+<span class="nc" id="L589">    }</span>
+<span class="nc" id="L590">    return true;</span>
+  }
+
+  private static int fromSieveNameToIndex(String sieveName, String[] sieveNames)
+  {
+<span class="nc bnc" id="L595" title="All 2 branches missed.">    if (&quot;*&quot;.equals(sieveName)) return -1;</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">    for (int i = 0; i &lt; sieveNames.length; i++) {</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">      if (sieveNames[i].equals(sieveName)) {</span>
+<span class="nc" id="L598">        return i;</span>
+      }
+    }
+<span class="nc" id="L601">    throw new IllegalArgumentException(&quot;Invalid sieve name: &quot; + sieveName);</span>
+  }
+
+  private static Pair&lt;Integer,Integer&gt; fromSieveOrderConstraintString(String s, String[] sieveNames)
+  {
+<span class="nc" id="L606">    String[] parts = s.split(&quot;&lt;&quot;);</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">    if (parts.length == 2) {</span>
+<span class="nc" id="L608">      String first = parts[0].trim();</span>
+<span class="nc" id="L609">      String second = parts[1].trim();</span>
+<span class="nc" id="L610">      int a = fromSieveNameToIndex(first, sieveNames);</span>
+<span class="nc" id="L611">      int b = fromSieveNameToIndex(second, sieveNames);</span>
+<span class="nc" id="L612">      return new Pair&lt;&gt;(a, b);</span>
+    } else {
+<span class="nc" id="L614">      throw new IllegalArgumentException(&quot;Invalid sieve ordering constraint: &quot; + s);</span>
+    }
+  }
+
+  private static String toSieveOrderConstraintString(Pair&lt;Integer,Integer&gt; orderedSieveIndices, String[] sieveNames)
+  {
+<span class="nc bnc" id="L620" title="All 2 branches missed.">    String first = (orderedSieveIndices.first() &lt; 0)? &quot;*&quot;:sieveNames[orderedSieveIndices.first()];</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">    String second = (orderedSieveIndices.second() &lt; 0)? &quot;*&quot;:sieveNames[orderedSieveIndices.second()];</span>
+<span class="nc" id="L622">    return first + &quot; &lt; &quot; + second;</span>
+  }
+
+  /**
+   * Given a set of sieves, select an optimal ordering for the sieves
+   * by iterating over sieves, and selecting the one that gives the best score and
+   *   adding sieves one at a time until no more sieves left
+   */
+  public void optimizeSieveOrdering(MentionExtractor mentionExtractor, Properties props, String timestamp) throws Exception
+  {
+<span class="nc" id="L632">    logger.info(&quot;=============SIEVE OPTIMIZATION START ====================&quot;);</span>
+<span class="nc" id="L633">    logger.info(&quot;Optimize sieves using score: &quot; + optimizeScoreType);</span>
+<span class="nc" id="L634">    FileFilter scoreFilesFilter = new FileFilter() {</span>
+      @Override
+      public boolean accept(File file) {
+<span class="nc" id="L637">        return file.getAbsolutePath().endsWith(&quot;.score&quot;);</span>
+      }
+      public String toString() {
+<span class="nc" id="L640">        return &quot;.score&quot;;</span>
+      }
+    };
+<span class="nc" id="L643">    Pattern scoreFilePattern = Pattern.compile(&quot;.*sieves\\.(\\d+)\\.(\\d+).score&quot;);</span>
+<span class="nc" id="L644">    String runDistributedCmd = props.getProperty(Constants.RUN_DIST_CMD_PROP);</span>
+<span class="nc" id="L645">    String mainWorkDirPath = props.getProperty(Constants.RUN_DIST_CMD_WORK_DIR, &quot;workdir&quot;) + &quot;-&quot; + timestamp + File.separator;</span>
+<span class="nc" id="L646">    DeterministicCorefSieve[] origSieves = sieves;</span>
+<span class="nc" id="L647">    String[] origSieveNames = sieveClassNames;</span>
+<span class="nc" id="L648">    Set&lt;Integer&gt; remainingSieveIndices = Generics.newHashSet();</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">    for (int i = 0; i &lt; origSieves.length; i++) {</span>
+<span class="nc" id="L650">      remainingSieveIndices.add(i);</span>
+    }
+<span class="nc" id="L652">    List&lt;Integer&gt; optimizedOrdering = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">    while (!remainingSieveIndices.isEmpty()) {</span>
+      // initialize array of current sieves
+<span class="nc" id="L655">      int curSievesNumber = optimizedOrdering.size();</span>
+<span class="nc" id="L656">      sieves = new DeterministicCorefSieve[curSievesNumber+1];</span>
+<span class="nc" id="L657">      sieveClassNames = new String[curSievesNumber+1];</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">      for (int i = 0; i &lt; curSievesNumber; i++) {</span>
+<span class="nc" id="L659">        sieves[i] = origSieves[optimizedOrdering.get(i)];</span>
+<span class="nc" id="L660">        sieveClassNames[i] = origSieveNames[optimizedOrdering.get(i)];</span>
+      }
+<span class="nc" id="L662">      logger.info(&quot;*** Optimizing Sieve ordering for pass &quot; + curSievesNumber + &quot; ***&quot;);</span>
+      // Get list of sieves that we can pick from for the next sieve
+<span class="nc" id="L664">      Set&lt;Integer&gt; selectableSieveIndices = new TreeSet&lt;&gt;(remainingSieveIndices);</span>
+      // Based on ordering constraints remove sieves from options
+<span class="nc bnc" id="L666" title="All 2 branches missed.">      if (sievesKeepOrder != null) {</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        for (Pair&lt;Integer,Integer&gt; ko:sievesKeepOrder) {</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">          if (ko.second() &lt; 0) {</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            if (remainingSieveIndices.contains(ko.first())) {</span>
+<span class="nc" id="L670">              logger.info(&quot;Restrict selection to &quot; + origSieveNames[ko.first()] + &quot; because of constraint &quot; +</span>
+<span class="nc" id="L671">                      toSieveOrderConstraintString(ko, origSieveNames));</span>
+<span class="nc" id="L672">              selectableSieveIndices = Generics.newHashSet(1);</span>
+<span class="nc" id="L673">              selectableSieveIndices.add(ko.first());</span>
+<span class="nc" id="L674">              break;</span>
+            }
+<span class="nc bnc" id="L676" title="All 4 branches missed.">          } else if (ko.first() &lt; 0 &amp;&amp; remainingSieveIndices.size() &gt; 1) {</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">            if (remainingSieveIndices.contains(ko.second())) {</span>
+<span class="nc" id="L678">              logger.info(&quot;Remove selection &quot; + origSieveNames[ko.second()] + &quot; because of constraint &quot; +</span>
+<span class="nc" id="L679">                    toSieveOrderConstraintString(ko, origSieveNames));</span>
+<span class="nc" id="L680">              selectableSieveIndices.remove(ko.second());</span>
+            }
+<span class="nc bnc" id="L682" title="All 2 branches missed.">          } else if (remainingSieveIndices.contains(ko.first())) {</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">            if (remainingSieveIndices.contains(ko.second())) {</span>
+<span class="nc" id="L684">              logger.info(&quot;Remove selection &quot; + origSieveNames[ko.second()] + &quot; because of constraint &quot; +</span>
+<span class="nc" id="L685">                    toSieveOrderConstraintString(ko, origSieveNames));</span>
+<span class="nc" id="L686">              selectableSieveIndices.remove(ko.second());</span>
+            }
+          }
+<span class="nc" id="L689">        }</span>
+      }
+<span class="nc bnc" id="L691" title="All 2 branches missed.">      if (selectableSieveIndices.isEmpty()) {</span>
+<span class="nc" id="L692">        throw new RuntimeException(&quot;Unable to find sieve ordering to satisfy all ordering constraints!!!!&quot;);</span>
+      }
+
+<span class="nc" id="L695">      int selected = -1;</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">      if (selectableSieveIndices.size() &gt; 1) {</span>
+        // Go through remaining sieves and see how well they do
+<span class="nc" id="L698">        List&lt;Pair&lt;Double,Integer&gt;&gt; scores = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">        if (runDistributedCmd != null) {</span>
+<span class="nc" id="L700">          String workDirPath = mainWorkDirPath + curSievesNumber + File.separator;</span>
+<span class="nc" id="L701">          File workDir = new File(workDirPath);</span>
+<span class="nc" id="L702">          workDir.mkdirs();</span>
+<span class="nc" id="L703">          workDirPath = workDir.getAbsolutePath() + File.separator;</span>
+          // Start jobs
+<span class="nc bnc" id="L705" title="All 2 branches missed.">          for (int potentialSieveIndex:selectableSieveIndices) {</span>
+<span class="nc" id="L706">            String sieveSelectionId = curSievesNumber + &quot;.&quot; + potentialSieveIndex;</span>
+<span class="nc" id="L707">            String jobDirPath = workDirPath + sieveSelectionId + File.separator;</span>
+<span class="nc" id="L708">            File jobDir = new File(jobDirPath);</span>
+<span class="nc" id="L709">            jobDir.mkdirs();</span>
+<span class="nc" id="L710">            Properties newProps = new Properties();</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">            for (String key:props.stringPropertyNames()) {</span>
+<span class="nc" id="L712">              String value = props.getProperty(key);</span>
+<span class="nc" id="L713">              value = value.replaceAll(&quot;\\$\\{JOBDIR\\}&quot;,jobDirPath);</span>
+<span class="nc" id="L714">              newProps.setProperty(key, value);</span>
+<span class="nc" id="L715">            }</span>
+            // try this sieve and see how well it works
+<span class="nc" id="L717">            sieves[curSievesNumber] = origSieves[potentialSieveIndex];</span>
+<span class="nc" id="L718">            sieveClassNames[curSievesNumber] = origSieveNames[potentialSieveIndex];</span>
+<span class="nc" id="L719">            newProps.setProperty(Constants.OPTIMIZE_SIEVES_PROP, &quot;false&quot;);</span>
+<span class="nc" id="L720">            newProps.setProperty(Constants.SCORE_PROP, &quot;true&quot;);</span>
+<span class="nc" id="L721">            newProps.setProperty(Constants.SIEVES_PROP, StringUtils.join(sieveClassNames,&quot;,&quot;));</span>
+<span class="nc" id="L722">            newProps.setProperty(Constants.LOG_PROP, jobDirPath + &quot;sieves.&quot; + sieveSelectionId + &quot;.log&quot;);</span>
+<span class="nc" id="L723">            newProps.setProperty(Constants.SCORE_FILE_PROP, workDirPath + &quot;sieves.&quot; + sieveSelectionId + &quot;.score&quot;);</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            if (Constants.PRINT_CONLL_OUTPUT || replicateCoNLL) {</span>
+<span class="nc" id="L725">              newProps.setProperty(Constants.CONLL_OUTPUT_PROP,  jobDirPath + &quot;sieves.&quot; + sieveSelectionId + &quot;.conlloutput&quot;);</span>
+            }
+<span class="nc" id="L727">            String distCmd = newProps.getProperty(Constants.RUN_DIST_CMD_PROP, runDistributedCmd);</span>
+<span class="nc" id="L728">            runAndScoreCorefDist(distCmd, newProps, workDirPath + &quot;sieves.&quot; + sieveSelectionId + &quot;.props&quot;);</span>
+<span class="nc" id="L729">          }</span>
+          // Wait for jobs to finish and collect scores
+<span class="nc" id="L731">          waitForFiles(workDir, scoreFilesFilter,selectableSieveIndices.size());</span>
+          // Get scores
+<span class="nc" id="L733">          File[] scoreFiles = workDir.listFiles(scoreFilesFilter);</span>
+<span class="nc bnc" id="L734" title="All 2 branches missed.">          for (File file:scoreFiles) {</span>
+<span class="nc" id="L735">            Matcher m = scoreFilePattern.matcher(file.getName());</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">            if (m.matches()) {</span>
+<span class="nc" id="L737">              int potentialSieveIndex = Integer.parseInt(m.group(2));</span>
+<span class="nc" id="L738">              String text = IOUtils.slurpFile(file);</span>
+<span class="nc" id="L739">              double score = Double.parseDouble(text);</span>
+              // keeps scores so we can select best score and log them
+<span class="nc" id="L741">              scores.add(new Pair&lt;&gt;(score, potentialSieveIndex));</span>
+<span class="nc" id="L742">            } else {</span>
+<span class="nc" id="L743">              throw new RuntimeException(&quot;Bad score file name: &quot; + file);</span>
+            }
+          }
+<span class="nc" id="L746">        } else {</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">          for (int potentialSieveIndex:selectableSieveIndices) {</span>
+            // try this sieve and see how well it works
+<span class="nc" id="L749">            sieves[curSievesNumber] = origSieves[potentialSieveIndex];</span>
+<span class="nc" id="L750">            sieveClassNames[curSievesNumber] = origSieveNames[potentialSieveIndex];</span>
+<span class="nc" id="L751">            logger.info(&quot;Trying sieve &quot; + curSievesNumber + &quot;=&quot;+ sieveClassNames[curSievesNumber] + &quot;: &quot;);</span>
+<span class="nc" id="L752">            logger.info(&quot; Trying sieves: &quot; + StringUtils.join(sieveClassNames,&quot;,&quot;));</span>
+
+<span class="nc" id="L754">            double score = runAndScoreCoref(this, mentionExtractor, props, timestamp);</span>
+            // keeps scores so we can select best score and log them
+<span class="nc" id="L756">            scores.add(new Pair&lt;&gt;(score, potentialSieveIndex));</span>
+<span class="nc" id="L757">            logger.info(&quot; Trying sieves: &quot; + StringUtils.join(sieveClassNames,&quot;,&quot;));</span>
+<span class="nc" id="L758">            logger.info(&quot; Trying sieves score: &quot; + score);</span>
+<span class="nc" id="L759">          }</span>
+        }
+        // Select bestScore
+<span class="nc" id="L762">        double bestScore = -1;</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">        for (Pair&lt;Double,Integer&gt; p:scores) {</span>
+<span class="nc bnc" id="L764" title="All 4 branches missed.">          if (selected &lt; 0 || p.first() &gt; bestScore) {</span>
+<span class="nc" id="L765">            bestScore = p.first();</span>
+<span class="nc" id="L766">            selected = p.second();</span>
+          }
+<span class="nc" id="L768">        }</span>
+        // log ordered scores
+<span class="nc" id="L770">        Collections.sort(scores);</span>
+<span class="nc" id="L771">        Collections.reverse(scores);</span>
+<span class="nc" id="L772">        logger.info(&quot;Ordered sieves&quot;);</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">        for (Pair&lt;Double,Integer&gt; p:scores) {</span>
+<span class="nc" id="L774">          logger.info(&quot;Sieve optimization pass &quot; + curSievesNumber</span>
+<span class="nc" id="L775">                  + &quot; scores: Sieve=&quot; + origSieveNames[p.second()] + &quot;, score=&quot; + p.first());</span>
+<span class="nc" id="L776">        }</span>
+<span class="nc" id="L777">      } else {</span>
+        // Only one sieve
+<span class="nc" id="L779">        logger.info(&quot;Only one choice for next sieve&quot;);</span>
+<span class="nc" id="L780">        selected = selectableSieveIndices.iterator().next();</span>
+      }
+      // log sieve we are adding
+<span class="nc" id="L783">      sieves[curSievesNumber] = origSieves[selected];</span>
+<span class="nc" id="L784">      sieveClassNames[curSievesNumber] = origSieveNames[selected];</span>
+<span class="nc" id="L785">      logger.info(&quot;Adding sieve &quot; + curSievesNumber + &quot;=&quot;+ sieveClassNames[curSievesNumber] + &quot; to existing sieves: &quot;);</span>
+<span class="nc" id="L786">      logger.info(&quot; Current Sieves: &quot; + StringUtils.join(sieveClassNames,&quot;,&quot;));</span>
+      // select optimal sieve and add it to our optimized ordering
+<span class="nc" id="L788">      optimizedOrdering.add(selected);</span>
+<span class="nc" id="L789">      remainingSieveIndices.remove(selected);</span>
+<span class="nc" id="L790">    }</span>
+<span class="nc" id="L791">    logger.info(&quot;Final Sieve Ordering: &quot; + StringUtils.join(sieveClassNames, &quot;,&quot;));</span>
+<span class="nc" id="L792">    logger.info(&quot;=============SIEVE OPTIMIZATION DONE ====================&quot;);</span>
+<span class="nc" id="L793">  }</span>
+
+  /**
+   * Extracts coreference clusters.
+   * This is the main API entry point for coreference resolution.
+   * Return a map from CorefChain ID to corresponding CorefChain.
+   * @throws Exception
+   */
+  public Map&lt;Integer, CorefChain&gt; coref(Document document) throws Exception {
+
+    // Multi-pass sieve coreference resolution
+<span class="nc bnc" id="L804" title="All 2 branches missed.">    for (int i = 0; i &lt; sieves.length ; i++){</span>
+<span class="nc" id="L805">      currentSieve = i;</span>
+<span class="nc" id="L806">      DeterministicCorefSieve sieve = sieves[i];</span>
+      // Do coreference resolution using this pass
+<span class="nc" id="L808">      coreference(document, sieve);</span>
+    }
+
+    // post processing (e.g., removing singletons, appositions for conll)
+<span class="nc bnc" id="L812" title="All 4 branches missed.">    if((!Constants.USE_GOLD_MENTIONS &amp;&amp; doPostProcessing) || replicateCoNLL) postProcessing(document);</span>
+
+    // coref system output: CorefChain
+<span class="nc" id="L815">    Map&lt;Integer, CorefChain&gt; result = Generics.newHashMap();</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">    for(CorefCluster c : document.corefClusters.values()) {</span>
+<span class="nc" id="L817">      result.put(c.clusterID, new CorefChain(c, document.positions));</span>
+<span class="nc" id="L818">    }</span>
+
+<span class="nc" id="L820">    return result;</span>
+  }
+
+  public Map&lt;Integer, edu.stanford.nlp.coref.data.CorefChain&gt; corefReturnHybridOutput(Document document) throws Exception {
+
+    // Multi-pass sieve coreference resolution
+<span class="nc bnc" id="L826" title="All 2 branches missed.">    for (int i = 0; i &lt; sieves.length ; i++){</span>
+<span class="nc" id="L827">      currentSieve = i;</span>
+<span class="nc" id="L828">      DeterministicCorefSieve sieve = sieves[i];</span>
+      // Do coreference resolution using this pass
+<span class="nc" id="L830">      coreference(document, sieve);</span>
+    }
+
+    // post processing (e.g., removing singletons, appositions for conll)
+<span class="nc bnc" id="L834" title="All 4 branches missed.">    if((!Constants.USE_GOLD_MENTIONS &amp;&amp; doPostProcessing) || replicateCoNLL) postProcessing(document);</span>
+
+    // coref system output: edu.stanford.nlp.hcoref.data.CorefChain
+<span class="nc" id="L837">    Map&lt;Integer, edu.stanford.nlp.coref.data.CorefChain&gt; result = Generics.newHashMap();</span>
+
+<span class="nc bnc" id="L839" title="All 2 branches missed.">    for(CorefCluster c : document.corefClusters.values()) {</span>
+      // build mentionsMap and represents
+<span class="nc" id="L841">      Map&lt;IntPair, Set&lt;edu.stanford.nlp.coref.data.CorefChain.CorefMention&gt;&gt; mentionsMap = Generics.newHashMap();</span>
+<span class="nc" id="L842">      IntPair keyPair = new IntPair(0,0);</span>
+<span class="nc" id="L843">      mentionsMap.put(keyPair, new HashSet&lt;&gt;());</span>
+<span class="nc" id="L844">      Mention represents = null;</span>
+<span class="nc" id="L845">      edu.stanford.nlp.coref.data.CorefChain.CorefMention representsHybridVersion = null;</span>
+<span class="nc bnc" id="L846" title="All 2 branches missed.">      for (Mention mention : c.getCorefMentions()) {</span>
+        // convert dcoref CorefMention to hcoref CorefMention
+        //IntPair mentionPosition = new IntPair(mention.sentNum, mention.headIndex);
+<span class="nc" id="L849">        IntTuple mentionPosition = document.positions.get(mention);</span>
+<span class="nc" id="L850">        CorefMention dcorefMention = new CorefMention(mention, mentionPosition);</span>
+        // tokens need the hcoref version of CorefClusterIdAnnotation
+<span class="nc" id="L852">        mention.headWord.set(edu.stanford.nlp.coref.CorefCoreAnnotations.CorefClusterIdAnnotation.class,</span>
+<span class="nc" id="L853">                mention.corefClusterID);</span>
+        // drop the dcoref version of CorefClusterIdAnnotation
+<span class="nc" id="L855">        mention.headWord.remove(CorefCoreAnnotations.CorefClusterIdAnnotation.class);</span>
+        // make the hcoref mention
+<span class="nc" id="L857">        edu.stanford.nlp.coref.data.CorefChain.CorefMention hcorefMention =</span>
+                new edu.stanford.nlp.coref.data.CorefChain.CorefMention(
+<span class="nc" id="L859">                        edu.stanford.nlp.coref.data.Dictionaries.MentionType.valueOf(dcorefMention.mentionType.name()),</span>
+<span class="nc" id="L860">                        edu.stanford.nlp.coref.data.Dictionaries.Number.valueOf(dcorefMention.number.name()),</span>
+<span class="nc" id="L861">                        edu.stanford.nlp.coref.data.Dictionaries.Gender.valueOf(dcorefMention.gender.name()),</span>
+<span class="nc" id="L862">                        edu.stanford.nlp.coref.data.Dictionaries.Animacy.valueOf(dcorefMention.animacy.name()),</span>
+                        dcorefMention.startIndex,
+                        dcorefMention.endIndex,
+                        dcorefMention.headIndex,
+                        dcorefMention.corefClusterID,
+                        dcorefMention.mentionID,
+                        dcorefMention.sentNum,
+                        dcorefMention.position,
+                        dcorefMention.mentionSpan);
+<span class="nc" id="L871">        mentionsMap.get(keyPair).add(hcorefMention);</span>
+<span class="nc bnc" id="L872" title="All 2 branches missed.">        if (mention.moreRepresentativeThan(represents)) {</span>
+<span class="nc" id="L873">          represents = mention;</span>
+<span class="nc" id="L874">          representsHybridVersion = hcorefMention;</span>
+        }
+<span class="nc" id="L876">      }</span>
+<span class="nc" id="L877">      edu.stanford.nlp.coref.data.CorefChain hybridCorefChain =</span>
+              new edu.stanford.nlp.coref.data.CorefChain(c.clusterID, mentionsMap, representsHybridVersion);
+<span class="nc" id="L879">      result.put(c.clusterID, hybridCorefChain);</span>
+<span class="nc" id="L880">    }</span>
+
+<span class="nc" id="L882">    return result;</span>
+  }
+
+  /**
+   * Do coreference resolution using one sieve pass.
+   *
+   * @param document An extracted document
+   * @throws Exception
+   */
+  private void coreference(
+      Document document,
+      DeterministicCorefSieve sieve) throws Exception {
+
+    //Redwood.forceTrack(&quot;Coreference: sieve &quot; + sieve.getClass().getSimpleName());
+<span class="nc" id="L896">    logger.finer(&quot;Coreference: sieve &quot; + sieve.getClass().getSimpleName());</span>
+<span class="nc" id="L897">    List&lt;List&lt;Mention&gt;&gt; orderedMentionsBySentence = document.getOrderedMentions();</span>
+<span class="nc" id="L898">    Map&lt;Integer, CorefCluster&gt; corefClusters = document.corefClusters;</span>
+<span class="nc" id="L899">    Set&lt;Mention&gt; roleSet = document.roleSet;</span>
+
+<span class="nc" id="L901">    logger.finest(&quot;ROLE SET (Skip exact string match): ------------------&quot;);</span>
+<span class="nc bnc" id="L902" title="All 2 branches missed.">    for(Mention m : roleSet){</span>
+<span class="nc" id="L903">      logger.finest(&quot;\t&quot;+m.spanToString());</span>
+<span class="nc" id="L904">    }</span>
+<span class="nc" id="L905">    logger.finest(&quot;-------------------------------------------------------&quot;);</span>
+
+<span class="nc" id="L907">    additionalCorrectLinksCount = 0;</span>
+<span class="nc" id="L908">    additionalLinksCount = 0;</span>
+
+<span class="nc bnc" id="L910" title="All 2 branches missed.">    for (int sentI = 0; sentI &lt; orderedMentionsBySentence.size(); sentI++) {</span>
+<span class="nc" id="L911">      List&lt;Mention&gt; orderedMentions = orderedMentionsBySentence.get(sentI);</span>
+
+<span class="nc bnc" id="L913" title="All 2 branches missed.">      for (int mentionI = 0; mentionI &lt; orderedMentions.size(); mentionI++) {</span>
+
+<span class="nc" id="L915">        Mention m1 = orderedMentions.get(mentionI);</span>
+
+        // check for skip: first mention only, discourse salience
+<span class="nc bnc" id="L918" title="All 2 branches missed.">        if(sieve.skipThisMention(document, m1, corefClusters.get(m1.corefClusterID), dictionaries)) {</span>
+<span class="nc" id="L919">          continue;</span>
+        }
+
+        LOOP:
+<span class="nc bnc" id="L923" title="All 2 branches missed.">          for (int sentJ = sentI; sentJ &gt;= 0; sentJ--) {</span>
+<span class="nc" id="L924">            List&lt;Mention&gt; l = sieve.getOrderedAntecedents(sentJ, sentI, orderedMentions, orderedMentionsBySentence, m1, mentionI, corefClusters, dictionaries);</span>
+<span class="nc bnc" id="L925" title="All 4 branches missed.">            if(maxSentDist != -1 &amp;&amp; sentI - sentJ &gt; maxSentDist) continue;</span>
+
+            // Sort mentions by length whenever we have two mentions beginning at the same position and having the same head
+<span class="nc bnc" id="L928" title="All 2 branches missed.">            for(int i = 0; i &lt; l.size(); i++) {</span>
+<span class="nc bnc" id="L929" title="All 2 branches missed.">              for(int j = 0; j &lt; l.size(); j++) {</span>
+<span class="nc bnc" id="L930" title="All 2 branches missed.">                if(l.get(i).headString.equals(l.get(j).headString) &amp;&amp;</span>
+<span class="nc bnc" id="L931" title="All 2 branches missed.">                    l.get(i).startIndex == l.get(j).startIndex &amp;&amp;</span>
+<span class="nc bnc" id="L932" title="All 4 branches missed.">                    l.get(i).sameSentence(l.get(j)) &amp;&amp; j &gt; i &amp;&amp;</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">                    l.get(i).spanToString().length() &gt; l.get(j).spanToString().length()) {</span>
+<span class="nc" id="L934">                  logger.finest(&quot;FLIPPED: &quot;+l.get(i).spanToString()+&quot;(&quot;+i+&quot;), &quot;+l.get(j).spanToString()+&quot;(&quot;+j+&quot;)&quot;);</span>
+<span class="nc" id="L935">                  l.set(j, l.set(i, l.get(j)));</span>
+                }
+              }
+            }
+
+<span class="nc bnc" id="L940" title="All 2 branches missed.">            for (Mention m2 : l) {</span>
+              // m2 - antecedent of m1                   l
+
+              // Skip singletons according to the singleton predictor
+              // (only for non-NE mentions)
+              // Recasens, de Marneffe, and Potts (NAACL 2013)
+<span class="nc bnc" id="L946" title="All 8 branches missed.">              if (m1.isSingleton &amp;&amp; m1.mentionType != MentionType.PROPER &amp;&amp; m2.isSingleton &amp;&amp; m2.mentionType != MentionType.PROPER) continue;</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">              if (m1.corefClusterID == m2.corefClusterID) continue;</span>
+<span class="nc" id="L948">              CorefCluster c1 = corefClusters.get(m1.corefClusterID);</span>
+<span class="nc" id="L949">              CorefCluster c2 = corefClusters.get(m2.corefClusterID);</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">              if (c2 == null) {</span>
+<span class="nc" id="L951">                logger.warning(&quot;NO corefcluster id &quot; + m2.corefClusterID);</span>
+              }
+<span class="nc bnc" id="L953" title="All 4 branches missed.">              assert(c1 != null);</span>
+<span class="nc bnc" id="L954" title="All 4 branches missed.">              assert(c2 != null);</span>
+
+<span class="nc bnc" id="L956" title="All 2 branches missed.">              if (sieve.useRoleSkip()) {</span>
+<span class="nc bnc" id="L957" title="All 2 branches missed.">                if (m1.isRoleAppositive(m2, dictionaries)) {</span>
+<span class="nc" id="L958">                  roleSet.add(m1);</span>
+<span class="nc bnc" id="L959" title="All 2 branches missed.">                } else if (m2.isRoleAppositive(m1, dictionaries)) {</span>
+<span class="nc" id="L960">                  roleSet.add(m2);</span>
+                }
+                continue;
+              }
+
+<span class="nc bnc" id="L965" title="All 2 branches missed.">              if (sieve.coreferent(document, c1, c2, m1, m2, dictionaries, roleSet, semantics)) {</span>
+
+                // print logs for analysis
+<span class="nc bnc" id="L968" title="All 2 branches missed.">                if (doScore()) {</span>
+<span class="nc" id="L969">                  printLogs(c1, c2, m1, m2, document, currentSieve);</span>
+                }
+
+<span class="nc" id="L972">                int removeID = c1.clusterID;</span>
+<span class="nc" id="L973">                CorefCluster.mergeClusters(c2, c1);</span>
+<span class="nc" id="L974">                document.mergeIncompatibles(c2, c1);</span>
+<span class="nc" id="L975">                document.mergeAcronymCache(c2, c1);</span>
+//                logger.warning(&quot;Removing cluster &quot; + removeID + &quot;, merged with &quot; + c2.getClusterID());
+<span class="nc" id="L977">                corefClusters.remove(removeID);</span>
+<span class="nc" id="L978">                break LOOP;</span>
+              }
+<span class="nc" id="L980">            }</span>
+          } // End of &quot;LOOP&quot;
+      }
+    }
+
+    // scoring
+<span class="nc bnc" id="L986" title="All 2 branches missed.">    if(doScore()){</span>
+<span class="nc" id="L987">      scoreMUC.get(currentSieve).calculateScore(document);</span>
+<span class="nc" id="L988">      scoreBcubed.get(currentSieve).calculateScore(document);</span>
+<span class="nc" id="L989">      scorePairwise.get(currentSieve).calculateScore(document);</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">      if(currentSieve==0) {</span>
+<span class="nc" id="L991">        scoreSingleDoc = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L992">        scoreSingleDoc.add(new ScorerPairwise());</span>
+<span class="nc" id="L993">        scoreSingleDoc.get(currentSieve).calculateScore(document);</span>
+<span class="nc" id="L994">        additionalCorrectLinksCount = (int) scoreSingleDoc.get(currentSieve).precisionNumSum;</span>
+<span class="nc" id="L995">        additionalLinksCount = (int) scoreSingleDoc.get(currentSieve).precisionDenSum;</span>
+      } else {
+<span class="nc" id="L997">        scoreSingleDoc.add(new ScorerPairwise());</span>
+<span class="nc" id="L998">        scoreSingleDoc.get(currentSieve).calculateScore(document);</span>
+<span class="nc" id="L999">        additionalCorrectLinksCount = (int) (scoreSingleDoc.get(currentSieve).precisionNumSum - scoreSingleDoc.get(currentSieve-1).precisionNumSum);</span>
+<span class="nc" id="L1000">        additionalLinksCount = (int) (scoreSingleDoc.get(currentSieve).precisionDenSum - scoreSingleDoc.get(currentSieve-1).precisionDenSum);</span>
+      }
+<span class="nc" id="L1002">      linksCountInPass.get(currentSieve).setFirst(linksCountInPass.get(currentSieve).first() + additionalCorrectLinksCount);</span>
+<span class="nc" id="L1003">      linksCountInPass.get(currentSieve).setSecond(linksCountInPass.get(currentSieve).second() + additionalLinksCount);</span>
+
+<span class="nc" id="L1005">      printSieveScore(document, sieve);</span>
+    }
+    //Redwood.endTrack(&quot;Coreference: sieve &quot; + sieve.getClass().getSimpleName());
+<span class="nc" id="L1008">  }</span>
+
+  /** Remove singletons, appositive, predicate nominatives, relative pronouns */
+  private static void postProcessing(Document document) {
+<span class="nc" id="L1012">    Set&lt;Mention&gt; removeSet = Generics.newHashSet();</span>
+<span class="nc" id="L1013">    Set&lt;Integer&gt; removeClusterSet = Generics.newHashSet();</span>
+
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">    for(CorefCluster c : document.corefClusters.values()){</span>
+<span class="nc" id="L1016">      Set&lt;Mention&gt; removeMentions = Generics.newHashSet();</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">      for(Mention m : c.getCorefMentions()) {</span>
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">        if(Constants.REMOVE_APPOSITION_PREDICATENOMINATIVES</span>
+<span class="nc bnc" id="L1019" title="All 4 branches missed.">            &amp;&amp; ((m.appositions!=null &amp;&amp; m.appositions.size() &gt; 0)</span>
+<span class="nc bnc" id="L1020" title="All 4 branches missed.">                || (m.predicateNominatives!=null &amp;&amp; m.predicateNominatives.size() &gt; 0)</span>
+<span class="nc bnc" id="L1021" title="All 2 branches missed.">                || (m.relativePronouns!=null &amp;&amp; m.relativePronouns.size() &gt; 0))){</span>
+<span class="nc" id="L1022">          removeMentions.add(m);</span>
+<span class="nc" id="L1023">          removeSet.add(m);</span>
+<span class="nc" id="L1024">          m.corefClusterID = m.mentionID;</span>
+        }
+<span class="nc" id="L1026">      }</span>
+<span class="nc" id="L1027">      c.corefMentions.removeAll(removeMentions);</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">      if(Constants.REMOVE_SINGLETONS &amp;&amp; c.getCorefMentions().size()==1) {</span>
+<span class="nc" id="L1029">        removeClusterSet.add(c.clusterID);</span>
+      }
+<span class="nc" id="L1031">    }</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">    for (int removeId : removeClusterSet){</span>
+<span class="nc" id="L1033">      document.corefClusters.remove(removeId);</span>
+<span class="nc" id="L1034">    }</span>
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">    for(Mention m : removeSet){</span>
+<span class="nc" id="L1036">      document.positions.remove(m);</span>
+<span class="nc" id="L1037">    }</span>
+<span class="nc" id="L1038">  }</span>
+
+  public static LogisticClassifier&lt;String, String&gt; getSingletonPredictorFromSerializedFile(String serializedFile) {
+    try {
+<span class="nc" id="L1042">      ObjectInputStream ois = IOUtils.readStreamFromString(serializedFile);</span>
+<span class="nc" id="L1043">      Object o = ois.readObject();</span>
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">      if (o instanceof LogisticClassifier&lt;?, ?&gt;) {</span>
+<span class="nc" id="L1045">        return (LogisticClassifier&lt;String, String&gt;) o;</span>
+      }
+<span class="nc" id="L1047">      throw new ClassCastException(&quot;Wanted SingletonPredictor, got &quot; + o.getClass());</span>
+<span class="nc" id="L1048">    } catch (IOException e) {</span>
+<span class="nc" id="L1049">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1050">    } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L1051">      throw new RuntimeException(e);</span>
+    }
+  }
+
+  /** Remove singleton clusters */
+  public static List&lt;List&lt;Mention&gt;&gt; filterMentionsWithSingletonClusters(Document document, List&lt;List&lt;Mention&gt;&gt; mentions)
+  {
+
+<span class="nc" id="L1059">    List&lt;List&lt;Mention&gt;&gt; res = new ArrayList&lt;&gt;(mentions.size());</span>
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">    for (List&lt;Mention&gt; ml:mentions) {</span>
+<span class="nc" id="L1061">      List&lt;Mention&gt; filtered = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">      for (Mention m:ml) {</span>
+<span class="nc" id="L1063">        CorefCluster cluster = document.corefClusters.get(m.corefClusterID);</span>
+<span class="nc bnc" id="L1064" title="All 4 branches missed.">        if (cluster != null &amp;&amp; cluster.getCorefMentions().size() &gt; 1) {</span>
+<span class="nc" id="L1065">          filtered.add(m);</span>
+        }
+<span class="nc" id="L1067">      }</span>
+<span class="nc" id="L1068">      res.add(filtered);</span>
+<span class="nc" id="L1069">    }</span>
+<span class="nc" id="L1070">    return res;</span>
+  }
+  public static void runConllEval(String conllMentionEvalScript,
+      String goldFile, String predictFile, String evalFile, String errFile) throws IOException {
+<span class="nc" id="L1074">    ProcessBuilder process = new ProcessBuilder(conllMentionEvalScript, &quot;all&quot;, goldFile, predictFile);</span>
+<span class="nc" id="L1075">    PrintWriter out = new PrintWriter(new FileOutputStream(evalFile));</span>
+<span class="nc" id="L1076">    PrintWriter err = new PrintWriter(new FileOutputStream(errFile));</span>
+<span class="nc" id="L1077">    SystemUtils.run(process, out, err);</span>
+<span class="nc" id="L1078">    out.close();</span>
+<span class="nc" id="L1079">    err.close();</span>
+<span class="nc" id="L1080">  }</span>
+
+  public static String getConllEvalSummary(String conllMentionEvalScript,
+      String goldFile, String predictFile) throws IOException {
+<span class="nc" id="L1084">    ProcessBuilder process = new ProcessBuilder(conllMentionEvalScript, &quot;all&quot;, goldFile, predictFile, &quot;none&quot;);</span>
+<span class="nc" id="L1085">    StringOutputStream errSos = new StringOutputStream();</span>
+<span class="nc" id="L1086">    StringOutputStream outSos = new StringOutputStream();</span>
+<span class="nc" id="L1087">    PrintWriter out = new PrintWriter(outSos);</span>
+<span class="nc" id="L1088">    PrintWriter err = new PrintWriter(errSos);</span>
+<span class="nc" id="L1089">    SystemUtils.run(process, out, err);</span>
+<span class="nc" id="L1090">    out.close();</span>
+<span class="nc" id="L1091">    err.close();</span>
+<span class="nc" id="L1092">    String summary = outSos.toString();</span>
+<span class="nc" id="L1093">    String errStr = errSos.toString();</span>
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">    if ( ! errStr.isEmpty()) {</span>
+<span class="nc" id="L1095">      summary += &quot;\nERROR: &quot; + errStr;</span>
+    }
+<span class="nc" id="L1097">    Pattern pattern = Pattern.compile(&quot;\\d+\\.\\d\\d\\d+&quot;);</span>
+<span class="nc" id="L1098">    DecimalFormat df = new DecimalFormat(&quot;#.##&quot;);</span>
+<span class="nc" id="L1099">    Matcher matcher = pattern.matcher(summary);</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">    while(matcher.find()) {</span>
+<span class="nc" id="L1101">      String number = matcher.group();</span>
+<span class="nc" id="L1102">      summary = summary.replaceFirst(number, df.format(Double.parseDouble(number)));</span>
+<span class="nc" id="L1103">    }</span>
+<span class="nc" id="L1104">    return summary;</span>
+  }
+
+  /** Print logs for error analysis */
+  public void printTopK(Logger logger, Document document, Semantics semantics) {
+
+<span class="nc" id="L1110">    List&lt;List&lt;Mention&gt;&gt; orderedMentionsBySentence = document.getOrderedMentions();</span>
+<span class="nc" id="L1111">    Map&lt;Integer, CorefCluster&gt; corefClusters = document.corefClusters;</span>
+<span class="nc" id="L1112">    Map&lt;Mention, IntTuple&gt; positions = document.allPositions;</span>
+<span class="nc" id="L1113">    Map&lt;Integer, Mention&gt; golds = document.allGoldMentions;</span>
+
+<span class="nc" id="L1115">    logger.fine(&quot;=======ERROR ANALYSIS=========================================================&quot;);</span>
+
+    // Temporary sieve for getting ordered antecedents
+<span class="nc" id="L1118">    DeterministicCorefSieve tmpSieve = new ExactStringMatch();</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">    for (int i = 0 ; i &lt; orderedMentionsBySentence.size(); i++) {</span>
+<span class="nc" id="L1120">      List&lt;Mention&gt; orderedMentions = orderedMentionsBySentence.get(i);</span>
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">      for (int j = 0 ; j &lt; orderedMentions.size(); j++) {</span>
+<span class="nc" id="L1122">        Mention m = orderedMentions.get(j);</span>
+<span class="nc" id="L1123">        logger.fine(&quot;=========Line: &quot;+i+&quot;\tmention: &quot;+j+&quot;=======================================================&quot;);</span>
+<span class="nc" id="L1124">        logger.fine(m.spanToString()+&quot;\tmentionID: &quot;+m.mentionID+&quot;\tcorefClusterID: &quot;+m.corefClusterID+&quot;\tgoldCorefClusterID: &quot;+m.goldCorefClusterID);</span>
+<span class="nc" id="L1125">        CorefCluster corefCluster = corefClusters.get(m.corefClusterID);</span>
+<span class="nc bnc" id="L1126" title="All 2 branches missed.">        if (corefCluster != null) {</span>
+<span class="nc" id="L1127">          corefCluster.printCorefCluster(logger);</span>
+        } else {
+<span class="nc" id="L1129">          logger.finer(&quot;CANNOT find coref cluster for cluster &quot; + m.corefClusterID);</span>
+        }
+<span class="nc" id="L1131">        logger.fine(&quot;-------------------------------------------------------&quot;);</span>
+
+<span class="nc" id="L1133">        boolean oneRecallErrorPrinted = false;</span>
+<span class="nc" id="L1134">        boolean onePrecisionErrorPrinted = false;</span>
+<span class="nc" id="L1135">        boolean alreadyChoose = false;</span>
+
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">        for (int sentJ = i; sentJ &gt;= 0; sentJ--) {</span>
+<span class="nc" id="L1138">          List&lt;Mention&gt; l = tmpSieve.getOrderedAntecedents(sentJ, i, orderedMentions, orderedMentionsBySentence, m, j, corefClusters, dictionaries);</span>
+
+          // Sort mentions by length whenever we have two mentions beginning at the same position and having the same head
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">          for(int ii = 0; ii &lt; l.size(); ii++) {</span>
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">            for(int jj = 0; jj &lt; l.size(); jj++) {</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">              if(l.get(ii).headString.equals(l.get(jj).headString) &amp;&amp;</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">                  l.get(ii).startIndex == l.get(jj).startIndex &amp;&amp;</span>
+<span class="nc bnc" id="L1145" title="All 4 branches missed.">                  l.get(ii).sameSentence(l.get(jj)) &amp;&amp; jj &gt; ii &amp;&amp;</span>
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">                  l.get(ii).spanToString().length() &gt; l.get(jj).spanToString().length()) {</span>
+<span class="nc" id="L1147">                logger.finest(&quot;FLIPPED: &quot;+l.get(ii).spanToString()+&quot;(&quot;+ii+&quot;), &quot;+l.get(jj).spanToString()+&quot;(&quot;+jj+&quot;)&quot;);</span>
+<span class="nc" id="L1148">                l.set(jj, l.set(ii, l.get(jj)));</span>
+              }
+            }
+          }
+
+<span class="nc" id="L1153">          logger.finest(&quot;Candidates in sentence #&quot;+sentJ+&quot; for mention: &quot;+m.spanToString());</span>
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">          for(int ii = 0; ii &lt; l.size(); ii ++){</span>
+<span class="nc" id="L1155">            logger.finest(&quot;\tCandidate #&quot;+ii+&quot;: &quot;+l.get(ii).spanToString());</span>
+          }
+
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">          for (Mention antecedent : l) {</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">            boolean chosen = (m.corefClusterID == antecedent.corefClusterID);</span>
+<span class="nc" id="L1160">            IntTuple src = new IntTuple(2);</span>
+<span class="nc" id="L1161">            src.set(0,i);</span>
+<span class="nc" id="L1162">            src.set(1,j);</span>
+
+<span class="nc" id="L1164">            IntTuple ant = positions.get(antecedent);</span>
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">            if(ant==null) continue;</span>
+            //correct=(chosen==goldLinks.contains(new Pair&lt;IntTuple, IntTuple&gt;(src,ant)));
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">            boolean coreferent = golds.containsKey(m.mentionID)</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">            &amp;&amp; golds.containsKey(antecedent.mentionID)</span>
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">            &amp;&amp; (golds.get(m.mentionID).goldCorefClusterID == golds.get(antecedent.mentionID).goldCorefClusterID);</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">            boolean correct = (chosen == coreferent);</span>
+
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">            String chosenness = chosen ? &quot;Chosen&quot; : &quot;Not Chosen&quot;;</span>
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">            String correctness = correct ? &quot;Correct&quot; : &quot;Incorrect&quot;;</span>
+<span class="nc" id="L1174">            logger.fine(&quot;\t&quot; + correctness +&quot;\t\t&quot; + chosenness + &quot;\t&quot;+antecedent.spanToString());</span>
+<span class="nc" id="L1175">            CorefCluster mC = corefClusters.get(m.corefClusterID);</span>
+<span class="nc" id="L1176">            CorefCluster aC = corefClusters.get(antecedent.corefClusterID);</span>
+
+<span class="nc bnc" id="L1178" title="All 8 branches missed.">            if(chosen &amp;&amp; !correct &amp;&amp; !onePrecisionErrorPrinted &amp;&amp; !alreadyChoose)  {</span>
+<span class="nc" id="L1179">              onePrecisionErrorPrinted = true;</span>
+<span class="nc" id="L1180">              printLinkWithContext(logger, &quot;\nPRECISION ERROR &quot;, src, ant, document, semantics);</span>
+<span class="nc" id="L1181">              logger.fine(&quot;END of PRECISION ERROR LOG&quot;);</span>
+            }
+
+<span class="nc bnc" id="L1184" title="All 12 branches missed.">            if(!chosen &amp;&amp; !correct &amp;&amp; !oneRecallErrorPrinted &amp;&amp; (!alreadyChoose || (alreadyChoose &amp;&amp; onePrecisionErrorPrinted))) {</span>
+<span class="nc" id="L1185">              oneRecallErrorPrinted = true;</span>
+<span class="nc" id="L1186">              printLinkWithContext(logger, &quot;\nRECALL ERROR &quot;, src, ant, document, semantics);</span>
+
+<span class="nc" id="L1188">              logger.finer(&quot;cluster info: &quot;);</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">              if (mC != null) {</span>
+<span class="nc" id="L1190">                mC.printCorefCluster(logger);</span>
+              } else {
+<span class="nc" id="L1192">                logger.finer(&quot;CANNOT find coref cluster for cluster &quot; + m.corefClusterID);</span>
+              }
+<span class="nc" id="L1194">              logger.finer(&quot;----------------------------------------------------------&quot;);</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">              if (aC != null) {</span>
+<span class="nc" id="L1196">                aC.printCorefCluster(logger);</span>
+              } else {
+<span class="nc" id="L1198">                logger.finer(&quot;CANNOT find coref cluster for cluster &quot; + m.corefClusterID);</span>
+              }
+<span class="nc" id="L1200">              logger.finer(&quot;&quot;);</span>
+<span class="nc" id="L1201">              logger.fine(&quot;END of RECALL ERROR LOG&quot;);</span>
+            }
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">            if(chosen) alreadyChoose = true;</span>
+<span class="nc" id="L1204">          }</span>
+        }
+<span class="nc" id="L1206">        logger.fine(&quot;\n&quot;);</span>
+      }
+    }
+<span class="nc" id="L1209">    logger.fine(&quot;===============================================================================&quot;);</span>
+<span class="nc" id="L1210">  }</span>
+
+  public void printF1(boolean printF1First) {
+<span class="nc" id="L1213">    scoreMUC.get(sieveClassNames.length - 1).printF1(logger, printF1First);</span>
+<span class="nc" id="L1214">    scoreBcubed.get(sieveClassNames.length - 1).printF1(logger, printF1First);</span>
+<span class="nc" id="L1215">    scorePairwise.get(sieveClassNames.length - 1).printF1(logger, printF1First);</span>
+<span class="nc" id="L1216">  }</span>
+
+  private void printSieveScore(Document document, DeterministicCorefSieve sieve) {
+<span class="nc" id="L1219">    logger.fine(&quot;===========================================&quot;);</span>
+<span class="nc" id="L1220">    logger.fine(&quot;pass&quot;+currentSieve+&quot;: &quot;+ sieve.flagsToString());</span>
+<span class="nc" id="L1221">    scoreMUC.get(currentSieve).printF1(logger);</span>
+<span class="nc" id="L1222">    scoreBcubed.get(currentSieve).printF1(logger);</span>
+<span class="nc" id="L1223">    scorePairwise.get(currentSieve).printF1(logger);</span>
+<span class="nc" id="L1224">    logger.fine(&quot;# of Clusters: &quot;+document.corefClusters.size() + &quot;,\t# of additional links: &quot;+additionalLinksCount</span>
+        +&quot;,\t# of additional correct links: &quot;+additionalCorrectLinksCount
+        +&quot;,\tprecision of new links: &quot;+1.0*additionalCorrectLinksCount/additionalLinksCount);
+<span class="nc" id="L1227">    logger.fine(&quot;# of total additional links: &quot;+linksCountInPass.get(currentSieve).second()</span>
+<span class="nc" id="L1228">        +&quot;,\t# of total additional correct links: &quot;+linksCountInPass.get(currentSieve).first()</span>
+<span class="nc" id="L1229">        +&quot;,\taccumulated precision of this pass: &quot;+1.0*linksCountInPass.get(currentSieve).first()/linksCountInPass.get(currentSieve).second());</span>
+<span class="nc" id="L1230">    logger.fine(&quot;--------------------------------------&quot;);</span>
+<span class="nc" id="L1231">  }</span>
+  /** Print coref link info */
+  private static void printLink(Logger logger, String header, IntTuple src, IntTuple dst, List&lt;List&lt;Mention&gt;&gt; orderedMentionsBySentence) {
+<span class="nc" id="L1234">    Mention srcMention = orderedMentionsBySentence.get(src.get(0)).get(src.get(1));</span>
+<span class="nc" id="L1235">    Mention dstMention = orderedMentionsBySentence.get(dst.get(0)).get(dst.get(1));</span>
+<span class="nc bnc" id="L1236" title="All 2 branches missed.">    if(src.get(0)==dst.get(0)) {</span>
+<span class="nc" id="L1237">      logger.fine(header + &quot;: [&quot;+srcMention.spanToString()+&quot;](id=&quot;+srcMention.mentionID</span>
+<span class="nc" id="L1238">          +&quot;) in sent #&quot;+src.get(0)+&quot; =&gt; [&quot;+dstMention.spanToString()+&quot;](id=&quot;+dstMention.mentionID+&quot;) in sent #&quot;+dst.get(0) + &quot; Same Sentence&quot;);</span>
+    } else {
+<span class="nc" id="L1240">      logger.fine(header + &quot;: [&quot;+srcMention.spanToString()+&quot;](id=&quot;+srcMention.mentionID</span>
+<span class="nc" id="L1241">          +&quot;) in sent #&quot;+src.get(0)+&quot; =&gt; [&quot;+dstMention.spanToString()+&quot;](id=&quot;+dstMention.mentionID+&quot;) in sent #&quot;+dst.get(0));</span>
+    }
+<span class="nc" id="L1243">  }</span>
+
+  protected static void printList(Logger logger, String... args)  {
+<span class="nc" id="L1246">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">    for (String arg : args) {</span>
+<span class="nc" id="L1248">      sb.append(arg);</span>
+<span class="nc" id="L1249">      sb.append('\t');</span>
+    }
+<span class="nc" id="L1251">    logger.fine(sb.toString());</span>
+<span class="nc" id="L1252">  }</span>
+
+  /** print a coref link information including context and parse tree */
+  private static void printLinkWithContext(Logger logger,
+      String header,
+      IntTuple src,
+      IntTuple dst,
+      Document document,
+      Semantics semantics
+  ) {
+<span class="nc" id="L1262">    List&lt;List&lt;Mention&gt;&gt; orderedMentionsBySentence = document.getOrderedMentions();</span>
+<span class="nc" id="L1263">    List&lt;List&lt;Mention&gt;&gt; goldOrderedMentionsBySentence = document.goldOrderedMentionsBySentence;</span>
+
+<span class="nc" id="L1265">    Mention srcMention = orderedMentionsBySentence.get(src.get(0)).get(src.get(1));</span>
+<span class="nc" id="L1266">    Mention dstMention = orderedMentionsBySentence.get(dst.get(0)).get(dst.get(1));</span>
+<span class="nc" id="L1267">    List&lt;CoreLabel&gt; srcSentence = srcMention.sentenceWords;</span>
+<span class="nc" id="L1268">    List&lt;CoreLabel&gt; dstSentence = dstMention.sentenceWords;</span>
+
+<span class="nc" id="L1270">    printLink(logger, header, src, dst, orderedMentionsBySentence);</span>
+
+<span class="nc" id="L1272">    printList(logger, &quot;Mention:&quot; + srcMention.spanToString(),</span>
+<span class="nc" id="L1273">        &quot;Gender:&quot; + srcMention.gender.toString(),</span>
+<span class="nc" id="L1274">        &quot;Number:&quot; + srcMention.number.toString(),</span>
+<span class="nc" id="L1275">        &quot;Animacy:&quot; + srcMention.animacy.toString(),</span>
+<span class="nc" id="L1276">        &quot;Person:&quot; + srcMention.person.toString(),</span>
+        &quot;NER:&quot; + srcMention.nerString,
+        &quot;Head:&quot; + srcMention.headString,
+<span class="nc" id="L1279">        &quot;Type:&quot; + srcMention.mentionType.toString(),</span>
+<span class="nc" id="L1280">        &quot;utter: &quot;+srcMention.headWord.get(CoreAnnotations.UtteranceAnnotation.class),</span>
+<span class="nc" id="L1281">        &quot;speakerID: &quot;+srcMention.headWord.get(CoreAnnotations.SpeakerAnnotation.class),</span>
+        &quot;twinless:&quot; + srcMention.twinless);
+<span class="nc" id="L1283">    logger.fine(&quot;Context:&quot;);</span>
+
+<span class="nc" id="L1285">    String p = &quot;&quot;;</span>
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">    for(int i = 0; i &lt; srcSentence.size(); i++) {</span>
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">      if (i == srcMention.startIndex) {</span>
+<span class="nc" id="L1288">        p += &quot;[&quot;;</span>
+      }
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">      if (i == srcMention.endIndex) {</span>
+<span class="nc" id="L1291">        p += &quot;]&quot;;</span>
+      }
+<span class="nc" id="L1293">      p += srcSentence.get(i).word() + &quot; &quot;;</span>
+    }
+<span class="nc" id="L1295">    logger.fine(p);</span>
+
+<span class="nc" id="L1297">    StringBuilder golds = new StringBuilder();</span>
+<span class="nc" id="L1298">    golds.append(&quot;Gold mentions in the sentence:\n&quot;);</span>
+<span class="nc" id="L1299">    Counter&lt;Integer&gt; mBegin = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1300">    Counter&lt;Integer&gt; mEnd = new ClassicCounter&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">    for(Mention m : goldOrderedMentionsBySentence.get(src.get(0))){</span>
+<span class="nc" id="L1303">      mBegin.incrementCount(m.startIndex);</span>
+<span class="nc" id="L1304">      mEnd.incrementCount(m.endIndex);</span>
+<span class="nc" id="L1305">    }</span>
+<span class="nc" id="L1306">    List&lt;CoreLabel&gt; l = document.annotation.get(CoreAnnotations.SentencesAnnotation.class).get(src.get(0)).get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">    for(int i = 0 ; i &lt; l.size() ; i++){</span>
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">      for(int j = 0; j &lt; mEnd.getCount(i); j++){</span>
+<span class="nc" id="L1309">        golds.append(&quot;]&quot;);</span>
+      }
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">      for(int j = 0; j &lt; mBegin.getCount(i); j++){</span>
+<span class="nc" id="L1312">        golds.append(&quot;[&quot;);</span>
+      }
+<span class="nc" id="L1314">      golds.append(l.get(i).get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L1315">      golds.append(&quot; &quot;);</span>
+    }
+<span class="nc" id="L1317">    logger.fine(golds.toString());</span>
+
+<span class="nc" id="L1319">    printList(logger, &quot;\nAntecedent:&quot; + dstMention.spanToString(),</span>
+<span class="nc" id="L1320">        &quot;Gender:&quot; + dstMention.gender.toString(),</span>
+<span class="nc" id="L1321">        &quot;Number:&quot; + dstMention.number.toString(),</span>
+<span class="nc" id="L1322">        &quot;Animacy:&quot; + dstMention.animacy.toString(),</span>
+<span class="nc" id="L1323">        &quot;Person:&quot; + dstMention.person.toString(),</span>
+        &quot;NER:&quot; + dstMention.nerString,
+        &quot;Head:&quot; + dstMention.headString,
+<span class="nc" id="L1326">        &quot;Type:&quot; + dstMention.mentionType.toString(),</span>
+<span class="nc" id="L1327">        &quot;utter: &quot;+dstMention.headWord.get(CoreAnnotations.UtteranceAnnotation.class),</span>
+<span class="nc" id="L1328">        &quot;speakerID: &quot;+dstMention.headWord.get(CoreAnnotations.SpeakerAnnotation.class),</span>
+        &quot;twinless:&quot; + dstMention.twinless);
+<span class="nc" id="L1330">    logger.fine(&quot;Context:&quot;);</span>
+
+<span class="nc" id="L1332">    p = &quot;&quot;;</span>
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">    for(int i = 0; i &lt; dstSentence.size(); i++) {</span>
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">      if (i == dstMention.startIndex) {</span>
+<span class="nc" id="L1335">        p += &quot;[&quot;;</span>
+      }
+<span class="nc bnc" id="L1337" title="All 2 branches missed.">      if (i == dstMention.endIndex) {</span>
+<span class="nc" id="L1338">        p += &quot;]&quot;;</span>
+      }
+<span class="nc" id="L1340">      p += dstSentence.get(i).word() + &quot; &quot;;</span>
+    }
+<span class="nc" id="L1342">    logger.fine(p);</span>
+
+<span class="nc" id="L1344">    golds = new StringBuilder();</span>
+<span class="nc" id="L1345">    golds.append(&quot;Gold mentions in the sentence:\n&quot;);</span>
+<span class="nc" id="L1346">    mBegin = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1347">    mEnd = new ClassicCounter&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">    for(Mention m : goldOrderedMentionsBySentence.get(dst.get(0))){</span>
+<span class="nc" id="L1350">      mBegin.incrementCount(m.startIndex);</span>
+<span class="nc" id="L1351">      mEnd.incrementCount(m.endIndex);</span>
+<span class="nc" id="L1352">    }</span>
+<span class="nc" id="L1353">    l = document.annotation.get(CoreAnnotations.SentencesAnnotation.class).get(dst.get(0)).get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">    for(int i = 0 ; i &lt; l.size() ; i++){</span>
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">      for(int j = 0; j &lt; mEnd.getCount(i); j++){</span>
+<span class="nc" id="L1356">        golds.append(&quot;]&quot;);</span>
+      }
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">      for(int j = 0; j &lt; mBegin.getCount(i); j++){</span>
+<span class="nc" id="L1359">        golds.append(&quot;[&quot;);</span>
+      }
+<span class="nc" id="L1361">      golds.append(l.get(i).get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L1362">      golds.append(&quot; &quot;);</span>
+    }
+<span class="nc" id="L1364">    logger.fine(golds.toString());</span>
+
+<span class="nc" id="L1366">    logger.finer(&quot;\nMention:: --------------------------------------------------------&quot;);</span>
+    try {
+<span class="nc" id="L1368">      logger.finer(srcMention.dependency.toString());</span>
+<span class="nc" id="L1369">    } catch (Exception e){} //throw new RuntimeException(e);}</span>
+<span class="nc" id="L1370">    logger.finer(&quot;Parse:&quot;);</span>
+<span class="nc" id="L1371">    logger.finer(formatPennTree(srcMention.contextParseTree));</span>
+<span class="nc" id="L1372">    logger.finer(&quot;\nAntecedent:: -----------------------------------------------------&quot;);</span>
+    try {
+<span class="nc" id="L1374">      logger.finer(dstMention.dependency.toString());</span>
+<span class="nc" id="L1375">    } catch (Exception e){} //throw new RuntimeException(e);}</span>
+<span class="nc" id="L1376">    logger.finer(&quot;Parse:&quot;);</span>
+<span class="nc" id="L1377">    logger.finer(formatPennTree(dstMention.contextParseTree));</span>
+<span class="nc" id="L1378">  }</span>
+  /** For printing tree in a better format */
+  private static String formatPennTree(Tree parseTree)	{
+<span class="nc" id="L1381">    String treeString = parseTree.pennString();</span>
+<span class="nc" id="L1382">    treeString = treeString.replaceAll(&quot;\\[TextAnnotation=&quot;, &quot;&quot;);</span>
+<span class="nc" id="L1383">    treeString = treeString.replaceAll(&quot;(NamedEntityTag|Value|Index|PartOfSpeech)Annotation.+?\\)&quot;, &quot;)&quot;);</span>
+<span class="nc" id="L1384">    treeString = treeString.replaceAll(&quot;\\[.+?\\]&quot;, &quot;&quot;);</span>
+<span class="nc" id="L1385">    return treeString;</span>
+  }
+
+  /** Print pass results */
+  private static void printLogs(CorefCluster c1, CorefCluster c2, Mention m1,
+      Mention m2, Document document, int sieveIndex) {
+<span class="nc" id="L1391">    Map&lt;Mention, IntTuple&gt; positions = document.positions;</span>
+<span class="nc" id="L1392">    List&lt;List&lt;Mention&gt;&gt; orderedMentionsBySentence = document.getOrderedMentions();</span>
+<span class="nc" id="L1393">    List&lt;Pair&lt;IntTuple, IntTuple&gt;&gt; goldLinks = document.getGoldLinks();</span>
+
+<span class="nc" id="L1395">    IntTuple p1 = positions.get(m1);</span>
+<span class="nc bnc" id="L1396" title="All 4 branches missed.">    assert(p1 != null);</span>
+<span class="nc" id="L1397">    IntTuple p2 = positions.get(m2);</span>
+<span class="nc bnc" id="L1398" title="All 4 branches missed.">    assert(p2 != null);</span>
+
+<span class="nc" id="L1400">    int menDist = 0;</span>
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">    for (int i = p2.get(0) ; i&lt;= p1.get(0) ; i++){</span>
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">      if(p1.get(0)==p2.get(0)) {</span>
+<span class="nc" id="L1403">        menDist = p1.get(1)-p2.get(1);</span>
+<span class="nc" id="L1404">        break;</span>
+      }
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">      if(i==p2.get(0)) {</span>
+<span class="nc" id="L1407">        menDist += orderedMentionsBySentence.get(p2.get(0)).size()-p2.get(1);</span>
+<span class="nc" id="L1408">        continue;</span>
+      }
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">      if(i==p1.get(0)) {</span>
+<span class="nc" id="L1411">        menDist += p1.get(1);</span>
+<span class="nc" id="L1412">        continue;</span>
+      }
+<span class="nc bnc" id="L1414" title="All 4 branches missed.">      if(p2.get(0)&lt;i &amp;&amp; i &lt; p1.get(0)) menDist += orderedMentionsBySentence.get(i).size();</span>
+    }
+<span class="nc bnc" id="L1416" title="All 2 branches missed.">    String correct = (goldLinks.contains(new Pair&lt;&gt;(p1, p2)))? &quot;\tCorrect&quot; : &quot;\tIncorrect&quot;;</span>
+<span class="nc" id="L1417">    logger.finest(&quot;\nsentence distance: &quot;+(p1.get(0)-p2.get(0))+&quot;\tmention distance: &quot;+menDist + correct);</span>
+
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">    if(!goldLinks.contains(new Pair&lt;&gt;(p1, p2))){</span>
+<span class="nc" id="L1420">      logger.finer(&quot;-------Incorrect merge in pass&quot;+sieveIndex+&quot;::--------------------&quot;);</span>
+<span class="nc" id="L1421">      c1.printCorefCluster(logger);</span>
+<span class="nc" id="L1422">      logger.finer(&quot;--------------------------------------------&quot;);</span>
+<span class="nc" id="L1423">      c2.printCorefCluster(logger);</span>
+<span class="nc" id="L1424">      logger.finer(&quot;--------------------------------------------&quot;);</span>
+    }
+<span class="nc" id="L1426">    logger.finer(&quot;antecedent: &quot;+m2.spanToString()+&quot;(&quot;+m2.mentionID+&quot;)\tmention: &quot;+m1.spanToString()+&quot;(&quot;+m1.mentionID+&quot;)\tsentDistance: &quot;+Math.abs(m1.sentNum-m2.sentNum)+&quot;\t&quot;+correct+&quot; Pass&quot;+sieveIndex+&quot;:&quot;);</span>
+<span class="nc" id="L1427">  }</span>
+
+  private static void printDiscourseStructure(Document document) {
+<span class="nc" id="L1430">    logger.finer(&quot;DISCOURSE STRUCTURE==============================&quot;);</span>
+<span class="nc" id="L1431">    logger.finer(&quot;doc type: &quot;+document.docType);</span>
+<span class="nc" id="L1432">    int previousUtterIndex = -1;</span>
+<span class="nc" id="L1433">    String previousSpeaker = &quot;&quot;;</span>
+<span class="nc" id="L1434">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1435" title="All 2 branches missed.">    for(CoreMap s : document.annotation.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc bnc" id="L1436" title="All 2 branches missed.">      for(CoreLabel l : s.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+<span class="nc" id="L1437">        int utterIndex = l.get(CoreAnnotations.UtteranceAnnotation.class);</span>
+<span class="nc" id="L1438">        String speaker = l.get(CoreAnnotations.SpeakerAnnotation.class);</span>
+<span class="nc" id="L1439">        String word = l.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L1440" title="All 2 branches missed.">        if(previousUtterIndex!=utterIndex) {</span>
+          try {
+<span class="nc" id="L1442">            int previousSpeakerID = Integer.parseInt(previousSpeaker);</span>
+<span class="nc" id="L1443">            logger.finer(&quot;\n&lt;utter&gt;: &quot;+previousUtterIndex + &quot; &lt;speaker&gt;: &quot;+document.allPredictedMentions.get(previousSpeakerID).spanToString());</span>
+<span class="nc" id="L1444">          } catch (Exception e) {</span>
+<span class="nc" id="L1445">            logger.finer(&quot;\n&lt;utter&gt;: &quot;+previousUtterIndex + &quot; &lt;speaker&gt;: &quot;+previousSpeaker);</span>
+<span class="nc" id="L1446">          }</span>
+
+<span class="nc" id="L1448">          logger.finer(sb.toString());</span>
+<span class="nc" id="L1449">          sb.setLength(0);</span>
+<span class="nc" id="L1450">          previousUtterIndex = utterIndex;</span>
+<span class="nc" id="L1451">          previousSpeaker = speaker;</span>
+        }
+<span class="nc" id="L1453">        sb.append(&quot; &quot;).append(word);</span>
+<span class="nc" id="L1454">      }</span>
+<span class="nc" id="L1455">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1456">    }</span>
+    try {
+<span class="nc" id="L1458">      int previousSpeakerID = Integer.parseInt(previousSpeaker);</span>
+<span class="nc" id="L1459">      logger.finer(&quot;\n&lt;utter&gt;: &quot;+previousUtterIndex + &quot; &lt;speaker&gt;: &quot;+document.allPredictedMentions.get(previousSpeakerID).spanToString());</span>
+<span class="nc" id="L1460">    } catch (Exception e) {</span>
+<span class="nc" id="L1461">      logger.finer(&quot;\n&lt;utter&gt;: &quot;+previousUtterIndex + &quot; &lt;speaker&gt;: &quot;+previousSpeaker);</span>
+<span class="nc" id="L1462">    }</span>
+<span class="nc" id="L1463">    logger.finer(sb.toString());</span>
+<span class="nc" id="L1464">    logger.finer(&quot;END OF DISCOURSE STRUCTURE==============================&quot;);</span>
+<span class="nc" id="L1465">  }</span>
+
+  private static void printScoreSummary(String summary, Logger logger, boolean afterPostProcessing) {
+<span class="nc" id="L1468">    String[] lines = summary.split(&quot;\n&quot;);</span>
+<span class="nc bnc" id="L1469" title="All 2 branches missed.">    if(!afterPostProcessing) {</span>
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">      for(String line : lines) {</span>
+<span class="nc bnc" id="L1471" title="All 2 branches missed.">        if(line.startsWith(&quot;Identification of Mentions&quot;)) {</span>
+<span class="nc" id="L1472">          logger.info(line);</span>
+<span class="nc" id="L1473">          return;</span>
+        }
+      }
+    } else {
+<span class="nc" id="L1477">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1478" title="All 2 branches missed.">      for(String line : lines) {</span>
+<span class="nc bnc" id="L1479" title="All 2 branches missed.">        if(line.startsWith(&quot;METRIC&quot;)) sb.append(line);</span>
+<span class="nc bnc" id="L1480" title="All 4 branches missed.">        if(!line.startsWith(&quot;Identification of Mentions&quot;) &amp;&amp; line.contains(&quot;Recall&quot;)) {</span>
+<span class="nc" id="L1481">          sb.append(line).append(&quot;\n&quot;);</span>
+        }
+      }
+<span class="nc" id="L1484">      logger.info(sb.toString());</span>
+    }
+<span class="nc" id="L1486">  }</span>
+  /** Print average F1 of MUC, B^3, CEAF_E */
+  private static void printFinalConllScore(String summary) {
+<span class="nc" id="L1489">    Pattern f1 = Pattern.compile(&quot;Coreference:.*F1: (.*)%&quot;);</span>
+<span class="nc" id="L1490">    Matcher f1Matcher = f1.matcher(summary);</span>
+<span class="nc" id="L1491">    double[] F1s = new double[5];</span>
+<span class="nc" id="L1492">    int i = 0;</span>
+<span class="nc bnc" id="L1493" title="All 2 branches missed.">    while (f1Matcher.find()) {</span>
+<span class="nc" id="L1494">      F1s[i++] = Double.parseDouble(f1Matcher.group(1));</span>
+    }
+<span class="nc" id="L1496">    double finalScore = (F1s[0]+F1s[1]+F1s[3])/3;</span>
+<span class="nc" id="L1497">    logger.info(&quot;Final conll score ((muc+bcub+ceafe)/3) = &quot; + (new DecimalFormat(&quot;#.##&quot;)).format(finalScore));</span>
+<span class="nc" id="L1498">  }</span>
+
+  private static double getFinalConllScore(String summary, String metricType, String scoreType) {
+    // metricType can be muc, bcub, ceafm, ceafe or combined
+    // Expects to match metricType muc, bcub, ceafm, ceafe
+    // Will not match the BLANC metrics (coref links, noncoref links, overall)
+<span class="nc" id="L1504">    Pattern pattern = Pattern.compile(&quot;METRIC\\s+(.*):Coreference:.*&quot; + scoreType + &quot;:\\s*(\\([ 0-9./]*\\))?\\s*(\\d+(\\.\\d+)?)%&quot;);</span>
+<span class="nc" id="L1505">    Matcher matcher = pattern.matcher(summary);</span>
+<span class="nc" id="L1506">    double[] scores = new double[5];</span>
+<span class="nc" id="L1507">    String[] names = new String[5];</span>
+<span class="nc" id="L1508">    int i = 0;</span>
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">    while (matcher.find()) {</span>
+<span class="nc" id="L1510">      names[i] = matcher.group(1);</span>
+<span class="nc" id="L1511">      scores[i] = Double.parseDouble(matcher.group(3));</span>
+<span class="nc" id="L1512">      i++;</span>
+    }
+<span class="nc" id="L1514">    metricType = metricType.toLowerCase();</span>
+<span class="nc bnc" id="L1515" title="All 2 branches missed.">    if (&quot;combined&quot;.equals(metricType)) {</span>
+<span class="nc" id="L1516">      double finalScore = (scores[0]+scores[1]+scores[3])/3;</span>
+<span class="nc" id="L1517">      logger.info(&quot;Final conll score ((muc+bcub+ceafe)/3) &quot; + scoreType + &quot; = &quot; + finalScore);</span>
+<span class="nc" id="L1518">      return finalScore;</span>
+    } else {
+<span class="nc bnc" id="L1520" title="All 2 branches missed.">      if (&quot;bcubed&quot;.equals(metricType)) {</span>
+<span class="nc" id="L1521">        metricType = &quot;bcub&quot;;</span>
+      }
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">      for (i = 0; i &lt; names.length; i++) {</span>
+<span class="nc bnc" id="L1524" title="All 4 branches missed.">        if (names[i] != null &amp;&amp; names[i].equals(metricType)) {</span>
+<span class="nc" id="L1525">          double finalScore = scores[i];</span>
+<span class="nc" id="L1526">          logger.info(&quot;Final conll score (&quot; + metricType + &quot;) &quot; + scoreType + &quot; = &quot; + finalScore);</span>
+<span class="nc" id="L1527">          return finalScore;</span>
+        }
+      }
+<span class="nc" id="L1530">      throw new IllegalArgumentException(&quot;Invalid metricType:&quot; + metricType);</span>
+    }
+  }
+
+  /** Returns final selected score */
+  private double getFinalScore(String metricType, CorefScorer.SubScoreType subScoreType) {
+<span class="nc" id="L1536">    metricType = metricType.toLowerCase();</span>
+<span class="nc" id="L1537">    int passIndex = sieveClassNames.length - 1;</span>
+<span class="nc" id="L1538">    String scoreDesc = metricType;</span>
+    double finalScore;
+<span class="nc bnc" id="L1540" title="All 21 branches missed.">    switch (metricType) {</span>
+      case &quot;combined&quot;:
+<span class="nc" id="L1542">        finalScore = (scoreMUC.get(passIndex).getScore(subScoreType)</span>
+<span class="nc" id="L1543">            + scoreBcubed.get(passIndex).getScore(subScoreType)</span>
+<span class="nc" id="L1544">            + scorePairwise.get(passIndex).getScore(subScoreType)) / 3;</span>
+<span class="nc" id="L1545">        scoreDesc = &quot;(muc + bcub + pairwise)/3&quot;;</span>
+<span class="nc" id="L1546">        break;</span>
+      case &quot;muc&quot;:
+<span class="nc" id="L1548">        finalScore = scoreMUC.get(passIndex).getScore(subScoreType);</span>
+<span class="nc" id="L1549">        break;</span>
+      case &quot;bcub&quot;:
+      case &quot;bcubed&quot;:
+<span class="nc" id="L1552">        finalScore = scoreBcubed.get(passIndex).getScore(subScoreType);</span>
+<span class="nc" id="L1553">        break;</span>
+      case &quot;pairwise&quot;:
+<span class="nc" id="L1555">        finalScore = scorePairwise.get(passIndex).getScore(subScoreType);</span>
+<span class="nc" id="L1556">        break;</span>
+      default:
+<span class="nc" id="L1558">        throw new IllegalArgumentException(&quot;Invalid sub score type:&quot; + subScoreType);</span>
+    }
+<span class="nc" id="L1560">    logger.info(&quot;Final score (&quot; + scoreDesc + &quot;) &quot; + subScoreType + &quot; = &quot; + (new DecimalFormat(&quot;#.##&quot;)).format(finalScore));</span>
+<span class="nc" id="L1561">    return finalScore;</span>
+  }
+
+  public static void printConllOutput(Document document, PrintWriter writer, boolean gold) {
+<span class="nc" id="L1565">    printConllOutput(document, writer, gold, false);</span>
+<span class="nc" id="L1566">  }</span>
+
+  public static void printConllOutput(Document document, PrintWriter writer, boolean gold, boolean filterSingletons) {
+    List&lt;List&lt;Mention&gt;&gt; orderedMentions;
+<span class="nc bnc" id="L1570" title="All 2 branches missed.">    if (gold) {</span>
+<span class="nc" id="L1571">      orderedMentions = document.goldOrderedMentionsBySentence;</span>
+    } else {
+<span class="nc" id="L1573">      orderedMentions = document.predictedOrderedMentionsBySentence;</span>
+    }
+<span class="nc bnc" id="L1575" title="All 2 branches missed.">    if (filterSingletons) {</span>
+<span class="nc" id="L1576">      orderedMentions = filterMentionsWithSingletonClusters(document, orderedMentions);</span>
+    }
+<span class="nc" id="L1578">    printConllOutput(document, writer, orderedMentions, gold);</span>
+<span class="nc" id="L1579">  }</span>
+
+  private static void printConllOutput(Document document, PrintWriter writer, List&lt;List&lt;Mention&gt;&gt; orderedMentions, boolean gold) {
+<span class="nc" id="L1582">    Annotation anno = document.annotation;</span>
+<span class="nc" id="L1583">    List&lt;List&lt;String[]&gt;&gt; conllDocSentences = document.conllDoc.sentenceWordLists;</span>
+<span class="nc" id="L1584">    String docID = anno.get(CoreAnnotations.DocIDAnnotation.class);</span>
+<span class="nc" id="L1585">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L1586">    sb.append(&quot;#begin document &quot;).append(docID).append(&quot;\n&quot;);</span>
+<span class="nc" id="L1587">    List&lt;CoreMap&gt; sentences = anno.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L1588" title="All 2 branches missed.">    for(int sentNum = 0 ; sentNum &lt; sentences.size() ; sentNum++){</span>
+<span class="nc" id="L1589">      List&lt;CoreLabel&gt; sentence = sentences.get(sentNum).get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L1590">      List&lt;String[]&gt; conllSentence = conllDocSentences.get(sentNum);</span>
+<span class="nc" id="L1591">      Map&lt;Integer,Set&lt;Mention&gt;&gt; mentionBeginOnly = Generics.newHashMap();</span>
+<span class="nc" id="L1592">      Map&lt;Integer,Set&lt;Mention&gt;&gt; mentionEndOnly = Generics.newHashMap();</span>
+<span class="nc" id="L1593">      Map&lt;Integer,Set&lt;Mention&gt;&gt; mentionBeginEnd = Generics.newHashMap();</span>
+
+<span class="nc bnc" id="L1595" title="All 2 branches missed.">      for(int i=0 ; i&lt;sentence.size(); i++){</span>
+<span class="nc" id="L1596">        mentionBeginOnly.put(i, new LinkedHashSet&lt;&gt;());</span>
+<span class="nc" id="L1597">        mentionEndOnly.put(i, new LinkedHashSet&lt;&gt;());</span>
+<span class="nc" id="L1598">        mentionBeginEnd.put(i, new LinkedHashSet&lt;&gt;());</span>
+      }
+
+<span class="nc bnc" id="L1601" title="All 2 branches missed.">      for(Mention m : orderedMentions.get(sentNum)) {</span>
+<span class="nc bnc" id="L1602" title="All 2 branches missed.">        if(m.startIndex==m.endIndex-1) {</span>
+<span class="nc" id="L1603">          mentionBeginEnd.get(m.startIndex).add(m);</span>
+        } else {
+<span class="nc" id="L1605">          mentionBeginOnly.get(m.startIndex).add(m);</span>
+<span class="nc" id="L1606">          mentionEndOnly.get(m.endIndex-1).add(m);</span>
+        }
+<span class="nc" id="L1608">      }</span>
+
+<span class="nc bnc" id="L1610" title="All 2 branches missed.">      for(int i=0 ; i&lt;sentence.size(); i++){</span>
+<span class="nc" id="L1611">        StringBuilder sb2 = new StringBuilder();</span>
+<span class="nc bnc" id="L1612" title="All 2 branches missed.">        for(Mention m : mentionBeginOnly.get(i)){</span>
+<span class="nc bnc" id="L1613" title="All 2 branches missed.">          if (sb2.length() &gt; 0) {</span>
+<span class="nc" id="L1614">            sb2.append(&quot;|&quot;);</span>
+          }
+<span class="nc bnc" id="L1616" title="All 2 branches missed.">          int corefClusterId = (gold)? m.goldCorefClusterID:m.corefClusterID;</span>
+<span class="nc" id="L1617">          sb2.append(&quot;(&quot;).append(corefClusterId);</span>
+<span class="nc" id="L1618">        }</span>
+<span class="nc bnc" id="L1619" title="All 2 branches missed.">        for(Mention m : mentionBeginEnd.get(i)){</span>
+<span class="nc bnc" id="L1620" title="All 2 branches missed.">          if (sb2.length() &gt; 0) {</span>
+<span class="nc" id="L1621">            sb2.append(&quot;|&quot;);</span>
+          }
+<span class="nc bnc" id="L1623" title="All 2 branches missed.">          int corefClusterId = (gold)? m.goldCorefClusterID:m.corefClusterID;</span>
+<span class="nc" id="L1624">          sb2.append(&quot;(&quot;).append(corefClusterId).append(&quot;)&quot;);</span>
+<span class="nc" id="L1625">        }</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">        for(Mention m : mentionEndOnly.get(i)){</span>
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">          if (sb2.length() &gt; 0) {</span>
+<span class="nc" id="L1628">            sb2.append(&quot;|&quot;);</span>
+          }
+<span class="nc bnc" id="L1630" title="All 2 branches missed.">          int corefClusterId = (gold)? m.goldCorefClusterID:m.corefClusterID;</span>
+<span class="nc" id="L1631">          sb2.append(corefClusterId).append(&quot;)&quot;);</span>
+<span class="nc" id="L1632">        }</span>
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">        if(sb2.length() == 0) sb2.append(&quot;-&quot;);</span>
+
+<span class="nc" id="L1635">        String[] columns = conllSentence.get(i);</span>
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">        for(int j = 0 ; j &lt; columns.length-1 ; j++){</span>
+<span class="nc" id="L1637">          String column = columns[j];</span>
+<span class="nc" id="L1638">          sb.append(column).append(&quot;\t&quot;);</span>
+        }
+<span class="nc" id="L1640">        sb.append(sb2).append(&quot;\n&quot;);</span>
+      }
+<span class="nc" id="L1642">      sb.append(&quot;\n&quot;);</span>
+    }
+
+<span class="nc" id="L1645">    sb.append(&quot;#end document&quot;).append(&quot;\n&quot;);</span>
+    //    sb.append(&quot;#end document &quot;).append(docID).append(&quot;\n&quot;);
+
+<span class="nc" id="L1648">    writer.print(sb.toString());</span>
+<span class="nc" id="L1649">    writer.flush();</span>
+<span class="nc" id="L1650">  }</span>
+
+  /** Print raw document for analysis */
+  private static void printRawDoc(Document document, boolean gold) throws FileNotFoundException {
+<span class="nc" id="L1654">    List&lt;CoreMap&gt; sentences = document.annotation.get(CoreAnnotations.SentencesAnnotation.class);</span>
+    List&lt;List&lt;Mention&gt;&gt; allMentions;
+<span class="nc bnc" id="L1656" title="All 2 branches missed.">    if (gold) {</span>
+<span class="nc" id="L1657">      allMentions = document.goldOrderedMentionsBySentence;</span>
+    } else {
+<span class="nc" id="L1659">      allMentions = document.predictedOrderedMentionsBySentence;</span>
+    }
+    //    String filename = document.annotation.get()
+
+<span class="nc" id="L1663">    StringBuilder doc = new StringBuilder();</span>
+<span class="nc" id="L1664">    int previousOffset = 0;</span>
+
+<span class="nc bnc" id="L1666" title="All 2 branches missed.">    for(int i = 0 ; i&lt;sentences.size(); i++) {</span>
+<span class="nc" id="L1667">      CoreMap sentence = sentences.get(i);</span>
+<span class="nc" id="L1668">      List&lt;Mention&gt; mentions = allMentions.get(i);</span>
+
+<span class="nc" id="L1670">      List&lt;CoreLabel&gt; t = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L1671">      String[] tokens = new String[t.size()];</span>
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">      for(CoreLabel c : t) {</span>
+<span class="nc" id="L1673">        tokens[c.index()-1] = c.word();</span>
+<span class="nc" id="L1674">      }</span>
+<span class="nc bnc" id="L1675" title="All 2 branches missed.">      if(previousOffset+2 &lt; t.get(0).get(CoreAnnotations.CharacterOffsetBeginAnnotation.class)) {</span>
+<span class="nc" id="L1676">        doc.append(&quot;\n&quot;);</span>
+      }
+<span class="nc" id="L1678">      previousOffset = t.get(t.size()-1).get(CoreAnnotations.CharacterOffsetEndAnnotation.class);</span>
+<span class="nc" id="L1679">      Counter&lt;Integer&gt; startCounts = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1680">      Counter&lt;Integer&gt; endCounts = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1681">      Map&lt;Integer, Set&lt;Mention&gt;&gt; endMentions = Generics.newHashMap();</span>
+<span class="nc bnc" id="L1682" title="All 2 branches missed.">      for (Mention m : mentions) {</span>
+<span class="nc" id="L1683">        startCounts.incrementCount(m.startIndex);</span>
+<span class="nc" id="L1684">        endCounts.incrementCount(m.endIndex);</span>
+<span class="nc bnc" id="L1685" title="All 2 branches missed.">        if(!endMentions.containsKey(m.endIndex)) endMentions.put(m.endIndex, Generics.&lt;Mention&gt;newHashSet());</span>
+<span class="nc" id="L1686">        endMentions.get(m.endIndex).add(m);</span>
+<span class="nc" id="L1687">      }</span>
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">      for (int j = 0 ; j &lt; tokens.length; j++){</span>
+<span class="nc bnc" id="L1689" title="All 2 branches missed.">        if(endMentions.containsKey(j)) {</span>
+<span class="nc bnc" id="L1690" title="All 2 branches missed.">          for(Mention m : endMentions.get(j)){</span>
+<span class="nc bnc" id="L1691" title="All 2 branches missed.">            int corefChainId =  (gold)? m.goldCorefClusterID: m.corefClusterID;</span>
+<span class="nc" id="L1692">            doc.append(&quot;]_&quot;).append(corefChainId);</span>
+<span class="nc" id="L1693">          }</span>
+        }
+<span class="nc bnc" id="L1695" title="All 2 branches missed.">        for (int k = 0 ; k &lt; startCounts.getCount(j) ; k++) {</span>
+<span class="nc bnc" id="L1696" title="All 4 branches missed.">          if (doc.length() &gt; 0 &amp;&amp; doc.charAt(doc.length()-1) != '[') doc.append(&quot; &quot;);</span>
+<span class="nc" id="L1697">          doc.append(&quot;[&quot;);</span>
+        }
+<span class="nc bnc" id="L1699" title="All 4 branches missed.">        if (doc.length() &gt; 0 &amp;&amp; doc.charAt(doc.length()-1)!='[') doc.append(&quot; &quot;);</span>
+<span class="nc" id="L1700">        doc.append(tokens[j]);</span>
+      }
+<span class="nc bnc" id="L1702" title="All 2 branches missed.">      if(endMentions.containsKey(tokens.length)) {</span>
+<span class="nc bnc" id="L1703" title="All 2 branches missed.">        for(Mention m : endMentions.get(tokens.length)){</span>
+<span class="nc bnc" id="L1704" title="All 2 branches missed.">          int corefChainId =  (gold)? m.goldCorefClusterID: m.corefClusterID;</span>
+<span class="nc" id="L1705">          doc.append(&quot;]_&quot;).append(corefChainId); //append(&quot;_&quot;).append(m.mentionID);</span>
+<span class="nc" id="L1706">        }</span>
+      }
+
+<span class="nc" id="L1709">      doc.append(&quot;\n&quot;);</span>
+    }
+<span class="nc" id="L1711">    logger.fine(document.annotation.get(CoreAnnotations.DocIDAnnotation.class));</span>
+<span class="nc bnc" id="L1712" title="All 2 branches missed.">    if (gold) {</span>
+<span class="nc" id="L1713">      logger.fine(&quot;New DOC: (GOLD MENTIONS) ==================================================&quot;);</span>
+    } else {
+<span class="nc" id="L1715">      logger.fine(&quot;New DOC: (Predicted Mentions) ==================================================&quot;);</span>
+    }
+<span class="nc" id="L1717">    logger.fine(doc.toString());</span>
+<span class="nc" id="L1718">  }</span>
+  public static List&lt;Pair&lt;IntTuple, IntTuple&gt;&gt; getLinks(
+      Map&lt;Integer, CorefChain&gt; result) {
+<span class="nc" id="L1721">    List&lt;Pair&lt;IntTuple, IntTuple&gt;&gt; links = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1722">    CorefChain.CorefMentionComparator comparator = new CorefChain.CorefMentionComparator();</span>
+
+<span class="nc bnc" id="L1724" title="All 2 branches missed.">    for (CorefChain c : result.values()) {</span>
+<span class="nc" id="L1725">      List&lt;CorefMention&gt; s = c.getMentionsInTextualOrder();</span>
+<span class="nc bnc" id="L1726" title="All 2 branches missed.">      for (CorefMention m1 : s) {</span>
+<span class="nc bnc" id="L1727" title="All 2 branches missed.">        for (CorefMention m2 : s) {</span>
+<span class="nc bnc" id="L1728" title="All 2 branches missed.">          if (comparator.compare(m1, m2)==1) {</span>
+<span class="nc" id="L1729">            links.add(new Pair&lt;&gt;(m1.position, m2.position));</span>
+          }
+<span class="nc" id="L1731">        }</span>
+<span class="nc" id="L1732">      }</span>
+<span class="nc" id="L1733">    }</span>
+<span class="nc" id="L1734">    return links;</span>
+  }
+
+  public static void debugPrintMentions(PrintStream out, String tag, List&lt;List&lt;Mention&gt;&gt; mentions) {
+<span class="nc bnc" id="L1738" title="All 2 branches missed.">    for(int i = 0; i &lt; mentions.size(); i ++){</span>
+<span class="nc" id="L1739">     out.println(tag + &quot; SENTENCE &quot; + i);</span>
+<span class="nc bnc" id="L1740" title="All 2 branches missed.">     for(int j = 0; j &lt; mentions.get(i).size(); j ++){</span>
+<span class="nc" id="L1741">       Mention m = mentions.get(i).get(j);</span>
+<span class="nc" id="L1742">       String ms = &quot;(&quot; + m.mentionID + &quot;,&quot; + m.originalRef + &quot;,&quot; + m.corefClusterID</span>
+               + &quot;,[&quot; + m.startIndex + &quot;,&quot; + m.endIndex +&quot;]&quot; + &quot;) &quot;;
+<span class="nc" id="L1744">       out.print(ms);</span>
+     }
+<span class="nc" id="L1746">     out.println();</span>
+   }
+<span class="nc" id="L1748">  }</span>
+
+  public static boolean checkClusters(Logger logger, String tag, Document document) {
+<span class="nc" id="L1751">    List&lt;List&lt;Mention&gt;&gt; mentions = document.getOrderedMentions();</span>
+<span class="nc" id="L1752">    boolean clustersOk = true;</span>
+<span class="nc bnc" id="L1753" title="All 2 branches missed.">    for (List&lt;Mention&gt; mentionCluster : mentions) {</span>
+<span class="nc bnc" id="L1754" title="All 2 branches missed.">      for (Mention m : mentionCluster) {</span>
+<span class="nc" id="L1755">        String ms = &quot;(&quot; + m.mentionID + &quot;,&quot; + m.originalRef + &quot;,&quot; + m.corefClusterID</span>
+                + &quot;,[&quot; + m.startIndex + &quot;,&quot; + m.endIndex + &quot;]&quot; + &quot;) &quot;;
+<span class="nc" id="L1757">        CorefCluster cluster = document.corefClusters.get(m.corefClusterID);</span>
+<span class="nc bnc" id="L1758" title="All 2 branches missed.">        if (cluster == null) {</span>
+<span class="nc" id="L1759">          logger.warning(tag + &quot;: Cluster not found for mention: &quot; + ms);</span>
+<span class="nc" id="L1760">          clustersOk = false;</span>
+<span class="nc bnc" id="L1761" title="All 2 branches missed.">        } else if (!cluster.getCorefMentions().contains(m)) {</span>
+<span class="nc" id="L1762">          logger.warning(tag + &quot;: Cluster does not contain mention: &quot; + ms);</span>
+<span class="nc" id="L1763">          clustersOk = false;</span>
+        }
+<span class="nc" id="L1765">      }</span>
+<span class="nc" id="L1766">    }</span>
+<span class="nc" id="L1767">    return clustersOk;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

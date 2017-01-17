@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShiftReduceParserQuery.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.shiftreduce</a> &gt; <span class="el_source">ShiftReduceParserQuery.java</span></div><h1>ShiftReduceParserQuery.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.shiftreduce; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+import java.io.PrintWriter;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.PriorityQueue;
+
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.ling.SentenceUtils;
+import edu.stanford.nlp.parser.KBestViterbiParser;
+import edu.stanford.nlp.parser.common.ParserConstraint;
+import edu.stanford.nlp.parser.common.ParserQuery;
+import edu.stanford.nlp.parser.lexparser.Debinarizer;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon;
+import edu.stanford.nlp.trees.tregex.tsurgeon.TsurgeonPattern;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+import edu.stanford.nlp.util.ScoredComparator;
+import edu.stanford.nlp.util.ScoredObject;
+
+public class ShiftReduceParserQuery implements ParserQuery  {
+
+  /** A logger for this class */
+<span class="nc" id="L31">  private static Redwood.RedwoodChannels log = Redwood.channels(ShiftReduceParserQuery.class);</span>
+<span class="nc" id="L32">  Debinarizer debinarizer = new Debinarizer(false);</span>
+
+  List&lt;? extends HasWord&gt; originalSentence;
+  private State initialState, finalState;
+  Tree debinarized;
+
+  boolean success;
+  boolean unparsable;
+
+  private List&lt;State&gt; bestParses;
+
+  final ShiftReduceParser parser;
+
+<span class="nc" id="L45">  List&lt;ParserConstraint&gt; constraints = null;</span>
+
+<span class="nc" id="L47">  public ShiftReduceParserQuery(ShiftReduceParser parser) {</span>
+<span class="nc" id="L48">    this.parser = parser;</span>
+<span class="nc" id="L49">  }</span>
+
+  @Override
+  public boolean parse(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L53">    this.originalSentence = sentence;</span>
+<span class="nc" id="L54">    initialState = ShiftReduceParser.initialStateFromTaggedSentence(sentence);</span>
+<span class="nc" id="L55">    return parseInternal();</span>
+  }
+
+  public boolean parse(Tree tree) {
+<span class="nc" id="L59">    this.originalSentence = tree.yieldHasWord();</span>
+<span class="nc" id="L60">    initialState = ShiftReduceParser.initialStateFromGoldTagTree(tree);</span>
+<span class="nc" id="L61">    return parseInternal();</span>
+  }
+
+  // TODO: we are assuming that sentence final punctuation always has
+  // either . or PU as the tag.
+<span class="nc" id="L66">  private static TregexPattern rearrangeFinalPunctuationTregex =</span>
+<span class="nc" id="L67">    TregexPattern.compile(&quot;__ !&gt; __ &lt;- (__=top &lt;- (__ &lt;&lt;- (/[.]|PU/=punc &lt; /[.!?。！？]/ ?&gt; (__=single &lt;: =punc))))&quot;);</span>
+
+<span class="nc" id="L69">  private static TsurgeonPattern rearrangeFinalPunctuationTsurgeon =</span>
+<span class="nc" id="L70">    Tsurgeon.parseOperation(&quot;[move punc &gt;-1 top] [if exists single prune single]&quot;);</span>
+
+  private boolean parseInternal() {
+<span class="nc" id="L73">    final int maxBeamSize = Math.max(parser.op.testOptions().beamSize, 1);</span>
+
+<span class="nc" id="L75">    success = true;</span>
+<span class="nc" id="L76">    unparsable = false;</span>
+<span class="nc" id="L77">    PriorityQueue&lt;State&gt; beam = new PriorityQueue&lt;&gt;(maxBeamSize + 1, ScoredComparator.ASCENDING_COMPARATOR);</span>
+<span class="nc" id="L78">    beam.add(initialState);</span>
+    // TODO: don't construct as many PriorityQueues
+<span class="nc bnc" id="L80" title="All 2 branches missed.">    while (beam.size() &gt; 0) {</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">      if (Thread.interrupted()) { // Allow interrupting the parser</span>
+<span class="nc" id="L82">        throw new RuntimeInterruptedException();</span>
+      }
+      // log.info(&quot;================================================&quot;);
+      // log.info(&quot;Current beam:&quot;);
+      // log.info(beam);
+<span class="nc" id="L87">      PriorityQueue&lt;State&gt; oldBeam = beam;</span>
+<span class="nc" id="L88">      beam = new PriorityQueue&lt;&gt;(maxBeamSize + 1, ScoredComparator.ASCENDING_COMPARATOR);</span>
+<span class="nc" id="L89">      State bestState = null;</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">      for (State state : oldBeam) {</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        if (Thread.interrupted()) {  // Allow interrupting the parser</span>
+<span class="nc" id="L92">          throw new RuntimeInterruptedException();</span>
+        }
+<span class="nc" id="L94">        Collection&lt;ScoredObject&lt;Integer&gt;&gt; predictedTransitions = parser.model.findHighestScoringTransitions(state, true, maxBeamSize, constraints);</span>
+        // log.info(&quot;Examining state: &quot; + state);
+<span class="nc bnc" id="L96" title="All 2 branches missed.">        for (ScoredObject&lt;Integer&gt; predictedTransition : predictedTransitions) {</span>
+<span class="nc" id="L97">          Transition transition = parser.model.transitionIndex.get(predictedTransition.object());</span>
+<span class="nc" id="L98">          State newState = transition.apply(state, predictedTransition.score());</span>
+          // log.info(&quot;  Transition: &quot; + transition + &quot; (&quot; + predictedTransition.score() + &quot;)&quot;);
+<span class="nc bnc" id="L100" title="All 4 branches missed.">          if (bestState == null || bestState.score() &lt; newState.score()) {</span>
+<span class="nc" id="L101">            bestState = newState;</span>
+          }
+<span class="nc" id="L103">          beam.add(newState);</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">          if (beam.size() &gt; maxBeamSize) {</span>
+<span class="nc" id="L105">            beam.poll();</span>
+          }
+<span class="nc" id="L107">        }</span>
+<span class="nc" id="L108">      }</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">      if (beam.size() == 0) {</span>
+        // Oops, time for some fallback plan
+        // This can happen with the set of constraints given by the original paper
+        // For example, one particular French model had a situation where it would reach
+        //   @Ssub @Ssub .
+        // without a left(Ssub) transition, so finishing the parse was impossible.
+        // This will probably result in a bad parse, but at least it
+        // will result in some sort of parse.
+<span class="nc bnc" id="L117" title="All 2 branches missed.">        for (State state : oldBeam) {</span>
+<span class="nc" id="L118">          Transition transition = parser.model.findEmergencyTransition(state, constraints);</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">          if (transition != null) {</span>
+<span class="nc" id="L120">            State newState = transition.apply(state);</span>
+<span class="nc bnc" id="L121" title="All 4 branches missed.">            if (bestState == null || bestState.score() &lt; newState.score()) {</span>
+<span class="nc" id="L122">              bestState = newState;</span>
+            }
+<span class="nc" id="L124">            beam.add(newState);</span>
+          }
+<span class="nc" id="L126">        }</span>
+      }
+
+      // bestState == null only happens when we have failed to make progress, so quit
+      // If the bestState is finished, we are done
+<span class="nc bnc" id="L131" title="All 4 branches missed.">      if (bestState == null || bestState.isFinished()) {</span>
+<span class="nc" id="L132">        break;</span>
+      }
+<span class="nc" id="L134">    }</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">    if (beam.size() == 0) {</span>
+<span class="nc" id="L136">      success = false;</span>
+<span class="nc" id="L137">      unparsable = true;</span>
+<span class="nc" id="L138">      debinarized = null;</span>
+<span class="nc" id="L139">      finalState = null;</span>
+<span class="nc" id="L140">      bestParses = Collections.emptyList();</span>
+    } else {
+      // TODO: filter out beam elements that aren't finished
+<span class="nc" id="L143">      bestParses = Generics.newArrayList(beam);</span>
+<span class="nc" id="L144">      Collections.sort(bestParses, beam.comparator());</span>
+<span class="nc" id="L145">      Collections.reverse(bestParses);</span>
+<span class="nc" id="L146">      finalState = bestParses.get(0);</span>
+<span class="nc" id="L147">      debinarized = debinarizer.transformTree(finalState.stack.peek());</span>
+<span class="nc" id="L148">      debinarized = Tsurgeon.processPattern(rearrangeFinalPunctuationTregex, rearrangeFinalPunctuationTsurgeon, debinarized);</span>
+    }
+<span class="nc" id="L150">    return success;</span>
+  }
+
+  /**
+   * TODO: if we add anything interesting to report, we should report it here
+   */
+  @Override
+  public boolean parseAndReport(List&lt;? extends HasWord&gt; sentence, PrintWriter pwErr) {
+<span class="nc" id="L158">    boolean success = parse(sentence);</span>
+    //log.info(getBestTransitionSequence());
+    //log.info(getBestBinarizedParse());
+<span class="nc" id="L161">    return success;</span>
+  }
+
+  public Tree getBestBinarizedParse() {
+<span class="nc" id="L165">    return finalState.stack.peek();</span>
+  }
+
+  public List&lt;Transition&gt; getBestTransitionSequence() {
+<span class="nc" id="L169">    return finalState.transitions.asList();</span>
+  }
+
+  @Override
+  public double getPCFGScore() {
+<span class="nc" id="L174">    return finalState.score;</span>
+  }
+
+  @Override
+  public Tree getBestParse() {
+<span class="nc" id="L179">    return debinarized;</span>
+  }
+
+  @Override
+<span class="nc" id="L183">  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKBestParses(int k) { return this.getKBestPCFGParses(k); }</span>
+
+  @Override
+<span class="nc" id="L186">  public double getBestScore() { return this.getPCFGScore(); }</span>
+
+  /** TODO: can we get away with not calling this PCFG? */
+  @Override
+  public Tree getBestPCFGParse() {
+<span class="nc" id="L191">    return debinarized;</span>
+  }
+
+  @Override
+  public Tree getBestDependencyParse(boolean debinarize) {
+<span class="nc" id="L196">    return null;</span>
+  }
+
+  @Override
+  public Tree getBestFactoredParse() {
+<span class="nc" id="L201">    return null;</span>
+  }
+
+  /** TODO: if this is a beam, return all equal parses */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getBestPCFGParses() {
+<span class="nc" id="L207">    ScoredObject&lt;Tree&gt; parse = new ScoredObject&lt;&gt;(debinarized, finalState.score);</span>
+<span class="nc" id="L208">    return Collections.singletonList(parse);</span>
+  }
+
+  @Override
+  public boolean hasFactoredParse() {
+<span class="nc" id="L213">    return false;</span>
+  }
+
+  /** TODO: return more if this used a beam */
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKBestPCFGParses(int kbestPCFG) {
+<span class="nc" id="L219">    ScoredObject&lt;Tree&gt; parse = new ScoredObject&lt;&gt;(debinarized, finalState.score);</span>
+<span class="nc" id="L220">    return Collections.singletonList(parse);</span>
+  }
+
+  @Override
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKGoodFactoredParses(int kbest) {
+<span class="nc" id="L225">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public KBestViterbiParser getPCFGParser() {
+    // TODO: find some way to treat this as a KBestViterbiParser?
+<span class="nc" id="L231">    return null;</span>
+  }
+
+  @Override
+  public KBestViterbiParser getDependencyParser() {
+<span class="nc" id="L236">    return null;</span>
+  }
+
+  @Override
+  public KBestViterbiParser getFactoredParser() {
+<span class="nc" id="L241">    return null;</span>
+  }
+
+  @Override
+  public void setConstraints(List&lt;ParserConstraint&gt; constraints) {
+<span class="nc" id="L246">    this.constraints = constraints;</span>
+<span class="nc" id="L247">  }</span>
+
+  @Override
+  public boolean saidMemMessage() {
+<span class="nc" id="L251">    return false;</span>
+  }
+
+  @Override
+  public boolean parseSucceeded() {
+<span class="nc" id="L256">    return success;</span>
+  }
+
+  /** TODO: skip sentences which are too long */
+  @Override
+  public boolean parseSkipped() {
+<span class="nc" id="L262">    return false;</span>
+  }
+
+  @Override
+  public boolean parseFallback() {
+<span class="nc" id="L267">    return false;</span>
+  }
+
+  /** TODO: add memory handling? */
+  @Override
+  public boolean parseNoMemory() {
+<span class="nc" id="L273">    return false;</span>
+  }
+
+  @Override
+  public boolean parseUnparsable() {
+<span class="nc" id="L278">    return unparsable;</span>
+  }
+
+  @Override
+  public List&lt;? extends HasWord&gt; originalSentence() {
+<span class="nc" id="L283">    return originalSentence;</span>
+  }
+
+  /**
+   * TODO: clearly this should be a default method in ParserQuery once Java 8 comes out
+   */
+  @Override
+  public void restoreOriginalWords(Tree tree) {
+<span class="nc bnc" id="L291" title="All 4 branches missed.">    if (originalSentence == null || tree == null) {</span>
+<span class="nc" id="L292">      return;</span>
+    }
+<span class="nc" id="L294">    List&lt;Tree&gt; leaves = tree.getLeaves();</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">    if (leaves.size() != originalSentence.size()) {</span>
+<span class="nc" id="L296">      throw new IllegalStateException(&quot;originalWords and sentence of different sizes: &quot; + originalSentence.size() + &quot; vs. &quot; + leaves.size() +</span>
+<span class="nc" id="L297">                                      &quot;\n Orig: &quot; + SentenceUtils.listToString(originalSentence) +</span>
+<span class="nc" id="L298">                                      &quot;\n Pars: &quot; + SentenceUtils.listToString(leaves));</span>
+    }
+    // TODO: get rid of this cast
+<span class="nc" id="L301">    Iterator&lt;? extends Label&gt; wordsIterator = (Iterator&lt;? extends Label&gt;) originalSentence.iterator();</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">    for (Tree leaf : leaves) {</span>
+<span class="nc" id="L303">      leaf.setLabel(wordsIterator.next());</span>
+<span class="nc" id="L304">    }</span>
+<span class="nc" id="L305">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

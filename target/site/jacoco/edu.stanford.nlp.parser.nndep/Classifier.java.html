@@ -1,0 +1,753 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Classifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.nndep</a> &gt; <span class="el_source">Classifier.java</span></div><h1>Classifier.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.nndep;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.util.CollectionUtils;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.IntStream;
+
+/**
+ * Neural network classifier which powers a transition-based dependency
+ * parser.
+ *
+ * This classifier is built to accept distributed-representation
+ * inputs, and feeds back errors to these input layers as it learns.
+ *
+ * In order to train a classifier, instantiate this class using the
+ * {@link #Classifier(Config, Dataset, double[][], double[][], double[], double[][], java.util.List)}
+ * constructor. (The presence of a non-null dataset signals that we
+ * wish to train.) After training by alternating calls to
+ * {@link #computeCostFunction(int, double, double)} and,
+ * {@link #takeAdaGradientStep(edu.stanford.nlp.parser.nndep.Classifier.Cost, double, double)},
+ * be sure to call {@link #finalizeTraining()} in order to allow the
+ * classifier to clean up resources used during training.
+ *
+ * @author Danqi Chen
+ * @author Jon Gauthier
+ */
+public class Classifier  {
+
+  /** A logger for this class */
+<span class="nc" id="L40">  private static Redwood.RedwoodChannels log = Redwood.channels(Classifier.class);</span>
+  // E: numFeatures x embeddingSize
+  // W1: hiddenSize x (embeddingSize x numFeatures)
+  // b1: hiddenSize
+  // W2: numLabels x hiddenSize
+
+  // Weight matrices
+  private final double[][] W1, W2, E;
+  private final double[] b1;
+
+  // Global gradSaved
+  private double[][] gradSaved;
+
+  // Gradient histories
+  private double[][] eg2W1, eg2W2, eg2E;
+  private double[] eg2b1;
+
+  /**
+   * Pre-computed hidden layer unit activations. Each double array
+   * within this data is an entire hidden layer. The sub-arrays are
+   * indexed somewhat arbitrarily; in order to find hidden-layer unit
+   * activations for a given feature ID, use {@link #preMap} to find
+   * the proper index into this data.
+   */
+  private double[][] saved;
+
+  /**
+   * Describes features which should be precomputed. Each entry maps a
+   * feature ID to its destined index in the saved hidden unit
+   * activation data (see {@link #saved}).
+   */
+  private final Map&lt;Integer, Integer&gt; preMap;
+
+  /**
+   * Initial training state is dependent on how the classifier is
+   * initialized. We use this flag to determine whether calls to
+   * {@link #computeCostFunction(int, double, double)}, etc. are valid.
+   */
+  private boolean isTraining;
+
+  /**
+   * All training examples.
+   */
+  private final Dataset dataset;
+
+  /**
+   * We use MulticoreWrapper to parallelize mini-batch training.
+   * &lt;p&gt;
+   * Threaded job input: partition of minibatch;
+   * current weights + params
+   * Threaded job output: cost value, weight gradients for partition of
+   * minibatch
+   */
+  private final MulticoreWrapper&lt;Pair&lt;Collection&lt;Example&gt;, FeedforwardParams&gt;, Cost&gt; jobHandler;
+
+  private final Config config;
+
+  /**
+   * Number of possible dependency relation labels among which this
+   * classifier will choose.
+   */
+  private final int numLabels;
+
+  /**
+   * Instantiate a classifier with previously learned parameters in
+   * order to perform new inference.
+   *
+   * @param config
+   * @param E
+   * @param W1
+   * @param b1
+   * @param W2
+   * @param preComputed
+   */
+  public Classifier(Config config, double[][] E, double[][] W1, double[] b1, double[][] W2, List&lt;Integer&gt; preComputed) {
+<span class="nc" id="L115">    this(config, null, E, W1, b1, W2, preComputed);</span>
+<span class="nc" id="L116">  }</span>
+
+  /**
+   * Instantiate a classifier with training data and randomly
+   * initialized parameter matrices in order to begin training.
+   *
+   * @param config
+   * @param dataset
+   * @param E
+   * @param W1
+   * @param b1
+   * @param W2
+   * @param preComputed
+   */
+  public Classifier(Config config, Dataset dataset, double[][] E, double[][] W1, double[] b1, double[][] W2,
+<span class="nc" id="L131">                    List&lt;Integer&gt; preComputed) {</span>
+<span class="nc" id="L132">    this.config = config;</span>
+<span class="nc" id="L133">    this.dataset = dataset;</span>
+
+<span class="nc" id="L135">    this.E = E;</span>
+<span class="nc" id="L136">    this.W1 = W1;</span>
+<span class="nc" id="L137">    this.b1 = b1;</span>
+<span class="nc" id="L138">    this.W2 = W2;</span>
+
+<span class="nc" id="L140">    initGradientHistories();</span>
+
+<span class="nc" id="L142">    numLabels = W2.length;</span>
+
+<span class="nc" id="L144">    preMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L145" title="All 4 branches missed.">    for (int i = 0; i &lt; preComputed.size() &amp;&amp; i &lt; config.numPreComputed; ++i)</span>
+<span class="nc" id="L146">      preMap.put(preComputed.get(i), i);</span>
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">    isTraining = dataset != null;</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">    if (isTraining)</span>
+<span class="nc" id="L150">      jobHandler = new MulticoreWrapper&lt;&gt;(config.trainingThreads, new CostFunction(), false);</span>
+    else
+<span class="nc" id="L152">      jobHandler = null;</span>
+<span class="nc" id="L153">  }</span>
+
+  /**
+   * Evaluates the training cost of a particular subset of training
+   * examples given the current learned weights.
+   *
+   * This function will be evaluated in parallel on different data in
+   * separate threads, and accesses the classifier's weights stored in
+   * the outer class instance.
+   *
+   * Each nested class instance accumulates its own weight gradients;
+   * these gradients will be merged on a main thread after all cost
+   * function runs complete.
+   *
+   * @see #computeCostFunction(int, double, double)
+   */
+<span class="nc" id="L169">  private class CostFunction implements ThreadsafeProcessor&lt;Pair&lt;Collection&lt;Example&gt;, FeedforwardParams&gt;, Cost&gt; {</span>
+
+    private double[][] gradW1;
+    private double[] gradb1;
+    private double[][] gradW2;
+    private double[][] gradE;
+
+    @Override
+    public Cost process(Pair&lt;Collection&lt;Example&gt;, FeedforwardParams&gt; input) {
+<span class="nc" id="L178">      Collection&lt;Example&gt; examples = input.first();</span>
+<span class="nc" id="L179">      FeedforwardParams params = input.second();</span>
+
+      // We can't fix the seed used with ThreadLocalRandom
+      // TODO: Is this a serious problem?
+<span class="nc" id="L183">      ThreadLocalRandom random = ThreadLocalRandom.current();</span>
+
+<span class="nc" id="L185">      gradW1 = new double[W1.length][W1[0].length];</span>
+<span class="nc" id="L186">      gradb1 = new double[b1.length];</span>
+<span class="nc" id="L187">      gradW2 = new double[W2.length][W2[0].length];</span>
+<span class="nc" id="L188">      gradE = new double[E.length][E[0].length];</span>
+
+<span class="nc" id="L190">      double cost = 0.0;</span>
+<span class="nc" id="L191">      double correct = 0.0;</span>
+
+<span class="nc bnc" id="L193" title="All 2 branches missed.">      for (Example ex : examples) {</span>
+<span class="nc" id="L194">        List&lt;Integer&gt; feature = ex.getFeature();</span>
+<span class="nc" id="L195">        List&lt;Integer&gt; label = ex.getLabel();</span>
+
+<span class="nc" id="L197">        double[] scores = new double[numLabels];</span>
+<span class="nc" id="L198">        double[] hidden = new double[config.hiddenSize];</span>
+<span class="nc" id="L199">        double[] hidden3 = new double[config.hiddenSize];</span>
+
+        // Run dropout: randomly drop some hidden-layer units. `ls`
+        // contains the indices of those units which are still active
+<span class="nc" id="L203">        int[] ls = IntStream.range(0, config.hiddenSize)</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                            .filter(n -&gt; random.nextDouble() &gt; params.getDropOutProb())</span>
+<span class="nc" id="L205">                            .toArray();</span>
+
+<span class="nc" id="L207">        int offset = 0;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        for (int j = 0; j &lt; config.numTokens; ++j) {</span>
+<span class="nc" id="L209">          int tok = feature.get(j);</span>
+<span class="nc" id="L210">          int index = tok * config.numTokens + j;</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">          if (preMap.containsKey(index)) {</span>
+            // Unit activations for this input feature value have been
+            // precomputed
+<span class="nc" id="L215">            int id = preMap.get(index);</span>
+
+            // Only extract activations for those nodes which are still
+            // activated (`ls`)
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            for (int nodeIndex : ls)</span>
+<span class="nc" id="L220">              hidden[nodeIndex] += saved[id][nodeIndex];</span>
+<span class="nc" id="L221">          } else {</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            for (int nodeIndex : ls) {</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">              for (int k = 0; k &lt; config.embeddingSize; ++k)</span>
+<span class="nc" id="L224">                hidden[nodeIndex] += W1[nodeIndex][offset + k] * E[tok][k];</span>
+            }
+          }
+<span class="nc" id="L227">          offset += config.embeddingSize;</span>
+        }
+
+        // Add bias term and apply activation function
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        for (int nodeIndex : ls) {</span>
+<span class="nc" id="L232">          hidden[nodeIndex] += b1[nodeIndex];</span>
+<span class="nc" id="L233">          hidden3[nodeIndex] = Math.pow(hidden[nodeIndex], 3);</span>
+        }
+
+        // Feed forward to softmax layer (no activation yet)
+<span class="nc" id="L237">        int optLabel = -1;</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        for (int i = 0; i &lt; numLabels; ++i) {</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">          if (label.get(i) &gt;= 0) {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">            for (int nodeIndex : ls)</span>
+<span class="nc" id="L241">              scores[i] += W2[i][nodeIndex] * hidden3[nodeIndex];</span>
+
+<span class="nc bnc" id="L243" title="All 4 branches missed.">            if (optLabel &lt; 0 || scores[i] &gt; scores[optLabel])</span>
+<span class="nc" id="L244">              optLabel = i;</span>
+          }
+        }
+
+<span class="nc" id="L248">        double sum1 = 0.0;</span>
+<span class="nc" id="L249">        double sum2 = 0.0;</span>
+<span class="nc" id="L250">        double maxScore = scores[optLabel];</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        for (int i = 0; i &lt; numLabels; ++i) {</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">          if (label.get(i) &gt;= 0) {</span>
+<span class="nc" id="L253">            scores[i] = Math.exp(scores[i] - maxScore);</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            if (label.get(i) == 1) sum1 += scores[i];</span>
+<span class="nc" id="L255">            sum2 += scores[i];</span>
+          }
+        }
+
+<span class="nc" id="L259">        cost += (Math.log(sum2) - Math.log(sum1)) / params.getBatchSize();</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (label.get(optLabel) == 1)</span>
+<span class="nc" id="L261">          correct += +1.0 / params.getBatchSize();</span>
+
+<span class="nc" id="L263">        double[] gradHidden3 = new double[config.hiddenSize];</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        for (int i = 0; i &lt; numLabels; ++i)</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">          if (label.get(i) &gt;= 0) {</span>
+<span class="nc" id="L266">            double delta = -(label.get(i) - scores[i] / sum2) / params.getBatchSize();</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            for (int nodeIndex : ls) {</span>
+<span class="nc" id="L268">              gradW2[i][nodeIndex] += delta * hidden3[nodeIndex];</span>
+<span class="nc" id="L269">              gradHidden3[nodeIndex] += delta * W2[i][nodeIndex];</span>
+            }
+          }
+
+<span class="nc" id="L273">        double[] gradHidden = new double[config.hiddenSize];</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        for (int nodeIndex : ls) {</span>
+<span class="nc" id="L275">          gradHidden[nodeIndex] = gradHidden3[nodeIndex] * 3 * hidden[nodeIndex] * hidden[nodeIndex];</span>
+<span class="nc" id="L276">          gradb1[nodeIndex] += gradHidden[nodeIndex];</span>
+        }
+
+<span class="nc" id="L279">        offset = 0;</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        for (int j = 0; j &lt; config.numTokens; ++j) {</span>
+<span class="nc" id="L281">          int tok = feature.get(j);</span>
+<span class="nc" id="L282">          int index = tok * config.numTokens + j;</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">          if (preMap.containsKey(index)) {</span>
+<span class="nc" id="L284">            int id = preMap.get(index);</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            for (int nodeIndex : ls)</span>
+<span class="nc" id="L286">              gradSaved[id][nodeIndex] += gradHidden[nodeIndex];</span>
+<span class="nc" id="L287">          } else {</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            for (int nodeIndex : ls) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">              for (int k = 0; k &lt; config.embeddingSize; ++k) {</span>
+<span class="nc" id="L290">                gradW1[nodeIndex][offset + k] += gradHidden[nodeIndex] * E[tok][k];</span>
+<span class="nc" id="L291">                gradE[tok][k] += gradHidden[nodeIndex] * W1[nodeIndex][offset + k];</span>
+              }
+            }
+          }
+<span class="nc" id="L295">          offset += config.embeddingSize;</span>
+        }
+<span class="nc" id="L297">      }</span>
+
+<span class="nc" id="L299">      return new Cost(cost, correct, gradW1, gradb1, gradW2, gradE);</span>
+    }
+
+    /**
+     * Return a new threadsafe instance.
+     */
+    @Override
+    public ThreadsafeProcessor&lt;Pair&lt;Collection&lt;Example&gt;, FeedforwardParams&gt;, Cost&gt; newInstance() {
+<span class="nc" id="L307">      return new CostFunction();</span>
+    }
+  }
+
+  /**
+   * Describes the parameters for a particular invocation of a cost
+   * function.
+   */
+  private static class FeedforwardParams {
+
+    /**
+     * Size of the entire mini-batch (not just the chunk that might be
+     * fed-forward at this moment).
+     */
+    private final int batchSize;
+
+    private final double dropOutProb;
+
+<span class="nc" id="L325">    private FeedforwardParams(int batchSize, double dropOutProb) {</span>
+<span class="nc" id="L326">      this.batchSize = batchSize;</span>
+<span class="nc" id="L327">      this.dropOutProb = dropOutProb;</span>
+<span class="nc" id="L328">    }</span>
+
+    public int getBatchSize() {
+<span class="nc" id="L331">      return batchSize;</span>
+    }
+
+    public double getDropOutProb() {
+<span class="nc" id="L335">      return dropOutProb;</span>
+    }
+
+  }
+
+  /**
+   * Describes the result of feedforward + backpropagation through
+   * the neural network for the batch provided to a `CostFunction.`
+   * &lt;p&gt;
+   * The members of this class represent weight deltas computed by
+   * backpropagation.
+   *
+   * @see Classifier.CostFunction
+   */
+  public class Cost {
+
+    private double cost;
+
+    // Percent of training examples predicted correctly
+    private double percentCorrect;
+
+    // Weight deltas
+    private final double[][] gradW1;
+    private final double[] gradb1;
+    private final double[][] gradW2;
+    private final double[][] gradE;
+
+    private Cost(double cost, double percentCorrect, double[][] gradW1, double[] gradb1, double[][] gradW2,
+<span class="nc" id="L363">                 double[][] gradE) {</span>
+<span class="nc" id="L364">      this.cost = cost;</span>
+<span class="nc" id="L365">      this.percentCorrect = percentCorrect;</span>
+
+<span class="nc" id="L367">      this.gradW1 = gradW1;</span>
+<span class="nc" id="L368">      this.gradb1 = gradb1;</span>
+<span class="nc" id="L369">      this.gradW2 = gradW2;</span>
+<span class="nc" id="L370">      this.gradE = gradE;</span>
+<span class="nc" id="L371">    }</span>
+
+    /**
+     * Merge the given {@code Cost} data with the data in this
+     * instance.
+     *
+     * @param otherCost
+     */
+    public void merge(Cost otherCost) {
+<span class="nc" id="L380">      this.cost += otherCost.getCost();</span>
+<span class="nc" id="L381">      this.percentCorrect += otherCost.getPercentCorrect();</span>
+
+<span class="nc" id="L383">      addInPlace(gradW1, otherCost.getGradW1());</span>
+<span class="nc" id="L384">      addInPlace(gradb1, otherCost.getGradb1());</span>
+<span class="nc" id="L385">      addInPlace(gradW2, otherCost.getGradW2());</span>
+<span class="nc" id="L386">      addInPlace(gradE, otherCost.getGradE());</span>
+<span class="nc" id="L387">    }</span>
+
+    /**
+     * Backpropagate gradient values from gradSaved into the gradients
+     * for the E vectors that generated them.
+     *
+     * @param featuresSeen Feature IDs observed during training for
+     *                     which gradSaved values need to be backprop'd
+     *                     into gradE
+     */
+    private void backpropSaved(Set&lt;Integer&gt; featuresSeen) {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">      for (int x : featuresSeen) {</span>
+<span class="nc" id="L399">        int mapX = preMap.get(x);</span>
+<span class="nc" id="L400">        int tok = x / config.numTokens;</span>
+<span class="nc" id="L401">        int offset = (x % config.numTokens) * config.embeddingSize;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        for (int j = 0; j &lt; config.hiddenSize; ++j) {</span>
+<span class="nc" id="L403">          double delta = gradSaved[mapX][j];</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">          for (int k = 0; k &lt; config.embeddingSize; ++k) {</span>
+<span class="nc" id="L405">            gradW1[j][offset + k] += delta * E[tok][k];</span>
+<span class="nc" id="L406">            gradE[tok][k] += delta * W1[j][offset + k];</span>
+          }
+        }
+<span class="nc" id="L409">      }</span>
+<span class="nc" id="L410">    }</span>
+
+    /**
+     * Add L2 regularization cost to the gradients associated with this
+     * instance.
+     */
+    private void addL2Regularization(double regularizationWeight) {
+<span class="nc bnc" id="L417" title="All 2 branches missed.">      for (int i = 0; i &lt; W1.length; ++i) {</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        for (int j = 0; j &lt; W1[i].length; ++j) {</span>
+<span class="nc" id="L419">          cost += regularizationWeight * W1[i][j] * W1[i][j] / 2.0;</span>
+<span class="nc" id="L420">          gradW1[i][j] += regularizationWeight * W1[i][j];</span>
+        }
+      }
+
+<span class="nc bnc" id="L424" title="All 2 branches missed.">      for (int i = 0; i &lt; b1.length; ++i) {</span>
+<span class="nc" id="L425">        cost += regularizationWeight * b1[i] * b1[i] / 2.0;</span>
+<span class="nc" id="L426">        gradb1[i] += regularizationWeight * b1[i];</span>
+      }
+
+<span class="nc bnc" id="L429" title="All 2 branches missed.">      for (int i = 0; i &lt; W2.length; ++i) {</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        for (int j = 0; j &lt; W2[i].length; ++j) {</span>
+<span class="nc" id="L431">          cost += regularizationWeight * W2[i][j] * W2[i][j] / 2.0;</span>
+<span class="nc" id="L432">          gradW2[i][j] += regularizationWeight * W2[i][j];</span>
+        }
+      }
+
+<span class="nc bnc" id="L436" title="All 2 branches missed.">      for (int i = 0; i &lt; E.length; ++i) {</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        for (int j = 0; j &lt; E[i].length; ++j) {</span>
+<span class="nc" id="L438">          cost += regularizationWeight * E[i][j] * E[i][j] / 2.0;</span>
+<span class="nc" id="L439">          gradE[i][j] += regularizationWeight * E[i][j];</span>
+        }
+      }
+<span class="nc" id="L442">    }</span>
+
+    public double getCost() {
+<span class="nc" id="L445">      return cost;</span>
+    }
+
+    public double getPercentCorrect() {
+<span class="nc" id="L449">      return percentCorrect;</span>
+    }
+
+    public double[][] getGradW1() {
+<span class="nc" id="L453">      return gradW1;</span>
+    }
+
+    public double[] getGradb1() {
+<span class="nc" id="L457">      return gradb1;</span>
+    }
+
+    public double[][] getGradW2() {
+<span class="nc" id="L461">      return gradW2;</span>
+    }
+
+    public double[][] getGradE() {
+<span class="nc" id="L465">      return gradE;</span>
+    }
+
+  }
+
+  /**
+   * Determine the feature IDs which need to be pre-computed for
+   * training with these examples.
+   */
+  private Set&lt;Integer&gt; getToPreCompute(List&lt;Example&gt; examples) {
+<span class="nc" id="L475">    Set&lt;Integer&gt; featureIDs = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">    for (Example ex : examples) {</span>
+<span class="nc" id="L477">      List&lt;Integer&gt; feature = ex.getFeature();</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">      for (int j = 0; j &lt; config.numTokens; j++) {</span>
+<span class="nc" id="L480">        int tok = feature.get(j);</span>
+<span class="nc" id="L481">        int index = tok * config.numTokens + j;</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (preMap.containsKey(index))</span>
+<span class="nc" id="L483">          featureIDs.add(index);</span>
+      }
+<span class="nc" id="L485">    }</span>
+
+<span class="nc" id="L487">    double percentagePreComputed = featureIDs.size() / (float) config.numPreComputed;</span>
+<span class="nc" id="L488">    System.err.printf(&quot;Percent actually necessary to pre-compute: %f%%%n&quot;, percentagePreComputed * 100);</span>
+
+<span class="nc" id="L490">    return featureIDs;</span>
+  }
+
+  /**
+   * Determine the total cost on the dataset associated with this
+   * classifier using the current learned parameters. This cost is
+   * evaluated using mini-batch adaptive gradient descent.
+   *
+   * This method launches multiple threads, each of which evaluates
+   * training cost on a partition of the mini-batch.
+   *
+   * @param batchSize
+   * @param regParameter Regularization parameter (lambda)
+   * @param dropOutProb Drop-out probability. Hidden-layer units in the
+   *                    neural network will be randomly turned off
+   *                    while training a particular example with this
+   *                    probability.
+   * @return A {@link edu.stanford.nlp.parser.nndep.Classifier.Cost}
+   *         object which describes the total cost of the given
+   *         weights, and includes gradients to be used for further
+   *         training
+   */
+  public Cost computeCostFunction(int batchSize, double regParameter, double dropOutProb) {
+<span class="nc" id="L513">    validateTraining();</span>
+
+<span class="nc" id="L515">    List&lt;Example&gt; examples = Util.getRandomSubList(dataset.examples, batchSize);</span>
+
+    // Redo precomputations for only those features which are triggered
+    // by examples in this mini-batch.
+<span class="nc" id="L519">    Set&lt;Integer&gt; toPreCompute = getToPreCompute(examples);</span>
+<span class="nc" id="L520">    preCompute(toPreCompute);</span>
+
+    // Set up parameters for feedforward
+<span class="nc" id="L523">    FeedforwardParams params = new FeedforwardParams(batchSize, dropOutProb);</span>
+
+    // Zero out saved-embedding gradients
+<span class="nc" id="L526">    gradSaved = new double[preMap.size()][config.hiddenSize];</span>
+
+<span class="nc" id="L528">    int numChunks = config.trainingThreads;</span>
+<span class="nc" id="L529">    List&lt;List&lt;Example&gt;&gt; chunks = CollectionUtils.partitionIntoFolds(examples, numChunks);</span>
+
+    // Submit chunks for processing on separate threads
+<span class="nc bnc" id="L532" title="All 2 branches missed.">    for (Collection&lt;Example&gt; chunk : chunks)</span>
+<span class="nc" id="L533">      jobHandler.put(new Pair&lt;&gt;(chunk, params));</span>
+<span class="nc" id="L534">    jobHandler.join(false);</span>
+
+    // Join costs from each chunk
+<span class="nc" id="L537">    Cost cost = null;</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">    while (jobHandler.peek()) {</span>
+<span class="nc" id="L539">      Cost otherCost = jobHandler.poll();</span>
+
+<span class="nc bnc" id="L541" title="All 2 branches missed.">      if (cost == null)</span>
+<span class="nc" id="L542">        cost = otherCost;</span>
+      else
+<span class="nc" id="L544">        cost.merge(otherCost);</span>
+<span class="nc" id="L545">    }</span>
+
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    if (cost == null)</span>
+<span class="nc" id="L548">      return null;</span>
+
+    // Backpropagate gradients on saved pre-computed values to actual
+    // embeddings
+<span class="nc" id="L552">    cost.backpropSaved(toPreCompute);</span>
+
+<span class="nc" id="L554">    cost.addL2Regularization(regParameter);</span>
+
+<span class="nc" id="L556">    return cost;</span>
+  }
+
+  /**
+   * Update classifier weights using the given training cost
+   * information.
+   *
+   * @param cost Cost information as returned by
+   *             {@link #computeCostFunction(int, double, double)}.
+   * @param adaAlpha Global AdaGrad learning rate
+   * @param adaEps Epsilon value for numerical stability in AdaGrad's
+   *               division
+   */
+  public void takeAdaGradientStep(Cost cost, double adaAlpha, double adaEps) {
+<span class="nc" id="L570">    validateTraining();</span>
+
+<span class="nc" id="L572">    double[][] gradW1 = cost.getGradW1(), gradW2 = cost.getGradW2(),</span>
+<span class="nc" id="L573">        gradE = cost.getGradE();</span>
+<span class="nc" id="L574">    double[] gradb1 = cost.getGradb1();</span>
+
+<span class="nc bnc" id="L576" title="All 2 branches missed.">    for (int i = 0; i &lt; W1.length; ++i) {</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">      for (int j = 0; j &lt; W1[i].length; ++j) {</span>
+<span class="nc" id="L578">        eg2W1[i][j] += gradW1[i][j] * gradW1[i][j];</span>
+<span class="nc" id="L579">        W1[i][j] -= adaAlpha * gradW1[i][j] / Math.sqrt(eg2W1[i][j] + adaEps);</span>
+      }
+    }
+
+<span class="nc bnc" id="L583" title="All 2 branches missed.">    for (int i = 0; i &lt; b1.length; ++i) {</span>
+<span class="nc" id="L584">      eg2b1[i] += gradb1[i] * gradb1[i];</span>
+<span class="nc" id="L585">      b1[i] -= adaAlpha * gradb1[i] / Math.sqrt(eg2b1[i] + adaEps);</span>
+    }
+
+<span class="nc bnc" id="L588" title="All 2 branches missed.">    for (int i = 0; i &lt; W2.length; ++i) {</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">      for (int j = 0; j &lt; W2[i].length; ++j) {</span>
+<span class="nc" id="L590">        eg2W2[i][j] += gradW2[i][j] * gradW2[i][j];</span>
+<span class="nc" id="L591">        W2[i][j] -= adaAlpha * gradW2[i][j] / Math.sqrt(eg2W2[i][j] + adaEps);</span>
+      }
+    }
+
+<span class="nc bnc" id="L595" title="All 2 branches missed.">    if (config.doWordEmbeddingGradUpdate) {</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">      for (int i = 0; i &lt; E.length; ++i) {</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">        for (int j = 0; j &lt; E[i].length; ++j) {</span>
+<span class="nc" id="L598">          eg2E[i][j] += gradE[i][j] * gradE[i][j];</span>
+<span class="nc" id="L599">          E[i][j] -= adaAlpha * gradE[i][j] / Math.sqrt(eg2E[i][j] + adaEps);</span>
+        }
+      }
+    }
+<span class="nc" id="L603">  }</span>
+
+  private void initGradientHistories() {
+<span class="nc" id="L606">    eg2E = new double[E.length][E[0].length];</span>
+<span class="nc" id="L607">    eg2W1 = new double[W1.length][W1[0].length];</span>
+<span class="nc" id="L608">    eg2b1 = new double[b1.length];</span>
+<span class="nc" id="L609">    eg2W2 = new double[W2.length][W2[0].length];</span>
+<span class="nc" id="L610">  }</span>
+
+  /**
+   * Clear all gradient histories used for AdaGrad training.
+   *
+   * @throws java.lang.IllegalStateException If not training
+   */
+  public void clearGradientHistories() {
+<span class="nc" id="L618">    validateTraining();</span>
+<span class="nc" id="L619">    initGradientHistories();</span>
+<span class="nc" id="L620">  }</span>
+
+  private void validateTraining() {
+<span class="nc bnc" id="L623" title="All 2 branches missed.">    if (!isTraining)</span>
+<span class="nc" id="L624">      throw new IllegalStateException(&quot;Not training, or training was already finalized&quot;);</span>
+<span class="nc" id="L625">  }</span>
+
+  /**
+   * Finish training this classifier; prepare for a shutdown.
+   */
+  public void finalizeTraining() {
+<span class="nc" id="L631">    validateTraining();</span>
+
+    // Destroy threadpool
+<span class="nc" id="L634">    jobHandler.join(true);</span>
+
+<span class="nc" id="L636">    isTraining = false;</span>
+<span class="nc" id="L637">  }</span>
+
+  /**
+   * @see #preCompute(java.util.Set)
+   */
+  public void preCompute() {
+<span class="nc" id="L643">    preCompute(preMap.keySet());</span>
+<span class="nc" id="L644">  }</span>
+
+  /**
+   * Pre-compute hidden layer activations for some set of possible
+   * feature inputs.
+   *
+   * @param toPreCompute Set of feature IDs for which hidden layer
+   *                     activations should be precomputed
+   */
+  public void preCompute(Set&lt;Integer&gt; toPreCompute) {
+<span class="nc" id="L654">    long startTime = System.currentTimeMillis();</span>
+
+    // NB: It'd make sense to just make the first dimension of this
+    // array the same size as `toPreCompute`, then recalculate all
+    // `preMap` indices to map into this denser array. But this
+    // actually hurt training performance! (See experiments with
+    // &quot;smallMap.&quot;)
+<span class="nc" id="L661">    saved = new double[preMap.size()][config.hiddenSize];</span>
+
+<span class="nc bnc" id="L663" title="All 2 branches missed.">    for (int x : toPreCompute) {</span>
+<span class="nc" id="L664">      int mapX = preMap.get(x);</span>
+<span class="nc" id="L665">      int tok = x / config.numTokens;</span>
+<span class="nc" id="L666">      int pos = x % config.numTokens;</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">      for (int j = 0; j &lt; config.hiddenSize; ++j)</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">        for (int k = 0; k &lt; config.embeddingSize; ++k)</span>
+<span class="nc" id="L669">          saved[mapX][j] += W1[j][pos * config.embeddingSize + k] * E[tok][k];</span>
+<span class="nc" id="L670">    }</span>
+<span class="nc" id="L671">    log.info(&quot;PreComputed &quot; + toPreCompute.size() + &quot;, Elapsed Time: &quot; + (System</span>
+<span class="nc" id="L672">        .currentTimeMillis() - startTime) / 1000.0 + &quot; (s)&quot;);</span>
+<span class="nc" id="L673">  }</span>
+
+  double[] computeScores(int[] feature) {
+<span class="nc" id="L676">    return computeScores(feature, preMap);</span>
+  }
+
+  /**
+   * Feed a feature vector forward through the network. Returns the
+   * values of the output layer.
+   */
+  private double[] computeScores(int[] feature, Map&lt;Integer, Integer&gt; preMap) {
+<span class="nc" id="L684">    double[] hidden = new double[config.hiddenSize];</span>
+<span class="nc" id="L685">    int offset = 0;</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">    for (int j = 0; j &lt; feature.length; ++j) {</span>
+<span class="nc" id="L687">      int tok = feature[j];</span>
+<span class="nc" id="L688">      int index = tok * config.numTokens + j;</span>
+
+<span class="nc bnc" id="L690" title="All 2 branches missed.">      if (preMap.containsKey(index)) {</span>
+<span class="nc" id="L691">        int id = preMap.get(index);</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        for (int i = 0; i &lt; config.hiddenSize; ++i)</span>
+<span class="nc" id="L693">          hidden[i] += saved[id][i];</span>
+<span class="nc" id="L694">      } else {</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        for (int i = 0; i &lt; config.hiddenSize; ++i)</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">          for (int k = 0; k &lt; config.embeddingSize; ++k)</span>
+<span class="nc" id="L697">            hidden[i] += W1[i][offset + k] * E[tok][k];</span>
+      }
+<span class="nc" id="L699">      offset += config.embeddingSize;</span>
+    }
+
+<span class="nc bnc" id="L702" title="All 2 branches missed.">    for (int i = 0; i &lt; config.hiddenSize; ++i) {</span>
+<span class="nc" id="L703">      hidden[i] += b1[i];</span>
+<span class="nc" id="L704">      hidden[i] = hidden[i] * hidden[i] * hidden[i];  // cube nonlinearity</span>
+    }
+
+<span class="nc" id="L707">    double[] scores = new double[numLabels];</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">    for (int i = 0; i &lt; numLabels; ++i)</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">      for (int j = 0; j &lt; config.hiddenSize; ++j)</span>
+<span class="nc" id="L710">        scores[i] += W2[i][j] * hidden[j];</span>
+<span class="nc" id="L711">    return scores;</span>
+  }
+
+  public double[][] getW1() {
+<span class="nc" id="L715">    return W1;</span>
+  }
+
+  public double[] getb1() {
+<span class="nc" id="L719">    return b1;</span>
+  }
+
+  public double[][] getW2() {
+<span class="nc" id="L723">    return W2;</span>
+  }
+
+  public double[][] getE() {
+<span class="nc" id="L727">    return E;</span>
+  }
+
+  /**
+   * Add the two 2d arrays in place of {@code m1}.
+   *
+   * @throws java.lang.IndexOutOfBoundsException (possibly) If
+   *                                             {@code m1} and {@code m2} are not of the same dimensions
+   */
+  private static void addInPlace(double[][] m1, double[][] m2) {
+<span class="nc bnc" id="L737" title="All 2 branches missed.">    for (int i = 0; i &lt; m1.length; i++)</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">      for (int j = 0; j &lt; m1[0].length; j++)</span>
+<span class="nc" id="L739">        m1[i][j] += m2[i][j];</span>
+<span class="nc" id="L740">  }</span>
+
+  /**
+   * Add the two 1d arrays in place of {@code a1}.
+   *
+   * @throws java.lang.IndexOutOfBoundsException (Possibly) if
+   *                                             {@code a1} and {@code a2} are not of the same dimensions
+   */
+  private static void addInPlace(double[] a1, double[] a2) {
+<span class="nc bnc" id="L749" title="All 2 branches missed.">    for (int i = 0; i &lt; a1.length; i++)</span>
+<span class="nc" id="L750">      a1[i] += a2[i];</span>
+<span class="nc" id="L751">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,1666 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CMMClassifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.ner</a> &gt; <span class="el_source">CMMClassifier.java</span></div><h1>CMMClassifier.java</h1><pre class="source lang-java linenums">// CMMClassifier -- a conditional maximum-entropy markov model, mainly used for NER.
+// Copyright (c) 2002-2014 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software Foundation,
+// Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    Support/Questions: java-nlp-user@lists.stanford.edu
+//    Licensing: java-nlp-support@lists.stanford.edu
+
+package edu.stanford.nlp.ie.ner;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.classify.Dataset;
+import edu.stanford.nlp.classify.LinearClassifier;
+import edu.stanford.nlp.classify.LinearClassifierFactory;
+import edu.stanford.nlp.classify.LogPrior;
+import edu.stanford.nlp.classify.NBLinearClassifierFactory;
+import edu.stanford.nlp.classify.ProbabilisticClassifier;
+import edu.stanford.nlp.classify.SVMLightClassifierFactory;
+import edu.stanford.nlp.ie.AbstractSequenceClassifier;
+import edu.stanford.nlp.ie.NERFeatureFactory;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.BasicDatum;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.math.SloppyMath;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.sequences.BeamBestSequenceFinder;
+import edu.stanford.nlp.sequences.Clique;
+import edu.stanford.nlp.sequences.DocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.ExactBestSequenceFinder;
+import edu.stanford.nlp.sequences.FeatureFactory;
+import edu.stanford.nlp.sequences.PlainTextDocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.sequences.SequenceModel;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.TwoDimensionalCounter;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+/**
+ * Does Sequence Classification using a Conditional Markov Model.
+ * It could be used for other purposes, but the provided features
+ * are aimed at doing Named Entity Recognition.
+ * The code has functionality for different document encodings, but when
+ * using the standard {@code ColumnDocumentReader},
+ * input files are expected to
+ * be one word per line with the columns indicating things like the word,
+ * POS, chunk, and class.
+ * &lt;p&gt;
+ * &lt;b&gt;Typical usage&lt;/b&gt;
+ * &lt;p&gt;For running a trained model with a provided serialized classifier: &lt;p&gt;
+ * {@code
+ * java -server -mx1000m edu.stanford.nlp.ie.ner.CMMClassifier -loadClassifier
+ * conll.ner.gz -textFile samplesentences.txt
+ * }&lt;p&gt;
+ * When specifying all parameters in a properties file (train, test, or
+ * runtime):&lt;p&gt;
+ * {@code
+ * java -mx1000m edu.stanford.nlp.ie.ner.CMMClassifier -prop propFile
+ * }&lt;p&gt;
+ * To train and test a model from the command line:&lt;p&gt;
+ * {@code java -mx1000m edu.stanford.nlp.ie.ner.CMMClassifier
+ * -trainFile trainFile -testFile testFile -goodCoNLL &amp;gt; output }
+ * &lt;p&gt;
+ * Features are defined by a {@link FeatureFactory}; the
+ * {@link FeatureFactory} which is used by default is
+ * {@link NERFeatureFactory}, and you should look there for feature templates.
+ * Features are specified either by a Properties file (which is the
+ * recommended method) or on the command line.  The features are read into
+ * a {@link SeqClassifierFlags} object, which the
+ * user need not know much about, unless one wishes to add new features.
+ * &lt;p&gt;
+ * CMMClassifier may also be used programmatically.  When creating a new instance, you
+ * &lt;i&gt;must&lt;/i&gt; specify a properties file.  The other way to get a CMMClassifier is to
+ * deserialize one via {@link CMMClassifier#getClassifier(String)}, which returns a
+ * deserialized classifier.  You may then tag sentences using either the assorted
+ * {@code test} or {@code testSentence} methods.
+ *
+ * @author Dan Klein
+ * @author Jenny Finkel
+ * @author Christopher Manning
+ * @author Shipra Dingare
+ * @author Huy Nguyen
+ * @author Sarah Spikes (sdspikes@cs.stanford.edu) - cleanup and filling in types
+ */
+
+public class CMMClassifier&lt;IN extends CoreLabel&gt; extends AbstractSequenceClassifier&lt;IN&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L129">  private static final Redwood.RedwoodChannels log = Redwood.channels(CMMClassifier.class);</span>
+
+  private ProbabilisticClassifier&lt;String, String&gt; classifier;
+
+  /** The set of empirically legal label sequences (of length (order) at most
+   *  {@code flags.maxLeft}).  Used to filter valid class sequences if
+   *  {@code useObuseObservedSequencesOnly} is set.
+   */
+  Set&lt;List&lt;String&gt;&gt; answerArrays;
+
+  /** Default place to look in Jar file for classifier. */
+  public static final String DEFAULT_CLASSIFIER = &quot;/classifiers/ner-eng-ie.cmm-3-all2006.ser.gz&quot;;
+
+  protected CMMClassifier() {
+<span class="nc" id="L143">    super(new SeqClassifierFlags());</span>
+<span class="nc" id="L144">  }</span>
+
+  public CMMClassifier(Properties props) {
+<span class="nc" id="L147">    super(props);</span>
+<span class="nc" id="L148">  }</span>
+
+
+  public CMMClassifier(SeqClassifierFlags flags) {
+<span class="nc" id="L152">    super(flags);</span>
+<span class="nc" id="L153">  }</span>
+
+  /**
+   * Returns the Set of entities recognized by this Classifier.
+   *
+   * @return The Set of entities recognized by this Classifier.
+   */
+  public Set&lt;String&gt; getTags() {
+<span class="nc" id="L161">    Set&lt;String&gt; tags = Generics.newHashSet(classIndex.objectsList());</span>
+<span class="nc" id="L162">    tags.remove(flags.backgroundSymbol);</span>
+<span class="nc" id="L163">    return tags;</span>
+  }
+
+  /**
+   * Classify a {@link List} of {@link CoreLabel}s.
+   *
+   * @param document A {@link List} of {@link CoreLabel}s
+   *                 to be classified.
+   */
+  @Override
+  public List&lt;IN&gt; classify(List&lt;IN&gt; document) {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">    if (flags.useSequences) {</span>
+<span class="nc" id="L175">      classifySeq(document);</span>
+    } else {
+<span class="nc" id="L177">      classifyNoSeq(document);</span>
+    }
+<span class="nc" id="L179">    return document;</span>
+  }
+
+  /**
+   * Classify a List of {@link CoreLabel}s without using sequence information
+   * (i.e. no Viterbi algorithm, just distribution over next class).
+   *
+   * @param document a List of {@link CoreLabel}s to be classified
+   */
+  private void classifyNoSeq(List&lt;IN&gt; document) {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">    if (flags.useReverse) {</span>
+<span class="nc" id="L190">      Collections.reverse(document);</span>
+    }
+
+<span class="nc bnc" id="L193" title="All 2 branches missed.">    if (flags.lowerNewgeneThreshold) {</span>
+      // Used to raise recall for task 1B
+<span class="nc" id="L195">      log.info(&quot;Using NEWGENE threshold: &quot; + flags.newgeneThreshold);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">      for (int i = 0, docSize = document.size(); i &lt; docSize; i++) {</span>
+<span class="nc" id="L197">        CoreLabel wordInfo = document.get(i);</span>
+<span class="nc" id="L198">        Datum&lt;String, String&gt; d = makeDatum(document, i, featureFactories);</span>
+<span class="nc" id="L199">        Counter&lt;String&gt; scores = classifier.scoresOf(d);</span>
+        //String answer = BACKGROUND;
+<span class="nc" id="L201">        String answer = flags.backgroundSymbol;</span>
+        // HN: The evaluation of scoresOf seems to result in some
+        // kind of side effect.  Specifically, the symptom is that
+        // if scoresOf is not evaluated at every position, the
+        // answers are different
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (&quot;NEWGENE&quot;.equals(wordInfo.get(CoreAnnotations.GazAnnotation.class))) {</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">          for (String label : scores.keySet()) {</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (&quot;G&quot;.equals(label)) {</span>
+<span class="nc" id="L209">              log.info(wordInfo.word() + ':' + scores.getCount(label));</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">              if (scores.getCount(label) &gt; flags.newgeneThreshold) {</span>
+<span class="nc" id="L211">                answer = label;</span>
+              }
+            }
+<span class="nc" id="L214">          }</span>
+        }
+<span class="nc" id="L216">        wordInfo.set(CoreAnnotations.AnswerAnnotation.class, answer);</span>
+      }
+    } else {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">      for (int i = 0, listSize = document.size(); i &lt; listSize; i++) {</span>
+<span class="nc" id="L220">        String answer = classOf(document, i);</span>
+<span class="nc" id="L221">        CoreLabel wordInfo = document.get(i);</span>
+        //log.info(&quot;XXX answer for &quot; +
+        //        wordInfo.word() + &quot; is &quot; + answer);
+<span class="nc" id="L224">        wordInfo.set(CoreAnnotations.AnswerAnnotation.class, answer);</span>
+      }
+<span class="nc bnc" id="L226" title="All 4 branches missed.">      if (flags.justify &amp;&amp; (classifier instanceof LinearClassifier)) {</span>
+<span class="nc" id="L227">        LinearClassifier&lt;String, String&gt; lc = (LinearClassifier&lt;String, String&gt;) classifier;</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        for (int i = 0, lsize = document.size(); i &lt; lsize; i++) {</span>
+<span class="nc" id="L229">          CoreLabel lineInfo = document.get(i);</span>
+<span class="nc" id="L230">          log.info(&quot;@@ Position &quot; + i + &quot;: &quot;);</span>
+<span class="nc" id="L231">          log.info(lineInfo.word() + &quot; chose &quot; + lineInfo.get(CoreAnnotations.AnswerAnnotation.class));</span>
+<span class="nc" id="L232">          lc.justificationOf(makeDatum(document, i, featureFactories));</span>
+        }
+      }
+    }
+<span class="nc bnc" id="L236" title="All 2 branches missed.">    if (flags.useReverse) {</span>
+<span class="nc" id="L237">      Collections.reverse(document);</span>
+    }
+<span class="nc" id="L239">  }</span>
+
+  /**
+   * Returns the most likely class for the word at the given position.
+   */
+  protected String classOf(List&lt;IN&gt; lineInfos, int pos) {
+<span class="nc" id="L245">    Datum&lt;String, String&gt; d = makeDatum(lineInfos, pos, featureFactories);</span>
+<span class="nc" id="L246">    return classifier.classOf(d);</span>
+  }
+
+  /**
+   * Returns the log conditional likelihood of the given dataset.
+   *
+   * @return The log conditional likelihood of the given dataset.
+   */
+  public double loglikelihood(List&lt;IN&gt; lineInfos) {
+<span class="nc" id="L255">    double cll = 0.0;</span>
+
+<span class="nc bnc" id="L257" title="All 2 branches missed.">    for (int i = 0; i &lt; lineInfos.size(); i++) {</span>
+<span class="nc" id="L258">      Datum&lt;String, String&gt; d = makeDatum(lineInfos, i, featureFactories);</span>
+<span class="nc" id="L259">      Counter&lt;String&gt; c = classifier.logProbabilityOf(d);</span>
+
+<span class="nc" id="L261">      double total = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">      for (String s : c.keySet()) {</span>
+<span class="nc" id="L263">        total = SloppyMath.logAdd(total, c.getCount(s));</span>
+<span class="nc" id="L264">      }</span>
+<span class="nc" id="L265">      cll -= c.getCount(d.label()) - total;</span>
+    }
+    // quadratic prior
+    // HN: TODO: add other priors
+
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    if (classifier instanceof LinearClassifier) {</span>
+<span class="nc" id="L271">      double sigmaSq = flags.sigma * flags.sigma;</span>
+<span class="nc" id="L272">      LinearClassifier&lt;String, String&gt; lc = (LinearClassifier&lt;String, String&gt;)classifier;</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">      for (String feature: lc.features()) {</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        for (String classLabel: classIndex) {</span>
+<span class="nc" id="L275">          double w = lc.weight(feature, classLabel);</span>
+<span class="nc" id="L276">          cll += w * w / 2.0 / sigmaSq;</span>
+<span class="nc" id="L277">        }</span>
+<span class="nc" id="L278">      }</span>
+    }
+<span class="nc" id="L280">    return cll;</span>
+  }
+
+  @Override
+  public SequenceModel getSequenceModel(List&lt;IN&gt; document) {
+    //log.info(flags.useReverse);
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">    if (flags.useReverse) {</span>
+<span class="nc" id="L288">      Collections.reverse(document);</span>
+    }
+
+    // cdm Aug 2005: why is this next line needed?  Seems really ugly!!!  [2006: it broke things! removed]
+    // document.add(0, new CoreLabel());
+
+<span class="nc bnc" id="L294" title="All 6 branches missed.">    SequenceModel ts = new Scorer&lt;&gt;(document,</span>
+            classIndex,
+            this,
+            (!flags.useTaggySequences ? (flags.usePrevSequences ? 1 : 0) : flags.maxLeft),
+            (flags.useNextSequences ? 1 : 0),
+            answerArrays);
+
+<span class="nc" id="L301">    return ts;</span>
+  }
+
+  /**
+   * Classify a List of {@link CoreLabel}s using sequence information
+   * (i.e. Viterbi or Beam Search).
+   *
+   * @param document A List of {@link CoreLabel}s to be classified
+   */
+  private void classifySeq(List&lt;IN&gt; document) {
+
+<span class="nc bnc" id="L312" title="All 2 branches missed.">    if (document.isEmpty()) {</span>
+<span class="nc" id="L313">      return;</span>
+    }
+
+<span class="nc" id="L316">    SequenceModel ts = getSequenceModel(document);</span>
+
+    //    TagScorer ts = new PrevOnlyScorer(document, tagIndex, this, (!flags.useTaggySequences ? (flags.usePrevSequences ? 1 : 0) : flags.maxLeft), 0, answerArrays);
+
+    int[] tags;
+    //log.info(&quot;***begin test***&quot;);
+<span class="nc bnc" id="L322" title="All 2 branches missed.">    if (flags.useViterbi) {</span>
+<span class="nc" id="L323">      ExactBestSequenceFinder ti = new ExactBestSequenceFinder();</span>
+<span class="nc" id="L324">      tags = ti.bestSequence(ts);</span>
+<span class="nc" id="L325">    } else {</span>
+<span class="nc" id="L326">      BeamBestSequenceFinder ti = new BeamBestSequenceFinder(flags.beamSize, true, true);</span>
+<span class="nc" id="L327">      tags = ti.bestSequence(ts, document.size());</span>
+    }
+    //log.info(&quot;***end test***&quot;);
+
+    // used to improve recall in task 1b
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (flags.lowerNewgeneThreshold) {</span>
+<span class="nc" id="L333">      log.info(&quot;Using NEWGENE threshold: &quot; + flags.newgeneThreshold);</span>
+
+<span class="nc" id="L335">      int[] copy = new int[tags.length];</span>
+<span class="nc" id="L336">      System.arraycopy(tags, 0, copy, 0, tags.length);</span>
+
+      // for each sequence marked as NEWGENE in the gazette
+      // tag the entire sequence as NEWGENE and sum the score
+      // if the score is greater than newgeneThreshold, accept
+<span class="nc" id="L341">      int ngTag = classIndex.indexOf(&quot;G&quot;);</span>
+      //int bgTag = classIndex.indexOf(BACKGROUND);
+<span class="nc" id="L343">      int bgTag = classIndex.indexOf(flags.backgroundSymbol);</span>
+
+<span class="nc bnc" id="L345" title="All 2 branches missed.">      for (int i = 0, dSize = document.size(); i &lt; dSize; i++) {</span>
+<span class="nc" id="L346">        CoreLabel wordInfo =document.get(i);</span>
+
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (&quot;NEWGENE&quot;.equals(wordInfo.get(CoreAnnotations.GazAnnotation.class))) {</span>
+<span class="nc" id="L349">          int start = i;</span>
+          int j;
+<span class="nc bnc" id="L351" title="All 2 branches missed.">          for (j = i; j &lt; document.size(); j++) {</span>
+<span class="nc" id="L352">            wordInfo = document.get(j);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            if (!&quot;NEWGENE&quot;.equals(wordInfo.get(CoreAnnotations.GazAnnotation.class))) {</span>
+<span class="nc" id="L354">              break;</span>
+            }
+          }
+<span class="nc" id="L357">          int end = j;</span>
+          //int end = i + 1;
+
+<span class="nc" id="L360">          int winStart = Math.max(0, start - 4);</span>
+<span class="nc" id="L361">          int winEnd = Math.min(tags.length, end + 4);</span>
+          // clear a window around the sequences
+<span class="nc bnc" id="L363" title="All 2 branches missed.">          for (j = winStart; j &lt; winEnd; j++) {</span>
+<span class="nc" id="L364">            copy[j] = bgTag;</span>
+          }
+
+          // score as nongene
+<span class="nc" id="L368">          double bgScore = 0.0;</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">          for (j = start; j &lt; end; j++) {</span>
+<span class="nc" id="L370">            double[] scores = ts.scoresOf(copy, j);</span>
+<span class="nc" id="L371">            scores = Scorer.recenter(scores);</span>
+<span class="nc" id="L372">            bgScore += scores[bgTag];</span>
+          }
+
+          // first pass, compute all of the scores
+<span class="nc" id="L376">          ClassicCounter&lt;Pair&lt;Integer,Integer&gt;&gt; prevScores = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">          for (j = start; j &lt; end; j++) {</span>
+            // clear the sequence
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            for (int k = start; k &lt; end; k++) {</span>
+<span class="nc" id="L380">              copy[k] = bgTag;</span>
+            }
+
+            // grow the sequence from j until the end
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            for (int k = j; k &lt; end; k++) {</span>
+<span class="nc" id="L385">              copy[k] = ngTag;</span>
+              // score the sequence
+<span class="nc" id="L387">              double ngScore = 0.0;</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">              for (int m = start; m &lt; end; m++) {</span>
+<span class="nc" id="L389">                double[] scores = ts.scoresOf(copy, m);</span>
+<span class="nc" id="L390">                scores = Scorer.recenter(scores);</span>
+<span class="nc" id="L391">                ngScore += scores[tags[m]];</span>
+              }
+<span class="nc" id="L393">              prevScores.incrementCount(new Pair&lt;&gt;(Integer.valueOf(j), Integer.valueOf(k)), ngScore - bgScore);</span>
+            }
+          }
+<span class="nc bnc" id="L396" title="All 2 branches missed.">          for (j = start; j &lt; end; j++) {</span>
+            // grow the sequence from j until the end
+<span class="nc bnc" id="L398" title="All 2 branches missed.">            for (int k = j; k &lt; end; k++) {</span>
+<span class="nc" id="L399">              double score = prevScores.getCount(new Pair&lt;&gt;(Integer.valueOf(j), Integer.valueOf(k)));</span>
+<span class="nc" id="L400">              Pair&lt;Integer, Integer&gt; al = new Pair&lt;&gt;(Integer.valueOf(j - 1), Integer.valueOf(k)); // adding a word to the left</span>
+<span class="nc" id="L401">              Pair&lt;Integer, Integer&gt; ar = new Pair&lt;&gt;(Integer.valueOf(j), Integer.valueOf(k + 1)); // adding a word to the right</span>
+<span class="nc" id="L402">              Pair&lt;Integer, Integer&gt; sl = new Pair&lt;&gt;(Integer.valueOf(j + 1), Integer.valueOf(k)); // subtracting word from left</span>
+<span class="nc" id="L403">              Pair&lt;Integer, Integer&gt; sr = new Pair&lt;&gt;(Integer.valueOf(j), Integer.valueOf(k - 1)); // subtracting word from right</span>
+
+              // make sure the score is greater than all its neighbors (one add or subtract)
+<span class="nc bnc" id="L406" title="All 18 branches missed.">              if (score &gt;= flags.newgeneThreshold &amp;&amp; (!prevScores.containsKey(al) || score &gt; prevScores.getCount(al)) &amp;&amp; (!prevScores.containsKey(ar) || score &gt; prevScores.getCount(ar)) &amp;&amp; (!prevScores.containsKey(sl) || score &gt; prevScores.getCount(sl)) &amp;&amp; (!prevScores.containsKey(sr) || score &gt; prevScores.getCount(sr))) {</span>
+<span class="nc" id="L407">                StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L408">                wordInfo = document.get(j);</span>
+<span class="nc" id="L409">                String docId = wordInfo.get(CoreAnnotations.IDAnnotation.class);</span>
+<span class="nc" id="L410">                String startIndex = wordInfo.get(CoreAnnotations.PositionAnnotation.class);</span>
+<span class="nc" id="L411">                wordInfo = document.get(k);</span>
+<span class="nc" id="L412">                String endIndex = wordInfo.get(CoreAnnotations.PositionAnnotation.class);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">                for (int m = j; m &lt;= k; m++) {</span>
+<span class="nc" id="L414">                  wordInfo = document.get(m);</span>
+<span class="nc" id="L415">                  sb.append(wordInfo.word());</span>
+<span class="nc" id="L416">                  sb.append(' ');</span>
+                }
+                /*log.info(sb.toString()+&quot;score:&quot;+score+
+                  &quot; al:&quot;+prevScores.getCount(al)+
+                  &quot; ar:&quot;+prevScores.getCount(ar)+
+                  &quot;  sl:&quot;+prevScores.getCount(sl)+&quot; sr:&quot;+ prevScores.getCount(sr));*/
+<span class="nc" id="L422">                System.out.println(docId + '|' + startIndex + ' ' + endIndex + '|' + sb.toString().trim());</span>
+              }
+            }
+          }
+
+          // restore the original tags
+<span class="nc bnc" id="L428" title="All 2 branches missed.">          for (j = winStart; j &lt; winEnd; j++) {</span>
+<span class="nc" id="L429">            copy[j] = tags[j];</span>
+          }
+<span class="nc" id="L431">          i = end;</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L436" title="All 2 branches missed.">    for (int i = 0, docSize = document.size(); i &lt; docSize; i++) {</span>
+<span class="nc" id="L437">      CoreLabel lineInfo = document.get(i);</span>
+<span class="nc" id="L438">      String answer = classIndex.get(tags[i]);</span>
+<span class="nc" id="L439">      lineInfo.set(CoreAnnotations.AnswerAnnotation.class, answer);</span>
+    }
+
+<span class="nc bnc" id="L442" title="All 4 branches missed.">    if (flags.justify &amp;&amp; classifier instanceof LinearClassifier) {</span>
+<span class="nc" id="L443">      LinearClassifier&lt;String, String&gt; lc = (LinearClassifier&lt;String, String&gt;) classifier;</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">      if (flags.dump) {</span>
+<span class="nc" id="L445">        lc.dump();</span>
+      }
+<span class="nc bnc" id="L447" title="All 2 branches missed.">      for (int i = 0, docSize = document.size(); i &lt; docSize; i++) {</span>
+<span class="nc" id="L448">        CoreLabel lineInfo = document.get(i);</span>
+<span class="nc" id="L449">        log.info(&quot;@@ Position is: &quot; + i + &quot;: &quot;);</span>
+<span class="nc" id="L450">        log.info(lineInfo.word() + ' ' + lineInfo.get(CoreAnnotations.AnswerAnnotation.class));</span>
+<span class="nc" id="L451">        lc.justificationOf(makeDatum(document, i, featureFactories));</span>
+      }
+    }
+
+//    document.remove(0);
+
+<span class="nc bnc" id="L457" title="All 2 branches missed.">    if (flags.useReverse) {</span>
+<span class="nc" id="L458">      Collections.reverse(document);</span>
+
+    }
+<span class="nc" id="L461">  } // end testSeq</span>
+
+
+  /**
+   * @param filename adaptation file
+   * @param trainDataset original dataset (used in training)
+   */
+  public void adapt(String filename, Dataset&lt;String, String&gt; trainDataset,
+                    DocumentReaderAndWriter&lt;IN&gt; readerWriter) {
+<span class="nc" id="L470">    flags.ocrTrain = false;  // ?? Do we need this? (Pi-Chuan Sat Nov  5 15:42:49 2005)</span>
+<span class="nc" id="L471">    ObjectBank&lt;List&lt;IN&gt;&gt; docs =</span>
+<span class="nc" id="L472">      makeObjectBankFromFile(filename, readerWriter);</span>
+<span class="nc" id="L473">    adapt(docs, trainDataset);</span>
+<span class="nc" id="L474">  }</span>
+
+  /**
+   * @param featureLabels adaptation docs
+   * @param trainDataset original dataset (used in training)
+   */
+  public void adapt(ObjectBank&lt;List&lt;IN&gt;&gt; featureLabels, Dataset&lt;String, String&gt; trainDataset) {
+<span class="nc" id="L481">    Dataset&lt;String, String&gt; adapt = getDataset(featureLabels, trainDataset);</span>
+<span class="nc" id="L482">    adapt(adapt);</span>
+<span class="nc" id="L483">  }</span>
+
+  /**
+   * @param featureLabels retrain docs
+   * @param featureIndex featureIndex of original dataset (used in training)
+   * @param labelIndex labelIndex of original dataset (used in training)
+   */
+  public void retrain(ObjectBank&lt;List&lt;IN&gt;&gt; featureLabels, Index&lt;String&gt; featureIndex, Index&lt;String&gt; labelIndex) {
+<span class="nc" id="L491">    int fs = featureIndex.size(); // old dim</span>
+<span class="nc" id="L492">    int ls = labelIndex.size();   // old dim</span>
+
+<span class="nc" id="L494">    Dataset&lt;String, String&gt; adapt = getDataset(featureLabels, featureIndex, labelIndex);</span>
+
+<span class="nc" id="L496">    int prior = LogPrior.LogPriorType.QUADRATIC.ordinal();</span>
+<span class="nc" id="L497">    LinearClassifier&lt;String, String&gt; lc = (LinearClassifier&lt;String, String&gt;) classifier;</span>
+<span class="nc" id="L498">    LinearClassifierFactory&lt;String, String&gt; lcf = new LinearClassifierFactory&lt;&gt;(flags.tolerance, flags.useSum, prior, flags.sigma, flags.epsilon, flags.QNsize);</span>
+
+<span class="nc" id="L500">    double[][] weights = lc.weights();  // old dim</span>
+<span class="nc" id="L501">    Index&lt;String&gt; newF = adapt.featureIndex;</span>
+<span class="nc" id="L502">    Index&lt;String&gt; newL = adapt.labelIndex;</span>
+<span class="nc" id="L503">    int newFS = newF.size();</span>
+<span class="nc" id="L504">    int newLS = newL.size();</span>
+<span class="nc" id="L505">    double[] x = new double[newFS*newLS]; // new dim</span>
+    //log.info(&quot;old  [&quot;+fs+&quot;]&quot;+&quot;[&quot;+ls+&quot;]&quot;);
+    //log.info(&quot;new  [&quot;+newFS+&quot;]&quot;+&quot;[&quot;+newLS+&quot;]&quot;);
+    //log.info(&quot;new  [&quot;+newFS*newLS+&quot;]&quot;);
+<span class="nc bnc" id="L509" title="All 2 branches missed.">    for (int i = 0; i &lt; fs; i++) {</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">      for (int j = 0; j &lt; ls; j++) {</span>
+<span class="nc" id="L511">        String f = featureIndex.get(i);</span>
+<span class="nc" id="L512">        String l = labelIndex.get(j);</span>
+<span class="nc" id="L513">        int newi = newF.indexOf(f)*newLS+newL.indexOf(l);</span>
+<span class="nc" id="L514">        x[newi] = weights[i][j];</span>
+        //if (newi == 144745*2) {
+        //log.info(&quot;What??&quot;+i+&quot;\t&quot;+j);
+        //}
+      }
+    }
+    //log.info(&quot;x[144745*2]&quot;+x[144745*2]);
+<span class="nc" id="L521">    weights = lcf.trainWeights(adapt, x);</span>
+    //log.info(&quot;x[144745*2]&quot;+x[144745*2]);
+    //log.info(&quot;weights[144745]&quot;+&quot;[0]=&quot;+weights[144745][0]);
+
+<span class="nc" id="L525">    lc.setWeights(weights);</span>
+    /*
+    int delme = 0;
+    if (true) {
+      for (double[] dd : weights) {
+        delme++;
+        for (double d : dd) {
+        }
+      }
+    }
+    log.info(weights[delme-1][0]);
+    log.info(&quot;size of weights: &quot;+delme);
+    */
+<span class="nc" id="L538">  }</span>
+
+
+  public void retrain(ObjectBank&lt;List&lt;IN&gt;&gt; doc) {
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    if (classifier == null) {</span>
+<span class="nc" id="L543">      throw new UnsupportedOperationException(&quot;Cannot retrain before you train!&quot;);</span>
+    }
+<span class="nc" id="L545">    Index&lt;String&gt; findex = ((LinearClassifier&lt;String, String&gt;)classifier).featureIndex();</span>
+<span class="nc" id="L546">    Index&lt;String&gt; lindex = ((LinearClassifier&lt;String, String&gt;)classifier).labelIndex();</span>
+<span class="nc" id="L547">    log.info(&quot;Starting retrain:\t# of original features&quot;+findex.size()+&quot;, # of original labels&quot;+lindex.size());</span>
+<span class="nc" id="L548">    retrain(doc, findex, lindex);</span>
+<span class="nc" id="L549">  }</span>
+
+
+  @Override
+  public void train(Collection&lt;List&lt;IN&gt;&gt; wordInfos,
+                    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc" id="L555">    Dataset&lt;String, String&gt; train = getDataset(wordInfos);</span>
+    //train.summaryStatistics();
+    //train.printSVMLightFormat();
+    // wordInfos = null;  // cdm: I think this does no good as ptr exists in caller (could empty the list or better refactor so conversion done earlier?)
+<span class="nc" id="L559">    train(train);</span>
+
+<span class="nc bnc" id="L561" title="All 2 branches missed.">    for (int i = 0; i &lt; flags.numTimesPruneFeatures; i++) {</span>
+
+<span class="nc" id="L563">      Index&lt;String&gt; featuresAboveThreshold = getFeaturesAboveThreshold(train, flags.featureDiffThresh);</span>
+<span class="nc" id="L564">      log.info(&quot;Removing features with weight below &quot; + flags.featureDiffThresh + &quot; and retraining...&quot;);</span>
+<span class="nc" id="L565">      train = getDataset(train, featuresAboveThreshold);</span>
+
+<span class="nc" id="L567">      int tmp = flags.QNsize;</span>
+<span class="nc" id="L568">      flags.QNsize = flags.QNsize2;</span>
+<span class="nc" id="L569">      train(train);</span>
+<span class="nc" id="L570">      flags.QNsize = tmp;</span>
+    }
+
+<span class="nc bnc" id="L573" title="All 4 branches missed.">    if (flags.doAdaptation &amp;&amp; flags.adaptFile != null) {</span>
+<span class="nc" id="L574">      adapt(flags.adaptFile,train,readerAndWriter);</span>
+    }
+
+<span class="nc" id="L577">    log.info(&quot;Built this classifier: &quot;);</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">    if (classifier instanceof LinearClassifier) {</span>
+<span class="nc" id="L579">      String classString = ((LinearClassifier&lt;String, String&gt;)classifier).toString(flags.printClassifier, flags.printClassifierParam);</span>
+<span class="nc" id="L580">      log.info(classString);</span>
+<span class="nc" id="L581">    } else {</span>
+<span class="nc" id="L582">      String classString = classifier.toString();</span>
+<span class="nc" id="L583">      log.info(classString);</span>
+    }
+<span class="nc" id="L585">  }</span>
+
+  private Index&lt;String&gt; getFeaturesAboveThreshold(Dataset&lt;String, String&gt; dataset, double thresh) {
+<span class="nc bnc" id="L588" title="All 2 branches missed.">    if (!(classifier instanceof LinearClassifier)) {</span>
+<span class="nc" id="L589">      throw new RuntimeException(&quot;Attempting to remove features based on weight from a non-linear classifier&quot;);</span>
+    }
+<span class="nc" id="L591">    Index&lt;String&gt; featureIndex = dataset.featureIndex;</span>
+<span class="nc" id="L592">    Index&lt;String&gt; labelIndex = dataset.labelIndex;</span>
+
+<span class="nc" id="L594">    Index&lt;String&gt; features = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L595">    Iterator&lt;String&gt; featureIt = featureIndex.iterator();</span>
+<span class="nc" id="L596">    LinearClassifier&lt;String, String&gt; lc = (LinearClassifier&lt;String, String&gt;)classifier;</span>
+    LOOP:
+<span class="nc bnc" id="L598" title="All 2 branches missed.">    while (featureIt.hasNext()) {</span>
+<span class="nc" id="L599">      String f = featureIt.next();</span>
+<span class="nc" id="L600">      double smallest = Double.POSITIVE_INFINITY;</span>
+<span class="nc" id="L601">      double biggest = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">      for (String l : labelIndex) {</span>
+<span class="nc" id="L603">        double weight = lc.weight(f, l);</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if (weight &lt; smallest) {</span>
+<span class="nc" id="L605">          smallest = weight;</span>
+        }
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        if (weight &gt; biggest) {</span>
+<span class="nc" id="L608">          biggest = weight;</span>
+        }
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        if (biggest - smallest &gt; thresh) {</span>
+<span class="nc" id="L611">          features.add(f);</span>
+<span class="nc" id="L612">          continue LOOP;</span>
+        }
+<span class="nc" id="L614">      }</span>
+<span class="nc" id="L615">    }</span>
+<span class="nc" id="L616">    return features;</span>
+  }
+
+  /**
+   * Build a Dataset from some data. Used for training a classifier.
+   *
+   * @param data This variable is a list of lists of CoreLabel.  That is,
+   *             it is a collection of documents, each of which is represented
+   *             as a sequence of CoreLabel objects.
+   * @return The Dataset which is an efficient encoding of the information
+   *         in a List of Datums
+   */
+  public Dataset&lt;String, String&gt; getDataset(Collection&lt;List&lt;IN&gt;&gt; data) {
+<span class="nc" id="L629">    return getDataset(data, null, null);</span>
+  }
+
+  /**
+   * Build a Dataset from some data. Used for training a classifier.
+   *
+   * By passing in extra featureIndex and classIndex, you can get a Dataset based on featureIndex and
+   * classIndex.
+   *
+   * @param data This variable is a list of lists of CoreLabel.  That is,
+   *             it is a collection of documents, each of which is represented
+   *             as a sequence of CoreLabel objects.
+   * @param classIndex if you want to get a Dataset based on featureIndex and
+   *                    classIndex in an existing origDataset
+   * @return The Dataset which is an efficient encoding of the information
+   *         in a List of Datums
+   */
+  public Dataset&lt;String, String&gt; getDataset(Collection&lt;List&lt;IN&gt;&gt; data, Index&lt;String&gt; featureIndex, Index&lt;String&gt; classIndex) {
+<span class="nc" id="L647">    makeAnswerArraysAndTagIndex(data);</span>
+
+<span class="nc" id="L649">    int size = 0;</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : data) {</span>
+<span class="nc" id="L651">      size += doc.size();</span>
+<span class="nc" id="L652">    }</span>
+
+<span class="nc" id="L654">    log.info(&quot;Making Dataset ... &quot;);</span>
+<span class="nc" id="L655">    System.err.flush();</span>
+    Dataset&lt;String, String&gt; train;
+<span class="nc bnc" id="L657" title="All 4 branches missed.">    if (featureIndex != null &amp;&amp; classIndex != null) {</span>
+<span class="nc" id="L658">      log.info(&quot;  Using feature/class Index from existing Dataset...&quot;);</span>
+<span class="nc" id="L659">      log.info(&quot;  (This is used when getting Dataset from adaptation set. We want to make the index consistent.)&quot;); //pichuan</span>
+<span class="nc" id="L660">      train = new Dataset&lt;&gt;(size, featureIndex, classIndex);</span>
+    } else {
+<span class="nc" id="L662">      train = new Dataset&lt;&gt;(size);</span>
+    }
+
+<span class="nc bnc" id="L665" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : data) {</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc" id="L667">        Collections.reverse(doc);</span>
+      }
+
+<span class="nc bnc" id="L670" title="All 2 branches missed.">      for (int i = 0, dSize = doc.size(); i &lt; dSize; i++) {</span>
+<span class="nc" id="L671">        Datum&lt;String, String&gt; d = makeDatum(doc, i, featureFactories);</span>
+
+        //CoreLabel fl = doc.get(i);
+
+<span class="nc" id="L675">        train.add(d);</span>
+      }
+
+<span class="nc bnc" id="L678" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc" id="L679">        Collections.reverse(doc);</span>
+      }
+<span class="nc" id="L681">    }</span>
+
+<span class="nc" id="L683">    log.info(&quot;done.&quot;);</span>
+
+<span class="nc bnc" id="L685" title="All 2 branches missed.">    if (flags.featThreshFile != null) {</span>
+<span class="nc" id="L686">      log.info(&quot;applying thresholds...&quot;);</span>
+<span class="nc" id="L687">      List&lt;Pair&lt;Pattern, Integer&gt;&gt; thresh = getThresholds(flags.featThreshFile);</span>
+<span class="nc" id="L688">      train.applyFeatureCountThreshold(thresh);</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">    } else if (flags.featureThreshold &gt; 1) {</span>
+<span class="nc" id="L690">      log.info(&quot;Removing Features with counts &lt; &quot; + flags.featureThreshold);</span>
+<span class="nc" id="L691">      train.applyFeatureCountThreshold(flags.featureThreshold);</span>
+    }
+<span class="nc" id="L693">    train.summaryStatistics();</span>
+<span class="nc" id="L694">    return train;</span>
+  }
+
+  public Dataset&lt;String, String&gt; getBiasedDataset(ObjectBank&lt;List&lt;IN&gt;&gt; data, Index&lt;String&gt; featureIndex, Index&lt;String&gt; classIndex) {
+<span class="nc" id="L698">    makeAnswerArraysAndTagIndex(data);</span>
+
+<span class="nc" id="L700">    Index&lt;String&gt; origFeatIndex = new HashIndex&lt;&gt;(featureIndex.objectsList()); // mg2009: TODO: check</span>
+
+<span class="nc" id="L702">    int size = 0;</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : data) {</span>
+<span class="nc" id="L704">      size += doc.size();</span>
+<span class="nc" id="L705">    }</span>
+
+<span class="nc" id="L707">    log.info(&quot;Making Dataset ... &quot;);</span>
+<span class="nc" id="L708">    System.err.flush();</span>
+<span class="nc" id="L709">    Dataset&lt;String, String&gt; train = new Dataset&lt;&gt;(size, featureIndex, classIndex);</span>
+
+<span class="nc bnc" id="L711" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : data) {</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc" id="L713">        Collections.reverse(doc);</span>
+      }
+
+<span class="nc bnc" id="L716" title="All 2 branches missed.">      for (int i = 0, dsize = doc.size(); i &lt; dsize; i++) {</span>
+<span class="nc" id="L717">        Datum&lt;String, String&gt; d = makeDatum(doc, i, featureFactories);</span>
+<span class="nc" id="L718">        Collection&lt;String&gt; newFeats = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">        for (String f : d.asFeatures()) {</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">          if ( ! origFeatIndex.contains(f)) {</span>
+<span class="nc" id="L721">            newFeats.add(f);</span>
+          }
+<span class="nc" id="L723">        }</span>
+//        log.info(d.label()+&quot;\t&quot;+d.asFeatures()+&quot;\n\t&quot;+newFeats);
+//        d = new BasicDatum(newFeats, d.label());
+<span class="nc" id="L726">        train.add(d);</span>
+      }
+
+<span class="nc bnc" id="L729" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc" id="L730">        Collections.reverse(doc);</span>
+      }
+<span class="nc" id="L732">    }</span>
+
+<span class="nc" id="L734">    log.info(&quot;done.&quot;);</span>
+
+<span class="nc bnc" id="L736" title="All 2 branches missed.">    if (flags.featThreshFile != null) {</span>
+<span class="nc" id="L737">      log.info(&quot;applying thresholds...&quot;);</span>
+<span class="nc" id="L738">      List&lt;Pair&lt;Pattern, Integer&gt;&gt; thresh = getThresholds(flags.featThreshFile);</span>
+<span class="nc" id="L739">      train.applyFeatureCountThreshold(thresh);</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">    } else if (flags.featureThreshold &gt; 1) {</span>
+<span class="nc" id="L741">      log.info(&quot;Removing Features with counts &lt; &quot; + flags.featureThreshold);</span>
+<span class="nc" id="L742">      train.applyFeatureCountThreshold(flags.featureThreshold);</span>
+    }
+<span class="nc" id="L744">    train.summaryStatistics();</span>
+<span class="nc" id="L745">    return train;</span>
+  }
+
+
+
+
+  /**
+   * Build a Dataset from some data. Used for training a classifier.
+   *
+   * By passing in an extra origDataset, you can get a Dataset based on featureIndex and
+   * classIndex in an existing origDataset.
+   *
+   * @param data This variable is a list of lists of CoreLabel.  That is,
+   *             it is a collection of documents, each of which is represented
+   *             as a sequence of CoreLabel objects.
+   * @param origDataset if you want to get a Dataset based on featureIndex and
+   *                    classIndex in an existing origDataset
+   * @return The Dataset which is an efficient encoding of the information
+   *         in a List of Datums
+   */
+  public Dataset&lt;String, String&gt; getDataset(ObjectBank&lt;List&lt;IN&gt;&gt; data, Dataset&lt;String, String&gt; origDataset) {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">    if(origDataset == null) {</span>
+<span class="nc" id="L767">      return getDataset(data);</span>
+    }
+<span class="nc" id="L769">    return getDataset(data, origDataset.featureIndex, origDataset.labelIndex);</span>
+  }
+
+
+  /**
+   * Build a Dataset from some data.
+   *
+   * @param oldData      This {@link Dataset} represents data for which we which to
+   *                     some features, specifically those features not in the {@link edu.stanford.nlp.util.Index}
+   *                     goodFeatures.
+   * @param goodFeatures An {@link edu.stanford.nlp.util.Index} of features we wish to retain.
+   * @return A new {@link Dataset} wheres each data point contains only features
+   *         which were in goodFeatures.
+   */
+  public Dataset&lt;String, String&gt; getDataset(Dataset&lt;String, String&gt; oldData, Index&lt;String&gt; goodFeatures) {
+    //public Dataset getDataset(List data, Collection goodFeatures) {
+    //makeAnswerArraysAndTagIndex(data);
+
+<span class="nc" id="L787">    int[][] oldDataArray = oldData.getDataArray();</span>
+<span class="nc" id="L788">    int[] oldLabelArray = oldData.getLabelsArray();</span>
+<span class="nc" id="L789">    Index&lt;String&gt; oldFeatureIndex = oldData.featureIndex;</span>
+
+<span class="nc" id="L791">    int[] oldToNewFeatureMap = new int[oldFeatureIndex.size()];</span>
+
+<span class="nc" id="L793">    int[][] newDataArray = new int[oldDataArray.length][];</span>
+
+<span class="nc" id="L795">    log.info(&quot;Building reduced dataset...&quot;);</span>
+
+<span class="nc" id="L797">    int size = oldFeatureIndex.size();</span>
+<span class="nc" id="L798">    int max = 0;</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L800">      oldToNewFeatureMap[i] = goodFeatures.indexOf(oldFeatureIndex.get(i));</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">      if (oldToNewFeatureMap[i] &gt; max) {</span>
+<span class="nc" id="L802">        max = oldToNewFeatureMap[i];</span>
+      }
+    }
+
+<span class="nc bnc" id="L806" title="All 2 branches missed.">    for (int i = 0; i &lt; oldDataArray.length; i++) {</span>
+<span class="nc" id="L807">      int[] data = oldDataArray[i];</span>
+<span class="nc" id="L808">      size = 0;</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">      for (int oldF : data) {</span>
+<span class="nc bnc" id="L810" title="All 2 branches missed.">        if (oldToNewFeatureMap[oldF] &gt; 0) {</span>
+<span class="nc" id="L811">          size++;</span>
+        }
+      }
+<span class="nc" id="L814">      int[] newData = new int[size];</span>
+<span class="nc" id="L815">      int index = 0;</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">      for (int oldF : data) {</span>
+<span class="nc" id="L817">        int f = oldToNewFeatureMap[oldF];</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">        if (f &gt; 0) {</span>
+<span class="nc" id="L819">          newData[index++] = f;</span>
+        }
+      }
+<span class="nc" id="L822">      newDataArray[i] = newData;</span>
+    }
+
+<span class="nc" id="L825">    Dataset&lt;String, String&gt; train = new Dataset&lt;&gt;(oldData.labelIndex, oldLabelArray, goodFeatures, newDataArray, newDataArray.length);</span>
+
+<span class="nc" id="L827">    log.info(&quot;done.&quot;);</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">    if (flags.featThreshFile != null) {</span>
+<span class="nc" id="L829">      log.info(&quot;applying thresholds...&quot;);</span>
+<span class="nc" id="L830">      List&lt;Pair&lt;Pattern,Integer&gt;&gt; thresh = getThresholds(flags.featThreshFile);</span>
+<span class="nc" id="L831">      train.applyFeatureCountThreshold(thresh);</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">    } else if (flags.featureThreshold &gt; 1) {</span>
+<span class="nc" id="L833">      log.info(&quot;Removing Features with counts &lt; &quot; + flags.featureThreshold);</span>
+<span class="nc" id="L834">      train.applyFeatureCountThreshold(flags.featureThreshold);</span>
+    }
+<span class="nc" id="L836">    train.summaryStatistics();</span>
+<span class="nc" id="L837">    return train;</span>
+  }
+
+  private void adapt(Dataset&lt;String, String&gt; adapt) {
+<span class="nc bnc" id="L841" title="All 2 branches missed.">    if (flags.classifierType.equalsIgnoreCase(&quot;SVM&quot;)) {</span>
+<span class="nc" id="L842">      throw new UnsupportedOperationException();</span>
+    }
+<span class="nc" id="L844">    adaptMaxEnt(adapt);</span>
+<span class="nc" id="L845">  }</span>
+
+  private void adaptMaxEnt(Dataset&lt;String, String&gt; adapt) {
+<span class="nc bnc" id="L848" title="All 2 branches missed.">    if (classifier instanceof LinearClassifier) {</span>
+      // So far the adaptation is only done on Gaussian Prior. Haven't checked how it'll work on other kinds of priors. -pichuan
+<span class="nc" id="L850">      int prior = LogPrior.LogPriorType.QUADRATIC.ordinal();</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">      if (flags.useHuber) {</span>
+<span class="nc" id="L852">        throw new UnsupportedOperationException();</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">      } else if (flags.useQuartic) {</span>
+<span class="nc" id="L854">        throw new UnsupportedOperationException();</span>
+      }
+
+<span class="nc" id="L857">      LinearClassifierFactory&lt;String, String&gt; lcf = new LinearClassifierFactory&lt;&gt;(flags.tolerance, flags.useSum, prior, flags.adaptSigma, flags.epsilon, flags.QNsize);</span>
+<span class="nc" id="L858">      ((LinearClassifier&lt;String, String&gt;)classifier).adaptWeights(adapt,lcf);</span>
+<span class="nc" id="L859">    } else {</span>
+<span class="nc" id="L860">      throw new UnsupportedOperationException();</span>
+    }
+<span class="nc" id="L862">  }</span>
+
+  private void train(Dataset&lt;String, String&gt; train) {
+<span class="nc bnc" id="L865" title="All 2 branches missed.">    if (flags.classifierType.equalsIgnoreCase(&quot;SVM&quot;)) {</span>
+<span class="nc" id="L866">      trainSVM(train);</span>
+    } else {
+<span class="nc" id="L868">      trainMaxEnt(train);</span>
+    }
+<span class="nc" id="L870">  }</span>
+
+  private void trainSVM(Dataset&lt;String, String&gt; train) {
+<span class="nc" id="L873">    SVMLightClassifierFactory&lt;String, String&gt; fact = new SVMLightClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L874">    classifier = fact.trainClassifier(train);</span>
+
+<span class="nc" id="L876">  }</span>
+
+  private void trainMaxEnt(Dataset&lt;String, String&gt; train) {
+<span class="nc" id="L879">    int prior = LogPrior.LogPriorType.QUADRATIC.ordinal();</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">    if (flags.useHuber) {</span>
+<span class="nc" id="L881">      prior = LogPrior.LogPriorType.HUBER.ordinal();</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">    } else if (flags.useQuartic) {</span>
+<span class="nc" id="L883">      prior = LogPrior.LogPriorType.QUARTIC.ordinal();</span>
+    }
+
+    LinearClassifier&lt;String, String&gt; lc;
+<span class="nc bnc" id="L887" title="All 2 branches missed.">    if (flags.useNB) {</span>
+<span class="nc" id="L888">      lc = new NBLinearClassifierFactory&lt;String, String&gt;(flags.sigma).trainClassifier(train);</span>
+    } else {
+<span class="nc" id="L890">      LinearClassifierFactory&lt;String, String&gt; lcf = new LinearClassifierFactory&lt;&gt;(flags.tolerance, flags.useSum, prior, flags.sigma, flags.epsilon, flags.QNsize);</span>
+<span class="nc" id="L891">      lcf.setVerbose(true);</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">      if (flags.useQN) {</span>
+<span class="nc" id="L893">        lcf.useQuasiNewton(flags.useRobustQN);</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">      } else if(flags.useStochasticQN) {</span>
+<span class="nc" id="L895">        lcf.useStochasticQN(flags.initialGain,flags.stochasticBatchSize);</span>
+<span class="nc bnc" id="L896" title="All 2 branches missed.">      } else if(flags.useSMD) {</span>
+<span class="nc" id="L897">        lcf.useStochasticMetaDescent(flags.initialGain, flags.stochasticBatchSize,flags.stochasticMethod,flags.SGDPasses);</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">      } else if(flags.useSGD) {</span>
+<span class="nc" id="L899">        lcf.useStochasticGradientDescent(flags.gainSGD,flags.stochasticBatchSize);</span>
+<span class="nc bnc" id="L900" title="All 2 branches missed.">      } else if(flags.useSGDtoQN) {</span>
+<span class="nc" id="L901">        lcf.useStochasticGradientDescentToQuasiNewton(flags.initialGain, flags.stochasticBatchSize,</span>
+                                       flags.SGDPasses, flags.QNPasses, flags.SGD2QNhessSamples,
+                                       flags.QNsize, flags.outputIterationsToFile);
+<span class="nc bnc" id="L904" title="All 2 branches missed.">      } else if(flags.useHybrid) {</span>
+<span class="nc" id="L905">        lcf.useHybridMinimizer(flags.initialGain, flags.stochasticBatchSize ,flags.stochasticMethod ,flags.hybridCutoffIteration );</span>
+      } else {
+<span class="nc" id="L907">        lcf.useConjugateGradientAscent();</span>
+      }
+<span class="nc" id="L909">      lc = lcf.trainClassifier(train);</span>
+    }
+<span class="nc" id="L911">    this.classifier = lc;</span>
+<span class="nc" id="L912">  }</span>
+
+  private void trainSemiSup(Dataset&lt;String, String&gt; data, Dataset&lt;String, String&gt; biasedData, double[][] confusionMatrix) {
+<span class="nc" id="L915">    int prior = LogPrior.LogPriorType.QUADRATIC.ordinal();</span>
+<span class="nc bnc" id="L916" title="All 2 branches missed.">    if (flags.useHuber) {</span>
+<span class="nc" id="L917">      prior = LogPrior.LogPriorType.HUBER.ordinal();</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">    } else if (flags.useQuartic) {</span>
+<span class="nc" id="L919">      prior = LogPrior.LogPriorType.QUARTIC.ordinal();</span>
+    }
+
+    LinearClassifierFactory&lt;String, String&gt; lcf;
+<span class="nc" id="L923">    lcf = new LinearClassifierFactory&lt;&gt;(flags.tolerance, flags.useSum, prior, flags.sigma, flags.epsilon, flags.QNsize);</span>
+<span class="nc bnc" id="L924" title="All 2 branches missed.">    if (flags.useQN) {</span>
+<span class="nc" id="L925">      lcf.useQuasiNewton();</span>
+    } else{
+<span class="nc" id="L927">      lcf.useConjugateGradientAscent();</span>
+    }
+
+<span class="nc" id="L930">    this.classifier = (LinearClassifier&lt;String, String&gt;) lcf.trainClassifierSemiSup(data, biasedData, confusionMatrix, null);</span>
+<span class="nc" id="L931">  }</span>
+
+
+//   public void crossValidateTrainAndTest() throws Exception {
+//     crossValidateTrainAndTest(flags.trainFile);
+//   }
+
+//   public void crossValidateTrainAndTest(String filename) throws Exception {
+//     // wordshapes
+
+//     for (int fold = flags.startFold; fold &lt;= flags.endFold; fold++) {
+//       log.info(&quot;fold &quot; + fold + &quot; of &quot; + flags.endFold);
+//       // train
+
+//       List = makeObjectBank(filename);
+//       List folds = split(data, flags.numFolds);
+//       data = null;
+
+//       List train = new ArrayList();
+
+//       for (int i = 0; i &lt; flags.numFolds; i++) {
+//         List docs = (List) folds.get(i);
+//         if (i != fold) {
+//           train.addAll(docs);
+//         }
+//       }
+//       folds = null;
+//       train(train);
+//       train = null;
+
+//       List test = new ArrayList();
+//       data = makeObjectBank(filename);
+//       folds = split(data, flags.numFolds);
+//       data = null;
+
+//       for (int i = 0; i &lt; flags.numFolds; i++) {
+//         List docs = (List) folds.get(i);
+//         if (i == fold) {
+//           test.addAll(docs);
+//         }
+//       }
+//       folds = null;
+//       // test
+//       test(test);
+//       writeAnswers(test);
+//     }
+//   }
+
+//   /**
+//    * Splits the given train corpus into a train and a test corpus based on the fold number.
+//    * 1 / numFolds documents are held out for test, with the offset determined by the fold number.
+//    *
+//    * @param data     The original data
+//    * @param numFolds The number of folds to split the data into
+//    * @return A list of folds giving the new training set
+//    */
+//   private List split(List data, int numFolds) {
+//     List folds = new ArrayList();
+//     int foldSize = data.size() / numFolds;
+//     int r = data.size() - (numFolds * foldSize);
+
+//     int index = 0;
+//     for (int i = 0; i &lt; numFolds; i++) {
+//       List fold = new ArrayList();
+//       int end = (i &lt; r ? foldSize + 1 : foldSize);
+//       for (int j = 0; j &lt; end; j++) {
+//         fold.add(data.get(index++));
+//       }
+//       folds.add(fold);
+//     }
+
+//     return folds;
+//   }
+
+  @Override
+  public void serializeClassifier(String serializePath) {
+
+<span class="nc" id="L1008">    log.info(&quot;Serializing classifier to &quot; + serializePath + &quot;...&quot;);</span>
+
+    try {
+<span class="nc" id="L1011">      ObjectOutputStream oos = IOUtils.writeStreamFromString(serializePath);</span>
+
+<span class="nc" id="L1013">      oos.writeObject(classifier);</span>
+<span class="nc" id="L1014">      oos.writeObject(flags);</span>
+<span class="nc" id="L1015">      oos.writeObject(featureFactories);</span>
+<span class="nc" id="L1016">      oos.writeObject(classIndex);</span>
+<span class="nc" id="L1017">      oos.writeObject(answerArrays);</span>
+      //oos.writeObject(WordShapeClassifier.getKnownLowerCaseWords());
+
+<span class="nc" id="L1020">      oos.writeObject(knownLCWords);</span>
+
+<span class="nc" id="L1022">      oos.close();</span>
+<span class="nc" id="L1023">      log.info(&quot;Done.&quot;);</span>
+
+<span class="nc" id="L1025">    } catch (Exception e) {</span>
+<span class="nc" id="L1026">      log.info(&quot;Error serializing to &quot; + serializePath);</span>
+<span class="nc" id="L1027">      e.printStackTrace();</span>
+<span class="nc" id="L1028">    }</span>
+<span class="nc" id="L1029">  }</span>
+
+  public void serializeClassifier(ObjectOutputStream oos) {
+
+    //log.info(&quot;Serializing classifier to &quot; + serializePath + &quot;...&quot;);
+
+    try {
+      //ObjectOutputStream oos = IOUtils.writeStreamFromString(oos);
+
+<span class="nc" id="L1038">      oos.writeObject(classifier);</span>
+<span class="nc" id="L1039">      oos.writeObject(flags);</span>
+<span class="nc" id="L1040">      oos.writeObject(featureFactories);</span>
+<span class="nc" id="L1041">      oos.writeObject(classIndex);</span>
+<span class="nc" id="L1042">      oos.writeObject(answerArrays);</span>
+      //oos.writeObject(WordShapeClassifier.getKnownLowerCaseWords());
+
+<span class="nc" id="L1045">      oos.writeObject(knownLCWords);</span>
+
+<span class="nc" id="L1047">      oos.close();</span>
+<span class="nc" id="L1048">      log.info(&quot;Done.&quot;);</span>
+
+<span class="nc" id="L1050">    } catch (Exception e) {</span>
+      //log.info(&quot;Error serializing to &quot; + serializePath);
+<span class="nc" id="L1052">      e.printStackTrace();</span>
+<span class="nc" id="L1053">    }</span>
+<span class="nc" id="L1054">  }</span>
+
+
+  /**
+   * Used to load the default supplied classifier.  **THIS FUNCTION
+   * WILL ONLY WORK IF RUN INSIDE A JAR FILE**
+   */
+  public void loadDefaultClassifier() {
+<span class="nc" id="L1062">    loadJarClassifier(DEFAULT_CLASSIFIER, null);</span>
+<span class="nc" id="L1063">  }</span>
+
+  /**
+   * Used to obtain the default classifier which is
+   * stored inside a jar file.  &lt;i&gt;THIS FUNCTION
+   * WILL ONLY WORK IF RUN INSIDE A JAR FILE.&lt;/i&gt;
+   *
+   * @return A Default CMMClassifier from a jar file
+   */
+  public static CMMClassifier&lt;? extends CoreLabel&gt; getDefaultClassifier() {
+
+<span class="nc" id="L1074">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1075">    cmm.loadDefaultClassifier();</span>
+<span class="nc" id="L1076">    return cmm;</span>
+
+  }
+
+  /** Load a classifier from the given Stream.
+   *  &lt;i&gt;Implementation note: &lt;/i&gt; This method &lt;i&gt;does not&lt;/i&gt; close the
+   *  Stream that it reads from.
+   *
+   *  @param ois The ObjectInputStream to load the serialized classifier from
+   *
+   *  @throws IOException If there are problems accessing the input stream
+   *  @throws ClassCastException If there are problems interpreting the serialized data
+   *  @throws ClassNotFoundException If there are problems interpreting the serialized data
+
+   *  */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  @Override
+  public void loadClassifier(ObjectInputStream ois, Properties props) throws ClassCastException, IOException, ClassNotFoundException {
+<span class="nc" id="L1094">    classifier = (LinearClassifier&lt;String, String&gt;) ois.readObject();</span>
+<span class="nc" id="L1095">    flags = (SeqClassifierFlags) ois.readObject();</span>
+<span class="nc" id="L1096">    Object featureFactory = ois.readObject();</span>
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">    if (featureFactory instanceof List) {</span>
+<span class="nc" id="L1098">      featureFactories = ErasureUtils.uncheckedCast(featureFactory);</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">    } else if (featureFactory instanceof FeatureFactory) {</span>
+<span class="nc" id="L1100">      featureFactories = Generics.newArrayList();</span>
+<span class="nc" id="L1101">      featureFactories.add((FeatureFactory) featureFactory);</span>
+    }
+
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">    if (props != null) {</span>
+<span class="nc" id="L1105">      flags.setProperties(props);</span>
+    }
+<span class="nc" id="L1107">    reinit();</span>
+
+<span class="nc" id="L1109">    classIndex = (Index&lt;String&gt;) ois.readObject();</span>
+<span class="nc" id="L1110">    answerArrays = (Set&lt;List&lt;String&gt;&gt;) ois.readObject();</span>
+
+<span class="nc" id="L1112">    knownLCWords = (MaxSizeConcurrentHashSet&lt;String&gt;) ois.readObject();</span>
+<span class="nc" id="L1113">  }</span>
+
+
+  public static CMMClassifier&lt;? extends CoreLabel&gt; getClassifierNoExceptions(File file) {
+<span class="nc" id="L1117">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1118">    cmm.loadClassifierNoExceptions(file);</span>
+<span class="nc" id="L1119">    return cmm;</span>
+
+  }
+
+  public static CMMClassifier&lt;? extends CoreLabel&gt; getClassifier(File file) throws IOException, ClassCastException, ClassNotFoundException {
+
+<span class="nc" id="L1125">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1126">    cmm.loadClassifier(file);</span>
+<span class="nc" id="L1127">    return cmm;</span>
+  }
+
+  public static CMMClassifier&lt;CoreLabel&gt; getClassifierNoExceptions(String loadPath) {
+<span class="nc" id="L1131">    CMMClassifier&lt;CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1132">    cmm.loadClassifierNoExceptions(loadPath);</span>
+<span class="nc" id="L1133">    return cmm;</span>
+
+  }
+
+  public static CMMClassifier&lt;? extends CoreLabel&gt; getClassifier(String loadPath) throws IOException, ClassCastException, ClassNotFoundException {
+
+<span class="nc" id="L1139">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1140">    cmm.loadClassifier(loadPath);</span>
+<span class="nc" id="L1141">    return cmm;</span>
+  }
+
+  public static CMMClassifier&lt;? extends CoreLabel&gt; getClassifierNoExceptions(InputStream in) {
+<span class="nc" id="L1145">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1146">    cmm.loadClassifierNoExceptions(new BufferedInputStream(in), null);</span>
+<span class="nc" id="L1147">    return cmm;</span>
+  }
+
+  // new method for getting a CMM from an ObjectInputStream - by JB
+  public static &lt;INN extends CoreMap&gt; CMMClassifier&lt;? extends CoreLabel&gt; getClassifier(ObjectInputStream ois) throws IOException,
+          ClassCastException,
+          ClassNotFoundException {
+<span class="nc" id="L1154">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1155">    cmm.loadClassifier(ois, null);</span>
+<span class="nc" id="L1156">    return cmm;</span>
+  }
+
+  public static &lt;INN extends CoreMap&gt; CMMClassifier&lt;? extends CoreLabel&gt; getClassifier(ObjectInputStream ois, Properties props) throws IOException,
+          ClassCastException,
+          ClassNotFoundException {
+<span class="nc" id="L1162">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1163">    cmm.loadClassifier(ois, props);</span>
+<span class="nc" id="L1164">    return cmm;</span>
+  }
+
+  public static CMMClassifier&lt;? extends CoreLabel&gt; getClassifier(InputStream in) throws IOException, ClassCastException, ClassNotFoundException {
+<span class="nc" id="L1168">    CMMClassifier&lt;? extends CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;();</span>
+<span class="nc" id="L1169">    cmm.loadClassifier(new BufferedInputStream(in));</span>
+<span class="nc" id="L1170">    return cmm;</span>
+  }
+
+  /** This routine builds the {@code answerArrays} which give the
+   *  empirically legal label sequences (of length (order) at most
+   *  {@code flags.maxLeft}) and the {@code classIndex},
+   *  which indexes known answer classes.
+   *
+   * @param docs The training data: A List of List of CoreLabel
+   */
+  private void makeAnswerArraysAndTagIndex(Collection&lt;List&lt;IN&gt;&gt; docs) {
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">    if (answerArrays == null) {</span>
+<span class="nc" id="L1182">      answerArrays = Generics.newHashSet();</span>
+    }
+<span class="nc bnc" id="L1184" title="All 2 branches missed.">    if (classIndex == null) {</span>
+<span class="nc" id="L1185">      classIndex = new HashIndex&lt;&gt;();</span>
+    }
+
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : docs) {</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc" id="L1190">        Collections.reverse(doc);</span>
+      }
+
+<span class="nc" id="L1193">      int leng = doc.size();</span>
+<span class="nc bnc" id="L1194" title="All 2 branches missed.">      for (int start = 0; start &lt; leng; start++) {</span>
+<span class="nc bnc" id="L1195" title="All 4 branches missed.">        for (int diff = 1; diff &lt;= flags.maxLeft &amp;&amp; start + diff &lt;= leng; diff++) {</span>
+<span class="nc" id="L1196">          String[] seq = new String[diff];</span>
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">          for (int i = start; i &lt; start + diff; i++) {</span>
+<span class="nc" id="L1198">            seq[i - start] = doc.get(i).get(CoreAnnotations.AnswerAnnotation.class);</span>
+          }
+<span class="nc" id="L1200">          answerArrays.add(Arrays.asList(seq));</span>
+        }
+      }
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">      for (IN wordInfo : doc) {</span>
+<span class="nc" id="L1204">        classIndex.add(wordInfo.get(CoreAnnotations.AnswerAnnotation.class));</span>
+<span class="nc" id="L1205">      }</span>
+
+<span class="nc bnc" id="L1207" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc" id="L1208">        Collections.reverse(doc);</span>
+      }
+<span class="nc" id="L1210">    }</span>
+<span class="nc" id="L1211">  }</span>
+
+  /** Make an individual Datum out of the data list info, focused at position loc.
+   *
+   *  @param info A List of IN objects
+   *  @param loc  The position in the info list to focus feature creation on
+   *  @param featureFactories The factory that constructs features out of the item
+   *  @return A Datum (BasicDatum) representing this data instance
+   */
+  public Datum&lt;String, String&gt; makeDatum(List&lt;IN&gt; info, int loc, List&lt;FeatureFactory&lt;IN&gt;&gt; featureFactories) {
+<span class="nc" id="L1221">    PaddedList&lt;IN&gt; pInfo = new PaddedList&lt;&gt;(info, pad);</span>
+
+<span class="nc" id="L1223">    Collection&lt;String&gt; features = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1224" title="All 2 branches missed.">    for (FeatureFactory&lt;IN&gt; featureFactory : featureFactories) {</span>
+<span class="nc" id="L1225">      List&lt;Clique&gt; cliques = featureFactory.getCliques();</span>
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">      for (Clique c : cliques) {</span>
+<span class="nc" id="L1227">        Collection&lt;String&gt; feats = featureFactory.getCliqueFeatures(pInfo, loc, c);</span>
+<span class="nc" id="L1228">        feats = addOtherClasses(feats, pInfo, loc, c);</span>
+<span class="nc" id="L1229">        features.addAll(feats);</span>
+<span class="nc" id="L1230">      }</span>
+<span class="nc" id="L1231">    }</span>
+
+<span class="nc" id="L1233">    printFeatures(pInfo.get(loc), features);</span>
+<span class="nc" id="L1234">    CoreLabel c = info.get(loc);</span>
+<span class="nc" id="L1235">    return new BasicDatum&lt;&gt;(features, c.get(CoreAnnotations.AnswerAnnotation.class));</span>
+  }
+
+
+  /** This adds to the feature name the name of classes that are other than
+   *  the current class that are involved in the clique.  In the CMM, these
+   *  other classes become part of the conditioning feature, and only the
+   *  class of the current position is being predicted.
+   *
+   *  @return A collection of features with extra class information put
+   *          into the feature name.
+   */
+  private static Collection&lt;String&gt; addOtherClasses(Collection&lt;String&gt; feats, List&lt;? extends CoreLabel&gt; info,
+                                     int loc, Clique c) {
+<span class="nc" id="L1249">    String addend = null;</span>
+<span class="nc" id="L1250">    String pAnswer = info.get(loc - 1).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1251">    String p2Answer = info.get(loc - 2).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1252">    String p3Answer = info.get(loc - 3).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1253">    String p4Answer = info.get(loc - 4).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1254">    String p5Answer = info.get(loc - 5).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1255">    String nAnswer = info.get(loc + 1).get(CoreAnnotations.AnswerAnnotation.class);</span>
+    // cdm 2009: Is this really right? Do we not need to differentiate names that would collide???
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">    if (c == FeatureFactory.cliqueCpC) {</span>
+<span class="nc" id="L1258">      addend = '|' + pAnswer;</span>
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCp2C) {</span>
+<span class="nc" id="L1260">      addend = '|' + p2Answer;</span>
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCp3C) {</span>
+<span class="nc" id="L1262">      addend = '|' + p3Answer;</span>
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCp4C) {</span>
+<span class="nc" id="L1264">      addend = '|' + p4Answer;</span>
+<span class="nc bnc" id="L1265" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCp5C) {</span>
+<span class="nc" id="L1266">      addend = '|' + p5Answer;</span>
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCpCp2C) {</span>
+<span class="nc" id="L1268">      addend = '|' + pAnswer + '-' + p2Answer;</span>
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCpCp2Cp3C) {</span>
+<span class="nc" id="L1270">      addend = '|' + pAnswer + '-' + p2Answer + '-' + p3Answer;</span>
+<span class="nc bnc" id="L1271" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCpCp2Cp3Cp4C) {</span>
+<span class="nc" id="L1272">      addend = '|' + pAnswer + '-' + p2Answer + '-' + p3Answer + '-' + p4Answer;</span>
+<span class="nc bnc" id="L1273" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCpCp2Cp3Cp4Cp5C) {</span>
+<span class="nc" id="L1274">      addend = '|' + pAnswer + '-' + p2Answer + '-' + p3Answer + '-' + p4Answer + '-' + p5Answer;</span>
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCnC) {</span>
+<span class="nc" id="L1276">      addend = '|' + nAnswer;</span>
+<span class="nc bnc" id="L1277" title="All 2 branches missed.">    } else if (c == FeatureFactory.cliqueCpCnC) {</span>
+<span class="nc" id="L1278">      addend = '|' + pAnswer + '-' + nAnswer;</span>
+    }
+<span class="nc bnc" id="L1280" title="All 2 branches missed.">    if (addend == null) {</span>
+<span class="nc" id="L1281">      return feats;</span>
+    }
+<span class="nc" id="L1283">    Collection&lt;String&gt; newFeats = Generics.newHashSet();</span>
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">    for (String feat : feats) {</span>
+<span class="nc" id="L1285">      String newFeat = feat + addend;</span>
+<span class="nc" id="L1286">      newFeats.add(newFeat);</span>
+<span class="nc" id="L1287">    }</span>
+<span class="nc" id="L1288">    return newFeats;</span>
+  }
+
+
+  private static List&lt;Pair&lt;Pattern, Integer&gt;&gt; getThresholds(String filename) {
+<span class="nc" id="L1293">    BufferedReader in = null;</span>
+    try {
+<span class="nc" id="L1295">      in = IOUtils.readerFromString(filename);</span>
+<span class="nc" id="L1296">      List&lt;Pair&lt;Pattern, Integer&gt;&gt; thresholds = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1297" title="All 2 branches missed.">      for (String line; (line = in.readLine()) != null; ) {</span>
+<span class="nc" id="L1298">        int i = line.lastIndexOf(' ');</span>
+<span class="nc" id="L1299">        Pattern p = Pattern.compile(line.substring(0, i));</span>
+        //log.info(&quot;:&quot;+line.substring(0,i)+&quot;:&quot;);
+<span class="nc" id="L1301">        Integer t = Integer.valueOf(line.substring(i + 1));</span>
+<span class="nc" id="L1302">        Pair&lt;Pattern, Integer&gt; pair = new Pair&lt;&gt;(p, t);</span>
+<span class="nc" id="L1303">        thresholds.add(pair);</span>
+<span class="nc" id="L1304">      }</span>
+<span class="nc" id="L1305">      in.close();</span>
+<span class="nc" id="L1306">      return thresholds;</span>
+<span class="nc" id="L1307">    } catch (IOException e) {</span>
+<span class="nc" id="L1308">      throw new RuntimeIOException(&quot;Error reading threshold file&quot;, e);</span>
+    } finally {
+<span class="nc" id="L1310">      IOUtils.closeIgnoringExceptions(in);</span>
+    }
+  }
+
+  public void trainSemiSup() {
+<span class="nc" id="L1315">    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter = makeReaderAndWriter();</span>
+
+<span class="nc" id="L1317">    String filename = flags.trainFile;</span>
+<span class="nc" id="L1318">    String biasedFilename = flags.biasedTrainFile;</span>
+
+<span class="nc" id="L1320">    ObjectBank&lt;List&lt;IN&gt;&gt; data =</span>
+<span class="nc" id="L1321">      makeObjectBankFromFile(filename, readerAndWriter);</span>
+<span class="nc" id="L1322">    ObjectBank&lt;List&lt;IN&gt;&gt; biasedData =</span>
+<span class="nc" id="L1323">      makeObjectBankFromFile(biasedFilename, readerAndWriter);</span>
+
+<span class="nc" id="L1325">    Index&lt;String&gt; featureIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L1326">    Index&lt;String&gt; classIndex = new HashIndex&lt;&gt;();</span>
+
+<span class="nc" id="L1328">    Dataset&lt;String, String&gt; dataset = getDataset(data, featureIndex, classIndex);</span>
+<span class="nc" id="L1329">    Dataset&lt;String, String&gt; biasedDataset = getBiasedDataset(biasedData, featureIndex, classIndex);</span>
+
+<span class="nc" id="L1331">    double[][] confusionMatrix = new double[classIndex.size()][classIndex.size()];</span>
+
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">    for (int i = 0; i &lt; confusionMatrix.length; i++) {</span>
+      // Arrays.fill(confusionMatrix[i], 0.0);  // not needed; Java arrays zero initialized
+<span class="nc" id="L1335">      confusionMatrix[i][i] = 1.0;</span>
+    }
+
+<span class="nc" id="L1338">    String cm = flags.confusionMatrix;</span>
+<span class="nc" id="L1339">    String[] bits = cm.split(&quot;:&quot;);</span>
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">    for (String bit : bits) {</span>
+<span class="nc" id="L1341">      String[] bits1 = bit.split(&quot;\\|&quot;);</span>
+<span class="nc" id="L1342">      int i1 = classIndex.indexOf(bits1[0]);</span>
+<span class="nc" id="L1343">      int i2 = classIndex.indexOf(bits1[1]);</span>
+<span class="nc" id="L1344">      double d = Double.parseDouble(bits1[2]);</span>
+<span class="nc" id="L1345">      confusionMatrix[i2][i1] = d;</span>
+    }
+
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">    for (double[] row : confusionMatrix) {</span>
+<span class="nc" id="L1349">      ArrayMath.normalize(row);</span>
+    }
+
+<span class="nc bnc" id="L1352" title="All 2 branches missed.">    for (int i = 0; i &lt; confusionMatrix.length; i++) {</span>
+<span class="nc bnc" id="L1353" title="All 2 branches missed.">      for (int j = 0; j &lt; i; j++) {</span>
+<span class="nc" id="L1354">        double d = confusionMatrix[i][j];</span>
+<span class="nc" id="L1355">        confusionMatrix[i][j] = confusionMatrix[j][i];</span>
+<span class="nc" id="L1356">        confusionMatrix[j][i] = d;</span>
+      }
+    }
+
+<span class="nc bnc" id="L1360" title="All 2 branches missed.">    for (int i = 0; i &lt; confusionMatrix.length; i++) {</span>
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">      for (int j = 0; j &lt; confusionMatrix.length; j++) {</span>
+<span class="nc" id="L1362">        log.info(&quot;P(&quot;+classIndex.get(j)+ '|' +classIndex.get(i)+&quot;) = &quot;+confusionMatrix[j][i]);</span>
+      }
+    }
+
+<span class="nc" id="L1366">    trainSemiSup(dataset, biasedDataset, confusionMatrix);</span>
+<span class="nc" id="L1367">  }</span>
+
+
+
+  public double weight(String feature, String label) {
+<span class="nc" id="L1372">    return ((LinearClassifier&lt;String, String&gt;)classifier).weight(feature, label);</span>
+  }
+
+  public double[][] weights() {
+<span class="nc" id="L1376">    return ((LinearClassifier&lt;String, String&gt;)classifier).weights();</span>
+  }
+
+  @Override
+  public List&lt;IN&gt; classifyWithGlobalInformation(List&lt;IN&gt; tokenSeq, final CoreMap doc, final CoreMap sent) {
+<span class="nc" id="L1381">    return classify(tokenSeq);</span>
+  }
+
+
+  static class Scorer&lt;INN extends CoreLabel&gt; implements SequenceModel {
+
+    private final CMMClassifier&lt;INN&gt; classifier;
+
+    private final int[] tagArray;
+    private final int[] backgroundTags;
+    private final Index&lt;String&gt; tagIndex;
+    private final List&lt;INN&gt; lineInfos;
+    private final int pre;
+    private final int post;
+    private final Set&lt;List&lt;String&gt;&gt; legalTags;
+
+    private static final boolean VERBOSE = false;
+
+    private static int[] buildTagArray(int sz) {
+<span class="nc" id="L1400">      int[] temp = new int[sz];</span>
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">      for (int i = 0; i &lt; sz; i++) {</span>
+<span class="nc" id="L1402">        temp[i] = i;</span>
+      }
+<span class="nc" id="L1404">      return temp;</span>
+    }
+
+    @Override
+    public int length() {
+<span class="nc" id="L1409">      return lineInfos.size() - pre - post;</span>
+    }
+
+    @Override
+    public int leftWindow() {
+<span class="nc" id="L1414">      return pre;</span>
+    }
+
+    @Override
+    public int rightWindow() {
+<span class="nc" id="L1419">      return post;</span>
+    }
+
+    @Override
+    public int[] getPossibleValues(int position) {
+      // if (position == 0 || position == lineInfos.size() - 1) {
+      //   int[] a = new int[1];
+      //   a[0] = tagIndex.indexOf(BACKGROUND);
+      //   return a;
+      // }
+      // if (tagArray == null) {
+      //   buildTagArray();
+      // }
+<span class="nc bnc" id="L1432" title="All 2 branches missed.">      if (position &lt; pre) {</span>
+<span class="nc" id="L1433">        return backgroundTags;</span>
+      }
+<span class="nc" id="L1435">      return tagArray;</span>
+    }
+
+    @Override
+    public double scoreOf(int[] sequence) {
+<span class="nc" id="L1440">      throw new UnsupportedOperationException();</span>
+    }
+
+<span class="nc" id="L1443">    private double[] scoreCache = null;</span>
+<span class="nc" id="L1444">    private int[] lastWindow = null;</span>
+    //private int lastPos = -1;
+
+    @Override
+    public double scoreOf(int[] tags, int pos) {
+      if (false) {
+        return scoresOf(tags, pos)[tags[pos]];
+      }
+<span class="nc bnc" id="L1452" title="All 2 branches missed.">      if (lastWindow == null) {</span>
+<span class="nc" id="L1453">        lastWindow = new int[leftWindow() + rightWindow() + 1];</span>
+<span class="nc" id="L1454">        Arrays.fill(lastWindow, -1);</span>
+      }
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">      boolean match = (pos == lastPos);</span>
+<span class="nc bnc" id="L1457" title="All 2 branches missed.">      for (int i = pos - leftWindow(); i &lt;= pos + rightWindow(); i++) {</span>
+<span class="nc bnc" id="L1458" title="All 4 branches missed.">        if (i == pos || i &lt; 0) {</span>
+<span class="nc" id="L1459">          continue;</span>
+        }
+        /*log.info(&quot;p:&quot;+pos);
+        log.info(&quot;lw:&quot;+leftWindow());
+        log.info(&quot;i:&quot;+i);*/
+<span class="nc bnc" id="L1464" title="All 2 branches missed.">        match &amp;= tags[i] == lastWindow[i - pos + leftWindow()];</span>
+      }
+<span class="nc bnc" id="L1466" title="All 2 branches missed.">      if (!match) {</span>
+<span class="nc" id="L1467">        scoreCache = scoresOf(tags, pos);</span>
+<span class="nc bnc" id="L1468" title="All 2 branches missed.">        for (int i = pos - leftWindow(); i &lt;= pos + rightWindow(); i++) {</span>
+<span class="nc bnc" id="L1469" title="All 2 branches missed.">          if (i &lt; 0) {</span>
+<span class="nc" id="L1470">            continue;</span>
+          }
+<span class="nc" id="L1472">          lastWindow[i - pos + leftWindow()] = tags[i];</span>
+        }
+<span class="nc" id="L1474">        lastPos = pos;</span>
+      }
+<span class="nc" id="L1476">      return scoreCache[tags[pos]];</span>
+    }
+
+<span class="nc" id="L1479">    private int percent = -1;</span>
+<span class="nc" id="L1480">    private int num = 0;</span>
+<span class="nc" id="L1481">    private long secs = System.currentTimeMillis();</span>
+<span class="nc" id="L1482">    private long hit = 0;</span>
+<span class="nc" id="L1483">    private long tot = 0;</span>
+
+    @Override
+    public double[] scoresOf(int[] tags, int pos) {
+      if (VERBOSE) {
+        int p = (100 * pos) / length();
+        if (p &gt; percent) {
+          long secs2 = System.currentTimeMillis();
+          log.info(StringUtils.padLeft(p, 3) + &quot;%   &quot; + ((secs2 - secs == 0) ? 0 : (num * 1000 / (secs2 - secs))) + &quot; hits per sec, position=&quot; + pos + &quot;, legal=&quot; + ((tot == 0) ? 100 : ((100 * hit) / tot)));
+          // + &quot;% [hit=&quot; + hit + &quot;, tot=&quot; + tot + &quot;]&quot;);
+          percent = p;
+          num = 0;
+          secs = secs2;
+        }
+        tot++;
+      }
+<span class="nc" id="L1499">      String[] answers = new String[1 + leftWindow() + rightWindow()];</span>
+<span class="nc" id="L1500">      String[] pre = new String[leftWindow()];</span>
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">      for (int i = 0; i &lt; 1 + leftWindow() + rightWindow(); i++) {</span>
+<span class="nc" id="L1502">        int absPos = pos - leftWindow() + i;</span>
+<span class="nc bnc" id="L1503" title="All 2 branches missed.">        if (absPos &lt; 0) {</span>
+<span class="nc" id="L1504">          continue;</span>
+        }
+<span class="nc" id="L1506">        answers[i] = tagIndex.get(tags[absPos]);</span>
+<span class="nc" id="L1507">        CoreLabel li = lineInfos.get(absPos);</span>
+<span class="nc" id="L1508">        li.set(CoreAnnotations.AnswerAnnotation.class, answers[i]);</span>
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">        if (i &lt; leftWindow()) {</span>
+<span class="nc" id="L1510">          pre[i] = answers[i];</span>
+        }
+      }
+<span class="nc" id="L1513">      double[] scores = new double[tagIndex.size()];</span>
+      //System.out.println(&quot;Considering: &quot;+Arrays.asList(pre));
+<span class="nc bnc" id="L1515" title="All 4 branches missed.">      if (!legalTags.contains(Arrays.asList(pre)) &amp;&amp; classifier.flags.useObservedSequencesOnly) {</span>
+        // System.out.println(&quot;Rejecting: &quot; + Arrays.asList(pre));
+        // System.out.println(legalTags);
+<span class="nc" id="L1518">        Arrays.fill(scores, -1000);// Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L1519">        return scores;</span>
+      }
+<span class="nc" id="L1521">      num++;</span>
+<span class="nc" id="L1522">      hit++;</span>
+<span class="nc" id="L1523">      Counter&lt;String&gt; c = classifier.scoresOf(lineInfos, pos);</span>
+      //System.out.println(&quot;Pos &quot;+pos+&quot; hist &quot;+Arrays.asList(pre)+&quot; result &quot;+c);
+      //System.out.println(c);
+      //if (false &amp;&amp; flags.justify) {
+      //    System.out.println(&quot;Considering position &quot; + pos + &quot;, word is &quot; + ((CoreLabel) lineInfos.get(pos)).word());
+      //    //System.out.println(&quot;Datum is &quot;+d.asFeatures());
+      //    System.out.println(&quot;History: &quot; + Arrays.asList(pre));
+      //}
+<span class="nc bnc" id="L1531" title="All 2 branches missed.">      for (String s : c.keySet()) {</span>
+<span class="nc" id="L1532">        int t = tagIndex.indexOf(s);</span>
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">        if (t &gt; -1) {</span>
+<span class="nc" id="L1534">          int[] tA = getPossibleValues(pos);</span>
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">          for (int j = 0; j &lt; tA.length; j++) {</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">            if (tA[j] == t) {</span>
+<span class="nc" id="L1537">              scores[j] = c.getCount(s);</span>
+              //if (false &amp;&amp; flags.justify) {
+              //    System.out.println(&quot;Label &quot; + s + &quot; got score &quot; + scores[j]);
+              //}
+            }
+          }
+        }
+<span class="nc" id="L1544">      }</span>
+      // normalize?
+<span class="nc bnc" id="L1546" title="All 2 branches missed.">      if (classifier.normalize()) {</span>
+<span class="nc" id="L1547">        ArrayMath.logNormalize(scores);</span>
+      }
+<span class="nc" id="L1549">      return scores;</span>
+    }
+
+    static double[] recenter(double[] x) {
+<span class="nc" id="L1553">      double[] r = new double[x.length];</span>
+      // double logTotal = Double.NEGATIVE_INFINITY;
+      // for (int i = 0; i &lt; x.length; i++)
+      //    logTotal = SloppyMath.logAdd(logTotal, x[i]);
+<span class="nc" id="L1557">      double logTotal = ArrayMath.logSum(x);</span>
+<span class="nc bnc" id="L1558" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L1559">        r[i] = x[i] - logTotal;</span>
+      }
+<span class="nc" id="L1561">      return r;</span>
+    }
+
+    /**
+     * Build a Scorer.
+     *
+     * @param lineInfos  List of INN data items to classify
+     * @param classifier The trained Classifier
+     * @param pre        Number of previous tags that condition current tag
+     * @param post       Number of following tags that condition previous tag
+     *                   (if pre and post are both nonzero, then you have a
+     *                   dependency network tagger)
+     */
+<span class="nc" id="L1574">    Scorer(List&lt;INN&gt; lineInfos, Index&lt;String&gt; tagIndex, CMMClassifier&lt;INN&gt; classifier, int pre, int post, Set&lt;List&lt;String&gt;&gt; legalTags) {</span>
+      if (VERBOSE) {
+        log.info(&quot;Built Scorer for &quot; + lineInfos.size() + &quot; words, clique pre=&quot; + pre + &quot; post=&quot; + post);
+      }
+<span class="nc" id="L1578">      this.pre = pre;</span>
+<span class="nc" id="L1579">      this.post = post;</span>
+<span class="nc" id="L1580">      this.lineInfos = lineInfos;</span>
+<span class="nc" id="L1581">      this.tagIndex = tagIndex;</span>
+<span class="nc" id="L1582">      this.classifier = classifier;</span>
+<span class="nc" id="L1583">      this.legalTags = legalTags;</span>
+<span class="nc" id="L1584">      backgroundTags = new int[]{tagIndex.indexOf(classifier.flags.backgroundSymbol)};</span>
+<span class="nc" id="L1585">      tagArray = buildTagArray(tagIndex.size());</span>
+<span class="nc" id="L1586">    }</span>
+
+  } // end static class Scorer
+
+  private boolean normalize() {
+<span class="nc" id="L1591">    return flags.normalize;</span>
+  }
+
+<span class="nc" id="L1594">  private static int lastPos = -1;  // TODO: Looks like CMMClassifier still isn't threadsafe!</span>
+
+  public Counter&lt;String&gt; scoresOf(List&lt;IN&gt; lineInfos, int pos) {
+//     if (pos != lastPos) {
+//       log.info(pos+&quot;.&quot;);
+//       lastPos = pos;
+//     }
+//     log.info(&quot;!&quot;);
+<span class="nc" id="L1602">    Datum&lt;String, String&gt; d = makeDatum(lineInfos, pos, featureFactories);</span>
+<span class="nc" id="L1603">    return classifier.logProbabilityOf(d);</span>
+  }
+
+  /**
+   * Takes a {@link List} of {@link CoreLabel}s and prints the likelihood
+   * of each possible label at each point.
+   * TODO: Write this method!
+   *
+   * @param document A {@link List} of {@link CoreLabel}s.
+   */
+  @Override
+  public Triple&lt;Counter&lt;Integer&gt;, Counter&lt;Integer&gt;, TwoDimensionalCounter&lt;Integer,String&gt;&gt; printProbsDocument(List&lt;IN&gt; document) {
+    //ClassicCounter&lt;String&gt; c = scoresOf(document, 0);
+<span class="nc" id="L1616">    throw new UnsupportedOperationException();</span>
+  }
+
+  /** Command-line version of the classifier.  See the class
+   *  comments for examples of use, and SeqClassifierFlags
+   *  for more information on supported flags.
+   */
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L1624">    StringUtils.logInvocationString(log, args);</span>
+
+<span class="nc" id="L1626">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L1627">    CMMClassifier&lt;CoreLabel&gt; cmm = new CMMClassifier&lt;&gt;(props);</span>
+<span class="nc" id="L1628">    String testFile = cmm.flags.testFile;</span>
+<span class="nc" id="L1629">    String textFile = cmm.flags.textFile;</span>
+<span class="nc" id="L1630">    String loadPath = cmm.flags.loadClassifier;</span>
+<span class="nc" id="L1631">    String serializeTo = cmm.flags.serializeTo;</span>
+
+    // cmm.crossValidateTrainAndTest(trainFile);
+<span class="nc bnc" id="L1634" title="All 2 branches missed.">    if (loadPath != null) {</span>
+<span class="nc" id="L1635">      cmm.loadClassifierNoExceptions(loadPath, props);</span>
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">    } else if (cmm.flags.loadJarClassifier != null) {</span>
+<span class="nc" id="L1637">      cmm.loadJarClassifier(cmm.flags.loadJarClassifier, props);</span>
+<span class="nc bnc" id="L1638" title="All 2 branches missed.">    } else if (cmm.flags.trainFile != null) {</span>
+<span class="nc bnc" id="L1639" title="All 2 branches missed.">      if (cmm.flags.biasedTrainFile != null) {</span>
+<span class="nc" id="L1640">        cmm.trainSemiSup();</span>
+      } else {
+<span class="nc" id="L1642">        cmm.train();</span>
+      }
+    } else {
+<span class="nc" id="L1645">      cmm.loadDefaultClassifier();</span>
+    }
+
+<span class="nc bnc" id="L1648" title="All 2 branches missed.">    if (serializeTo != null) {</span>
+<span class="nc" id="L1649">      cmm.serializeClassifier(serializeTo);</span>
+    }
+
+<span class="nc bnc" id="L1652" title="All 2 branches missed.">    if (testFile != null) {</span>
+<span class="nc" id="L1653">      cmm.classifyAndWriteAnswers(testFile, cmm.makeReaderAndWriter(), true);</span>
+<span class="nc bnc" id="L1654" title="All 2 branches missed.">    } else if (cmm.flags.testFiles != null) {</span>
+<span class="nc" id="L1655">      cmm.classifyAndWriteAnswers(cmm.flags.baseTestDir, cmm.flags.testFiles, cmm.makeReaderAndWriter(), true);</span>
+    }
+
+<span class="nc bnc" id="L1658" title="All 2 branches missed.">    if (textFile != null) {</span>
+<span class="nc" id="L1659">      DocumentReaderAndWriter&lt;CoreLabel&gt; readerAndWriter =</span>
+              new PlainTextDocumentReaderAndWriter&lt;&gt;();
+<span class="nc" id="L1661">      cmm.classifyAndWriteAnswers(textFile, readerAndWriter, false);</span>
+    }
+<span class="nc" id="L1663">  } // end main</span>
+
+} // end class CMMClassifier
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

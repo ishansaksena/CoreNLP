@@ -1,0 +1,600 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoreMapExpressionExtractor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ling.tokensregex</a> &gt; <span class="el_source">CoreMapExpressionExtractor.java</span></div><h1>CoreMapExpressionExtractor.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ling.tokensregex;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.tokensregex.parser.ParseException;
+import edu.stanford.nlp.ling.tokensregex.parser.TokenSequenceParseException;
+import edu.stanford.nlp.ling.tokensregex.parser.TokenSequenceParser;
+import edu.stanford.nlp.ling.tokensregex.types.Expression;
+import edu.stanford.nlp.ling.tokensregex.types.Tags;
+import edu.stanford.nlp.ling.tokensregex.types.Value;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.StringReader;
+import java.util.*;
+import java.util.function.Predicate;
+
+
+/**
+ * &lt;p&gt;Represents a list of assignment and extraction rules over sequence patterns.
+ *    See {@link SequenceMatchRules} for the syntax of rules.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;Assignment rules are used to assign a value to a variable for later use in
+ * extraction rules or for expansions in patterns.&lt;/p&gt;
+ * &lt;p&gt;Extraction rules are used to extract text/tokens matching regular expressions.
+ * Extraction rules are grouped into stages, with each stage consisting of the following:
+ * &lt;ol&gt;
+ *   &lt;li&gt;Matching of rules over &lt;b&gt;text&lt;/b&gt; and &lt;b&gt;tokens&lt;/b&gt;.  These rules are applied directly on the &lt;b&gt;text&lt;/b&gt; and &lt;b&gt;tokens&lt;/b&gt; fields of the {@code CoreMap}.&lt;/li&gt;
+ *   &lt;li&gt;Matching of &lt;b&gt;composite&lt;/b&gt; rules.  Matched expression are merged, and composite rules
+ *       are applied recursively until no more changes to the matched expressions are detected.&lt;/li&gt;
+ *   &lt;li&gt;&lt;b&gt;Filtering&lt;/b&gt; of an invalid expression.  In the final phase, a final filtering stage filters out invalid expressions.&lt;/li&gt;
+ * &lt;/ol&gt;
+ * The different stages are numbered and are applied in numeric order.
+ * &lt;/p&gt;
+ *
+ * @author Angel Chang
+ * @see SequenceMatchRules
+ */
+public class CoreMapExpressionExtractor&lt;T extends MatchedExpression&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L46">  private static final Redwood.RedwoodChannels log = Redwood.channels(CoreMapExpressionExtractor.class);</span>
+
+<span class="nc" id="L48">  private static boolean verbose = false;</span>
+
+  // TODO: Remove templating of MatchedExpressions&lt;?&gt;  (keep for now until TimeExpression rules can be decoupled)
+
+  private final Env env;
+  /* Keeps temporary tags created by extractor */
+<span class="nc" id="L54">  private boolean keepTags = false;</span>
+  /* Collapses extraction rules - use with care */
+<span class="nc" id="L56">  private boolean collapseExtractionRules = false;</span>
+  private final Class&lt;CoreAnnotation&lt;List&lt;? extends CoreMap&gt;&gt;&gt; tokensAnnotationKey;
+  private final Map&lt;Integer, Stage&lt;T&gt;&gt; stages;
+
+  /**
+   * Describes one stage of extraction.
+   * @param &lt;T&gt;
+   */
+<span class="nc" id="L64">  public static class Stage&lt;T&gt; {</span>
+    /** Whether to clear matched expressions from previous stages or not */
+<span class="nc" id="L66">    boolean clearMatched = false;</span>
+    /**
+     * Limit the number of iterations for which the composite rules are applied
+     * (prevents badly formed rules from iterating forever)
+     */
+<span class="nc" id="L71">    int limitIters = 50;</span>
+    /**
+     * Stage id (stages are applied in numeric order from low to high)
+     */
+    int stageId;
+    /** Rules to extract matched  expressions directly from tokens */
+    SequenceMatchRules.ExtractRule&lt;CoreMap, T&gt; basicExtractRule;
+    /** Rules to extract composite expressions (grouped in stages) */
+    SequenceMatchRules.ExtractRule&lt;List&lt;? extends CoreMap&gt;, T&gt; compositeExtractRule;
+    /** Filtering rule */
+    Predicate&lt;T&gt; filterRule;
+
+    private static &lt;I,O&gt; SequenceMatchRules.ExtractRule&lt;I,O&gt; addRule(SequenceMatchRules.ExtractRule&lt;I, O&gt; origRule,
+                                                                     SequenceMatchRules.ExtractRule&lt;I, O&gt; rule) {
+      SequenceMatchRules.ListExtractRule&lt;I,O&gt; r;
+<span class="nc bnc" id="L86" title="All 2 branches missed.">      if (origRule instanceof SequenceMatchRules.ListExtractRule) {</span>
+<span class="nc" id="L87">        r = (SequenceMatchRules.ListExtractRule&lt;I,O&gt;) origRule;</span>
+      } else {
+<span class="nc" id="L89">        r = new SequenceMatchRules.ListExtractRule&lt;&gt;();</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        if (origRule != null)</span>
+<span class="nc" id="L91">        r.addRules(origRule);</span>
+      }
+<span class="nc" id="L93">      r.addRules(rule);</span>
+<span class="nc" id="L94">      return r;</span>
+    }
+
+    private void addCompositeRule(SequenceMatchRules.ExtractRule&lt;List&lt;? extends CoreMap&gt;, T&gt; rule) {
+<span class="nc" id="L98">      compositeExtractRule = addRule(compositeExtractRule, rule);</span>
+<span class="nc" id="L99">    }</span>
+
+    private void addBasicRule(SequenceMatchRules.ExtractRule&lt;CoreMap, T&gt; rule) {
+<span class="nc" id="L102">      basicExtractRule = addRule(basicExtractRule, rule);</span>
+<span class="nc" id="L103">    }</span>
+
+    private void addFilterRule(Predicate&lt;T&gt; rule) {
+      Filters.DisjFilter&lt;T&gt; r;
+<span class="nc bnc" id="L107" title="All 2 branches missed.">      if (filterRule instanceof Filters.DisjFilter) {</span>
+<span class="nc" id="L108">        r = (Filters.DisjFilter&lt;T&gt;) filterRule;</span>
+<span class="nc" id="L109">        r.addFilter(rule);</span>
+      } else {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        if (filterRule == null) {</span>
+<span class="nc" id="L112">          r = new Filters.DisjFilter&lt;&gt;(rule);</span>
+        } else {
+<span class="nc" id="L114">          r = new Filters.DisjFilter&lt;&gt;(filterRule, rule);</span>
+        }
+<span class="nc" id="L116">        filterRule = r;</span>
+      }
+<span class="nc" id="L118">    }</span>
+  }
+
+  /**
+   * Creates an empty instance with no rules.
+   */
+  public CoreMapExpressionExtractor() {
+<span class="nc" id="L125">    this(null);</span>
+<span class="nc" id="L126">  }</span>
+
+  /**
+   * Creates a default instance with the specified environment.
+   *   (use the default tokens annotation key as specified in the environment)
+   * @param env Environment to use for binding variables and applying rules
+   */
+<span class="nc" id="L133">  public CoreMapExpressionExtractor(Env env) {</span>
+<span class="nc" id="L134">    this.stages = new HashMap&lt;&gt;();//Generics.newHashMap();</span>
+<span class="nc" id="L135">    this.env = env;</span>
+<span class="nc" id="L136">    this.tokensAnnotationKey = EnvLookup.getDefaultTokensAnnotationKey(env);</span>
+<span class="nc" id="L137">    this.collapseExtractionRules = false;</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">    if (env != null) {</span>
+<span class="nc" id="L139">      this.collapseExtractionRules = Objects.equals((Boolean) env.get(&quot;collapseExtractionRules&quot;), true);</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">      if (env.get(&quot;verbose&quot;) != null)</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        verbose =  (env.get(&quot;verbose&quot;) != null) &amp;&amp;</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">                Objects.equals((Boolean) env.get(&quot;verbose&quot;), true);</span>
+    }
+<span class="nc" id="L144">  }</span>
+
+  /**
+   * Creates an instance with the specified environment and list of rules
+   * @param env Environment to use for binding variables and applying rules
+   * @param rules List of rules for this extractor
+   */
+  public CoreMapExpressionExtractor(Env env, List&lt;SequenceMatchRules.Rule&gt; rules) {
+<span class="nc" id="L152">    this(env);</span>
+<span class="nc" id="L153">    appendRules(rules);</span>
+<span class="nc" id="L154">  }</span>
+
+  /**
+   * Add specified rules to this extractor.
+   *
+   * @param rules
+   */
+  public void appendRules(List&lt;SequenceMatchRules.Rule&gt; rules)
+  {
+<span class="nc bnc" id="L163" title="All 2 branches missed.">    if (verbose)</span>
+<span class="nc" id="L164">      log.info(&quot;Read &quot; + rules.size() + &quot; rules&quot;);</span>
+    // Put rules into stages
+<span class="nc bnc" id="L166" title="All 2 branches missed.">    if (collapseExtractionRules) {</span>
+<span class="nc" id="L167">      rules = collapse(rules);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      if (verbose)</span>
+<span class="nc" id="L169">        log.info(&quot;Collapsing into &quot; + rules.size() + &quot; rules&quot;);</span>
+    }
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    for (SequenceMatchRules.Rule r:rules) {</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">      if (r instanceof SequenceMatchRules.AssignmentRule) {</span>
+        // Nothing to do
+        // Assignments are added to environment as they are parsed
+<span class="nc" id="L175">        ((SequenceMatchRules.AssignmentRule) r).evaluate(env);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">      } else if (r instanceof SequenceMatchRules.AnnotationExtractRule) {</span>
+<span class="nc" id="L177">        SequenceMatchRules.AnnotationExtractRule aer = (SequenceMatchRules.AnnotationExtractRule) r;</span>
+<span class="nc" id="L178">        Stage&lt;T&gt; stage = stages.get(aer.stage);</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (stage == null) {</span>
+<span class="nc" id="L180">          stages.put(aer.stage, stage = new Stage&lt;&gt;());</span>
+<span class="nc" id="L181">          stage.stageId = aer.stage;</span>
+<span class="nc" id="L182">          Boolean clearMatched = (Boolean) env.getDefaults().get(&quot;stage.clearMatched&quot;);</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">          if (clearMatched != null) {</span>
+<span class="nc" id="L184">            stage.clearMatched = clearMatched;</span>
+          }
+<span class="nc" id="L186">          Integer limitIters = (Integer) env.getDefaults().get(&quot;stage.limitIters&quot;);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">          if (limitIters != null) {</span>
+<span class="nc" id="L188">            stage.limitIters = limitIters;</span>
+          }
+        }
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (aer.active) {</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">          if (SequenceMatchRules.FILTER_RULE_TYPE.equals(aer.ruleType)) {</span>
+<span class="nc" id="L193">            stage.addFilterRule(aer);</span>
+          } else {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (aer.isComposite) {</span>
+//            if (SequenceMatchRules.COMPOSITE_RULE_TYPE.equals(aer.ruleType)) {
+<span class="nc" id="L197">              stage.addCompositeRule(aer);</span>
+            } else {
+<span class="nc" id="L199">              stage.addBasicRule(aer);</span>
+            }
+          }
+        } else {
+<span class="nc" id="L203">          log.debug(&quot;Ignoring inactive rule: &quot; + aer.name); // used to be INFO but annoyed Chris/users</span>
+        }
+      }
+<span class="nc" id="L206">    }</span>
+<span class="nc" id="L207">  }</span>
+
+  private SequenceMatchRules.AnnotationExtractRule createMergedRule(SequenceMatchRules.AnnotationExtractRule aerTemplate, List&lt;TokenSequencePattern&gt; patterns) {
+<span class="nc" id="L210">    return SequenceMatchRules.createMultiTokenPatternRule(env, aerTemplate, patterns);</span>
+  }
+
+  private List&lt;SequenceMatchRules.Rule&gt; collapse(List&lt;SequenceMatchRules.Rule&gt; rules) {
+<span class="nc" id="L214">    List&lt;SequenceMatchRules.Rule&gt; collapsed = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L215">    List&lt;TokenSequencePattern&gt; patterns = null;</span>
+<span class="nc" id="L216">    SequenceMatchRules.AnnotationExtractRule aerTemplate = null;</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">    for (SequenceMatchRules.Rule rule:rules) {</span>
+<span class="nc" id="L218">      boolean ruleHandled = false;</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">      if (rule instanceof SequenceMatchRules.AnnotationExtractRule) {</span>
+<span class="nc" id="L220">        SequenceMatchRules.AnnotationExtractRule aer = (SequenceMatchRules.AnnotationExtractRule) rule;</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (aer.hasTokensRegexPattern()) {</span>
+<span class="nc bnc" id="L222" title="All 4 branches missed.">          if (aerTemplate == null || aerTemplate.isMostlyCompatible(aer)) {</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (aerTemplate == null) {</span>
+<span class="nc" id="L224">              aerTemplate = aer;</span>
+            }
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (patterns == null) {</span>
+<span class="nc" id="L227">              patterns = new ArrayList&lt;&gt;();</span>
+            }
+<span class="nc" id="L229">            patterns.add((TokenSequencePattern) aer.pattern);</span>
+<span class="nc" id="L230">            ruleHandled = true;</span>
+          }
+        }
+      }
+
+      // Did we handle this rule?
+<span class="nc bnc" id="L236" title="All 2 branches missed.">      if (!ruleHandled) {</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (aerTemplate != null) {</span>
+<span class="nc" id="L238">          SequenceMatchRules.AnnotationExtractRule merged = createMergedRule(aerTemplate, patterns);</span>
+<span class="nc" id="L239">          collapsed.add(merged);</span>
+<span class="nc" id="L240">          aerTemplate = null;</span>
+<span class="nc" id="L241">          patterns = null;</span>
+        }
+<span class="nc" id="L243">        collapsed.add(rule);</span>
+      }
+<span class="nc" id="L245">    }</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">    if (aerTemplate != null) {</span>
+<span class="nc" id="L247">      SequenceMatchRules.AnnotationExtractRule merged = createMergedRule(aerTemplate, patterns);</span>
+<span class="nc" id="L248">      collapsed.add(merged);</span>
+    }
+<span class="nc" id="L250">    return collapsed;</span>
+  }
+
+  public Env getEnv() {
+<span class="nc" id="L254">    return env;</span>
+  }
+
+  public void setExtractRules(SequenceMatchRules.ExtractRule&lt;CoreMap, T&gt; basicExtractRule,
+                              SequenceMatchRules.ExtractRule&lt;List&lt;? extends CoreMap&gt;, T&gt; compositeExtractRule,
+                              Predicate&lt;T&gt; filterRule)
+  {
+<span class="nc" id="L261">    Stage&lt;T&gt; stage = new Stage&lt;&gt;();</span>
+<span class="nc" id="L262">    stage.basicExtractRule = basicExtractRule;</span>
+<span class="nc" id="L263">    stage.compositeExtractRule = compositeExtractRule;</span>
+<span class="nc" id="L264">    stage.filterRule = filterRule;</span>
+<span class="nc" id="L265">    this.stages.clear();</span>
+<span class="nc" id="L266">    this.stages.put(1, stage);</span>
+<span class="nc" id="L267">  }</span>
+
+  /**
+   * Creates an extractor using the specified environment, and reading the rules from the given filenames.
+   * @param env
+   * @param filenames
+   * @throws RuntimeException
+   */
+  public static &lt;M extends MatchedExpression&gt; CoreMapExpressionExtractor&lt;M&gt; createExtractorFromFiles(Env env, String... filenames) throws RuntimeException {
+<span class="nc" id="L276">    return createExtractorFromFiles(env, Arrays.asList(filenames));</span>
+  }
+
+  /**
+   * Creates an extractor using the specified environment, and reading the rules from the given filenames.
+   * @param env
+   * @param filenames
+   * @throws RuntimeException
+   */
+  public static &lt;M extends MatchedExpression&gt; CoreMapExpressionExtractor&lt;M&gt; createExtractorFromFiles(Env env, List&lt;String&gt; filenames) throws RuntimeException {
+<span class="nc" id="L286">    CoreMapExpressionExtractor&lt;M&gt; extractor = new CoreMapExpressionExtractor&lt;&gt;(env);</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">    for (String filename:filenames) {</span>
+      try {
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (verbose)</span>
+<span class="nc" id="L290">          log.info(&quot;Reading TokensRegex rules from &quot; + filename);</span>
+<span class="nc" id="L291">        BufferedReader br = IOUtils.readerFromString(filename);</span>
+<span class="nc" id="L292">        TokenSequenceParser parser = new TokenSequenceParser();</span>
+<span class="nc" id="L293">        parser.updateExpressionExtractor(extractor, br);</span>
+<span class="nc" id="L294">        IOUtils.closeIgnoringExceptions(br);</span>
+<span class="nc" id="L295">      } catch (Exception ex) {</span>
+<span class="nc" id="L296">        throw new RuntimeException(&quot;Error parsing file: &quot; + filename, ex);</span>
+<span class="nc" id="L297">      }</span>
+<span class="nc" id="L298">    }</span>
+<span class="nc" id="L299">    return extractor;</span>
+  }
+
+  /**
+   * Creates an extractor using the specified environment, and reading the rules from the given filename.
+   * @param env
+   * @param filename
+   * @throws RuntimeException
+   */
+  public static CoreMapExpressionExtractor createExtractorFromFile(Env env, String filename) throws RuntimeException {
+<span class="nc" id="L309">    return createExtractorFromFiles(env, Collections.singletonList(filename));</span>
+  }
+
+  /**
+   * Creates an extractor using the specified environment, and reading the rules from the given string
+   * @param env
+   * @param str
+   * @throws IOException, ParseException
+   */
+  public static CoreMapExpressionExtractor createExtractorFromString(Env env, String str) throws IOException, ParseException, TokenSequenceParseException {
+<span class="nc" id="L319">    TokenSequenceParser parser = new TokenSequenceParser();</span>
+<span class="nc" id="L320">    CoreMapExpressionExtractor extractor = parser.getExpressionExtractor(env, new StringReader(str));</span>
+<span class="nc" id="L321">    return extractor;</span>
+  }
+
+  public Value getValue(String varname)
+  {
+<span class="nc" id="L326">    Expression expr = (Expression) env.get(varname);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">    if (expr != null) {</span>
+<span class="nc" id="L328">      return expr.evaluate(env);</span>
+    } else {
+<span class="nc" id="L330">      throw new RuntimeException(&quot;Unable get expression for variable &quot; + varname);</span>
+    }
+  }
+
+  private List&lt;CoreMap&gt; extractCoreMapsToList(List&lt;CoreMap&gt; res, CoreMap annotation) {
+<span class="nc" id="L335">    List&lt;T&gt; exprs = extractExpressions(annotation);</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    for (T expr : exprs) {</span>
+<span class="nc" id="L337">      res.add(expr.getAnnotation());</span>
+<span class="nc" id="L338">    }</span>
+<span class="nc" id="L339">    return res;</span>
+  }
+
+  /**
+   * Returns list of coremaps that matches the specified rules.
+   *
+   * @param annotation
+   */
+  public List&lt;CoreMap&gt; extractCoreMaps(CoreMap annotation) {
+<span class="nc" id="L348">    List&lt;CoreMap&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L349">    return extractCoreMapsToList(res, annotation);</span>
+  }
+
+  /**
+   * Returns list of merged tokens and original tokens.
+   *
+   * @param annotation
+   */
+  public List&lt;CoreMap&gt; extractCoreMapsMergedWithTokens(CoreMap annotation) {
+<span class="nc" id="L358">    List&lt;CoreMap&gt; res = extractCoreMaps(annotation);</span>
+<span class="nc" id="L359">    Integer startTokenOffset = annotation.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">    if (startTokenOffset == null) {</span>
+<span class="nc" id="L361">      startTokenOffset = 0;</span>
+    }
+<span class="nc" id="L363">    final Integer startTokenOffsetFinal = startTokenOffset;</span>
+<span class="nc" id="L364">    List&lt;CoreMap&gt; merged = CollectionUtils.mergeListWithSortedMatchedPreAggregated(</span>
+<span class="nc" id="L365">            annotation.get(tokensAnnotationKey), res, (CoreMap in) -&gt; Interval.toInterval(in.get(CoreAnnotations.TokenBeginAnnotation.class) - startTokenOffsetFinal,</span>
+<span class="nc" id="L366">                    in.get(CoreAnnotations.TokenEndAnnotation.class) - startTokenOffsetFinal)</span>
+    );
+<span class="nc" id="L368">    return merged;</span>
+  }
+
+  public List&lt;CoreMap&gt; flatten(List&lt;CoreMap&gt; cms) {
+<span class="nc" id="L372">    return flatten(cms, tokensAnnotationKey);</span>
+  }
+
+  private static List&lt;CoreMap&gt; flatten(List&lt;CoreMap&gt; cms, Class key) {
+<span class="nc" id="L376">    List&lt;CoreMap&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    for (CoreMap cm : cms) {</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      if (cm.get(key) != null) {</span>
+<span class="nc" id="L379">        res.addAll( (List&lt;CoreMap&gt;) cm.get(key));</span>
+      } else {
+<span class="nc" id="L381">        res.add(cm);</span>
+      }
+<span class="nc" id="L383">    }</span>
+<span class="nc" id="L384">    return res;</span>
+  }
+
+  private void cleanupTags(Collection objs, Map&lt;Object, Boolean&gt; cleaned) {
+<span class="nc bnc" id="L388" title="All 2 branches missed.">    for (Object obj:objs) {</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">      if (!cleaned.containsKey(obj)) {</span>
+<span class="nc" id="L390">        cleaned.put(obj, false);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">        if (obj instanceof CoreMap) {</span>
+<span class="nc" id="L392">          cleanupTags((CoreMap) obj, cleaned);</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        } else if (obj instanceof Collection) {</span>
+<span class="nc" id="L394">          cleanupTags((Collection) obj, cleaned);</span>
+        }
+<span class="nc" id="L396">        cleaned.put(obj, true);</span>
+      }
+<span class="nc" id="L398">    }</span>
+<span class="nc" id="L399">  }</span>
+
+  private void cleanupTags(CoreMap cm) {
+<span class="nc" id="L402">    cleanupTags(cm, new IdentityHashMap&lt;&gt;());</span>
+<span class="nc" id="L403">  }</span>
+
+  private void cleanupTags(CoreMap cm, Map&lt;Object, Boolean&gt; cleaned) {
+<span class="nc" id="L406">    cm.remove(Tags.TagsAnnotation.class);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">    for (Class key:cm.keySet()) {</span>
+<span class="nc" id="L408">      Object obj = cm.get(key);</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">      if (!cleaned.containsKey(obj)) {</span>
+<span class="nc" id="L410">        cleaned.put(obj, false);</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (obj instanceof CoreMap) {</span>
+<span class="nc" id="L412">          cleanupTags((CoreMap) obj, cleaned);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        } else if (obj instanceof Collection) {</span>
+<span class="nc" id="L414">          cleanupTags((Collection) obj, cleaned);</span>
+        }
+<span class="nc" id="L416">        cleaned.put(obj, true);</span>
+      }
+<span class="nc" id="L418">    }</span>
+<span class="nc" id="L419">  }</span>
+
+  private Pair&lt;List&lt;? extends CoreMap&gt;, List&lt;T&gt;&gt; applyCompositeRule(
+          SequenceMatchRules.ExtractRule&lt;List&lt;? extends CoreMap&gt;, T&gt; compositeExtractRule,
+          List&lt;? extends CoreMap&gt; merged,
+          List&lt;T&gt; matchedExpressions, int limit) {
+    // Apply higher order rules
+<span class="nc" id="L426">    boolean done = false;</span>
+    // Limit of number of times rules are applied just in case
+<span class="nc" id="L428">    int maxIters = limit;</span>
+<span class="nc" id="L429">    int iters = 0;</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">    while (! done) {</span>
+<span class="nc" id="L431">      List&lt;T&gt; newExprs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L432">      boolean extracted = compositeExtractRule.extract(merged, newExprs);</span>
+<span class="nc bnc" id="L433" title="All 4 branches missed.">      if (verbose &amp;&amp; extracted) log.info(&quot;applyCompositeRule() extracting with &quot; + compositeExtractRule + &quot; from &quot; + merged + &quot; gives &quot; + newExprs);</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">      if (extracted) {</span>
+<span class="nc" id="L435">        annotateExpressions(merged, newExprs);</span>
+<span class="nc" id="L436">        newExprs = MatchedExpression.removeNullValues(newExprs);</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if ( ! newExprs.isEmpty()) {</span>
+<span class="nc" id="L438">          newExprs = MatchedExpression.removeNested(newExprs);</span>
+<span class="nc" id="L439">          newExprs = MatchedExpression.removeOverlapping(newExprs);</span>
+<span class="nc" id="L440">          merged = MatchedExpression.replaceMerged(merged, newExprs);</span>
+          // Favor newly matched expressions over older ones
+<span class="nc" id="L442">          newExprs.addAll(matchedExpressions);</span>
+<span class="nc" id="L443">          matchedExpressions = MatchedExpression.removeNested(newExprs);</span>
+<span class="nc" id="L444">          matchedExpressions = MatchedExpression.removeOverlapping(matchedExpressions);</span>
+        } else {
+<span class="nc" id="L446">          extracted = false;</span>
+        }
+      }
+<span class="nc bnc" id="L449" title="All 2 branches missed.">      done = ! extracted;</span>
+<span class="nc" id="L450">      iters++;</span>
+<span class="nc bnc" id="L451" title="All 4 branches missed.">      if (maxIters &gt; 0 &amp;&amp; iters &gt;= maxIters) {</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        if (verbose) {</span>
+<span class="nc" id="L453">          log.warn(&quot;Aborting application of composite rules: Maximum iteration &quot; + maxIters + &quot; reached&quot;);</span>
+        }
+        break;
+      }
+<span class="nc" id="L457">    }</span>
+<span class="nc" id="L458">    return new Pair&lt;&gt;(merged, matchedExpressions);</span>
+  }
+
+  private static class CompositeMatchState&lt;T&gt; {
+    List&lt;? extends CoreMap&gt; merged;
+    List&lt;T&gt; matched;
+    int iters;
+
+<span class="nc" id="L466">    private CompositeMatchState(List&lt;? extends CoreMap&gt; merged, List&lt;T&gt; matched, int iters) {</span>
+<span class="nc" id="L467">      this.merged = merged;</span>
+<span class="nc" id="L468">      this.matched = matched;</span>
+<span class="nc" id="L469">      this.iters = iters;</span>
+<span class="nc" id="L470">    }</span>
+  }
+
+  public List&lt;T&gt; extractExpressions(CoreMap annotation) {
+    // Extract potential expressions
+<span class="nc" id="L475">    List&lt;T&gt; matchedExpressions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L476">    List&lt;Integer&gt; stageIds = new ArrayList&lt;&gt;(stages.keySet());</span>
+<span class="nc" id="L477">    Collections.sort(stageIds);</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">    for (int stageId : stageIds) {</span>
+<span class="nc" id="L479">      Stage&lt;T&gt; stage = stages.get(stageId);</span>
+<span class="nc" id="L480">      SequenceMatchRules.ExtractRule&lt;CoreMap, T&gt; basicExtractRule = stage.basicExtractRule;</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">      if (stage.clearMatched) {</span>
+<span class="nc" id="L482">        matchedExpressions.clear();</span>
+      }
+<span class="nc bnc" id="L484" title="All 2 branches missed.">      if (basicExtractRule != null) {</span>
+<span class="nc" id="L485">        basicExtractRule.extract(annotation, matchedExpressions);</span>
+<span class="nc bnc" id="L486" title="All 4 branches missed.">        if (verbose &amp;&amp; matchedExpressions != null) {</span>
+<span class="nc" id="L487">          log.info(&quot;extractExpressions() extracting with &quot; + basicExtractRule + &quot; from &quot; + annotation + &quot; gives &quot; + matchedExpressions);</span>
+        }
+<span class="nc" id="L489">        annotateExpressions(annotation, matchedExpressions);</span>
+<span class="nc" id="L490">        matchedExpressions = MatchedExpression.removeNullValues(matchedExpressions);</span>
+<span class="nc" id="L491">        matchedExpressions = MatchedExpression.removeNested(matchedExpressions);</span>
+<span class="nc" id="L492">        matchedExpressions = MatchedExpression.removeOverlapping(matchedExpressions);</span>
+      }
+
+<span class="nc" id="L495">      List&lt;? extends CoreMap&gt; merged = MatchedExpression.replaceMergedUsingTokenOffsets(annotation.get(tokensAnnotationKey), matchedExpressions);</span>
+<span class="nc" id="L496">      SequenceMatchRules.ExtractRule&lt;List&lt;? extends CoreMap&gt;, T&gt; compositeExtractRule = stage.compositeExtractRule;</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">      if (compositeExtractRule != null) {</span>
+<span class="nc" id="L498">        Pair&lt;List&lt;? extends CoreMap&gt;, List&lt;T&gt;&gt; p = applyCompositeRule(</span>
+                compositeExtractRule, merged, matchedExpressions, stage.limitIters);
+<span class="nc" id="L500">        merged = p.first();</span>
+<span class="nc" id="L501">        matchedExpressions = p.second();</span>
+      }
+<span class="nc" id="L503">      matchedExpressions = filterInvalidExpressions(stage.filterRule, matchedExpressions);</span>
+<span class="nc" id="L504">    }</span>
+<span class="nc" id="L505">    Collections.sort(matchedExpressions, MatchedExpression.EXPR_TOKEN_OFFSETS_NESTED_FIRST_COMPARATOR);</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    if (!keepTags) {</span>
+<span class="nc" id="L507">      cleanupTags(annotation);</span>
+    }
+<span class="nc" id="L509">    return matchedExpressions;</span>
+  }
+
+  private void annotateExpressions(CoreMap annotation, List&lt;T&gt; expressions) {
+    // TODO: Logging can be excessive
+<span class="nc" id="L514">    List&lt;T&gt; toDiscard = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">    for (T te : expressions) {</span>
+      // Add attributes and all
+<span class="nc bnc" id="L517" title="All 2 branches missed.">      if (te.annotation == null) {</span>
+        try {
+<span class="nc" id="L519">          boolean extractOkay = te.extractAnnotation(env, annotation);</span>
+<span class="nc bnc" id="L520" title="All 4 branches missed.">          if (verbose &amp;&amp; extractOkay) {</span>
+<span class="nc" id="L521">            log.info(&quot;annotateExpressions() matched &quot; + te + &quot; from &quot; + annotation);</span>
+          }
+<span class="nc bnc" id="L523" title="All 2 branches missed.">          if (!extractOkay) {</span>
+            // Things didn't turn out so well
+<span class="nc" id="L525">            toDiscard.add(te);</span>
+<span class="nc" id="L526">            log.warn(&quot;Error extracting annotation from &quot; + te /*+ &quot;, &quot; + te.getExtractErrorMessage() */);</span>
+          }
+<span class="nc" id="L528">        } catch (Exception ex) {</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">          if (verbose) {</span>
+<span class="nc" id="L530">            log.warn(&quot;Error extracting annotation from &quot; + te);</span>
+<span class="nc" id="L531">            log.warn(ex);</span>
+          }
+<span class="nc" id="L533">        }</span>
+      }
+<span class="nc" id="L535">    }</span>
+<span class="nc" id="L536">    expressions.removeAll(toDiscard);</span>
+<span class="nc" id="L537">  }</span>
+
+  private void annotateExpressions(List&lt;? extends CoreMap&gt; chunks, List&lt;T&gt; expressions) {
+    // TODO: Logging can be excessive
+<span class="nc" id="L541">    List&lt;T&gt; toDiscard = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    for (T te : expressions) {</span>
+      // Add attributes and all
+      try {
+<span class="nc" id="L545">        boolean extractOkay = te.extractAnnotation(env, chunks);</span>
+<span class="nc bnc" id="L546" title="All 4 branches missed.">        if (verbose &amp;&amp; extractOkay) {</span>
+<span class="nc" id="L547">          log.info(&quot;annotateExpressions() matched &quot; + te + &quot; from &quot; + chunks);</span>
+        }
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if (!extractOkay) {</span>
+          // Things didn't turn out so well
+<span class="nc" id="L551">          toDiscard.add(te);</span>
+<span class="nc" id="L552">          log.warn(&quot;Error extracting annotation from &quot; + te /*+ &quot;, &quot; + te.getExtractErrorMessage() */);</span>
+        }
+<span class="nc" id="L554">      } catch (Exception ex) {</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        if (verbose) {</span>
+<span class="nc" id="L556">          log.warn(&quot;Error extracting annotation from &quot; + te);</span>
+<span class="nc" id="L557">          log.warn(ex);</span>
+        }
+<span class="nc" id="L559">      }</span>
+<span class="nc" id="L560">    }</span>
+<span class="nc" id="L561">    expressions.removeAll(toDiscard);</span>
+<span class="nc" id="L562">  }</span>
+
+  private List&lt;T&gt; filterInvalidExpressions(Predicate&lt;T&gt; filterRule, List&lt;T&gt; expressions) {
+<span class="nc bnc" id="L565" title="All 2 branches missed.">    if (filterRule == null) return expressions;</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">    if (expressions.isEmpty()) return expressions;</span>
+<span class="nc" id="L567">    int nfiltered = 0;</span>
+<span class="nc" id="L568">    List&lt;T&gt; kept = new ArrayList&lt;&gt;(expressions.size());   // Approximate size</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">    for (T expr : expressions) {</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">      if (!filterRule.test(expr)) {</span>
+<span class="nc" id="L571">        kept.add(expr);</span>
+      } else {
+<span class="nc" id="L573">        nfiltered++;</span>
+//        logger.warning(&quot;Filtering out &quot; + expr.getText());
+      }
+<span class="nc" id="L576">    }</span>
+<span class="nc bnc" id="L577" title="All 4 branches missed.">    if (nfiltered &gt; 0 &amp;&amp; verbose) {</span>
+<span class="nc" id="L578">      log.debug(&quot;Filtered &quot; + nfiltered);</span>
+    }
+<span class="nc" id="L580">    return kept;</span>
+  }
+
+  /**
+   * Keeps the temporary tags on the sentence after extraction has finished.
+   * This can have potentially unexpected results if you run the same sentence through multiple extractors;
+   * but, it makes the extraction process 20+% faster.
+   *
+   * @return This object
+   */
+  public CoreMapExpressionExtractor keepTemporaryTags() {
+<span class="nc" id="L591">    this.keepTags = true;</span>
+<span class="nc" id="L592">    return this;</span>
+  }
+
+  public static void setVerbose(boolean v) {
+<span class="nc" id="L596">    verbose = v;</span>
+<span class="nc" id="L597">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

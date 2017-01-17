@@ -1,0 +1,614 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConcatVector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.loglinear.model</a> &gt; <span class="el_source">ConcatVector.java</span></div><h1>ConcatVector.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.loglinear.model; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.loglinear.model.proto.ConcatVectorProto;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.function.Function;
+
+/**
+ * Created on 12/7/14.
+ * @author keenon
+ * &lt;p&gt;
+ * Implements a concat vector using an array of arrays, with all its attending resizing efficiencies, and double-pointer
+ * inefficiencies. Benchmarking from MinimalML (where I adapted this design from) shows that this is the most efficient
+ * of several strategies that can be used to implement this.
+ * &lt;p&gt;
+ * What is a ConcatVector? Why do I need it?
+ * &lt;p&gt;
+ * In short, you want this for online learning, where you may not know all your sparse features' sizes at initialization.
+ * A concat vector is a vector that behaves like a concatenation of smaller component vectors when you want a dot product.
+ * However, it never physically concatenates anything, it just dot products each component, and takes the sum. That way,
+ * if you need to expand a component during online learning, it's no problem. As an auxiliary benefit, you can specify
+ * sparse and dense components, greatly speeding up dot product calculation when you have lots of sparse features.
+ */
+<span class="pc bpc" id="L27" title="1 of 2 branches missed.">public class ConcatVector  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L30">  private static Redwood.RedwoodChannels log = Redwood.channels(ConcatVector.class);</span>
+  double[][] pointers;
+  boolean[] sparse;
+  boolean[] copyOnWrite;
+
+  /**
+   * Constructor that initializes space for this concat vector. Don't worry, it can resize individual elements as
+   * necessary but it's most efficient if you get this right at construction.
+   *
+   * @param numComponents The number of components (usually number of features) to allocate for.
+   */
+<span class="fc" id="L41">  public ConcatVector(int numComponents) {</span>
+<span class="fc" id="L42">    pointers = new double[numComponents][];</span>
+<span class="fc" id="L43">    sparse = new boolean[numComponents];</span>
+<span class="fc" id="L44">    copyOnWrite = new boolean[numComponents];</span>
+<span class="fc" id="L45">  }</span>
+
+  /**
+   * Clone a concat vector constructor. Marks both vectors as copyOnWrite, but makes no immediate copies.
+   *
+   * @param clone the concat vector to clone.
+   */
+<span class="fc" id="L52">  private ConcatVector(ConcatVector clone) {</span>
+<span class="fc" id="L53">    pointers = new double[clone.pointers.length][];</span>
+<span class="fc" id="L54">    copyOnWrite = new boolean[clone.pointers.length];</span>
+<span class="fc bfc" id="L55" title="All 2 branches covered.">    for (int i = 0; i &lt; clone.pointers.length; i++) {</span>
+<span class="fc bfc" id="L56" title="All 2 branches covered.">      if (clone.pointers[i] == null) continue;</span>
+<span class="fc" id="L57">      pointers[i] = clone.pointers[i];</span>
+<span class="fc" id="L58">      copyOnWrite[i] = true;</span>
+<span class="fc" id="L59">      clone.copyOnWrite[i] = true;</span>
+    }
+<span class="fc" id="L61">    sparse = new boolean[clone.pointers.length];</span>
+<span class="fc bfc" id="L62" title="All 2 branches covered.">    if (clone.pointers.length &gt; 0) {</span>
+<span class="fc" id="L63">      System.arraycopy(clone.sparse, 0, sparse, 0, clone.pointers.length);</span>
+    }
+<span class="fc" id="L65">  }</span>
+
+  /**
+   * Creates a ConcatVector whose dimensions are the same as this one for all dense components, but is otherwise
+   * completely empty. This is useful to prevent resizing during optimizations where we're adding lots of sparse
+   * vectors.
+   *
+   * @return an empty vector suitable for use as a gradient
+   */
+  public ConcatVector newEmptyClone() {
+<span class="fc" id="L75">    ConcatVector clone = new ConcatVector(getNumberOfComponents());</span>
+<span class="fc bfc" id="L76" title="All 2 branches covered.">    for (int i = 0; i &lt; pointers.length; i++) {</span>
+<span class="fc bfc" id="L77" title="All 4 branches covered.">      if (pointers[i] != null &amp;&amp; !sparse[i]) {</span>
+<span class="fc" id="L78">        clone.pointers[i] = new double[pointers[i].length];</span>
+<span class="fc" id="L79">        clone.sparse[i] = false;</span>
+      }
+    }
+<span class="fc" id="L82">    return clone;</span>
+  }
+
+  /**
+   * Sets a single component of the concat vector value as a dense vector. This will make a copy of you values array,
+   * so you're free to continue mutating it.
+   *
+   * @param component the index of the component to set
+   * @param values    the array of dense values to put into the component
+   */
+  public void setDenseComponent(int component, double[] values) {
+<span class="fc bfc" id="L93" title="All 2 branches covered.">    if (component &gt;= pointers.length) {</span>
+<span class="fc" id="L94">      increaseSizeTo(component + 1);</span>
+    }
+<span class="fc" id="L96">    pointers[component] = values;</span>
+<span class="fc" id="L97">    sparse[component] = false;</span>
+<span class="fc" id="L98">    copyOnWrite[component] = true;</span>
+<span class="fc" id="L99">  }</span>
+
+  /**
+   * Sets a single component of the concat vector value as a sparse, one hot value.
+   *
+   * @param component the index of the component to set
+   * @param index     the index of the vector to one-hot
+   * @param value     the value of that index
+   */
+  public void setSparseComponent(int component, int index, double value) {
+<span class="fc bfc" id="L109" title="All 2 branches covered.">    if (component &gt;= pointers.length) {</span>
+<span class="fc" id="L110">      increaseSizeTo(component + 1);</span>
+    }
+<span class="fc" id="L112">    double[] sparseInfo = new double[2];</span>
+<span class="fc" id="L113">    sparseInfo[0] = index;</span>
+<span class="fc" id="L114">    sparseInfo[1] = value;</span>
+<span class="fc" id="L115">    pointers[component] = sparseInfo;</span>
+<span class="fc" id="L116">    sparse[component] = true;</span>
+<span class="fc" id="L117">    copyOnWrite[component] = false;</span>
+<span class="fc" id="L118">  }</span>
+
+  /**
+   * This function assumes both vectors are infinitely padded with 0s, so it won't complain if there's a dim mismatch.
+   * There are no side effects.
+   *
+   * @param other the MV to dot product with
+   * @return the dot product of this and other
+   */
+  public double dotProduct(ConcatVector other) {
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">    if (loadedNative) {</span>
+<span class="nc" id="L129">      return dotProductNative(other);</span>
+    } else {
+<span class="fc" id="L131">      double sum = 0.0f;</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">      for (int i = 0; i &lt; Math.min(pointers.length, other.pointers.length); i++) {</span>
+<span class="fc bfc" id="L133" title="All 4 branches covered.">        if (pointers[i] == null || other.pointers[i] == null) continue;</span>
+<span class="fc bfc" id="L134" title="All 4 branches covered.">        if (sparse[i] &amp;&amp; other.sparse[i]) {</span>
+<span class="fc bfc" id="L135" title="All 2 branches covered.">          if ((int) pointers[i][0] == (int) other.pointers[i][0]) {</span>
+<span class="fc" id="L136">            sum += pointers[i][1] * other.pointers[i][1];</span>
+          }
+<span class="pc bpc" id="L138" title="1 of 4 branches missed.">        } else if (sparse[i] &amp;&amp; !other.sparse[i]) {</span>
+<span class="fc" id="L139">          int sparseIndex = (int) pointers[i][0];</span>
+<span class="pc bpc" id="L140" title="1 of 4 branches missed.">          if (sparseIndex &gt;= 0 &amp;&amp; sparseIndex &lt; other.pointers[i].length) {</span>
+<span class="fc" id="L141">            sum += other.pointers[i][sparseIndex] * pointers[i][1];</span>
+          }
+<span class="pc bpc" id="L143" title="1 of 4 branches missed.">        } else if (!sparse[i] &amp;&amp; other.sparse[i]) {</span>
+<span class="fc" id="L144">          int sparseIndex = (int) other.pointers[i][0];</span>
+<span class="pc bpc" id="L145" title="1 of 4 branches missed.">          if (sparseIndex &gt;= 0 &amp;&amp; sparseIndex &lt; pointers[i].length) {</span>
+<span class="fc" id="L146">            sum += pointers[i][sparseIndex] * other.pointers[i][1];</span>
+          }
+<span class="fc" id="L148">        } else {</span>
+<span class="fc bfc" id="L149" title="All 2 branches covered.">          for (int j = 0; j &lt; Math.min(pointers[i].length, other.pointers[i].length); j++) {</span>
+<span class="fc" id="L150">            sum += pointers[i][j] * other.pointers[i][j];</span>
+          }
+        }
+      }
+<span class="fc" id="L154">      return sum;</span>
+    }
+  }
+
+  /**
+   * @return a clone of this concat vector, with deep copies of datastructures
+   */
+  public ConcatVector deepClone() {
+<span class="fc" id="L162">    return new ConcatVector(this);</span>
+  }
+
+  /**
+   * This will add the vector &quot;other&quot; to this vector, scaling other by multiple. In algebra,
+   * &lt;p&gt;
+   * this = this + (other * multiple)
+   * &lt;p&gt;
+   * The function assumes that both vectors are padded infinitely with 0s, so will scale this vector by adding components
+   * and changing component sizes (dense to bigger dense) and shapes (sparse to dense) in order to accommodate the result.
+   *
+   * @param other    the vector to add to this one
+   * @param multiple the multiple to use
+   */
+  public void addVectorInPlace(ConcatVector other, double multiple) {
+    // Resize if necessary
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">    if (pointers == null) {</span>
+<span class="nc" id="L179">      pointers = new double[other.pointers.length][];</span>
+<span class="nc" id="L180">      sparse = new boolean[other.pointers.length];</span>
+<span class="nc" id="L181">      copyOnWrite = new boolean[other.pointers.length];</span>
+<span class="fc bfc" id="L182" title="All 2 branches covered.">    } else if (pointers.length &lt; other.pointers.length) {</span>
+<span class="fc" id="L183">      increaseSizeTo(other.pointers.length);</span>
+    }
+
+    // Do the addition piece by piece
+
+<span class="fc bfc" id="L188" title="All 2 branches covered.">    for (int i = 0; i &lt; other.pointers.length; i++) {</span>
+      // If the other vector has no segment here, then skip
+<span class="fc bfc" id="L190" title="All 2 branches covered.">      if (other.pointers[i] == null) continue;</span>
+      // If we previously had no element here, fill it in accordingly
+<span class="fc bfc" id="L192" title="All 4 branches covered.">      if (pointers[i] == null || pointers[i].length == 0) {</span>
+<span class="fc" id="L193">        sparse[i] = other.sparse[i];</span>
+        // If the multiple is one, just follow the copying procedure
+<span class="fc bfc" id="L195" title="All 2 branches covered.">        if (multiple == 1.0) {</span>
+<span class="fc" id="L196">          pointers[i] = other.pointers[i];</span>
+<span class="fc" id="L197">          copyOnWrite[i] = true;</span>
+<span class="fc" id="L198">          other.copyOnWrite[i] = true;</span>
+        }
+        // Otherwise do the standard thing
+        else {
+<span class="fc bfc" id="L202" title="All 2 branches covered.">          if (other.sparse[i]) {</span>
+<span class="fc" id="L203">            pointers[i] = new double[2];</span>
+<span class="fc" id="L204">            copyOnWrite[i] = false;</span>
+<span class="fc" id="L205">            pointers[i][0] = other.pointers[i][0];</span>
+<span class="fc" id="L206">            pointers[i][1] = other.pointers[i][1] * multiple;</span>
+          } else {
+<span class="fc" id="L208">            pointers[i] = new double[other.pointers[i].length];</span>
+<span class="fc" id="L209">            copyOnWrite[i] = false;</span>
+<span class="fc bfc" id="L210" title="All 2 branches covered.">            for (int j = 0; j &lt; other.pointers[i].length; j++) {</span>
+<span class="fc" id="L211">              pointers[i][j] = other.pointers[i][j] * multiple;</span>
+            }
+          }
+        }
+      }
+      // Handle rescaling on a component-by-component basis
+<span class="fc bfc" id="L217" title="All 4 branches covered.">      else if (sparse[i] &amp;&amp; !other.sparse[i]) {</span>
+<span class="fc" id="L218">        int sparseIndex = (int) pointers[i][0];</span>
+<span class="fc" id="L219">        double sparseValue = pointers[i][1];</span>
+<span class="fc" id="L220">        sparse[i] = false;</span>
+<span class="fc" id="L221">        pointers[i] = new double[Math.max(sparseIndex + 1, other.pointers[i].length)];</span>
+<span class="fc" id="L222">        copyOnWrite[i] = false;</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">        if (sparseIndex &gt;= 0) {</span>
+<span class="fc" id="L224">          pointers[i][sparseIndex] = sparseValue;</span>
+        }
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        for (int j = 0; j &lt; other.pointers[i].length; j++) {</span>
+<span class="fc" id="L227">          pointers[i][j] += other.pointers[i][j] * multiple;</span>
+        }
+<span class="pc bpc" id="L229" title="1 of 4 branches missed.">      } else if (sparse[i] &amp;&amp; other.sparse[i]) {</span>
+<span class="fc" id="L230">        int mySparseIndex = (int) pointers[i][0];</span>
+<span class="fc" id="L231">        int otherSparseIndex = (int) other.pointers[i][0];</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        if (mySparseIndex == otherSparseIndex) {</span>
+<span class="fc bfc" id="L233" title="All 2 branches covered.">          if (copyOnWrite[i]) {</span>
+<span class="fc" id="L234">            pointers[i] = pointers[i].clone();</span>
+<span class="fc" id="L235">            copyOnWrite[i] = false;</span>
+          }
+<span class="fc" id="L237">          pointers[i][1] += other.pointers[i][1] * multiple;</span>
+        } else {
+<span class="fc" id="L239">          sparse[i] = false;</span>
+<span class="fc" id="L240">          double mySparseValue = pointers[i][1];</span>
+<span class="fc" id="L241">          pointers[i] = new double[Math.max(mySparseIndex + 1, otherSparseIndex + 1)];</span>
+<span class="fc" id="L242">          copyOnWrite[i] = false;</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">          if (mySparseIndex &gt;= 0) {</span>
+<span class="fc" id="L244">            pointers[i][mySparseIndex] = mySparseValue;</span>
+          }
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">          if (otherSparseIndex &gt;= 0) {</span>
+<span class="fc" id="L247">            pointers[i][otherSparseIndex] = other.pointers[i][1] * multiple;</span>
+          }
+        }
+<span class="pc bpc" id="L250" title="1 of 4 branches missed.">      } else if (!sparse[i] &amp;&amp; other.sparse[i]) {</span>
+<span class="fc" id="L251">        int sparseIndex = (int) other.pointers[i][0];</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">        if (sparseIndex &gt;= pointers[i].length) {</span>
+<span class="fc" id="L253">          int newSize = pointers[i].length;</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">          while (newSize &lt;= sparseIndex) newSize *= 2;</span>
+<span class="fc" id="L255">          double[] denseBuf = new double[newSize];</span>
+<span class="fc" id="L256">          System.arraycopy(pointers[i], 0, denseBuf, 0, pointers[i].length);</span>
+<span class="fc" id="L257">          copyOnWrite[i] = false;</span>
+<span class="fc" id="L258">          pointers[i] = denseBuf;</span>
+        }
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">        if (sparseIndex &gt;= 0) {</span>
+<span class="fc bfc" id="L261" title="All 2 branches covered.">          if (copyOnWrite[i]) {</span>
+<span class="fc" id="L262">            pointers[i] = pointers[i].clone();</span>
+<span class="fc" id="L263">            copyOnWrite[i] = false;</span>
+          }
+<span class="fc" id="L265">          pointers[i][sparseIndex] += other.pointers[i][1] * multiple;</span>
+        }
+<span class="fc" id="L267">      } else {</span>
+<span class="pc bpc" id="L268" title="3 of 6 branches missed.">        assert (!sparse[i] &amp;&amp; !other.sparse[i]);</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">        if (pointers[i].length &lt; other.pointers[i].length) {</span>
+<span class="fc" id="L270">          double[] denseBuf = new double[other.pointers[i].length];</span>
+<span class="fc" id="L271">          System.arraycopy(pointers[i], 0, denseBuf, 0, pointers[i].length);</span>
+<span class="fc" id="L272">          copyOnWrite[i] = false;</span>
+<span class="fc" id="L273">          pointers[i] = denseBuf;</span>
+        }
+<span class="fc bfc" id="L275" title="All 2 branches covered.">        if (copyOnWrite[i]) {</span>
+<span class="fc" id="L276">          pointers[i] = pointers[i].clone();</span>
+<span class="fc" id="L277">          copyOnWrite[i] = false;</span>
+        }
+<span class="fc bfc" id="L279" title="All 2 branches covered.">        for (int j = 0; j &lt; other.pointers[i].length; j++) {</span>
+<span class="fc" id="L280">          pointers[i][j] += other.pointers[i][j] * multiple;</span>
+        }
+      }
+    }
+<span class="fc" id="L284">  }</span>
+
+  /**
+   * This will multiply the vector &quot;other&quot; to this vector. It's the equivalent of the Matlab
+   * &lt;p&gt;
+   * this = this .* other
+   * &lt;p&gt;
+   * The function assumes that both vectors are padded infinitely with 0s, so will result in lots of 0s in this
+   * vector if it is longer than 'other'.
+   *
+   * @param other the vector to multiply into this one
+   */
+  public void elementwiseProductInPlace(ConcatVector other) {
+<span class="fc bfc" id="L297" title="All 2 branches covered.">    for (int i = 0; i &lt; pointers.length; i++) {</span>
+<span class="fc bfc" id="L298" title="All 2 branches covered.">      if (pointers[i] == null) continue;</span>
+
+<span class="fc bfc" id="L300" title="All 2 branches covered.">      if (copyOnWrite[i]) {</span>
+<span class="fc" id="L301">        copyOnWrite[i] = false;</span>
+<span class="fc" id="L302">        pointers[i] = pointers[i].clone();</span>
+      }
+
+<span class="fc bfc" id="L305" title="All 2 branches covered.">      if (i &gt;= other.pointers.length) {</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">        if (sparse[i]) {</span>
+<span class="fc" id="L307">          pointers[i][1] = 0;</span>
+        } else {
+<span class="fc bfc" id="L309" title="All 2 branches covered.">          for (int j = 0; j &lt; pointers[i].length; j++) {</span>
+<span class="fc" id="L310">            pointers[i][j] = 0;</span>
+          }
+        }
+<span class="fc bfc" id="L313" title="All 2 branches covered.">      } else if (other.pointers[i] == null) {</span>
+<span class="fc" id="L314">        pointers[i] = null;</span>
+<span class="fc bfc" id="L315" title="All 4 branches covered.">      } else if (sparse[i] &amp;&amp; other.sparse[i]) {</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">        if ((int) pointers[i][0] == (int) other.pointers[i][0]) {</span>
+<span class="fc" id="L317">          pointers[i][1] *= other.pointers[i][1];</span>
+        } else {
+<span class="fc" id="L319">          pointers[i][1] = 0.0f;</span>
+        }
+<span class="pc bpc" id="L321" title="1 of 4 branches missed.">      } else if (sparse[i] &amp;&amp; !other.sparse[i]) {</span>
+<span class="fc" id="L322">        int sparseIndex = (int) pointers[i][0];</span>
+<span class="pc bpc" id="L323" title="1 of 4 branches missed.">        if (sparseIndex &gt;= 0 &amp;&amp; sparseIndex &lt; other.pointers[i].length) {</span>
+<span class="fc" id="L324">          pointers[i][1] *= other.pointers[i][sparseIndex];</span>
+        } else {
+<span class="fc" id="L326">          pointers[i][1] = 0.0f;</span>
+        }
+<span class="pc bpc" id="L328" title="1 of 4 branches missed.">      } else if (!sparse[i] &amp;&amp; other.sparse[i]) {</span>
+<span class="fc" id="L329">        int sparseIndex = (int) other.pointers[i][0];</span>
+<span class="fc" id="L330">        double sparseValue = 0.0f;</span>
+<span class="pc bpc" id="L331" title="1 of 4 branches missed.">        if (sparseIndex &gt;= 0 &amp;&amp; sparseIndex &lt; pointers[i].length) {</span>
+<span class="fc" id="L332">          sparseValue = pointers[i][sparseIndex] * other.pointers[i][1];</span>
+        }
+<span class="fc" id="L334">        sparse[i] = true;</span>
+<span class="fc" id="L335">        pointers[i] = new double[]{</span>
+            sparseIndex,
+            sparseValue
+        };
+<span class="fc" id="L339">      } else {</span>
+<span class="fc bfc" id="L340" title="All 2 branches covered.">        for (int j = 0; j &lt; Math.min(pointers[i].length, other.pointers[i].length); j++) {</span>
+<span class="fc" id="L341">          pointers[i][j] *= other.pointers[i][j];</span>
+        }
+<span class="fc bfc" id="L343" title="All 2 branches covered.">        for (int j = other.pointers[i].length; j &lt; pointers[i].length; j++) {</span>
+<span class="fc" id="L344">          pointers[i][j] = 0.0f;</span>
+        }
+      }
+    }
+<span class="fc" id="L348">  }</span>
+
+  /**
+   * Apply a function to every element of every component of this vector, and replace with the result.
+   *
+   * @param fn the function to apply to every element of every component.
+   */
+  public void mapInPlace(Function&lt;Double, Double&gt; fn) {
+<span class="fc bfc" id="L356" title="All 2 branches covered.">    for (int i = 0; i &lt; pointers.length; i++) {</span>
+<span class="fc bfc" id="L357" title="All 2 branches covered.">      if (pointers[i] == null) continue;</span>
+
+<span class="fc bfc" id="L359" title="All 2 branches covered.">      if (copyOnWrite[i]) {</span>
+<span class="fc" id="L360">        copyOnWrite[i] = false;</span>
+<span class="fc" id="L361">        pointers[i] = pointers[i].clone();</span>
+      }
+
+<span class="fc bfc" id="L364" title="All 2 branches covered.">      if (sparse[i]) {</span>
+<span class="fc" id="L365">        pointers[i][1] = fn.apply(pointers[i][1]);</span>
+      } else {
+<span class="fc bfc" id="L367" title="All 2 branches covered.">        for (int j = 0; j &lt; pointers[i].length; j++) {</span>
+<span class="fc" id="L368">          pointers[i][j] = fn.apply(pointers[i][j]);</span>
+        }
+      }
+    }
+<span class="fc" id="L372">  }</span>
+
+  /**
+   * @return the number of concatenated vectors that compose this ConcatVector
+   */
+  public int getNumberOfComponents() {
+<span class="fc" id="L378">    return pointers.length;</span>
+  }
+
+  /**
+   * @param i the index of the component to check
+   * @return whether component i is sparse or not
+   */
+  public boolean isComponentSparse(int i) {
+<span class="fc" id="L386">    return sparse[i];</span>
+  }
+
+  /**
+   * This function will throw an assert if the component you're requesting isn't dense
+   *
+   * @param i the index of the component to look at
+   * @return the dense array composing that component
+   */
+  public double[] getDenseComponent(int i) {
+<span class="pc bpc" id="L396" title="2 of 4 branches missed.">    assert (!sparse[i]);</span>
+    // This will save the special case code down the line, so is worth the tiny object creation
+<span class="fc bfc" id="L398" title="All 2 branches covered.">    if (pointers[i] == null) return new double[0];</span>
+<span class="fc" id="L399">    return pointers[i];</span>
+  }
+
+  /**
+   * This assumes infinite padding with 0s. It will return you 0 if you're OOB (use getSegmentSizes() to check, if
+   * that's undesirable behavior). Otherwise it will return you the correct value.
+   *
+   * @param component the index of the component to retrieve a value from
+   * @param offset    the offset within that component
+   * @return the value retrieved, of 0 if OOB
+   */
+  public double getValueAt(int component, int offset) {
+<span class="fc bfc" id="L411" title="All 2 branches covered.">    if (component &lt; pointers.length) {</span>
+<span class="fc bfc" id="L412" title="All 2 branches covered.">      if (pointers[component] == null) return 0;</span>
+<span class="fc bfc" id="L413" title="All 2 branches covered.">      else if (sparse[component]) {</span>
+<span class="fc" id="L414">        int sparseIndex = (int) pointers[component][0];</span>
+<span class="fc bfc" id="L415" title="All 2 branches covered.">        if (sparseIndex == offset) return pointers[component][1];</span>
+<span class="fc" id="L416">      } else {</span>
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">        if (offset &lt; pointers[component].length) {</span>
+<span class="fc" id="L418">          return pointers[component][offset];</span>
+        }
+      }
+    }
+<span class="fc" id="L422">    return 0;</span>
+  }
+
+  /**
+   * Gets you the index of one hot in a component, assuming it is sparse. Throws an assert if it isn't.
+   *
+   * @param component the index of the sparse component.
+   * @return the index of the one-hot value within that sparse component.
+   */
+  public int getSparseIndex(int component) {
+<span class="pc bpc" id="L432" title="2 of 4 branches missed.">    assert (sparse[component]);</span>
+<span class="fc" id="L433">    return (int) pointers[component][0];</span>
+  }
+
+  /**
+   * Writes the protobuf version of this vector to a stream. reversible with readFromStream().
+   *
+   * @param stream the output stream to write to
+   * @throws IOException passed through from the stream
+   */
+  public void writeToStream(OutputStream stream) throws IOException {
+<span class="fc" id="L443">    getProtoBuilder().build().writeDelimitedTo(stream);</span>
+<span class="fc" id="L444">  }</span>
+
+  /**
+   * Static function to deserialize a concat vector from an input stream.
+   *
+   * @param stream the stream to read from, assuming protobuf encoding
+   * @return a new concat vector
+   * @throws IOException passed through from the stream
+   */
+  public static ConcatVector readFromStream(InputStream stream) throws IOException {
+<span class="fc" id="L454">    return readFromProto(ConcatVectorProto.ConcatVector.parseDelimitedFrom(stream));</span>
+  }
+
+  /**
+   * @return a Builder for proto serialization
+   */
+  public ConcatVectorProto.ConcatVector.Builder getProtoBuilder() {
+<span class="fc" id="L461">    ConcatVectorProto.ConcatVector.Builder m = ConcatVectorProto.ConcatVector.newBuilder();</span>
+<span class="fc bfc" id="L462" title="All 2 branches covered.">    for (int i = 0; i &lt; pointers.length; i++) {</span>
+<span class="fc" id="L463">      ConcatVectorProto.ConcatVector.Component.Builder c = ConcatVectorProto.ConcatVector.Component.newBuilder();</span>
+<span class="fc" id="L464">      c.setSparse(sparse[i]);</span>
+      // We want to keep the data array size 0 if the pointers for this component is null
+<span class="fc bfc" id="L466" title="All 2 branches covered.">      if (pointers[i] != null) {</span>
+<span class="fc bfc" id="L467" title="All 2 branches covered.">        for (int j = 0; j &lt; pointers[i].length; j++) {</span>
+<span class="fc" id="L468">          c.addData(pointers[i][j]);</span>
+        }
+      }
+<span class="fc" id="L471">      m.addComponent(c);</span>
+    }
+<span class="fc" id="L473">    return m;</span>
+  }
+
+  /**
+   * Recreates an in-memory concat vector object from a Proto serialization.
+   *
+   * @param m the concat vector proto
+   * @return an in-memory concat vector object
+   */
+  public static ConcatVector readFromProto(ConcatVectorProto.ConcatVector m) {
+<span class="fc" id="L483">    int components = m.getComponentCount();</span>
+
+<span class="fc" id="L485">    ConcatVector vec = new ConcatVector();</span>
+<span class="fc" id="L486">    vec.pointers = new double[components][];</span>
+<span class="fc" id="L487">    vec.sparse = new boolean[components];</span>
+<span class="fc bfc" id="L488" title="All 2 branches covered.">    for (int i = 0; i &lt; components; i++) {</span>
+<span class="fc" id="L489">      ConcatVectorProto.ConcatVector.Component c = m.getComponent(i);</span>
+<span class="fc" id="L490">      vec.sparse[i] = c.getSparse();</span>
+<span class="fc" id="L491">      int dataSize = c.getDataCount();</span>
+<span class="fc" id="L492">      vec.pointers[i] = new double[dataSize];</span>
+<span class="fc bfc" id="L493" title="All 2 branches covered.">      for (int j = 0; j &lt; dataSize; j++) {</span>
+<span class="fc" id="L494">        vec.pointers[i][j] = c.getData(j);</span>
+      }
+    }
+
+<span class="fc" id="L498">    return vec;</span>
+  }
+
+  /**
+   * Compares two concat vectors by value. This means that we're 0 padding, so a dense and sparse component might
+   * both be considered the same, if the dense array reflects the same value as the sparse array. This is pretty much
+   * only useful for testing. Since it's primarily for testing, we went with the slower, more obviously correct design.
+   *
+   * @param other     the vector we're comparing to
+   * @param tolerance the amount any pair of values can differ before we say the two vectors are different.
+   * @return whether the two vectors are the same
+   */
+  public boolean valueEquals(ConcatVector other, double tolerance) {
+<span class="fc bfc" id="L511" title="All 2 branches covered.">    for (int i = 0; i &lt; Math.max(pointers.length, other.pointers.length); i++) {</span>
+<span class="fc" id="L512">      int size = 0;</span>
+      // Find the maximum non-zero element in this component
+<span class="pc bpc" id="L514" title="1 of 8 branches missed.">      if (i &lt; pointers.length &amp;&amp; i &lt; other.pointers.length &amp;&amp; pointers[i] == null &amp;&amp; other.pointers[i] == null) {</span>
+<span class="fc" id="L515">        size = 0;</span>
+<span class="pc bpc" id="L516" title="1 of 6 branches missed.">      } else if (i &gt;= pointers.length || (i &lt; pointers.length &amp;&amp; pointers[i] == null)) {</span>
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">        if (i &gt;= other.pointers.length) {</span>
+<span class="nc" id="L518">          size = 0;</span>
+<span class="fc bfc" id="L519" title="All 2 branches covered.">        } else if (other.sparse[i]) {</span>
+<span class="fc" id="L520">          size = other.getSparseIndex(i) + 1;</span>
+        } else {
+<span class="fc" id="L522">          size = other.pointers[i].length;</span>
+        }
+<span class="pc bpc" id="L524" title="3 of 6 branches missed.">      } else if (i &gt;= other.pointers.length || (i &lt; other.pointers.length &amp;&amp; other.pointers[i] == null)) {</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        if (i &gt;= pointers.length) {</span>
+<span class="nc" id="L526">          size = 0;</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        } else if (sparse[i]) {</span>
+<span class="nc" id="L528">          size = getSparseIndex(i) + 1;</span>
+        } else {
+<span class="nc" id="L530">          size = pointers[i].length;</span>
+        }
+      } else {
+<span class="pc bpc" id="L533" title="1 of 4 branches missed.">        if (sparse[i] &amp;&amp; getSparseIndex(i) &gt;= size) size = getSparseIndex(i) + 1;</span>
+<span class="pc bpc" id="L534" title="1 of 4 branches missed.">        else if (!sparse[i] &amp;&amp; pointers[i].length &gt; size) size = pointers[i].length;</span>
+<span class="fc bfc" id="L535" title="All 4 branches covered.">        if (other.sparse[i] &amp;&amp; other.getSparseIndex(i) &gt;= size) size = other.getSparseIndex(i) + 1;</span>
+<span class="pc bpc" id="L536" title="1 of 4 branches missed.">        else if (!other.sparse[i] &amp;&amp; other.pointers[i].length &gt; size) size = other.pointers[i].length;</span>
+      }
+
+<span class="fc bfc" id="L539" title="All 2 branches covered.">      for (int j = 0; j &lt; size; j++) {</span>
+<span class="fc bfc" id="L540" title="All 2 branches covered.">        if (Math.abs(getValueAt(i, j) - other.getValueAt(i, j)) &gt; tolerance) return false;</span>
+      }
+    }
+<span class="fc" id="L543">    return true;</span>
+  }
+
+  public String toString() {
+<span class="fc" id="L547">    StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L548">    sb.append(&quot;[&quot;);</span>
+<span class="fc bfc" id="L549" title="All 2 branches covered.">    for (int i = 0; i &lt; pointers.length; i++) {</span>
+<span class="fc" id="L550">      sb.append(&quot; ..&quot;);</span>
+<span class="fc bfc" id="L551" title="All 2 branches covered.">      if (pointers[i] == null) {</span>
+<span class="fc" id="L552">        sb.append(&quot;0=0.0&quot;);</span>
+<span class="fc bfc" id="L553" title="All 2 branches covered.">      } else if (sparse[i]) {</span>
+<span class="fc" id="L554">        sb.append((int) pointers[i][0]).append(&quot;=&quot;).append(pointers[i][1]);</span>
+      } else {
+<span class="fc bfc" id="L556" title="All 2 branches covered.">        for (int j = 0; j &lt; pointers[i].length; j++) {</span>
+<span class="fc" id="L557">          sb.append(pointers[i][j]);</span>
+<span class="fc bfc" id="L558" title="All 2 branches covered.">          if (j != pointers[i].length - 1) sb.append(&quot; &quot;);</span>
+        }
+      }
+<span class="fc" id="L561">      sb.append(&quot;..&quot;);</span>
+    }
+<span class="fc" id="L563">    sb.append(&quot; ]&quot;);</span>
+<span class="fc" id="L564">    return sb.toString();</span>
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+  // PRIVATE IMPLEMENTATION
+  ////////////////////////////////////////////////////////////////////////////
+
+  /**
+   * This increases the length of the vector, while preserving its contents
+   *
+   * @param newSize the new size to increase to. Must be larger than the current size
+   */
+  private void increaseSizeTo(int newSize) {
+<span class="pc bpc" id="L577" title="2 of 4 branches missed.">    assert (newSize &gt; pointers.length);</span>
+<span class="fc" id="L578">    double[][] pointersBuf = new double[newSize][];</span>
+<span class="fc" id="L579">    boolean[] sparseBuf = new boolean[newSize];</span>
+<span class="fc" id="L580">    boolean[] copyOnWriteBuf = new boolean[newSize];</span>
+<span class="fc" id="L581">    System.arraycopy(pointers, 0, pointersBuf, 0, pointers.length);</span>
+<span class="fc" id="L582">    System.arraycopy(sparse, 0, sparseBuf, 0, pointers.length);</span>
+<span class="fc" id="L583">    System.arraycopy(copyOnWrite, 0, copyOnWriteBuf, 0, pointers.length);</span>
+<span class="fc" id="L584">    pointers = pointersBuf;</span>
+<span class="fc" id="L585">    sparse = sparseBuf;</span>
+<span class="fc" id="L586">    copyOnWrite = copyOnWriteBuf;</span>
+<span class="fc" id="L587">  }</span>
+
+<span class="fc" id="L589">  static boolean loadedNative = false;</span>
+
+  // Right now I'm not loading the native library even if it's available, since the dot product &quot;speedup&quot; is actually
+  // 10x slower. First need to diagnose if a speedup is possible by going through the JNI, which is unlikely.
+
+    /*
+    static {
+        try {
+            System.load(System.getProperty(&quot;user.dir&quot;)+&quot;/src/main/c/libconcatvec.so&quot;);
+            loadedNative = true;
+        }
+        catch (UnsatisfiedLinkError e) {
+            log.info(&quot;Couldn't find the native acceleration library for ConcatVector&quot;);
+        }
+    }
+    */
+
+  private native double dotProductNative(ConcatVector other);
+
+  /**
+   * DO NOT USE. FOR SERIALIZERS ONLY.
+   */
+<span class="fc" id="L611">  private ConcatVector() {</span>
+<span class="fc" id="L612">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

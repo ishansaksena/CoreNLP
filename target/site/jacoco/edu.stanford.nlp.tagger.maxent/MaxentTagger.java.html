@@ -1,0 +1,1924 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MaxentTagger.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.tagger.maxent</a> &gt; <span class="el_source">MaxentTagger.java</span></div><h1>MaxentTagger.java</h1><pre class="source lang-java linenums">// MaxentTagger -- StanfordMaxEnt, A Maximum Entropy Toolkit
+// Copyright (c) 2002-2016 Leland Stanford Junior University
+
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+// For more information, bug reports, fixes, contact:
+// Christopher Manning
+// Dept of Computer Science, Gates 2A
+// Stanford CA 94305-9020
+// USA
+// Support/Questions: stanford-nlp on SO or java-nlp-user@lists.stanford.edu
+// Licensing: java-nlp-support@lists.stanford.edu
+// http://nlp.stanford.edu/software/tagger.html
+
+package edu.stanford.nlp.tagger.maxent;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.PrintFile;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.*;
+import edu.stanford.nlp.maxent.CGRunner;
+import edu.stanford.nlp.maxent.Problem;
+import edu.stanford.nlp.maxent.iis.LambdaSolve;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.objectbank.ReaderIteratorFactory;
+import edu.stanford.nlp.process.DocumentPreprocessor;
+import edu.stanford.nlp.process.ListProcessor;
+import edu.stanford.nlp.process.Morphology;
+import edu.stanford.nlp.process.TokenizerFactory;
+import edu.stanford.nlp.process.PTBTokenizer.PTBTokenizerFactory;
+import edu.stanford.nlp.process.TransformXML;
+import edu.stanford.nlp.process.WhitespaceTokenizer;
+import edu.stanford.nlp.sequences.PlainTextDocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.PlainTextDocumentReaderAndWriter.OutputStyle;
+import edu.stanford.nlp.tagger.common.Tagger;
+import edu.stanford.nlp.tagger.io.TaggedFileRecord;
+import edu.stanford.nlp.util.DataFilePaths;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.ReflectionLoading;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.XMLUtils;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+import java.lang.reflect.Method;
+import java.text.NumberFormat;
+import java.text.DecimalFormat;
+
+
+/**
+ * The main class for users to run, train, and test the part of speech tagger.
+ *
+ * You can tag things through the Java API or from the command line.
+ * The two English taggers included in this distribution are:
+ * &lt;ul&gt;
+ * &lt;li&gt; A bi-directional dependency network tagger in
+ *      {@code edu/stanford/nlp/models/pos-tagger/english-left3words/english-bidirectional-distsim.tagger}.
+ *      Its accuracy was 97.32% on Penn Treebank WSJ secs. 22-24.&lt;/li&gt;
+ * &lt;li&gt; A model using only left second-order sequence information and similar but less
+ *      unknown words and lexical features as the previous model in
+ *      {@code edu/stanford/nlp/models/pos-tagger/english-left3words/english-left3words-distsim.tagger}
+ *      This tagger runs a lot faster, and is recommended for general use.
+ *      Its accuracy was 96.92% on Penn Treebank WSJ secs. 22-24.&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * &lt;h3&gt;Using the Java API&lt;/h3&gt;
+ * &lt;dl&gt;
+ * &lt;dt&gt;
+ * A MaxentTagger can be made with a constructor taking as argument the location of parameter files for a trained tagger: &lt;/dt&gt;
+ * &lt;dd&gt; {@code MaxentTagger tagger = new MaxentTagger(&quot;models/left3words-wsj-0-18.tagger&quot;); }&lt;/dd&gt;
+ * &lt;p&gt;
+ * &lt;dt&gt;A default path is provided for the location of the tagger on the Stanford NLP machines:&lt;/dt&gt;
+ * &lt;dd&gt;{@code MaxentTagger tagger = new MaxentTagger(DEFAULT_NLP_GROUP_MODEL_PATH); }&lt;/dd&gt;
+ * &lt;p&gt;
+ * &lt;dt&gt;If you set the NLP_DATA_HOME environment variable,
+ * DEFAULT_NLP_GROUP_MODEL_PATH will instead point to the directory
+ * given in NLP_DATA_HOME.&lt;/dt&gt;
+ * &lt;p&gt;
+ * &lt;dt&gt;To tag a List of HasWord and get a List of TaggedWord, you can use one of: &lt;/dt&gt;
+ * &lt;dd&gt;{@code List&amp;lt;TaggedWord&amp;gt; taggedSentence = tagger.tagSentence(List&amp;lt;? extends HasWord&amp;gt; sentence)}&lt;/dd&gt;
+ * &lt;dd&gt;{@code List&amp;lt;TaggedWord&amp;gt; taggedSentence = tagger.apply(List&amp;lt;? extends HasWord&amp;gt; sentence)}&lt;/dd&gt;
+ * &lt;p&gt;
+ * &lt;dt&gt;To tag a list of sentences and get back a list of tagged sentences:
+ * &lt;dd&gt;{@code List taggedList = tagger.process(List sentences)}&lt;/dd&gt;
+ * &lt;p&gt;
+ * &lt;dt&gt;To tag a String of text and to get back a String with tagged words:&lt;/dt&gt;
+ * &lt;dd&gt; {@code String taggedString = tagger.tagString(&quot;Here's a tagged string.&quot;)}&lt;/dd&gt;
+ * &lt;p&gt;
+ * &lt;dt&gt;To tag a string of &lt;i&gt;correctly tokenized&lt;/i&gt;, whitespace-separated words and get a string of tagged words back:&lt;/dt&gt;
+ * &lt;dd&gt; {@code String taggedString = tagger.tagTokenizedString(&quot;Here 's a tagged string .&quot;)}&lt;/dd&gt;
+ * &lt;/dl&gt;
+ * &lt;p&gt;
+ * The {@code tagString} method uses the default tokenizer (PTBTokenizer).
+ * If you wish to control tokenization, you may wish to call
+ * {@link #tokenizeText(Reader, TokenizerFactory)} and then to call
+ * {@code process()} on the result.
+ * &lt;/p&gt;
+ *
+ * &lt;h3&gt;Using the command line&lt;/h3&gt;
+ *
+ * Tagging, testing, and training can all also be done via the command line.
+ * &lt;h3&gt;Training from the command line&lt;/h3&gt;
+ * To train a model from the command line, first generate a property file:
+ * &lt;pre&gt;java edu.stanford.nlp.tagger.maxent.MaxentTagger -genprops &lt;/pre&gt;
+ *
+ * This gets you a default properties file with descriptions of each parameter you can set in
+ * your trained model.  You can modify the properties file, or use the default options.  To train, run:
+ * &lt;pre&gt;java -mx1g edu.stanford.nlp.tagger.maxent.MaxentTagger -props myPropertiesFile.props &lt;/pre&gt;
+ *
+ *  with the appropriate properties file specified. Any argument you give in the properties file can also
+ *  be specified on the command line.  You must have specified a model using -model, either in the properties file
+ *  or on the command line, as well as a file containing tagged words using -trainFile.
+ *
+ * Useful flags for controlling the amount of output are -verbose, which prints extra debugging information,
+ * and -verboseResults, which prints full information about intermediate results.  -verbose defaults to false
+ * and -verboseResults defaults to true.
+ *
+ * &lt;h3&gt;Tagging and Testing from the command line&lt;/h3&gt;
+ *
+ * Usage:
+ * For tagging (plain text):
+ * &lt;pre&gt;java edu.stanford.nlp.tagger.maxent.MaxentTagger -model &amp;lt;modelFile&amp;gt; -textFile &amp;lt;textfile&amp;gt; &lt;/pre&gt;
+ * For testing (evaluating against tagged text):
+ * &lt;pre&gt;java edu.stanford.nlp.tagger.maxent.MaxentTagger -model &amp;lt;modelFile&amp;gt; -testFile &amp;lt;testfile&amp;gt; &lt;/pre&gt;
+ * You can use the same properties file as for training
+ * if you pass it in with the &quot;-props&quot; argument. The most important
+ * arguments for tagging (besides &quot;model&quot; and &quot;file&quot;) are &quot;tokenize&quot;
+ * and &quot;tokenizerFactory&quot;. See below for more details.
+ * &lt;br&gt;
+ * Note that the tagger assumes input has not yet been tokenized and
+ * by default tokenizes it using a default English tokenizer.  If your
+ * input has already been tokenized, use the flag &quot;-tokenize false&quot;.
+ *
+ * &lt;p&gt; Parameters can be defined using a Properties file
+ * (specified on the command-line with {@code -prop} &lt;i&gt;propFile&lt;/i&gt;),
+ * or directly on the command line (by preceding their name with a minus sign
+ * (&quot;-&quot;) to turn them into a flag. The following properties are recognized:
+ * &lt;/p&gt;
+ * &lt;table border=&quot;1&quot;&gt;
+ * &lt;tr&gt;&lt;td&gt;&lt;b&gt;Property Name&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Type&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Default Value&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Relevant Phase(s)&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Description&lt;/b&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;model&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;All&lt;/td&gt;&lt;td&gt;Path and filename where you would like to save the model (training) or where the model should be loaded from (testing, tagging).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;trainFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;
+     &lt;td&gt;
+       Path to the file holding the training data; specifying this option puts the tagger in training mode.  Only one of 'trainFile','testFile','textFile', and 'dump' may be specified.&lt;br&gt;
+       There are three formats possible.  The first is a text file of tagged data. Each line is considered a separate sentence.  In each sentence, words are separated by whitespace.  Each word must have a tag, which is separated from the token using the specified {@code tagSeparator}.  This format, called TEXT, is the default format.&lt;br /&gt;
+       The second format is a file of Penn Treebank formatted tree files.  Trees are loaded one at a time and the tagged words in a tree are used as a training sentence.  To specify this format, preface the filename with &quot;{@code format=TREES,}&quot;.  &lt;br /&gt;
+       The final possible format is TSV files (tab-separated columns).  To specify a TSV file, set {@code trainFile} to &quot;{@code format=TSV,wordColumn=x,tagColumn=y,filename}&quot;.  Column numbers are indexed from 0, and sentences are separated with blank lines. The default wordColumn is 0 and default tagColumn is 1.
+       &lt;br&gt;
+       A file can be in a different character set encoding than the tagger's default encoding by prefacing the filename with {@code &quot;encoding=ENC&quot;}.
+       You can specify the tagSeparator character in a TEXT file by prefacing the filename with &quot;tagSeparator=c&quot;. &lt;br/&gt;
+       Tree files can be fed through TreeTransformers and TreeNormalizers.  To specify a transformer, preface the filename with &quot;treeTransformer=CLASSNAME&quot;.  To specify a normalizer, preface the filename with &quot;treeNormalizer=CLASSNAME&quot;.
+       You can also filter trees using a Filter&amp;lt;Tree&amp;gt;, which can be specified with &quot;treeFilter=CLASSNAME&quot;.  A specific range of trees to be used can be specified with treeRange=X-Y.  Multiple parts of the range can be separated by : as opposed to the normal separator of ,.
+       For example, one could use the argument &quot;-treeRange=25-50:75-100&quot;. You can specify a TreeReaderFactory by prefacing the filename with &quot;trf=CLASSNAME&quot;. &lt;br&gt;
+       Multiple files can be specified by making a semicolon separated list of files.  Each file can have its own format specifiers as above.&lt;br&gt;
+       You will note that none of , ; or = can be in filenames.
+     &lt;/td&gt;
+   &lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;testFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Test&lt;/td&gt;&lt;td&gt;Path to the file holding the test data; specifying this option puts the tagger in testing mode.  Only one of 'trainFile','testFile','textFile', and 'dump' may be specified.  The same format as trainFile applies, but only one file can be specified.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;textFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Tag&lt;/td&gt;&lt;td&gt;Path to the file holding the text to tag; specifying this option puts the tagger in tagging mode.  Only one of 'trainFile','testFile','textFile', and 'dump' may be specified.  No file reading options may be specified for textFile&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;dump&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Dump&lt;/td&gt;&lt;td&gt;Path to the file holding the model to dump; specifying this option puts the tagger in dumping mode.  Only one of 'trainFile','testFile','textFile', and 'dump' may be specified.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;genprops&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Use this option to output a default properties file, containing information about each of the possible configuration options.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;tagSeparator&lt;/td&gt;&lt;td&gt;char&lt;/td&gt;&lt;td&gt;/&lt;/td&gt;&lt;td&gt;All&lt;/td&gt;&lt;td&gt;Separator character that separates word and part of speech tags, such as out/IN or out_IN.  For training and testing, this is the separator used in the train/test files.  For tagging, this is the character that will be inserted between words and tags in the output.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;encoding&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;UTF-8&lt;/td&gt;&lt;td&gt;All&lt;/td&gt;&lt;td&gt;Encoding of the read files (training, testing) and the output text files.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;tokenize&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;true&lt;/td&gt;&lt;td&gt;Tag,Test&lt;/td&gt;&lt;td&gt;Whether or not the file needs to be tokenized.  If this is false, the tagger assumes that white space separates words if and only if they should be tagged as separate tokens, and that the input is strictly one sentence per line.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;tokenizerFactory&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;edu.stanford.nlp.&lt;br&gt;process.PTBTokenizer&lt;/td&gt;&lt;td&gt;Tag,Test&lt;/td&gt;&lt;td&gt;Fully qualified class name of the tokenizer to use.  edu.stanford.nlp.process.PTBTokenizer does basic English tokenization.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;tokenizerOptions&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;Tag,Test&lt;/td&gt;&lt;td&gt;Known options for the particular tokenizer used. A comma-separated list. For PTBTokenizer, options of interest include {@code americanize=false} and {@code asciiQuotes} (for German). Note that any choice of tokenizer options that conflicts with the tokenization used in the tagger training data will likely degrade tagger performance.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;sentenceDelimiter&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;Tag,Test&lt;/td&gt;&lt;td&gt;A marker used to separate a text into sentences. If not set (equal to {@code null}), sentence breaking is done by content (looking for periods, etc.) Otherwise, it will break on this String, except that if the String is &quot;newline&quot;, it breaks on the String &quot;\\n&quot;.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;arch&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;generic&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Architecture of the model, as a comma-separated list of options, some with a parenthesized integer argument written k here: this determines what features are used to build your model.  See {@link ExtractorFrames} and {@link ExtractorFramesRare} for more information.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;wordFunction&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;(none)&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;A function to apply to the text before training or testing.  Must inherit from edu.stanford.nlp.util.Function&amp;lt;String, String&amp;gt;.  Can be blank.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;lang&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;english&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Language from which the part of speech tags are drawn. This option determines which tags are considered closed-class (only fixed set of words can be tagged with a closed-class tag, such as prepositions). Defined languages are 'english' (Penn tag set), 'polish' (very rudimentary), 'french', 'chinese', 'arabic', 'german', and 'medline'.  &lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;openClassTags&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Space separated list of tags that should be considered open-class.  All tags encountered that are not in this list are considered closed-class.  E.g. format: &quot;NN VB&quot;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;closedClassTags&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Space separated list of tags that should be considered closed-class.  All tags encountered that are not in this list are considered open-class.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;learnClosedClassTags&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;If true, induce which tags are closed-class by counting as closed-class tags all those tags which have fewer unique word tokens than closedClassTagThreshold. &lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;closedClassTagThreshold&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Number of unique word tokens that a tag may have and still be considered closed-class; relevant only if learnClosedClassTags is true.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;sgml&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Tag, Test&lt;/td&gt;&lt;td&gt;Very basic tagging of the contents of all sgml fields; for more complex mark-up, consider using the xmlInput option.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;xmlInput&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;Tag, Test&lt;/td&gt;&lt;td&gt;Give a space separated list of tags in an XML file whose content you would like tagged.  Any internal tags that appear in the content of fields you would like tagged will be discarded; the rest of the XML will be preserved and the original text of specified fields will be replaced with the tagged text.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;outputFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&quot;&quot;&lt;/td&gt;&lt;td&gt;Tag&lt;/td&gt;&lt;td&gt;Path to write output to.  If blank, stdout is used.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;outputFormat&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&quot;&quot;&lt;/td&gt;&lt;td&gt;Tag&lt;/td&gt;&lt;td&gt;Output format. One of: slashTags (default), xml, or tsv&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;outputFormatOptions&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&quot;&quot;&lt;/td&gt;&lt;td&gt;Tag&lt;/td&gt;&lt;td&gt;Output format options.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;tagInside&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&quot;&quot;&lt;/td&gt;&lt;td&gt;Tag&lt;/td&gt;&lt;td&gt;Tags inside elements that match the regular expression given in the String.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;search&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;cg&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Specify the search method to be used in the optimization method for training.  Options are 'cg' (conjugate gradient), 'iis' (improved iterative scaling), or 'qn' (quasi-newton).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;sigmaSquared&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;0.5&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Sigma-squared smoothing/regularization parameter to be used for conjugate gradient search.  Default usually works reasonably well.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;iterations&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;100&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Number of iterations to be used for improved iterative scaling.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;rareWordThresh&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;5&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Words that appear fewer than this number of times during training are considered rare words and use extra rare word features.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;minFeatureThreshold&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;5&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Features whose history appears fewer than this number of times are discarded.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;curWordMinFeatureThreshold&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Words that occur more than this number of times will generate features with all of the tags they've been seen with.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;rareWordMinFeatureThresh&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;10&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Features of rare words whose histories occur fewer than this number of times are discarded.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;veryCommonWordThresh&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;250&lt;/td&gt;&lt;td&gt;Train&lt;/td&gt;&lt;td&gt;Words that occur more than this number of times form an equivalence class by themselves.  Ignored unless you are using ambiguity classes.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;debug&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;All&lt;/td&gt;&lt;td&gt;Whether to write debugging information (words, top words, unknown words, confusion matrix).  Useful for error analysis.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;debugPrefix&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;All&lt;/td&gt;&lt;td&gt;File (path) prefix for where to write out the debugging information (relevant only if debug=true).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;nthreads&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;Test,Text&lt;/td&gt;&lt;td&gt;Number of threads to use when processing text.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;/table&gt;
+ * &lt;p/&gt;
+ *
+ * @author Kristina Toutanova
+ * @author Miler Lee
+ * @author Joseph Smarr
+ * @author Anna Rafferty
+ * @author Michel Galley
+ * @author Christopher Manning
+ * @author John Bauer
+ */
+public class MaxentTagger extends Tagger implements ListProcessor&lt;List&lt;? extends HasWord&gt;,List&lt;TaggedWord&gt;&gt;, Serializable  {
+
+  /** A logger for this class */
+<span class="fc" id="L224">  private static final Redwood.RedwoodChannels log = Redwood.channels(MaxentTagger.class);</span>
+
+  /**
+   * The directory from which to get taggers when using
+   * DEFAULT_NLP_GROUP_MODEL_PATH.  Normally set to the location of
+   * the latest left3words tagger on the NLP machines, but can be
+   * changed by setting the environment variable NLP_DATA_HOME.
+   */
+  public static final String BASE_TAGGER_HOME =
+    &quot;$NLP_DATA_HOME/data/pos-tagger/distrib&quot;;
+<span class="fc" id="L234">  public static final String TAGGER_HOME =</span>
+<span class="fc" id="L235">    DataFilePaths.convert(BASE_TAGGER_HOME);</span>
+
+<span class="fc" id="L237">  public static final String DEFAULT_NLP_GROUP_MODEL_PATH =</span>
+<span class="fc" id="L238">    new File(TAGGER_HOME, &quot;english-left3words-distsim.tagger&quot;).getPath();</span>
+  public static final String DEFAULT_JAR_PATH =
+    &quot;edu/stanford/nlp/models/pos-tagger/english-left3words/english-left3words-distsim.tagger&quot;;
+  public static final String DEFAULT_DISTRIBUTION_PATH =
+    &quot;models/english-left3words-distsim.tagger&quot;;
+
+
+<span class="fc" id="L245">  public MaxentTagger() {</span>
+<span class="fc" id="L246">  }</span>
+
+  public MaxentTagger(TaggerConfig config) {
+    // todo: maybe this shouldn't do this but replace the zero arg constructor.
+    // i.e., call init() not readModelAndInit(). This method is currently UNUSED. Make non-public.
+<span class="nc" id="L251">    this(config.getModel(), config);</span>
+<span class="nc" id="L252">  }</span>
+
+  /**
+   * Constructor for a tagger, loading a model stored in a particular file,
+   * classpath resource, or URL.
+   * The tagger data is loaded when the constructor is called (this can be
+   * slow). This constructor first constructs a TaggerConfig object, which
+   * loads the tagger options from the modelFile.
+   *
+   * @param modelFile Filename, classpath resource, or URL for the trained model
+   * @throws RuntimeIOException if I/O errors or serialization errors
+   */
+  public MaxentTagger(String modelFile) {
+<span class="nc" id="L265">    this(modelFile, StringUtils.argsToProperties(&quot;-model&quot;, modelFile), true);</span>
+<span class="nc" id="L266">  }</span>
+
+  /**
+   * Constructor for a tagger, loading a model stored in a particular file,
+   * classpath resource, or URL.
+   * The tagger data is loaded when the constructor is called (this can be
+   * slow). This constructor first constructs a TaggerConfig object, which
+   * loads the tagger options from the modelFile.
+   *
+   * @param modelStream The InputStream from which to read the model
+   * @throws RuntimeIOException if I/O errors or serialization errors
+   */
+  public MaxentTagger(InputStream modelStream) {
+<span class="nc" id="L279">    this(modelStream, new Properties(), true);</span>
+<span class="nc" id="L280">  }</span>
+
+  /**
+   * Constructor for a tagger using a model stored in a particular file,
+   * with options taken from the supplied TaggerConfig.
+   * The tagger data is loaded when the
+   * constructor is called (this can be slow).
+   * This version assumes that the tagger options in the modelFile have
+   * already been loaded into the TaggerConfig (if that is desired).
+   *
+   * @param modelFile Filename, classpath resource, or URL for the trained model
+   * @param config The configuration for the tagger
+   * @throws RuntimeIOException if I/O errors or serialization errors
+   */
+  public MaxentTagger(String modelFile, Properties config) {
+<span class="nc" id="L295">    this(modelFile, config, true);</span>
+<span class="nc" id="L296">  }</span>
+
+  /**
+   * Initializer that loads the tagger.
+   *
+   * @param modelFile Where to initialize the tagger from.
+   *        Most commonly, this is the filename of the trained model, for example,
+   *        {@code /u/nlp/data/pos-tagger/wsj3t0-18-left3words/left3words-wsj-0-18.tagger}.
+   *        However, if it starts with &quot;https?://&quot; it will be interpreted as a URL.
+   *        One can also load models directly from the classpath, as in loading from
+   *        {@code edu/stanford/nlp/models/pos-tagger/wsj3t0-18-bidirectional/bidirectional-distsim-wsj-0-18.tagger}.
+   * @param config TaggerConfig based on command-line arguments
+   * @param printLoading Whether to print a message saying what model file is being loaded and how long it took when finished.
+   * @throws RuntimeIOException if I/O errors or serialization errors
+   */
+<span class="nc" id="L311">  public MaxentTagger(String modelFile, Properties config, boolean printLoading) {</span>
+<span class="nc" id="L312">    readModelAndInit(config, modelFile, printLoading);</span>
+<span class="nc" id="L313">  }</span>
+
+  /**
+   * Initializer that loads the tagger.
+   *
+   * @param modelStream An InputStream for reading the model file
+   * @param config TaggerConfig based on command-line arguments
+   * @param printLoading Whether to print a message saying what model file is being loaded and how long it took when finished.
+   * @throws RuntimeIOException if I/O errors or serialization errors
+   */
+<span class="nc" id="L323">  public MaxentTagger(InputStream modelStream, Properties config, boolean printLoading) {</span>
+<span class="nc" id="L324">    readModelAndInit(config, modelStream, printLoading);</span>
+<span class="nc" id="L325">  }</span>
+
+<span class="pc" id="L327">  final Dictionary dict = new Dictionary();</span>
+  TTags tags;
+
+  /**
+   * Will return the index of a tag, adding it if it doesn't already exist
+   */
+  public int addTag(String tag) {
+<span class="nc" id="L334">    return tags.add(tag);</span>
+  }
+  /**
+   * Will return the index of a tag if known, -1 if not already known
+   */
+  public int getTagIndex(String tag) {
+<span class="nc" id="L340">    return tags.getIndex(tag);</span>
+  }
+
+  public int numTags() {
+<span class="nc" id="L344">    return tags.getSize();</span>
+  }
+
+  public String getTag(int index) {
+<span class="nc" id="L348">    return tags.getTag(index);</span>
+  }
+
+  public Set&lt;String&gt; tagSet() {
+<span class="nc" id="L352">    return tags.tagSet();</span>
+  }
+
+  private LambdaSolveTagger prob;
+  // For each extractor index, we have a map from possible extracted
+  // features to an array which maps from tag number to feature weight index in the lambdas array.
+<span class="pc" id="L358">  List&lt;Map&lt;String, int[]&gt;&gt; fAssociations = Generics.newArrayList();</span>
+  //PairsHolder pairs = new PairsHolder();
+  Extractors extractors;
+  Extractors extractorsRare;
+  AmbiguityClasses ambClasses;
+<span class="pc" id="L363">  final boolean alltags = false;</span>
+<span class="pc" id="L364">  final Map&lt;String, Set&lt;String&gt;&gt; tagTokens = Generics.newHashMap();</span>
+
+<span class="fc" id="L366">  static final int RARE_WORD_THRESH = Integer.parseInt(TaggerConfig.RARE_WORD_THRESH);</span>
+<span class="fc" id="L367">  static final int MIN_FEATURE_THRESH = Integer.parseInt(TaggerConfig.MIN_FEATURE_THRESH);</span>
+<span class="fc" id="L368">  static final int CUR_WORD_MIN_FEATURE_THRESH = Integer.parseInt(TaggerConfig.CUR_WORD_MIN_FEATURE_THRESH);</span>
+<span class="fc" id="L369">  static final int RARE_WORD_MIN_FEATURE_THRESH = Integer.parseInt(TaggerConfig.RARE_WORD_MIN_FEATURE_THRESH);</span>
+<span class="fc" id="L370">  static final int VERY_COMMON_WORD_THRESH = Integer.parseInt(TaggerConfig.VERY_COMMON_WORD_THRESH);</span>
+
+<span class="fc" id="L372">  static final boolean OCCURRING_TAGS_ONLY = Boolean.parseBoolean(TaggerConfig.OCCURRING_TAGS_ONLY);</span>
+<span class="fc" id="L373">  static final boolean POSSIBLE_TAGS_ONLY = Boolean.parseBoolean(TaggerConfig.POSSIBLE_TAGS_ONLY);</span>
+
+  private double defaultScore;
+  private double[] defaultScores; // = null;
+
+  int leftContext;
+  int rightContext;
+
+  TaggerConfig config;
+
+  /**
+   * Determines which words are considered rare.  All words with count
+   * in the training data strictly less than this number (standardly, &amp;lt; 5) are
+   * considered rare.
+   */
+<span class="pc" id="L388">  private int rareWordThresh = RARE_WORD_THRESH;</span>
+
+  /**
+   * Determines which features are included in the model.  The model
+   * includes features that occurred strictly more times than this number
+   * (standardly, &amp;gt; 5) in the training data.  Here I look only at the
+   * history (not the tag), so the history appearing this often is enough.
+   */
+<span class="pc" id="L396">  int minFeatureThresh = MIN_FEATURE_THRESH;</span>
+
+  /**
+   * This is a special threshold for the current word feature.
+   * Only words that have occurred strictly &amp;gt; this number of times
+   * in total will generate word features with all of their occurring tags.
+   * The traditional default was 2.
+   */
+<span class="pc" id="L404">  int curWordMinFeatureThresh = CUR_WORD_MIN_FEATURE_THRESH;</span>
+
+  /**
+   * Determines which rare word features are included in the model.
+   * The features for rare words have a strictly higher support than
+   * this number are included. Traditional default is 10.
+   */
+<span class="pc" id="L411">  int rareWordMinFeatureThresh = RARE_WORD_MIN_FEATURE_THRESH;</span>
+
+  /**
+   * If using tag equivalence classes on following words, words that occur
+   * strictly more than this number of times (in total with any tag)
+   * are sufficiently frequent to form an equivalence class
+   * by themselves. (Not used unless using equivalence classes.)
+   *
+   * There are places in the code (ExtractorAmbiguityClass.java, for one)
+   * that assume this value is constant over the life of a tagger.
+   */
+<span class="pc" id="L422">  int veryCommonWordThresh = VERY_COMMON_WORD_THRESH;</span>
+
+
+  int xSize;
+  int ySize;
+<span class="pc" id="L427">  boolean occurringTagsOnly = OCCURRING_TAGS_ONLY;</span>
+<span class="pc" id="L428">  boolean possibleTagsOnly = POSSIBLE_TAGS_ONLY;</span>
+
+<span class="pc" id="L430">  private boolean initted = false;</span>
+
+<span class="pc" id="L432">  boolean VERBOSE = false;</span>
+
+  /**
+   * This is a function used to preprocess all text before applying
+   * the tagger to it.  For example, it could be a function to
+   * lowercase text, such as edu.stanford.nlp.util.LowercaseFunction
+   * (which makes the tagger case insensitive).  It is applied in
+   * ReadDataTagged, which loads in the training data, and in
+   * TestSentence, which processes sentences for new queries.  If any
+   * other classes are added or modified which use raw text, they must
+   * also use this function to keep results consistent.
+   * &lt;br&gt;
+   * An alternate design would have been to use the function at a
+   * lower level, such as at the extractor level.  That would have
+   * require more invasive changes to the tagger, though, because
+   * other data structures such as the Dictionary would then be using
+   * raw text as well.  This is also more efficient, in that the
+   * function is applied once at the start of the process.
+   */
+  Function&lt;String, String&gt; wordFunction;
+
+
+  /* Package access - shouldn't be part of public API. */
+  LambdaSolve getLambdaSolve() {
+<span class="nc" id="L456">    return prob;</span>
+  }
+
+  // TODO: make these constructors instead of init methods?
+  void init(TaggerConfig config) {
+<span class="pc bpc" id="L461" title="1 of 2 branches missed.">    if (initted) return;  // TODO: why not reinit?</span>
+
+<span class="fc" id="L463">    this.config = config;</span>
+
+    String lang, arch;
+    String[] openClassTags, closedClassTags;
+
+<span class="pc bpc" id="L468" title="1 of 2 branches missed.">    if (config == null) {</span>
+<span class="fc" id="L469">      lang = &quot;english&quot;;</span>
+<span class="fc" id="L470">      arch = &quot;left3words&quot;;</span>
+<span class="fc" id="L471">      openClassTags = StringUtils.EMPTY_STRING_ARRAY;</span>
+<span class="fc" id="L472">      closedClassTags = StringUtils.EMPTY_STRING_ARRAY;</span>
+<span class="fc" id="L473">      wordFunction = null;</span>
+    } else {
+<span class="nc" id="L475">      this.VERBOSE = config.getVerbose();</span>
+
+<span class="nc" id="L477">      lang = config.getLang();</span>
+<span class="nc" id="L478">      arch = config.getArch();</span>
+<span class="nc" id="L479">      openClassTags = config.getOpenClassTags();</span>
+<span class="nc" id="L480">      closedClassTags = config.getClosedClassTags();</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">      if (!config.getWordFunction().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L482">        wordFunction =</span>
+<span class="nc" id="L483">          ReflectionLoading.loadByReflection(config.getWordFunction());</span>
+      }
+
+<span class="nc bnc" id="L486" title="All 12 branches missed.">      if (((openClassTags.length &gt; 0) &amp;&amp; !lang.equals(&quot;&quot;)) || ((closedClassTags.length &gt; 0) &amp;&amp; !lang.equals(&quot;&quot;)) || ((closedClassTags.length &gt; 0) &amp;&amp; (openClassTags.length &gt; 0))) {</span>
+<span class="nc" id="L487">        throw new RuntimeException(&quot;At least two of lang (\&quot;&quot; + lang + &quot;\&quot;), openClassTags (length &quot; + openClassTags.length + &quot;: &quot; + Arrays.toString(openClassTags) + &quot;),&quot; +</span>
+<span class="nc" id="L488">            &quot;and closedClassTags (length &quot; + closedClassTags.length + &quot;: &quot; + Arrays.toString(closedClassTags) + &quot;) specified---you must choose one!&quot;);</span>
+<span class="nc bnc" id="L489" title="All 8 branches missed.">      } else if ((openClassTags.length == 0) &amp;&amp; lang.equals(&quot;&quot;) &amp;&amp; (closedClassTags.length == 0) &amp;&amp; ! config.getLearnClosedClassTags()) {</span>
+<span class="nc" id="L490">        log.info(&quot;warning: no language set, no open-class tags specified, and no closed-class tags specified; assuming ALL tags are open class tags&quot;);</span>
+      }
+    }
+
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">    if (openClassTags.length &gt; 0) {</span>
+<span class="nc" id="L495">      tags = new TTags();</span>
+<span class="nc" id="L496">      tags.setOpenClassTags(openClassTags);</span>
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">    } else if (closedClassTags.length &gt; 0) {</span>
+<span class="nc" id="L498">      tags = new TTags();</span>
+<span class="nc" id="L499">      tags.setClosedClassTags(closedClassTags);</span>
+    } else {
+<span class="fc" id="L501">      tags = new TTags(lang);</span>
+    }
+
+<span class="pc bpc" id="L504" title="1 of 2 branches missed.">    defaultScore = lang.equals(&quot;english&quot;) ? 1.0 : 0.0;</span>
+
+<span class="pc bpc" id="L506" title="1 of 2 branches missed.">    if (config != null) {</span>
+<span class="nc" id="L507">      rareWordThresh = config.getRareWordThresh();</span>
+<span class="nc" id="L508">      minFeatureThresh = config.getMinFeatureThresh();</span>
+<span class="nc" id="L509">      curWordMinFeatureThresh = config.getCurWordMinFeatureThresh();</span>
+<span class="nc" id="L510">      rareWordMinFeatureThresh = config.getRareWordMinFeatureThresh();</span>
+<span class="nc" id="L511">      veryCommonWordThresh = config.getVeryCommonWordThresh();</span>
+<span class="nc" id="L512">      occurringTagsOnly = config.occurringTagsOnly();</span>
+<span class="nc" id="L513">      possibleTagsOnly = config.possibleTagsOnly();</span>
+      // log.info(&quot;occurringTagsOnly: &quot;+occurringTagsOnly);
+      // log.info(&quot;possibleTagsOnly: &quot;+possibleTagsOnly);
+
+<span class="nc bnc" id="L517" title="All 2 branches missed.">      if(config.getDefaultScore() &gt;= 0)</span>
+<span class="nc" id="L518">        defaultScore = config.getDefaultScore();</span>
+    }
+
+    // just in case, reset the defaultScores array so it will be
+    // recached later when needed.  can't initialize it now in case we
+    // don't know ysize yet
+<span class="fc" id="L524">    defaultScores = null;</span>
+
+<span class="pc bpc" id="L526" title="3 of 4 branches missed.">    if (config == null || config.getMode() == TaggerConfig.Mode.TRAIN) {</span>
+      // initialize the extractors based on the arch variable
+      // you only need to do this when training; otherwise they will be
+      // restored from the serialized file
+<span class="fc" id="L530">      extractors = new Extractors(ExtractorFrames.getExtractorFrames(arch));</span>
+<span class="fc" id="L531">      extractorsRare = new Extractors(ExtractorFramesRare.getExtractorFramesRare(arch, tags));</span>
+
+<span class="fc" id="L533">      setExtractorsGlobal();</span>
+    }
+
+<span class="fc" id="L536">    ambClasses = new AmbiguityClasses(tags);</span>
+
+<span class="fc" id="L538">    initted = true;</span>
+<span class="fc" id="L539">  }</span>
+
+
+  private synchronized void initDefaultScores() {
+<span class="nc bnc" id="L543" title="All 2 branches missed.">    if (defaultScores == null) {</span>
+<span class="nc" id="L544">      defaultScores = new double[ySize + 1];</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">      for (int i = 0; i &lt; ySize + 1; ++i) {</span>
+<span class="nc" id="L546">        defaultScores[i] = Math.log(i * defaultScore);</span>
+      }
+    }
+<span class="nc" id="L549">  }</span>
+
+  /**
+   * Caches a math log operation to save a tiny bit of time
+   */
+  double getInactiveTagDefaultScore(int nDefault) {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">    if (defaultScores == null) {</span>
+<span class="nc" id="L556">      initDefaultScores();</span>
+    }
+<span class="nc" id="L558">    return defaultScores[nDefault];</span>
+  }
+
+  boolean hasApproximateScoring() {
+<span class="nc bnc" id="L562" title="All 2 branches missed.">    return defaultScore &gt; 0.0;</span>
+  }
+
+  /**
+   * Figures out what tokenizer factory might be described by the
+   * config.  If it's described by name in the config, uses reflection
+   * to get the factory (which may cause an exception, of course...)
+   */
+  protected TokenizerFactory&lt;? extends HasWord&gt; chooseTokenizerFactory() {
+<span class="nc" id="L571">    return chooseTokenizerFactory(config.getTokenize(),</span>
+<span class="nc" id="L572">                                  config.getTokenizerFactory(),</span>
+<span class="nc" id="L573">                                  config.getTokenizerOptions(),</span>
+<span class="nc" id="L574">                                  config.getTokenizerInvertible());</span>
+  }
+
+  protected static TokenizerFactory&lt;? extends HasWord&gt;
+    chooseTokenizerFactory(boolean tokenize, String tokenizerFactory,
+                           String tokenizerOptions, boolean invertible) {
+<span class="nc bnc" id="L580" title="All 4 branches missed.">    if (tokenize &amp;&amp; tokenizerFactory.trim().length() != 0) {</span>
+      //return (TokenizerFactory&lt;? extends HasWord&gt;) Class.forName(getTokenizerFactory()).newInstance();
+      try {
+        @SuppressWarnings({&quot;unchecked&quot;})
+<span class="nc" id="L584">        Class&lt;TokenizerFactory&lt;? extends HasWord&gt;&gt; clazz = (Class&lt;TokenizerFactory&lt;? extends HasWord&gt;&gt;) Class.forName(tokenizerFactory.trim());</span>
+<span class="nc" id="L585">        Method factoryMethod = clazz.getMethod(&quot;newTokenizerFactory&quot;);</span>
+        @SuppressWarnings({&quot;unchecked&quot;})
+<span class="nc" id="L587">        TokenizerFactory&lt;? extends HasWord&gt; factory = (TokenizerFactory&lt;? extends HasWord&gt;) factoryMethod.invoke(tokenizerOptions);</span>
+<span class="nc" id="L588">        return factory;</span>
+<span class="nc" id="L589">      } catch (Exception e) {</span>
+<span class="nc" id="L590">        throw new RuntimeException(&quot;Could not load tokenizer factory&quot;, e);</span>
+      }
+<span class="nc bnc" id="L592" title="All 2 branches missed.">    } else if (tokenize) {</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">      if (invertible) {</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        if (tokenizerOptions.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L595">          tokenizerOptions = &quot;invertible=true&quot;;</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        } else if (!tokenizerOptions.matches(&quot;(^|.*,)invertible=true&quot;)) {</span>
+<span class="nc" id="L597">          tokenizerOptions += &quot;,invertible=true&quot;;</span>
+        }
+<span class="nc" id="L599">        return PTBTokenizerFactory.newCoreLabelTokenizerFactory(tokenizerOptions);</span>
+      } else {
+<span class="nc" id="L601">        return PTBTokenizerFactory.newWordTokenizerFactory(tokenizerOptions);</span>
+      }
+    } else {
+<span class="nc" id="L604">      return WhitespaceTokenizer.factory();</span>
+    }
+  }
+
+  /** Serialize the ExtractorFrames and ExtractorFramesRare to os. */
+  private void saveExtractors(OutputStream os) throws IOException {
+<span class="nc" id="L610">    ObjectOutputStream out = new ObjectOutputStream(os);</span>
+<span class="nc" id="L611">    out.writeObject(extractors);</span>
+<span class="nc" id="L612">    out.writeObject(extractorsRare);</span>
+<span class="nc" id="L613">    out.flush();</span>
+<span class="nc" id="L614">  }</span>
+
+  /** Read the extractors from a stream. */
+  private void readExtractors(InputStream file) throws IOException, ClassNotFoundException {
+<span class="nc" id="L618">    ObjectInputStream in = new ObjectInputStream(file);</span>
+<span class="nc" id="L619">    extractors = (Extractors) in.readObject();</span>
+<span class="nc" id="L620">    extractorsRare = (Extractors) in.readObject();</span>
+<span class="nc" id="L621">    extractors.initTypes();</span>
+<span class="nc" id="L622">    extractorsRare.initTypes();</span>
+<span class="nc" id="L623">    int left = extractors.leftContext();</span>
+<span class="nc" id="L624">    int left_u = extractorsRare.leftContext();</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">    if (left_u &gt; left) {</span>
+<span class="nc" id="L626">      left = left_u;</span>
+    }
+<span class="nc" id="L628">    leftContext = left;</span>
+<span class="nc" id="L629">    int right = extractors.rightContext();</span>
+<span class="nc" id="L630">    int right_u = extractorsRare.rightContext();</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">    if (right_u &gt; right) {</span>
+<span class="nc" id="L632">      right = right_u;</span>
+    }
+<span class="nc" id="L634">    rightContext = right;</span>
+
+<span class="nc" id="L636">    setExtractorsGlobal();</span>
+<span class="nc" id="L637">  }</span>
+
+  // Sometimes there is data associated with the tagger (such as a
+  // dictionary) that we don't want saved with each extractor.  This
+  // call lets those extractors get that information from the tagger
+  // after being loaded from a data file.
+  private void setExtractorsGlobal() {
+<span class="fc" id="L644">    extractors.setGlobalHolder(this);</span>
+<span class="fc" id="L645">    extractorsRare.setGlobalHolder(this);</span>
+<span class="fc" id="L646">  }</span>
+
+  /** Removes features that never have a non-zero weight for any tag from
+   *  the fAssociations' appropriate Map.
+   */
+  private void removeDeadRules() {
+<span class="nc bnc" id="L652" title="All 2 branches missed.">    for (Map&lt;String, int[]&gt; fAssociation : fAssociations) {</span>
+<span class="nc" id="L653">      List&lt;String&gt; deadRules = Generics.newArrayList();</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">      for (Map.Entry&lt;String, int[]&gt; entry : fAssociation.entrySet()) {</span>
+<span class="nc" id="L655">        String value = entry.getKey();</span>
+<span class="nc" id="L656">        int[] fAssociations = entry.getValue();</span>
+
+<span class="nc" id="L658">        boolean found = false;</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        for (int index = 0; index &lt; ySize; ++index) {</span>
+<span class="nc" id="L660">          int fNum = fAssociations[index];</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">          if (fNum &gt; -1) {</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">            if (getLambdaSolve().lambda[fNum] != 0.0) {</span>
+<span class="nc" id="L663">              found = true;</span>
+<span class="nc" id="L664">              break;</span>
+            }
+          }
+        }
+<span class="nc bnc" id="L668" title="All 2 branches missed.">        if (!found) {</span>
+<span class="nc" id="L669">          deadRules.add(value);</span>
+        }
+<span class="nc" id="L671">      }</span>
+
+<span class="nc bnc" id="L673" title="All 2 branches missed.">      for (String rule : deadRules) {</span>
+<span class="nc" id="L674">        fAssociation.remove(rule);</span>
+<span class="nc" id="L675">      }</span>
+<span class="nc" id="L676">    }</span>
+<span class="nc" id="L677">  }</span>
+
+  /**
+   * Searching the lambda array for 0 entries, removes them.  This
+   * saves a large chunk of space in the tagger models which are build
+   * with L1 regularization.
+   * &lt;br&gt;
+   * After removing the zeros, go through the feature arrays and
+   * reindex the pointers into the lambda array.  This saves some time
+   * later on at runtime.
+   */
+  private void simplifyLambda() {
+<span class="nc" id="L689">    double[] lambda = getLambdaSolve().lambda;</span>
+<span class="nc" id="L690">    int[] map = new int[lambda.length];</span>
+<span class="nc" id="L691">    int current = 0;</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">    for (int index = 0; index &lt; lambda.length; ++index) {</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">      if (lambda[index] == 0.0) {</span>
+<span class="nc" id="L694">        map[index] = -1;</span>
+      } else {
+<span class="nc" id="L696">        map[index] = current;</span>
+<span class="nc" id="L697">        current++;</span>
+      }
+    }
+
+<span class="nc" id="L701">    double[] condensedLambda = new double[current];</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">    for (int i = 0; i &lt; lambda.length; ++i) {</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">      if (map[i] != -1) {</span>
+<span class="nc" id="L704">        condensedLambda[map[i]] = lambda[i];</span>
+      }
+    }
+
+<span class="nc bnc" id="L708" title="All 2 branches missed.">    for (Map&lt;String, int[]&gt; featureMap : fAssociations) {</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">      for (Map.Entry&lt;String, int[]&gt; entry : featureMap.entrySet()) {</span>
+<span class="nc" id="L710">        int[] fAssociations = entry.getValue();</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">        for (int index = 0; index &lt; ySize; ++index) {</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">          if (fAssociations[index] &gt;= 0) {</span>
+<span class="nc" id="L713">            fAssociations[index] = map[fAssociations[index]];</span>
+          }
+        }
+<span class="nc" id="L716">      }</span>
+<span class="nc" id="L717">    }</span>
+
+<span class="nc" id="L719">    prob = new LambdaSolveTagger(condensedLambda);</span>
+<span class="nc" id="L720">  }</span>
+
+  protected void saveModel(String filename) {
+    try {
+<span class="nc" id="L724">      DataOutputStream file = IOUtils.getDataOutputStream(filename);</span>
+<span class="nc" id="L725">      saveModel(file);</span>
+<span class="nc" id="L726">      file.close();</span>
+<span class="nc" id="L727">    } catch (IOException ioe) {</span>
+<span class="nc" id="L728">      log.info(&quot;Error saving tagger to file &quot; + filename);</span>
+<span class="nc" id="L729">      throw new RuntimeIOException(ioe);</span>
+<span class="nc" id="L730">    }</span>
+<span class="nc" id="L731">  }</span>
+
+  protected void saveModel(DataOutputStream file) throws IOException {
+<span class="nc" id="L734">      config.saveConfig(file);</span>
+<span class="nc" id="L735">      file.writeInt(xSize);</span>
+<span class="nc" id="L736">      file.writeInt(ySize);</span>
+<span class="nc" id="L737">      dict.save(file);</span>
+<span class="nc" id="L738">      tags.save(file, tagTokens);</span>
+
+<span class="nc" id="L740">      saveExtractors(file);</span>
+
+<span class="nc" id="L742">      int sizeAssoc = 0;</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">      for (Map&lt;String, int[]&gt; fValueAssociations : fAssociations) {</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        for (int[] fTagAssociations : fValueAssociations.values()) {</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">          for (int association : fTagAssociations) {</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">            if (association &gt;= 0) {</span>
+<span class="nc" id="L747">              ++sizeAssoc;</span>
+            }
+          }
+<span class="nc" id="L750">        }</span>
+<span class="nc" id="L751">      }</span>
+<span class="nc" id="L752">      file.writeInt(sizeAssoc);</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">      for (int i = 0; i &lt; fAssociations.size(); ++i) {</span>
+<span class="nc" id="L754">        Map&lt;String, int[]&gt; fValueAssociations = fAssociations.get(i);</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        for (Map.Entry&lt;String, int[]&gt; item : fValueAssociations.entrySet()) {</span>
+<span class="nc" id="L756">          String featureValue = item.getKey();</span>
+<span class="nc" id="L757">          int[] fTagAssociations = item.getValue();</span>
+<span class="nc bnc" id="L758" title="All 2 branches missed.">          for (int j = 0; j &lt; fTagAssociations.length; ++j) {</span>
+<span class="nc" id="L759">            int association = fTagAssociations[j];</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">            if (association &gt;= 0) {</span>
+<span class="nc" id="L761">              file.writeInt(association);</span>
+<span class="nc" id="L762">              FeatureKey fk = new FeatureKey(i, featureValue, tags.getTag(j));</span>
+<span class="nc" id="L763">              fk.save(file);</span>
+            }
+          }
+<span class="nc" id="L766">        }</span>
+      }
+
+<span class="nc" id="L769">      LambdaSolve.save_lambdas(file, prob.lambda);</span>
+<span class="nc" id="L770">  }</span>
+
+  /** This reads the complete tagger from a single model stored in a file, at a URL,
+   *  or as a resource in a jar file, and initializes the tagger using a
+   *  combination of the properties passed in and parameters from the file.
+   *  &lt;p&gt;
+   *  &lt;i&gt;Note for the future:&lt;/i&gt; This assumes that the TaggerConfig in the file
+   *  has already been read and used.  This work is done inside the
+   *  constructor of TaggerConfig.  It might be better to refactor
+   *  things so that is all done inside this method, but for the moment
+   *  it seemed better to leave working code alone [cdm 2008].
+   *
+   *  @param config The tagger config
+   *  @param modelFileOrUrl The name of the model file. This routine opens and closes it.
+   *  @param printLoading Whether to print a message saying what model file is being loaded and how long it took when finished.
+   *  @throws RuntimeIOException if I/O errors or serialization errors
+   */
+  protected void readModelAndInit(Properties config, String modelFileOrUrl, boolean printLoading) {
+    try {
+<span class="nc" id="L789">      readModelAndInit(config, IOUtils.getInputStreamFromURLOrClasspathOrFileSystem(modelFileOrUrl), printLoading);</span>
+<span class="nc" id="L790">    } catch (IOException e) {</span>
+<span class="nc" id="L791">      throw new RuntimeIOException(&quot;Error while loading a tagger model (probably missing model file)&quot;, e);</span>
+<span class="nc" id="L792">    }</span>
+<span class="nc" id="L793">  }</span>
+
+  /** This reads the complete tagger from a single model provided as an InputStream,
+   *  and initializes the tagger using a
+   *  combination of the properties passed in and parameters from the file.
+   *  &lt;p&gt;
+   *  &lt;i&gt;Note for the future:&lt;/i&gt; This assumes that the TaggerConfig in the file
+   *  has already been read and used.  This work is done inside the
+   *  constructor of TaggerConfig.  It might be better to refactor
+   *  things so that is all done inside this method, but for the moment
+   *  it seemed better to leave working code alone [cdm 2008].
+   *
+   *  @param config The tagger config
+   *  @param modelStream The model provided as an InputStream
+   *  @param printLoading Whether to print a message saying what model file is being loaded and how long it took when finished.
+   *  @throws RuntimeIOException if I/O errors or serialization errors
+   */
+  protected void readModelAndInit(Properties config, InputStream modelStream, boolean printLoading) {
+    try {
+      // first check can open file ... or else leave with exception
+<span class="nc" id="L813">      DataInputStream rf = new DataInputStream(modelStream);</span>
+
+<span class="nc" id="L815">      readModelAndInit(config, rf, printLoading);</span>
+<span class="nc" id="L816">      rf.close();</span>
+<span class="nc" id="L817">    } catch (IOException e) {</span>
+<span class="nc" id="L818">      throw new RuntimeIOException(&quot;Error while loading a tagger model (probably missing model file)&quot;, e);</span>
+<span class="nc" id="L819">    }</span>
+<span class="nc" id="L820">  }</span>
+
+
+  /** This reads the complete tagger from a single model file, and inits
+   *  the tagger using a combination of the properties passed in and
+   *  parameters from the file.
+   *  &lt;p&gt;
+   *  &lt;i&gt;Note for the future: This assumes that the TaggerConfig in the file
+   *  has already been read and used.  It might be better to refactor
+   *  things so that is all done inside this method, but for the moment
+   *  it seemed better to leave working code alone [cdm 2008].&lt;/i&gt;
+   *
+   *  @param config The tagger config
+   *  @param rf DataInputStream to read from.  It's the caller's job to open and close this stream.
+   *  @param printLoading Whether to print a message saying what model file is being loaded and how long it took when finished.
+   *  @throws RuntimeIOException if I/O errors or serialization errors
+   */
+  protected void readModelAndInit(Properties config, DataInputStream rf, boolean printLoading) {
+    try {
+<span class="nc" id="L839">      Timing t = new Timing();</span>
+<span class="nc" id="L840">      String source = null;</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">      if (printLoading) {</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">        if (config != null) {</span>
+          // TODO: &quot;model&quot;
+<span class="nc" id="L844">          source = config.getProperty(&quot;model&quot;);</span>
+        }
+<span class="nc bnc" id="L846" title="All 2 branches missed.">        if (source == null) {</span>
+<span class="nc" id="L847">          source = &quot;data stream&quot;;</span>
+        }
+      }
+<span class="nc" id="L850">      TaggerConfig taggerConfig = TaggerConfig.readConfig(rf);</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">      if (config != null) {</span>
+<span class="nc" id="L852">        taggerConfig.setProperties(config);</span>
+      }
+      // then init tagger
+<span class="nc" id="L855">      init(taggerConfig);</span>
+
+<span class="nc" id="L857">      xSize = rf.readInt();</span>
+<span class="nc" id="L858">      ySize = rf.readInt();</span>
+      // dict = new Dictionary();  // this method is called in constructor, and it's initialized as empty already
+<span class="nc" id="L860">      dict.read(rf);</span>
+
+<span class="nc bnc" id="L862" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L863">        log.info(&quot;Tagger dictionary read.&quot;);</span>
+      }
+<span class="nc" id="L865">      tags.read(rf);</span>
+<span class="nc" id="L866">      readExtractors(rf);</span>
+<span class="nc" id="L867">      dict.setAmbClasses(ambClasses, veryCommonWordThresh, tags);</span>
+
+<span class="nc" id="L869">      int[] numFA = new int[extractors.size() + extractorsRare.size()];</span>
+<span class="nc" id="L870">      int sizeAssoc = rf.readInt();</span>
+<span class="nc" id="L871">      fAssociations = Generics.newArrayList();</span>
+<span class="nc bnc" id="L872" title="All 2 branches missed.">      for (int i = 0; i &lt; extractors.size() + extractorsRare.size(); ++i) {</span>
+<span class="nc" id="L873">        fAssociations.add(Generics.&lt;String, int[]&gt;newHashMap());</span>
+      }
+<span class="nc bnc" id="L875" title="All 2 branches missed.">      if (VERBOSE) log.info(&quot;Reading %d feature keys...%n&quot;,sizeAssoc);</span>
+<span class="nc" id="L876">      PrintFile pfVP = null;</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L878">        pfVP = new PrintFile(&quot;pairs.txt&quot;);</span>
+      }
+<span class="nc bnc" id="L880" title="All 2 branches missed.">      for (int i = 0; i &lt; sizeAssoc; i++) {</span>
+<span class="nc" id="L881">        int numF = rf.readInt();</span>
+<span class="nc" id="L882">        FeatureKey fK = new FeatureKey();</span>
+<span class="nc" id="L883">        fK.read(rf);</span>
+<span class="nc" id="L884">        numFA[fK.num]++;</span>
+
+        // TODO: rewrite the writing / reading code to store
+        // fAssociations in a cleaner manner?  Only do this when
+        // rebuilding all the tagger models anyway.  When we do that, we
+        // can get rid of FeatureKey
+<span class="nc" id="L890">        Map&lt;String, int[]&gt; fValueAssociations = fAssociations.get(fK.num);</span>
+<span class="nc" id="L891">        int[] fTagAssociations = fValueAssociations.get(fK.val);</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">        if (fTagAssociations == null) {</span>
+<span class="nc" id="L893">          fTagAssociations = new int[ySize];</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">          for (int j = 0; j &lt; ySize; ++j) {</span>
+<span class="nc" id="L895">            fTagAssociations[j] = -1;</span>
+          }
+<span class="nc" id="L897">          fValueAssociations.put(fK.val, fTagAssociations);</span>
+        }
+<span class="nc" id="L899">        fTagAssociations[tags.getIndex(fK.tag)] = numF;</span>
+      }
+<span class="nc bnc" id="L901" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L902">        IOUtils.closeIgnoringExceptions(pfVP);</span>
+      }
+<span class="nc bnc" id="L904" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        for (int k = 0; k &lt; numFA.length; k++) {</span>
+<span class="nc" id="L906">          log.info(&quot;Number of features of kind &quot; + k + ' ' + numFA[k]);</span>
+        }
+      }
+<span class="nc" id="L909">      prob = new LambdaSolveTagger(rf);</span>
+<span class="nc bnc" id="L910" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L911">        log.info(&quot;prob read &quot;);</span>
+      }
+<span class="nc bnc" id="L913" title="All 2 branches missed.">      if (printLoading) {</span>
+<span class="nc" id="L914">        t.done(log, &quot;Loading POS tagger from &quot; + source);</span>
+      }
+<span class="nc" id="L916">    } catch (IOException | ClassNotFoundException e) {</span>
+<span class="nc" id="L917">      throw new RuntimeIOException(&quot;Error while loading a tagger model (probably missing model file)&quot;, e);</span>
+<span class="nc" id="L918">    }</span>
+<span class="nc" id="L919">  }</span>
+
+
+  protected void dumpModel(PrintStream out) {
+<span class="nc" id="L923">    out.println(&quot;Features: template featureValue tag: lambda&quot;);</span>
+<span class="nc" id="L924">    NumberFormat nf = new DecimalFormat(&quot; 0.000000;-0.000000&quot;);</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">    for (int i = 0; i &lt; fAssociations.size(); ++i) {</span>
+<span class="nc" id="L926">      Map&lt;String, int[]&gt; fValueAssociations = fAssociations.get(i);</span>
+<span class="nc" id="L927">      List&lt;String&gt; features = Generics.newArrayList();</span>
+<span class="nc" id="L928">      Collections.sort(features);</span>
+<span class="nc bnc" id="L929" title="All 2 branches missed.">      for (String featureValue : features) {</span>
+<span class="nc" id="L930">        int[] fTagAssociations = fValueAssociations.get(featureValue);</span>
+<span class="nc bnc" id="L931" title="All 2 branches missed.">        for (int j = 0; j &lt; fTagAssociations.length; ++j) {</span>
+<span class="nc" id="L932">          int association = fTagAssociations[j];</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">          if (association &gt;= 0) {</span>
+<span class="nc" id="L934">            FeatureKey fk = new FeatureKey(i, featureValue, tags.getTag(j));</span>
+<span class="nc bnc" id="L935" title="All 2 branches missed.">            out.println((fk.num &lt; extractors.size() ? extractors.get(fk.num) : extractorsRare.get(fk.num - extractors.size()))</span>
+<span class="nc" id="L936">                    + &quot; &quot; + fk.val + &quot; &quot; + fk.tag + &quot;: &quot; + nf.format(getLambdaSolve().lambda[association]));</span>
+          }
+        }
+<span class="nc" id="L939">      }</span>
+    }
+<span class="nc" id="L941">  }</span>
+
+
+  /* Package access so it doesn't appear in public API. */
+  boolean isRare(String word) {
+<span class="nc bnc" id="L946" title="All 2 branches missed.">    return dict.sum(word) &lt; rareWordThresh;</span>
+  }
+
+  /**
+   * Tags the tokenized input string and returns the tagged version.
+   * This method requires the input to already be tokenized.
+   * The tagger wants input that is whitespace separated tokens, tokenized
+   * according to the conventions of the training data. (For instance,
+   * for the Penn Treebank, punctuation marks and possessive &quot;'s&quot; should
+   * be separated from words.)
+   *
+   * @param toTag The untagged input String
+   * @return The same string with tags inserted in the form word/tag
+   */
+  public String tagTokenizedString(String toTag) {
+<span class="nc" id="L961">    List&lt;Word&gt; sent = SentenceUtils.toUntaggedList(Arrays.asList(toTag.split(&quot;\\s+&quot;)));</span>
+<span class="nc" id="L962">    TestSentence testSentence = new TestSentence(this);</span>
+<span class="nc" id="L963">    testSentence.tagSentence(sent, false);</span>
+<span class="nc" id="L964">    return testSentence.getTaggedNice();</span>
+  }
+
+
+  /**
+   * Tags the input string and returns the tagged version.
+   * This method tokenizes the input into words in perhaps multiple sentences
+   * and then tags those sentences.  The default (PTB English)
+   * tokenizer is used.
+   *
+   * @param toTag The untagged input String
+   * @return A String of sentences with tags inserted in the form word/tag
+   */
+  public String tagString(String toTag) {
+<span class="nc" id="L978">    TaggerWrapper tw = new TaggerWrapper(this);</span>
+<span class="nc" id="L979">    return tw.apply(toTag);</span>
+  }
+
+  /**
+   * Expects a sentence and returns a tagged sentence.
+   *
+   * @param in This needs to be a sentence (List of words)
+   * @return A sentence of TaggedWord
+   */
+  @Override
+  public List&lt;TaggedWord&gt; apply(List&lt;? extends HasWord&gt; in) {
+<span class="nc" id="L990">    TestSentence testSentence = new TestSentence(this);</span>
+<span class="nc" id="L991">    return testSentence.tagSentence(in, false);</span>
+  }
+
+
+  /**
+   * Tags the Words in each Sentence in the given List with their
+   * grammatical part-of-speech. The returned List contains Sentences
+   * consisting of TaggedWords.
+   * &lt;p&gt;&lt;b&gt;NOTE: &lt;/b&gt;The input document must contain sentences as its elements,
+   * not words. To turn a Document of words into a Document of sentences, run
+   * it through {@link edu.stanford.nlp.process.WordToSentenceProcessor}.
+   *
+   * @param sentences A List of Sentence
+   * @return A List of Sentence of TaggedWord
+   */
+  @Override
+  public List&lt;List&lt;TaggedWord&gt;&gt; process(List&lt;? extends List&lt;? extends HasWord&gt;&gt; sentences) {
+<span class="nc" id="L1008">    List&lt;List&lt;TaggedWord&gt;&gt; taggedSentences = Generics.newArrayList();</span>
+
+<span class="nc" id="L1010">    TestSentence testSentence = new TestSentence(this);</span>
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">    for (List&lt;? extends HasWord&gt; sentence : sentences) {</span>
+<span class="nc" id="L1012">      taggedSentences.add(testSentence.tagSentence(sentence, false));</span>
+<span class="nc" id="L1013">    }</span>
+<span class="nc" id="L1014">    return taggedSentences;</span>
+  }
+
+
+  /**
+   * Returns a new Sentence that is a copy of the given sentence with all the
+   * words tagged with their part-of-speech. Convenience method when you only
+   * want to tag a single List instead of a Document of sentences.
+   * @param sentence sentence to tag
+   * @return tagged sentence
+   */
+  public List&lt;TaggedWord&gt; tagSentence(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L1026">    TestSentence testSentence = new TestSentence(this);</span>
+<span class="nc" id="L1027">    return testSentence.tagSentence(sentence, false);</span>
+  }
+
+  /**
+   * Returns a new Sentence that is a copy of the given sentence with all the
+   * words tagged with their part-of-speech. Convenience method when you only
+   * want to tag a single List instead of a List of Lists.  If you
+   * supply tagSentence with a List of HasTag, and set reuseTags to
+   * true, the tagger will reuse the supplied tags.
+   *
+   * @param sentence sentence to tag
+   * @param reuseTags whether or not to reuse the given tag
+   * @return tagged sentence
+   */
+  public List&lt;TaggedWord&gt; tagSentence(List&lt;? extends HasWord&gt; sentence,
+                                           boolean reuseTags) {
+<span class="nc" id="L1043">    TestSentence testSentence = new TestSentence(this);</span>
+<span class="nc" id="L1044">    return testSentence.tagSentence(sentence, reuseTags);</span>
+  }
+
+  /**
+   * Takes a sentence composed of CoreLabels and add the tags to the
+   * CoreLabels, modifying the input sentence.
+   */
+  public void tagCoreLabels(List&lt;CoreLabel&gt; sentence) {
+<span class="nc" id="L1052">    tagCoreLabels(sentence, false);</span>
+<span class="nc" id="L1053">  }</span>
+
+  /**
+   * Takes a sentence composed of CoreLabels and add the tags to the
+   * CoreLabels, modifying the input sentence.  If reuseTags is set to
+   * true, any tags supplied with the CoreLabels are taken as correct.
+   */
+  public void tagCoreLabels(List&lt;CoreLabel&gt; sentence,
+                            boolean reuseTags) {
+<span class="nc" id="L1062">    List&lt;TaggedWord&gt; taggedWords = tagSentence(sentence, reuseTags);</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">    if (taggedWords.size() != sentence.size())</span>
+<span class="nc" id="L1064">      throw new AssertionError(&quot;Tagged word list not the same length &quot; +</span>
+                               &quot;as the original sentence&quot;);
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">    for (int i = 0, size = sentence.size(); i &lt; size; ++i) {</span>
+<span class="nc" id="L1067">      sentence.get(i).setTag(taggedWords.get(i).tag());</span>
+    }
+<span class="nc" id="L1069">  }</span>
+
+  /**
+   * Adds lemmas to the given list of CoreLabels, using the given
+   * Morphology object.  The input list must already have tags set.
+   */
+  public static void lemmatize(List&lt;CoreLabel&gt; sentence,
+                               Morphology morpha) {
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">    for (CoreLabel label : sentence) {</span>
+<span class="nc" id="L1078">      morpha.stem(label);</span>
+<span class="nc" id="L1079">    }</span>
+<span class="nc" id="L1080">  }</span>
+
+  /**
+   * Casts a list of HasWords, which we secretly know to be
+   * CoreLabels, to a list of CoreLabels.  Barfs if you didn't
+   * actually give it CoreLabels.
+   */
+  private static List&lt;CoreLabel&gt; castCoreLabels(List&lt;? extends HasWord&gt; sent) {
+<span class="nc" id="L1088">    List&lt;CoreLabel&gt; coreLabels = Generics.newArrayList();</span>
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">    for (HasWord word : sent) {</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">      if (!(word instanceof CoreLabel)) {</span>
+<span class="nc" id="L1091">        throw new ClassCastException(&quot;Expected CoreLabels&quot;);</span>
+      }
+<span class="nc" id="L1093">      coreLabels.add((CoreLabel) word);</span>
+<span class="nc" id="L1094">    }</span>
+<span class="nc" id="L1095">    return coreLabels;</span>
+  }
+
+  /**
+   * Reads data from r, tokenizes it with the default (Penn Treebank)
+   * tokenizer, and returns a List of Sentence objects, which can
+   * then be fed into tagSentence.
+   *
+   * @param r Reader where untokenized text is read
+   * @return List of tokenized sentences
+   */
+  public static List&lt;List&lt;HasWord&gt;&gt; tokenizeText(Reader r) {
+<span class="nc" id="L1107">    return tokenizeText(r, null);</span>
+  }
+
+
+  /**
+   * Reads data from r, tokenizes it with the given tokenizer, and
+   * returns a List of Lists of (extends) HasWord objects, which can then be
+   * fed into tagSentence.
+   *
+   * @param r Reader where untokenized text is read
+   * @param tokenizerFactory Tokenizer.  This can be &lt;code&gt;null&lt;/code&gt; in which case
+   *     the default English tokenizer (PTBTokenizerFactory) is used.
+   * @return List of tokenized sentences
+   */
+  public static List&lt;List&lt;HasWord&gt;&gt; tokenizeText(Reader r,
+                 TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory) {
+<span class="nc" id="L1123">    DocumentPreprocessor documentPreprocessor = new DocumentPreprocessor(r);</span>
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">    if (tokenizerFactory != null) {</span>
+<span class="nc" id="L1125">      documentPreprocessor.setTokenizerFactory(tokenizerFactory);</span>
+    }
+<span class="nc" id="L1127">    List&lt;List&lt;HasWord&gt;&gt; out = Generics.newArrayList();</span>
+<span class="nc bnc" id="L1128" title="All 2 branches missed.">    for (List&lt;HasWord&gt; item : documentPreprocessor) {</span>
+<span class="nc" id="L1129">      out.add(item);</span>
+<span class="nc" id="L1130">    }</span>
+<span class="nc" id="L1131">    return out;</span>
+  }
+
+
+  private static void dumpModel(TaggerConfig config) {
+    try {
+<span class="nc" id="L1137">      MaxentTagger tagger = new MaxentTagger(config.getModel(), config, false);</span>
+<span class="nc" id="L1138">      System.out.println(&quot;Serialized tagger built with config:&quot;);</span>
+<span class="nc" id="L1139">      tagger.config.dump(System.out);</span>
+<span class="nc" id="L1140">      tagger.dumpModel(System.out);</span>
+<span class="nc" id="L1141">    } catch (Exception e) {</span>
+<span class="nc" id="L1142">      e.printStackTrace();</span>
+<span class="nc" id="L1143">    }</span>
+<span class="nc" id="L1144">  }</span>
+
+
+  /**
+   * Tests a tagger on data with gold tags available.  This is TEST mode.
+   *
+   * @param config Properties giving parameters for the testing run
+   */
+  private static void runTest(TaggerConfig config) {
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">    if (config.getVerbose()) {</span>
+<span class="nc" id="L1154">      log.info(&quot;## tagger testing invoked at &quot; + new Date() + &quot; with arguments:&quot;);</span>
+<span class="nc" id="L1155">      config.dump();</span>
+    }
+
+    try {
+<span class="nc" id="L1159">      MaxentTagger tagger = new MaxentTagger(config.getModel(), config);</span>
+
+<span class="nc" id="L1161">      Timing t = new Timing();</span>
+<span class="nc" id="L1162">      TestClassifier testClassifier = new TestClassifier(tagger);</span>
+<span class="nc" id="L1163">      long millis = t.stop();</span>
+<span class="nc" id="L1164">      printErrWordsPerSec(millis, testClassifier.getNumWords());</span>
+<span class="nc" id="L1165">      testClassifier.printModelAndAccuracy(tagger);</span>
+<span class="nc" id="L1166">    } catch (Exception e) {</span>
+<span class="nc" id="L1167">      log.info(&quot;An error occurred while testing the tagger.&quot;);</span>
+<span class="nc" id="L1168">      e.printStackTrace();</span>
+<span class="nc" id="L1169">    }</span>
+<span class="nc" id="L1170">  }</span>
+
+
+  /**
+   * Reads in the training corpus from a filename and trains the tagger
+   *
+   * @param config Configuration parameters for training a model (filename, etc.
+   * @throws IOException If IO problem
+   */
+  private static void trainAndSaveModel(TaggerConfig config) throws IOException {
+
+<span class="nc" id="L1181">    String modelName = config.getModel();</span>
+<span class="nc" id="L1182">    MaxentTagger maxentTagger = new MaxentTagger();</span>
+<span class="nc" id="L1183">    maxentTagger.init(config);</span>
+
+    // Allow clobbering.  You want it all the time when running experiments.
+
+<span class="nc" id="L1187">    TaggerExperiments samples = new TaggerExperiments(config, maxentTagger);</span>
+<span class="nc" id="L1188">    TaggerFeatures feats = samples.getTaggerFeatures();</span>
+<span class="nc" id="L1189">    byte[][] fnumArr = samples.getFnumArr();</span>
+<span class="nc" id="L1190">    log.info(&quot;Samples from &quot; + config.getFile());</span>
+<span class="nc" id="L1191">    log.info(&quot;Number of features: &quot; + feats.size());</span>
+<span class="nc" id="L1192">    log.info(&quot;Tag set: &quot; + maxentTagger.tags.tagSet());</span>
+<span class="nc" id="L1193">    Problem p = new Problem(samples, feats);</span>
+<span class="nc" id="L1194">    LambdaSolveTagger prob = new LambdaSolveTagger(p, 0.0001, fnumArr);</span>
+<span class="nc" id="L1195">    maxentTagger.prob = prob;</span>
+
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">    if (config.getSearch().equals(&quot;owlqn&quot;)) {</span>
+<span class="nc" id="L1198">      CGRunner runner = new CGRunner(prob, config.getModel(), config.getSigmaSquared());</span>
+<span class="nc" id="L1199">      runner.solveL1(config.getRegL1());</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">    } else if (config.getSearch().equals(&quot;owlqn2&quot;)) {</span>
+<span class="nc" id="L1201">      CGRunner runner = new CGRunner(prob, config.getModel(), config.getSigmaSquared());</span>
+<span class="nc" id="L1202">      runner.solveOWLQN2(config.getRegL1());</span>
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">    } else if (config.getSearch().equals(&quot;cg&quot;)) {</span>
+<span class="nc" id="L1204">      CGRunner runner = new CGRunner(prob, config.getModel(), config.getSigmaSquared());</span>
+<span class="nc" id="L1205">      runner.solveCG();</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">    } else if (config.getSearch().equals(&quot;qn&quot;)) {</span>
+<span class="nc" id="L1207">      CGRunner runner = new CGRunner(prob, config.getModel(), config.getSigmaSquared());</span>
+<span class="nc" id="L1208">      runner.solveQN();</span>
+<span class="nc" id="L1209">    } else {</span>
+<span class="nc" id="L1210">      prob.improvedIterative(config.getIterations());</span>
+    }
+
+<span class="nc bnc" id="L1213" title="All 2 branches missed.">    if (prob.checkCorrectness()) {</span>
+<span class="nc" id="L1214">      log.info(&quot;Model is correct [empirical expec = model expec]&quot;);</span>
+    } else {
+<span class="nc" id="L1216">      log.info(&quot;Model is not correct&quot;);</span>
+    }
+
+    // Some of the rules may have been optimized so they don't have
+    // any effect on the final scores.  Eliminating those rules
+    // entirely saves space and runtime
+<span class="nc" id="L1222">    maxentTagger.removeDeadRules();</span>
+
+    // If any of the features have been optimized to 0, we can remove
+    // them from the LambdaSolve.  This will save quite a bit of space
+    // depending on the optimization used
+<span class="nc" id="L1227">    maxentTagger.simplifyLambda();</span>
+
+<span class="nc" id="L1229">    maxentTagger.saveModel(modelName);</span>
+<span class="nc" id="L1230">    log.info(&quot;Extractors list:&quot;);</span>
+<span class="nc" id="L1231">    log.info(maxentTagger.extractors.toString() + &quot;\nrare&quot; + maxentTagger.extractorsRare.toString());</span>
+<span class="nc" id="L1232">  }</span>
+
+
+  /**
+   * Trains a tagger model.
+   *
+   * @param config Properties giving parameters for the training run
+   */
+  private static void runTraining(TaggerConfig config)
+    throws IOException
+  {
+<span class="nc" id="L1243">    Date now = new Date();</span>
+
+<span class="nc" id="L1245">    log.info(&quot;## tagger training invoked at &quot; + now + &quot; with arguments:&quot;);</span>
+<span class="nc" id="L1246">    config.dump();</span>
+<span class="nc" id="L1247">    Timing tim = new Timing();</span>
+
+<span class="nc" id="L1249">    PrintFile log = new PrintFile(config.getModel() + &quot;.props&quot;);</span>
+<span class="nc" id="L1250">    log.println(&quot;## tagger training invoked at &quot; + now + &quot; with arguments:&quot;);</span>
+<span class="nc" id="L1251">    config.dump(log);</span>
+<span class="nc" id="L1252">    log.close();</span>
+
+<span class="nc" id="L1254">    trainAndSaveModel(config);</span>
+<span class="nc" id="L1255">    tim.done(&quot;Training POS tagger&quot;);</span>
+<span class="nc" id="L1256">  }</span>
+
+
+  private static void printErrWordsPerSec(long milliSec, int numWords) {
+<span class="nc" id="L1260">    double wordsPerSec = numWords / (((double) milliSec) / 1000);</span>
+<span class="nc" id="L1261">    NumberFormat nf = new DecimalFormat(&quot;0.00&quot;);</span>
+<span class="nc" id="L1262">    log.info(&quot;Tagged &quot; + numWords + &quot; words at &quot; +</span>
+<span class="nc" id="L1263">        nf.format(wordsPerSec) + &quot; words per second.&quot;);</span>
+<span class="nc" id="L1264">  }</span>
+
+
+  // not so much a wrapper as a class with some various functionality
+  // extending the MaxentTagger...
+  // TODO: can we get rid of this? [cdm: sure. I'm not quite sure why Anna added it.  It seems like it could just be inside MaxentTagger]
+  static class TaggerWrapper implements Function&lt;String, String&gt; {
+
+    private final TaggerConfig config;
+    private final MaxentTagger tagger;
+    private TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory;
+    private int sentNum; // = 0;
+
+    private final boolean tokenize;
+    private final boolean outputVerbosity, outputLemmas;
+    private final OutputStyle outputStyle;
+    // private final String tagSeparator;
+    private final Morphology morpha;
+
+<span class="nc" id="L1283">    protected TaggerWrapper(MaxentTagger tagger) {</span>
+<span class="nc" id="L1284">      this.tagger = tagger;</span>
+<span class="nc" id="L1285">      this.config = tagger.config;</span>
+
+      try {
+<span class="nc" id="L1288">        tokenizerFactory =</span>
+<span class="nc" id="L1289">          chooseTokenizerFactory(config.getTokenize(),</span>
+<span class="nc" id="L1290">                                 config.getTokenizerFactory(),</span>
+<span class="nc" id="L1291">                                 config.getTokenizerOptions(),</span>
+<span class="nc" id="L1292">                                 config.getTokenizerInvertible());</span>
+<span class="nc" id="L1293">      } catch (Exception e) {</span>
+<span class="nc" id="L1294">        log.info(&quot;Error in tokenizer factory instantiation for class: &quot; + config.getTokenizerFactory());</span>
+<span class="nc" id="L1295">        e.printStackTrace();</span>
+<span class="nc" id="L1296">        tokenizerFactory = PTBTokenizerFactory.newWordTokenizerFactory(config.getTokenizerOptions());</span>
+<span class="nc" id="L1297">      }</span>
+
+<span class="nc" id="L1299">      outputStyle = OutputStyle.fromShortName(config.getOutputFormat());</span>
+<span class="nc" id="L1300">      outputVerbosity = config.getOutputVerbosity();</span>
+<span class="nc" id="L1301">      outputLemmas = config.getOutputLemmas();</span>
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">      morpha = (outputLemmas) ? new Morphology() : null;</span>
+<span class="nc" id="L1303">      tokenize = config.getTokenize();</span>
+      // tagSeparator = config.getTagSeparator();
+<span class="nc" id="L1305">    }</span>
+
+    @Override
+    public String apply(String o) {
+<span class="nc" id="L1309">      StringWriter taggedResults = new StringWriter();</span>
+
+      List&lt;List&lt;HasWord&gt;&gt; sentences;
+<span class="nc bnc" id="L1312" title="All 2 branches missed.">      if (tokenize) {</span>
+<span class="nc" id="L1313">        sentences = tokenizeText(new StringReader(o), tokenizerFactory);</span>
+      } else {
+<span class="nc" id="L1315">        sentences = Generics.newArrayList();</span>
+<span class="nc" id="L1316">        sentences.add(SentenceUtils.toWordList(o.split(&quot;\\s+&quot;)));</span>
+      }
+
+      // TODO: there is another almost identical block of code elsewhere.  Refactor
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">      if (config.getNThreads() != 1) {</span>
+<span class="nc" id="L1321">        MulticoreWrapper&lt;List&lt;? extends HasWord&gt;, List&lt;? extends HasWord&gt;&gt; wrapper = new MulticoreWrapper&lt;&gt;(config.getNThreads(), new SentenceTaggingProcessor(tagger, outputLemmas));</span>
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">        for (List&lt;? extends HasWord&gt; sentence : sentences) {</span>
+<span class="nc" id="L1323">          wrapper.put(sentence);</span>
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">          while (wrapper.peek()) {</span>
+<span class="nc" id="L1325">            List&lt;? extends HasWord&gt; taggedSentence = wrapper.poll();</span>
+<span class="nc" id="L1326">            tagger.outputTaggedSentence(taggedSentence, outputLemmas, outputStyle, outputVerbosity, sentNum++, &quot; &quot;, taggedResults);</span>
+<span class="nc" id="L1327">          }</span>
+<span class="nc" id="L1328">        }</span>
+<span class="nc" id="L1329">        wrapper.join();</span>
+<span class="nc bnc" id="L1330" title="All 2 branches missed.">        while (wrapper.peek()) {</span>
+<span class="nc" id="L1331">          List&lt;? extends HasWord&gt; taggedSentence = wrapper.poll();</span>
+<span class="nc" id="L1332">          tagger.outputTaggedSentence(taggedSentence, outputLemmas, outputStyle, outputVerbosity, sentNum++, &quot; &quot;, taggedResults);</span>
+<span class="nc" id="L1333">        }</span>
+<span class="nc" id="L1334">      } else {</span>
+        // there is only one thread
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">        for (List&lt;? extends HasWord&gt; sent : sentences) {</span>
+          // Morphology morpha = (outputLemmas) ? new Morphology() : null;
+<span class="nc" id="L1338">          sent = tagger.tagCoreLabelsOrHasWords(sent, morpha, outputLemmas);</span>
+<span class="nc" id="L1339">          tagger.outputTaggedSentence(sent, outputLemmas, outputStyle, outputVerbosity, sentNum++, &quot; &quot;, taggedResults);</span>
+<span class="nc" id="L1340">        }</span>
+      }
+<span class="nc" id="L1342">      return taggedResults.toString();</span>
+    }
+
+  } // end class TaggerWrapper
+
+  private static String getXMLWords(List&lt;? extends HasWord&gt; sentence,
+                                    int sentNum, boolean outputLemmas) {
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">    boolean hasCoreLabels = (sentence != null &amp;&amp;</span>
+<span class="nc bnc" id="L1350" title="All 2 branches missed.">                             sentence.size() &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">                             sentence.get(0) instanceof CoreLabel);</span>
+<span class="nc" id="L1352">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L1353">    sb.append(&quot;&lt;sentence id=\&quot;&quot;).append(sentNum).append(&quot;\&quot;&gt;\n&quot;);</span>
+<span class="nc" id="L1354">    int wordIndex = 0;</span>
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">    for (HasWord hw : sentence) {</span>
+<span class="nc" id="L1356">      String word = hw.word();</span>
+<span class="nc bnc" id="L1357" title="All 2 branches missed.">      if (!(hw instanceof HasTag)) {</span>
+<span class="nc" id="L1358">        throw new IllegalArgumentException(&quot;Expected HasTags, got &quot; +</span>
+<span class="nc" id="L1359">                                           hw.getClass());</span>
+      }
+<span class="nc" id="L1361">      String tag = ((HasTag) hw).tag();</span>
+<span class="nc" id="L1362">      sb.append(&quot;  &lt;word wid=\&quot;&quot;).append(wordIndex).append(&quot;\&quot; pos=\&quot;&quot;).append(XMLUtils.escapeAttributeXML(tag)).append(&quot;\&quot;&quot;);</span>
+<span class="nc bnc" id="L1363" title="All 4 branches missed.">      if (outputLemmas &amp;&amp; hasCoreLabels) {</span>
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">        if (!(hw instanceof CoreLabel)) {</span>
+<span class="nc" id="L1365">          throw new IllegalArgumentException(&quot;You mixed CoreLabels with &quot; +</span>
+<span class="nc" id="L1366">                                             hw.getClass() + &quot;?  &quot; +</span>
+                                             &quot;Why would you do that?&quot;);
+        }
+<span class="nc" id="L1369">        CoreLabel label = (CoreLabel) hw;</span>
+<span class="nc" id="L1370">        String lemma = label.lemma();</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">        if (lemma != null) {</span>
+<span class="nc" id="L1372">          sb.append(&quot; lemma=\&quot;&quot;).append(XMLUtils.escapeElementXML(lemma)).append('\&quot;');</span>
+        }
+      }
+<span class="nc" id="L1375">      sb.append(&quot;&gt;&quot;).append(XMLUtils.escapeElementXML(word)).append(&quot;&lt;/word&gt;\n&quot;);</span>
+<span class="nc" id="L1376">      ++wordIndex;</span>
+<span class="nc" id="L1377">    }</span>
+<span class="nc" id="L1378">    sb.append(&quot;&lt;/sentence&gt;\n&quot;);</span>
+<span class="nc" id="L1379">    return sb.toString();</span>
+  }
+
+  private static String getTsvWords(boolean verbose, boolean outputLemmas,
+                                    List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L1384">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1385" title="All 4 branches missed.">    if (verbose &amp;&amp; sentence.size() &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L1386" title="All 2 branches missed.">        sentence.get(0) instanceof CoreLabel) {</span>
+<span class="nc bnc" id="L1387" title="All 2 branches missed.">      for (HasWord hw : sentence) {</span>
+<span class="nc bnc" id="L1388" title="All 2 branches missed.">        if (!(hw instanceof CoreLabel)) {</span>
+<span class="nc" id="L1389">          throw new IllegalArgumentException(&quot;You mixed CoreLabels with &quot; +</span>
+<span class="nc" id="L1390">                                             hw.getClass() + &quot;?  &quot; +</span>
+                                             &quot;Why would you do that?&quot;);
+        }
+<span class="nc" id="L1393">        CoreLabel label = (CoreLabel) hw;</span>
+<span class="nc" id="L1394">        sb.append(label.word());</span>
+<span class="nc" id="L1395">        sb.append(&quot;\t&quot;);</span>
+<span class="nc" id="L1396">        sb.append(label.originalText());</span>
+<span class="nc" id="L1397">        sb.append(&quot;\t&quot;);</span>
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">        if (outputLemmas) {</span>
+<span class="nc" id="L1399">          sb.append(label.lemma());</span>
+<span class="nc" id="L1400">          sb.append(&quot;\t&quot;);</span>
+        }
+<span class="nc" id="L1402">        sb.append(label.tag());</span>
+<span class="nc" id="L1403">        sb.append(&quot;\t&quot;);</span>
+<span class="nc" id="L1404">        sb.append(label.beginPosition());</span>
+<span class="nc" id="L1405">        sb.append(&quot;\t&quot;);</span>
+<span class="nc" id="L1406">        sb.append(label.endPosition());</span>
+<span class="nc" id="L1407">        sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1408">      }</span>
+<span class="nc" id="L1409">      sb.append('\n');</span>
+<span class="nc" id="L1410">      return sb.toString();</span>
+    } // otherwise, fall through
+
+    // either not verbose, or not CoreLabels
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">    for (HasWord hw : sentence) {</span>
+<span class="nc" id="L1415">      String word = hw.word();</span>
+<span class="nc bnc" id="L1416" title="All 2 branches missed.">      if (!(hw instanceof HasTag)) {</span>
+<span class="nc" id="L1417">        throw new IllegalArgumentException(&quot;Expected HasTags, got &quot; +</span>
+<span class="nc" id="L1418">                                           hw.getClass());</span>
+      }
+<span class="nc" id="L1420">      String tag = ((HasTag) hw).tag();</span>
+<span class="nc" id="L1421">      sb.append(word).append('\t').append(tag).append('\n');</span>
+<span class="nc" id="L1422">    }</span>
+<span class="nc" id="L1423">    sb.append('\n');</span>
+<span class="nc" id="L1424">    return sb.toString();</span>
+  }
+
+  /**
+   * Takes a tagged sentence and writes out the xml version.
+   *
+   * @param w Where to write the output to
+   * @param sent A tagged sentence
+   * @param sentNum The sentence index for XML printout
+   * @param outputLemmas Whether to write the lemmas of words
+   */
+  private static void writeXMLSentence(Writer w, List&lt;? extends HasWord&gt; sent,
+                                       int sentNum, boolean outputLemmas) {
+    try {
+<span class="nc" id="L1438">      w.write(getXMLWords(sent, sentNum, outputLemmas));</span>
+<span class="nc" id="L1439">    } catch (IOException e) {</span>
+<span class="nc" id="L1440">      log.info(&quot;Error writing sentence &quot; + sentNum + &quot;: &quot; +</span>
+<span class="nc" id="L1441">                         SentenceUtils.listToString(sent));</span>
+<span class="nc" id="L1442">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1443">    }</span>
+<span class="nc" id="L1444">  }</span>
+
+  /**
+   * Uses an XML transformer to turn an input stream into a bunch of
+   * output.  Tags all of the text between xmlTags.
+   *
+   * The difference between using this and using runTagger in XML mode
+   * is that this preserves the XML structure outside of the list of
+   * elements to tag, whereas the runTagger method throws away all of
+   * the surrounding structure and returns tagged plain text.
+   */
+  public void tagFromXML(InputStream input, Writer writer, String... xmlTags) {
+<span class="nc" id="L1456">    OutputStyle outputStyle =</span>
+<span class="nc" id="L1457">      OutputStyle.fromShortName(config.getOutputFormat());</span>
+
+<span class="nc" id="L1459">    TransformXML&lt;String&gt; txml = new TransformXML&lt;&gt;();</span>
+<span class="nc bnc" id="L1460" title="All 3 branches missed.">    switch(outputStyle) {</span>
+    case XML:
+    case INLINE_XML:
+<span class="nc" id="L1463">      txml.transformXML(xmlTags, new TaggerWrapper(this),</span>
+                        input, writer,
+                        new TransformXML.NoEscapingSAXInterface&lt;&gt;());
+<span class="nc" id="L1466">      break;</span>
+    case SLASH_TAGS:
+    case TSV:
+<span class="nc" id="L1469">      txml.transformXML(xmlTags, new TaggerWrapper(this),</span>
+                        input, writer,
+                        new TransformXML.SAXInterface&lt;&gt;());
+<span class="nc" id="L1472">      break;</span>
+    default:
+<span class="nc" id="L1474">      throw new RuntimeException(&quot;Unexpected format &quot; + outputStyle);</span>
+    }
+<span class="nc" id="L1476">  }</span>
+
+  public void tagFromXML(Reader input, Writer writer, String... xmlTags) {
+<span class="nc" id="L1479">    OutputStyle outputStyle =</span>
+<span class="nc" id="L1480">      OutputStyle.fromShortName(config.getOutputFormat());</span>
+
+<span class="nc" id="L1482">    TransformXML&lt;String&gt; txml = new TransformXML&lt;&gt;();</span>
+<span class="nc bnc" id="L1483" title="All 3 branches missed.">    switch(outputStyle) {</span>
+    case XML:
+    case INLINE_XML:
+<span class="nc" id="L1486">      txml.transformXML(xmlTags, new TaggerWrapper(this),</span>
+                        input, writer,
+                        new TransformXML.NoEscapingSAXInterface&lt;&gt;());
+<span class="nc" id="L1489">      break;</span>
+    case SLASH_TAGS:
+    case TSV:
+<span class="nc" id="L1492">      txml.transformXML(xmlTags, new TaggerWrapper(this),</span>
+                        input, writer,
+                        new TransformXML.SAXInterface&lt;&gt;());
+<span class="nc" id="L1495">      break;</span>
+    default:
+<span class="nc" id="L1497">      throw new RuntimeException(&quot;Unexpected format &quot; + outputStyle);</span>
+    }
+<span class="nc" id="L1499">  }</span>
+
+  private void tagFromXML() {
+<span class="nc" id="L1502">    Reader reader = null;</span>
+<span class="nc" id="L1503">    Writer w = null;</span>
+    try {
+      // todo [cdm dec 13]: change to use the IOUtils read-from-anywhere routines
+<span class="nc" id="L1506">      reader = new BufferedReader(new InputStreamReader(new FileInputStream(config.getFile()), config.getEncoding()));</span>
+
+<span class="nc" id="L1508">      String outFile = config.getOutputFile();</span>
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">      if (outFile.length() &gt; 0) {</span>
+<span class="nc" id="L1510">        w = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outFile),</span>
+<span class="nc" id="L1511">                                                      config.getEncoding()));</span>
+      } else {
+<span class="nc" id="L1513">        w = new BufferedWriter(new OutputStreamWriter(System.out, config.getEncoding()));</span>
+      }
+<span class="nc" id="L1515">      w.write(&quot;&lt;?xml version=\&quot;1.0\&quot; encoding=\&quot;&quot; +</span>
+<span class="nc" id="L1516">              config.getEncoding() + &quot;\&quot;?&gt;\n&quot;);</span>
+<span class="nc" id="L1517">      tagFromXML(reader, w, config.getXMLInput());</span>
+<span class="nc" id="L1518">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L1519">      log.info(&quot;Input file not found: &quot; + config.getFile());</span>
+<span class="nc" id="L1520">      e.printStackTrace();</span>
+<span class="nc" id="L1521">    } catch (IOException ioe) {</span>
+<span class="nc" id="L1522">      log.info(&quot;tagFromXML: mysterious IO Exception&quot;);</span>
+<span class="nc" id="L1523">      ioe.printStackTrace();</span>
+    } finally {
+<span class="nc" id="L1525">      IOUtils.closeIgnoringExceptions(reader);</span>
+<span class="nc" id="L1526">      IOUtils.closeIgnoringExceptions(w);</span>
+<span class="nc" id="L1527">    }</span>
+<span class="nc" id="L1528">  }</span>
+
+  /**
+   * Loads the tagger from a config file and then runs it in TAG mode.
+   *
+   * @param config The configuration parameters for the run.
+   */
+  private static void runTagger(TaggerConfig config)
+    throws IOException, ClassNotFoundException,
+           NoSuchMethodException, IllegalAccessException,
+           java.lang.reflect.InvocationTargetException
+  {
+<span class="nc bnc" id="L1540" title="All 2 branches missed.">    if (config.getVerbose()) {</span>
+<span class="nc" id="L1541">      Date now = new Date();</span>
+<span class="nc" id="L1542">      log.info(&quot;## tagger invoked at &quot; + now + &quot; with arguments:&quot;);</span>
+<span class="nc" id="L1543">      config.dump();</span>
+    }
+<span class="nc" id="L1545">    MaxentTagger tagger = new MaxentTagger(config.getModel(), config);</span>
+<span class="nc" id="L1546">    tagger.runTagger();</span>
+<span class="nc" id="L1547">  }</span>
+
+<span class="fc" id="L1549">  private static final Pattern formatPattern = Pattern.compile(&quot;format=[a-zA-Z]+,&quot;);</span>
+
+  /**
+   * Runs the tagger when we're in TAG mode.
+   * In this mode, the config contains either the name of the file to
+   * tag or stdin.  That file or input is then tagged.
+   */
+  private void runTagger()
+    throws IOException, ClassNotFoundException,
+           NoSuchMethodException, IllegalAccessException,
+           java.lang.reflect.InvocationTargetException
+  {
+<span class="nc" id="L1561">    String[] xmlInput = config.getXMLInput();</span>
+<span class="nc bnc" id="L1562" title="All 2 branches missed.">    if (xmlInput.length &gt; 0) {</span>
+<span class="nc bnc" id="L1563" title="All 4 branches missed.">      if(xmlInput.length &gt; 1 || !xmlInput[0].equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L1564">        tagFromXML();</span>
+<span class="nc" id="L1565">        return;</span>
+      }
+    }
+
+<span class="nc" id="L1569">    BufferedWriter writer = null;</span>
+<span class="nc" id="L1570">    BufferedReader br = null;</span>
+    try {
+<span class="nc" id="L1572">      String outFile = config.getOutputFile();</span>
+<span class="nc bnc" id="L1573" title="All 2 branches missed.">      if (outFile.length() &gt; 0) {</span>
+<span class="nc" id="L1574">        writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outFile), config.getEncoding()));</span>
+      } else {
+<span class="nc" id="L1576">        writer = new BufferedWriter(new OutputStreamWriter(System.out, config.getEncoding()));</span>
+      }
+
+      //Now determine if we're tagging from stdin or from a file,
+      //construct a reader accordingly
+<span class="nc" id="L1581">      boolean stdin = config.useStdin();</span>
+<span class="nc" id="L1582">      OutputStyle outputStyle = OutputStyle.fromShortName(config.getOutputFormat());</span>
+<span class="nc bnc" id="L1583" title="All 2 branches missed.">      if (!stdin) {</span>
+<span class="nc" id="L1584">        String filename = config.getFile();</span>
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">        if (formatPattern.matcher(filename).find()) {</span>
+<span class="nc" id="L1586">          TaggedFileRecord record = TaggedFileRecord.createRecord(config, filename);</span>
+<span class="nc" id="L1587">          runTagger(record.reader(), writer, outputStyle);</span>
+<span class="nc" id="L1588">        } else {</span>
+<span class="nc" id="L1589">          br = IOUtils.readerFromString(config.getFile(), config.getEncoding());</span>
+<span class="nc" id="L1590">          runTagger(br, writer, config.getTagInside(), outputStyle);</span>
+        }
+<span class="nc" id="L1592">      } else {</span>
+<span class="nc" id="L1593">        log.info(&quot;Type some text to tag, then EOF.&quot;);</span>
+<span class="nc" id="L1594">        log.info(&quot;  (For EOF, use Return, Ctrl-D on Unix; Enter, Ctrl-Z, Enter on Windows.)&quot;);</span>
+<span class="nc" id="L1595">        br = new BufferedReader(new InputStreamReader(System.in));</span>
+
+<span class="nc" id="L1597">        runTaggerStdin(br, writer, outputStyle);</span>
+      }
+    } finally {
+<span class="nc" id="L1600">      IOUtils.closeIgnoringExceptions(br);</span>
+<span class="nc" id="L1601">      IOUtils.closeIgnoringExceptions(writer);</span>
+<span class="nc" id="L1602">    }</span>
+<span class="nc" id="L1603">  }</span>
+
+  public void runTaggerStdin(BufferedReader reader, BufferedWriter writer, OutputStyle outputStyle)
+    throws IOException
+  {
+<span class="nc" id="L1608">    final TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory = chooseTokenizerFactory();</span>
+
+    //Counts
+<span class="nc" id="L1611">    long totalMillis = 0;</span>
+<span class="nc" id="L1612">    int numWords = 0;</span>
+<span class="nc" id="L1613">    int numSentences = 0;</span>
+
+<span class="nc" id="L1615">    boolean outputVerbosity = config.getOutputVerbosity();</span>
+<span class="nc" id="L1616">    boolean outputLemmas = config.getOutputLemmas();</span>
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">    Morphology morpha = (outputLemmas) ? new Morphology() : null;</span>
+
+<span class="nc bnc" id="L1619" title="All 4 branches missed.">    if (outputStyle == OutputStyle.XML ||</span>
+        outputStyle == OutputStyle.INLINE_XML) {
+<span class="nc" id="L1621">      writer.write(&quot;&lt;?xml version=\&quot;1.0\&quot; encoding=\&quot;&quot; +</span>
+<span class="nc" id="L1622">                   config.getEncoding() + &quot;\&quot;?&gt;\n&quot;);</span>
+<span class="nc" id="L1623">      writer.write(&quot;&lt;pos&gt;\n&quot;);</span>
+    }
+
+<span class="nc" id="L1626">    String sentenceDelimiter = config.getSentenceDelimiter();</span>
+<span class="nc bnc" id="L1627" title="All 4 branches missed.">    if (sentenceDelimiter != null &amp;&amp; sentenceDelimiter.equals(&quot;newline&quot;)) {</span>
+<span class="nc" id="L1628">      sentenceDelimiter = &quot;\n&quot;;</span>
+    }
+
+    while (true) {
+      //Now we do everything through the doc preprocessor
+      final DocumentPreprocessor docProcessor;
+<span class="nc" id="L1634">      String line = reader.readLine();</span>
+      // this happens when we reach end of file
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">      if (line == null)</span>
+<span class="nc" id="L1637">        break;</span>
+<span class="nc" id="L1638">      docProcessor = new DocumentPreprocessor(new StringReader(line));</span>
+<span class="nc" id="L1639">      docProcessor.setTokenizerFactory(tokenizerFactory);</span>
+<span class="nc" id="L1640">      docProcessor.setSentenceDelimiter(sentenceDelimiter);</span>
+<span class="nc bnc" id="L1641" title="All 2 branches missed.">      if (config.keepEmptySentences()) {</span>
+<span class="nc" id="L1642">        docProcessor.setKeepEmptySentences(true);</span>
+      }
+
+<span class="nc bnc" id="L1645" title="All 2 branches missed.">      for (List&lt;HasWord&gt; sentence : docProcessor) {</span>
+<span class="nc" id="L1646">        numWords += sentence.size();</span>
+
+<span class="nc" id="L1648">        Timing t = new Timing();</span>
+<span class="nc" id="L1649">        tagAndOutputSentence(sentence, outputLemmas, morpha, outputStyle,</span>
+                             outputVerbosity, numSentences, &quot;&quot;, writer);
+
+<span class="nc" id="L1652">        totalMillis += t.stop();</span>
+<span class="nc" id="L1653">        writer.newLine();</span>
+<span class="nc" id="L1654">        writer.flush();</span>
+<span class="nc" id="L1655">        numSentences++;</span>
+<span class="nc" id="L1656">      }</span>
+<span class="nc" id="L1657">    }</span>
+
+<span class="nc bnc" id="L1659" title="All 4 branches missed.">    if (outputStyle == OutputStyle.XML ||</span>
+        outputStyle == OutputStyle.INLINE_XML) {
+<span class="nc" id="L1661">      writer.write(&quot;&lt;/pos&gt;\n&quot;);</span>
+    }
+
+<span class="nc" id="L1664">    writer.flush();</span>
+<span class="nc" id="L1665">    printErrWordsPerSec(totalMillis, numWords);</span>
+<span class="nc" id="L1666">  }</span>
+
+  public void runTaggerSGML(BufferedReader reader, BufferedWriter writer, OutputStyle outputStyle)
+    throws IOException
+  {
+<span class="nc" id="L1671">    Timing t = new Timing();</span>
+
+    //Counts
+<span class="nc" id="L1674">    int numWords = 0;</span>
+<span class="nc" id="L1675">    int numSentences = 0;</span>
+
+<span class="nc bnc" id="L1677" title="All 4 branches missed.">    if (outputStyle == OutputStyle.XML ||</span>
+        outputStyle == OutputStyle.INLINE_XML) {
+<span class="nc" id="L1679">      writer.write(&quot;&lt;?xml version=\&quot;1.0\&quot; encoding=\&quot;&quot; +</span>
+<span class="nc" id="L1680">                   config.getEncoding() + &quot;\&quot;?&gt;\n&quot;);</span>
+<span class="nc" id="L1681">      writer.write(&quot;&lt;pos&gt;\n&quot;);</span>
+    }
+
+    // this uses NER codebase technology to read/write SGML-ish files
+<span class="nc" id="L1685">    PlainTextDocumentReaderAndWriter&lt;CoreLabel&gt; readerAndWriter = new PlainTextDocumentReaderAndWriter&lt;&gt;();</span>
+<span class="nc" id="L1686">    ObjectBank&lt;List&lt;CoreLabel&gt;&gt; ob = new ObjectBank&lt;&gt;(new ReaderIteratorFactory(reader), readerAndWriter);</span>
+<span class="nc" id="L1687">    PrintWriter pw = new PrintWriter(writer);</span>
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">    for (List&lt;CoreLabel&gt; sentence : ob) {</span>
+<span class="nc" id="L1689">      List&lt;CoreLabel&gt; s = Generics.newArrayList();</span>
+<span class="nc" id="L1690">      numWords += s.size();</span>
+<span class="nc" id="L1691">      List&lt;TaggedWord&gt; taggedSentence = tagSentence(s, false);</span>
+<span class="nc" id="L1692">      Iterator&lt;CoreLabel&gt; origIter = sentence.iterator();</span>
+<span class="nc bnc" id="L1693" title="All 2 branches missed.">      for (TaggedWord tw : taggedSentence) {</span>
+<span class="nc" id="L1694">        CoreLabel cl = origIter.next();</span>
+<span class="nc" id="L1695">        cl.set(CoreAnnotations.AnswerAnnotation.class, tw.tag());</span>
+<span class="nc" id="L1696">      }</span>
+<span class="nc" id="L1697">      readerAndWriter.printAnswers(sentence, pw, outputStyle, true);</span>
+<span class="nc" id="L1698">      ++numSentences;</span>
+<span class="nc" id="L1699">    }</span>
+
+<span class="nc bnc" id="L1701" title="All 4 branches missed.">    if (outputStyle == OutputStyle.XML ||</span>
+        outputStyle == OutputStyle.INLINE_XML) {
+<span class="nc" id="L1703">      writer.write(&quot;&lt;/pos&gt;\n&quot;);</span>
+    }
+
+<span class="nc" id="L1706">    writer.flush();</span>
+<span class="nc" id="L1707">    long millis = t.stop();</span>
+<span class="nc" id="L1708">    printErrWordsPerSec(millis, numWords);</span>
+<span class="nc" id="L1709">  }</span>
+
+  public &lt;X extends HasWord&gt; void runTagger(Iterable&lt;List&lt;X&gt;&gt; document,
+                                            BufferedWriter writer,
+                                            OutputStyle outputStyle)
+    throws IOException
+  {
+<span class="nc" id="L1716">    Timing t = new Timing();</span>
+
+    //Counts
+<span class="nc" id="L1719">    int numWords = 0;</span>
+<span class="nc" id="L1720">    int numSentences = 0;</span>
+
+<span class="nc" id="L1722">    boolean outputVerbosity = config.getOutputVerbosity();</span>
+<span class="nc" id="L1723">    boolean outputLemmas = config.getOutputLemmas();</span>
+
+<span class="nc bnc" id="L1725" title="All 4 branches missed.">    if (outputStyle == OutputStyle.XML ||</span>
+        outputStyle == OutputStyle.INLINE_XML) {
+<span class="nc" id="L1727">      writer.write(&quot;&lt;?xml version=\&quot;1.0\&quot; encoding=\&quot;&quot; +</span>
+<span class="nc" id="L1728">                   config.getEncoding() + &quot;\&quot;?&gt;\n&quot;);</span>
+<span class="nc" id="L1729">      writer.write(&quot;&lt;pos&gt;\n&quot;);</span>
+    }
+
+
+<span class="nc bnc" id="L1733" title="All 2 branches missed.">    if (config.getNThreads() != 1) {</span>
+<span class="nc" id="L1734">      MulticoreWrapper&lt;List&lt;? extends HasWord&gt;, List&lt;? extends HasWord&gt;&gt; wrapper = new MulticoreWrapper&lt;&gt;(config.getNThreads(), new SentenceTaggingProcessor(this, outputLemmas));</span>
+<span class="nc bnc" id="L1735" title="All 2 branches missed.">      for (List&lt;X&gt; sentence : document) {</span>
+<span class="nc" id="L1736">        wrapper.put(sentence);</span>
+<span class="nc bnc" id="L1737" title="All 2 branches missed.">        while (wrapper.peek()) {</span>
+<span class="nc" id="L1738">          List&lt;? extends HasWord&gt; taggedSentence = wrapper.poll();</span>
+<span class="nc" id="L1739">          numWords += taggedSentence.size();</span>
+<span class="nc" id="L1740">          outputTaggedSentence(taggedSentence, outputLemmas, outputStyle, outputVerbosity, numSentences, &quot;\n&quot;, writer);</span>
+<span class="nc" id="L1741">          numSentences++;</span>
+<span class="nc" id="L1742">        }</span>
+<span class="nc" id="L1743">      }</span>
+<span class="nc" id="L1744">      wrapper.join();</span>
+<span class="nc bnc" id="L1745" title="All 2 branches missed.">      while (wrapper.peek()) {</span>
+<span class="nc" id="L1746">        List&lt;? extends HasWord&gt; taggedSentence = wrapper.poll();</span>
+<span class="nc" id="L1747">        numWords += taggedSentence.size();</span>
+<span class="nc" id="L1748">        outputTaggedSentence(taggedSentence, outputLemmas, outputStyle, outputVerbosity, numSentences, &quot;\n&quot;, writer);</span>
+<span class="nc" id="L1749">        numSentences++;</span>
+<span class="nc" id="L1750">      }</span>
+<span class="nc" id="L1751">    } else {</span>
+<span class="nc bnc" id="L1752" title="All 2 branches missed.">      Morphology morpha = (outputLemmas) ? new Morphology() : null;</span>
+<span class="nc bnc" id="L1753" title="All 2 branches missed.">      for (List&lt;X&gt; sentence : document) {</span>
+<span class="nc" id="L1754">        numWords += sentence.size();</span>
+
+<span class="nc" id="L1756">        tagAndOutputSentence(sentence, outputLemmas, morpha, outputStyle,</span>
+                             outputVerbosity, numSentences, &quot;\n&quot;, writer);
+
+<span class="nc" id="L1759">        numSentences++;</span>
+<span class="nc" id="L1760">      }</span>
+    }
+
+<span class="nc bnc" id="L1763" title="All 4 branches missed.">    if (outputStyle == OutputStyle.XML ||</span>
+        outputStyle == OutputStyle.INLINE_XML) {
+<span class="nc" id="L1765">      writer.write(&quot;&lt;/pos&gt;\n&quot;);</span>
+    }
+
+<span class="nc" id="L1768">    writer.flush();</span>
+<span class="nc" id="L1769">    long millis = t.stop();</span>
+<span class="nc" id="L1770">    printErrWordsPerSec(millis, numWords);</span>
+<span class="nc" id="L1771">  }</span>
+
+
+  /**
+   * This method runs the tagger on the provided reader and writer.
+   *
+   * It takes input from the given {@code reader}, applies the
+   * tagger to it one sentence at a time (determined using
+   * documentPreprocessor), and writes the output to the given
+   * {@code writer}.
+   *
+   * The document is broken into sentences using the sentence
+   * processor determined in the tagger's TaggerConfig.
+   *
+   * {@code tagInside} makes the tagger run in XML mode.... If set
+   * to non-empty, instead of processing the document as one large
+   * text blob, it considers each region in between the given tag to
+   * be a separate text blob.
+   */
+  public void runTagger(BufferedReader reader, BufferedWriter writer,
+                        String tagInside, OutputStyle outputStyle)
+    throws IOException
+  {
+<span class="nc" id="L1794">    String sentenceDelimiter = config.getSentenceDelimiter();</span>
+<span class="nc bnc" id="L1795" title="All 4 branches missed.">    if (sentenceDelimiter != null &amp;&amp; sentenceDelimiter.equals(&quot;newline&quot;)) {</span>
+<span class="nc" id="L1796">      sentenceDelimiter = &quot;\n&quot;;</span>
+    }
+<span class="nc" id="L1798">    final TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory = chooseTokenizerFactory();</span>
+
+    //Now we do everything through the doc preprocessor
+    final DocumentPreprocessor docProcessor;
+<span class="nc bnc" id="L1802" title="All 2 branches missed.">    if (tagInside.length() &gt; 0) {</span>
+<span class="nc" id="L1803">      docProcessor = new DocumentPreprocessor(reader, DocumentPreprocessor.DocType.XML);</span>
+<span class="nc" id="L1804">      docProcessor.setElementDelimiter(tagInside);</span>
+<span class="nc bnc" id="L1805" title="All 2 branches missed.">      if (config.keepEmptySentences()) {</span>
+<span class="nc" id="L1806">        docProcessor.setKeepEmptySentences(true);</span>
+      }
+    } else {
+<span class="nc" id="L1809">      docProcessor = new DocumentPreprocessor(reader);</span>
+<span class="nc" id="L1810">      docProcessor.setSentenceDelimiter(sentenceDelimiter);</span>
+<span class="nc bnc" id="L1811" title="All 2 branches missed.">      if (config.keepEmptySentences()) {</span>
+<span class="nc" id="L1812">        docProcessor.setKeepEmptySentences(true);</span>
+      }
+    }
+<span class="nc" id="L1815">    docProcessor.setTokenizerFactory(tokenizerFactory);</span>
+
+<span class="nc" id="L1817">    runTagger(docProcessor, writer, outputStyle);</span>
+<span class="nc" id="L1818">  }</span>
+
+  public List&lt;? extends HasWord&gt; tagCoreLabelsOrHasWords(List&lt;? extends HasWord&gt; sentence, Morphology morpha, boolean outputLemmas) {
+<span class="nc bnc" id="L1821" title="All 4 branches missed.">    if (sentence.size() &gt; 0 &amp;&amp; sentence.get(0) instanceof CoreLabel) {</span>
+<span class="nc" id="L1822">      List&lt;CoreLabel&gt; coreLabels = castCoreLabels(sentence);</span>
+<span class="nc" id="L1823">      tagCoreLabels(coreLabels);</span>
+<span class="nc bnc" id="L1824" title="All 2 branches missed.">      if (outputLemmas) {</span>
+        // We may want to lemmatize things without using an existing
+        // Morphology object, as Morphology objects are not
+        // thread-safe, so we would make a new one here
+<span class="nc bnc" id="L1828" title="All 2 branches missed.">        if (morpha == null) {</span>
+<span class="nc" id="L1829">          morpha = new Morphology();</span>
+        }
+<span class="nc" id="L1831">        lemmatize(coreLabels, morpha);</span>
+      }
+<span class="nc" id="L1833">      return coreLabels;</span>
+    } else {
+<span class="nc" id="L1835">      List&lt;TaggedWord&gt; taggedSentence = tagSentence(sentence, false);</span>
+<span class="nc" id="L1836">      return taggedSentence;</span>
+    }
+  }
+
+  public void tagAndOutputSentence(List&lt;? extends HasWord&gt; sentence,
+                                   boolean outputLemmas, Morphology morpha,
+                                   OutputStyle outputStyle,
+                                   boolean outputVerbosity, int numSentences,
+                                   String separator, Writer writer) {
+<span class="nc" id="L1845">    sentence = tagCoreLabelsOrHasWords(sentence, morpha, outputLemmas);</span>
+<span class="nc" id="L1846">    outputTaggedSentence(sentence, outputLemmas, outputStyle, outputVerbosity, numSentences, separator, writer);</span>
+<span class="nc" id="L1847">  }</span>
+
+  public void outputTaggedSentence(List&lt;? extends HasWord&gt; sentence,
+                                   boolean outputLemmas, OutputStyle outputStyle,
+                                   boolean outputVerbosity, int numSentences,
+                                   String separator, Writer writer) {
+    try {
+<span class="nc bnc" id="L1854" title="All 4 branches missed.">      switch (outputStyle) {</span>
+      case TSV:
+<span class="nc" id="L1856">        writer.write(getTsvWords(outputVerbosity, outputLemmas, sentence));</span>
+<span class="nc" id="L1857">        break;</span>
+      case XML:
+      case INLINE_XML:
+<span class="nc" id="L1860">        writeXMLSentence(writer, sentence, numSentences, outputLemmas);</span>
+<span class="nc" id="L1861">        break;</span>
+      case SLASH_TAGS:
+<span class="nc" id="L1863">        writer.write(SentenceUtils.listToString(sentence, false, config.getTagSeparator()));</span>
+<span class="nc" id="L1864">        writer.write(separator);</span>
+<span class="nc" id="L1865">        break;</span>
+      default:
+<span class="nc" id="L1867">        throw new IllegalArgumentException(&quot;Unsupported output style &quot; + outputStyle);</span>
+      }
+<span class="nc" id="L1869">    } catch (IOException e) {</span>
+<span class="nc" id="L1870">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1871">    }</span>
+<span class="nc" id="L1872">  }</span>
+
+  /**
+   * Command-line tagger interface.
+   * Can be used to train or test taggers, or to tag text, taking input from
+   * stdin or a file.
+   * See class documentation for usage.
+   *
+   * @param args Command-line arguments
+   * @throws IOException If any file problems
+   */
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L1884">    TaggerConfig config = new TaggerConfig(args);</span>
+
+<span class="nc bnc" id="L1886" title="All 2 branches missed.">    if (config.getMode() == TaggerConfig.Mode.TRAIN) {</span>
+<span class="nc" id="L1887">      runTraining(config);</span>
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">    } else if (config.getMode() == TaggerConfig.Mode.TAG) {</span>
+<span class="nc" id="L1889">      runTagger(config);</span>
+<span class="nc bnc" id="L1890" title="All 2 branches missed.">    } else if (config.getMode() == TaggerConfig.Mode.TEST) {</span>
+<span class="nc" id="L1891">      runTest(config);</span>
+<span class="nc bnc" id="L1892" title="All 2 branches missed.">    } else if (config.getMode() == TaggerConfig.Mode.DUMP) {</span>
+<span class="nc" id="L1893">      dumpModel(config);</span>
+    } else {
+<span class="nc" id="L1895">      log.info(&quot;Impossible: nothing to do. None of train, tag, test, or dump was specified.&quot;);</span>
+    }
+<span class="nc" id="L1897">  } // end main()</span>
+
+
+  static class SentenceTaggingProcessor implements ThreadsafeProcessor&lt;List&lt;? extends HasWord&gt;, List&lt;? extends HasWord&gt;&gt; {
+    MaxentTagger maxentTagger;
+    boolean outputLemmas;
+
+<span class="nc" id="L1904">    SentenceTaggingProcessor(MaxentTagger maxentTagger, boolean outputLemmas) {</span>
+<span class="nc" id="L1905">      this.maxentTagger = maxentTagger;</span>
+<span class="nc" id="L1906">      this.outputLemmas = outputLemmas;</span>
+<span class="nc" id="L1907">    }</span>
+
+    @Override
+    public List&lt;? extends HasWord&gt; process(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L1911">      return maxentTagger.tagCoreLabelsOrHasWords(sentence, null, outputLemmas);</span>
+    }
+
+    @Override
+    public ThreadsafeProcessor&lt;List&lt;? extends HasWord&gt;, List&lt;? extends HasWord&gt;&gt; newInstance() {
+      // MaxentTagger is threadsafe
+<span class="nc" id="L1917">      return this;</span>
+    }
+  }
+
+  private static final long serialVersionUID = 2;
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

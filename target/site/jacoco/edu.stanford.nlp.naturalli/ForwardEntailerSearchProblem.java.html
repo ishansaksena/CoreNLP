@@ -1,0 +1,385 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ForwardEntailerSearchProblem.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.naturalli</a> &gt; <span class="el_source">ForwardEntailerSearchProblem.java</span></div><h1>ForwardEntailerSearchProblem.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.naturalli; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.util.Lazy;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * A particular instance of a search problem for finding entailed sentences.
+ * This problem already specifies the options for the search, as well as the sentence to search from.
+ *
+ * Note, again, that this only searches for deletions and not insertions or mutations.
+ *
+ * @author Gabor Angeli
+ */
+<span class="nc bnc" id="L23" title="All 2 branches missed.">public class ForwardEntailerSearchProblem  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L26">  private static Redwood.RedwoodChannels log = Redwood.channels(ForwardEntailerSearchProblem.class);</span>
+
+  /**
+   * The parse of this fragment. The vertices in the parse tree should be a subset
+   * (possibly not strict) of the tokens above.
+   */
+  public final SemanticGraph   parseTree;
+
+  /**
+   * The truth of the premise -- determines the direction we can mutate the sentences.
+   */
+  public final boolean truthOfPremise;
+
+  /**
+   * The maximum number of ticks top search for. Otherwise, the search will be exhaustive.
+   */
+  public final int maxTicks;
+
+  /**
+   * The maximum number of results to return from a single search.
+   */
+  public final int maxResults;
+
+  /**
+   * The weights to use for entailment.
+   */
+  public final NaturalLogicWeights weights;
+
+  /**
+   * A result from the search over possible shortenings of the sentence.
+   */
+  private static class SearchResult {
+    public final SemanticGraph tree;
+    public final List&lt;String&gt; deletedEdges;
+    public final double confidence;
+
+<span class="nc" id="L62">    private SearchResult(SemanticGraph tree, List&lt;String&gt; deletedEdges, double confidence) {</span>
+<span class="nc" id="L63">      this.tree = tree;</span>
+<span class="nc" id="L64">      this.deletedEdges = deletedEdges;</span>
+<span class="nc" id="L65">      this.confidence = confidence;</span>
+<span class="nc" id="L66">    }</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L70">      return StringUtils.join(tree.vertexListSorted().stream().map(IndexedWord::word), &quot; &quot;);</span>
+    }
+  }
+
+  /**
+   * A state in the search, denoting a partial shortening of the sentence.
+   */
+  private static class SearchState {
+    public final BitSet deletionMask;
+    public final int currentIndex;
+    public final SemanticGraph tree;
+    public final String lastDeletedEdge;
+    public final SearchState source;
+    public final double score;
+
+<span class="nc" id="L85">    private SearchState(BitSet deletionMask, int currentIndex, SemanticGraph tree, String lastDeletedEdge, SearchState source, double score) {</span>
+<span class="nc" id="L86">      this.deletionMask = (BitSet) deletionMask.clone();</span>
+<span class="nc" id="L87">      this.currentIndex = currentIndex;</span>
+<span class="nc" id="L88">      this.tree = tree;</span>
+<span class="nc" id="L89">      this.lastDeletedEdge = lastDeletedEdge;</span>
+<span class="nc" id="L90">      this.source = source;</span>
+<span class="nc" id="L91">      this.score = score;</span>
+<span class="nc" id="L92">    }</span>
+  }
+
+  /**
+   * Create a new search problem, fully specified.
+   * @see edu.stanford.nlp.naturalli.ForwardEntailer
+   */
+  protected ForwardEntailerSearchProblem(SemanticGraph parseTree,
+                                         boolean truthOfPremise,
+                                         int maxResults, int maxTicks,
+                                         NaturalLogicWeights weights
+<span class="nc" id="L103">                                      ) {</span>
+<span class="nc" id="L104">    this.parseTree = parseTree;</span>
+<span class="nc" id="L105">    this.truthOfPremise = truthOfPremise;</span>
+<span class="nc" id="L106">    this.maxResults = maxResults;</span>
+<span class="nc" id="L107">    this.maxTicks = maxTicks;</span>
+<span class="nc" id="L108">    this.weights = weights;</span>
+<span class="nc" id="L109">  }</span>
+
+
+  /**
+   * Run a search from this entailer. This will return a list of sentence fragments
+   * that are entailed by the original sentence / fragment.
+   *
+   * @return A list of entailed fragments.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;SentenceFragment&gt; search() {
+<span class="nc" id="L120">    return searchImplementation().stream()</span>
+<span class="nc" id="L121">        .map(x -&gt; new SentenceFragment(x.tree, truthOfPremise, false).changeScore(x.confidence))</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        .filter(x -&gt; x.words.size() &gt; 0 )</span>
+<span class="nc" id="L123">        .collect(Collectors.toList());</span>
+  }
+
+  /**
+   * The search algorithm, starting with a full sentence and iteratively shortening it to its entailed sentences.
+   *
+   * @return A list of search results, corresponding to shortenings of the sentence.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private List&lt;SearchResult&gt; searchImplementation() {
+    // Pre-process the tree
+<span class="nc" id="L134">    SemanticGraph parseTree = new SemanticGraph(this.parseTree);</span>
+<span class="nc bnc" id="L135" title="All 4 branches missed.">    assert Util.isTree(parseTree);</span>
+    // (remove common determiners)
+<span class="nc" id="L137">    List&lt;String&gt; determinerRemovals = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L138">    parseTree.getLeafVertices().stream().filter(vertex -&gt;</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        &quot;the&quot;.equalsIgnoreCase(vertex.word()) ||</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            &quot;a&quot;.equalsIgnoreCase(vertex.word()) ||</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            &quot;an&quot;.equalsIgnoreCase(vertex.word()) ||</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">            &quot;this&quot;.equalsIgnoreCase(vertex.word()) ||</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            &quot;that&quot;.equalsIgnoreCase(vertex.word()) ||</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">            &quot;those&quot;.equalsIgnoreCase(vertex.word()) ||</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            &quot;these&quot;.equalsIgnoreCase(vertex.word())</span>
+<span class="nc" id="L146">    ).forEach(vertex -&gt; {</span>
+<span class="nc" id="L147">      parseTree.removeVertex(vertex);</span>
+<span class="nc bnc" id="L148" title="All 4 branches missed.">      assert Util.isTree(parseTree);</span>
+<span class="nc" id="L149">      determinerRemovals.add(&quot;det&quot;);</span>
+<span class="nc" id="L150">    });</span>
+    // (cut conj_and nodes)
+<span class="nc" id="L152">    Set&lt;SemanticGraphEdge&gt; andsToAdd = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">    for (IndexedWord vertex : parseTree.vertexSet()) {</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">      if( parseTree.inDegree(vertex) &gt; 1 ) {</span>
+<span class="nc" id="L155">        SemanticGraphEdge conjAnd = null;</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        for (SemanticGraphEdge edge : parseTree.incomingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">          if (&quot;conj:and&quot;.equals(edge.getRelation().toString())) {</span>
+<span class="nc" id="L158">            conjAnd = edge;</span>
+          }
+<span class="nc" id="L160">        }</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (conjAnd != null) {</span>
+<span class="nc" id="L162">          parseTree.removeEdge(conjAnd);</span>
+<span class="nc bnc" id="L163" title="All 4 branches missed.">          assert Util.isTree(parseTree);</span>
+<span class="nc" id="L164">          andsToAdd.add(conjAnd);</span>
+        }
+      }
+<span class="nc" id="L167">    }</span>
+    // Clean the tree
+<span class="nc" id="L169">    Util.cleanTree(parseTree);</span>
+<span class="nc bnc" id="L170" title="All 4 branches missed.">    assert Util.isTree(parseTree);</span>
+
+    // Find the subject / object split
+    // This takes max O(n^2) time, expected O(n*log(n)) time.
+    // Optimal is O(n), but I'm too lazy to implement it.
+<span class="nc" id="L175">    BitSet isSubject = new BitSet(256);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">    for (IndexedWord vertex : parseTree.vertexSet()) {</span>
+      // Search up the tree for a subj node; if found, mark that vertex as a subject.
+<span class="nc" id="L178">      Iterator&lt;SemanticGraphEdge&gt; incomingEdges = parseTree.incomingEdgeIterator(vertex);</span>
+<span class="nc" id="L179">      SemanticGraphEdge edge = null;</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">      if (incomingEdges.hasNext()) {</span>
+<span class="nc" id="L181">        edge = incomingEdges.next();</span>
+      }
+<span class="nc" id="L183">      int numIters = 0;</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">      while (edge != null) {</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (edge.getRelation().toString().endsWith(&quot;subj&quot;)) {</span>
+<span class="nc bnc" id="L186" title="All 4 branches missed.">          assert vertex.index() &gt; 0;</span>
+<span class="nc" id="L187">          isSubject.set(vertex.index() - 1);</span>
+<span class="nc" id="L188">          break;</span>
+        }
+<span class="nc" id="L190">        incomingEdges = parseTree.incomingEdgeIterator(edge.getGovernor());</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (incomingEdges.hasNext()) {</span>
+<span class="nc" id="L192">          edge = incomingEdges.next();</span>
+        } else {
+<span class="nc" id="L194">          edge = null;</span>
+        }
+<span class="nc" id="L196">        numIters += 1;</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        if (numIters &gt; 100) {</span>
+//          log.error(&quot;tree has apparent depth &gt; 100&quot;);
+<span class="nc" id="L199">          return Collections.EMPTY_LIST;</span>
+        }
+      }
+<span class="nc" id="L202">    }</span>
+
+    // Outputs
+<span class="nc" id="L205">    List&lt;SearchResult&gt; results = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    if (!determinerRemovals.isEmpty()) {</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">      if (andsToAdd.isEmpty()) {</span>
+<span class="nc" id="L208">        double score = Math.pow(weights.deletionProbability(&quot;det&quot;), (double) determinerRemovals.size());</span>
+<span class="nc bnc" id="L209" title="All 4 branches missed.">        assert !Double.isNaN(score);</span>
+<span class="nc bnc" id="L210" title="All 4 branches missed.">        assert !Double.isInfinite(score);</span>
+<span class="nc" id="L211">        results.add(new SearchResult(parseTree, determinerRemovals, score));</span>
+<span class="nc" id="L212">      } else {</span>
+<span class="nc" id="L213">        SemanticGraph treeWithAnds = new SemanticGraph(parseTree);</span>
+<span class="nc bnc" id="L214" title="All 4 branches missed.">        assert Util.isTree(treeWithAnds);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        for (SemanticGraphEdge and : andsToAdd) {</span>
+<span class="nc" id="L216">          treeWithAnds.addEdge(and.getGovernor(), and.getDependent(), and.getRelation(), Double.NEGATIVE_INFINITY, false);</span>
+<span class="nc" id="L217">        }</span>
+<span class="nc bnc" id="L218" title="All 4 branches missed.">        assert Util.isTree(treeWithAnds);</span>
+<span class="nc" id="L219">        results.add(new SearchResult(treeWithAnds, determinerRemovals,</span>
+<span class="nc" id="L220">            Math.pow(weights.deletionProbability(&quot;det&quot;), (double) determinerRemovals.size())));</span>
+      }
+    }
+
+    // Initialize the search
+<span class="nc bnc" id="L225" title="All 4 branches missed.">    assert Util.isTree(parseTree);</span>
+    List&lt;IndexedWord&gt; topologicalVertices;
+    try {
+<span class="nc" id="L228">      topologicalVertices = parseTree.topologicalSort();</span>
+<span class="nc" id="L229">    } catch (IllegalStateException e) {</span>
+//      log.info(&quot;Could not topologically sort the vertices! Using left-to-right traversal.&quot;);
+<span class="nc" id="L231">      topologicalVertices = parseTree.vertexListSorted();</span>
+<span class="nc" id="L232">    }</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">    if (topologicalVertices.isEmpty()) {</span>
+<span class="nc" id="L234">      return results;</span>
+    }
+<span class="nc" id="L236">    Stack&lt;SearchState&gt; fringe = new Stack&lt;&gt;();</span>
+<span class="nc" id="L237">    fringe.push(new SearchState(new BitSet(256), 0, parseTree, null, null, 1.0));</span>
+
+    // Start the search
+<span class="nc" id="L240">    int numTicks = 0;</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">    while (!fringe.isEmpty()) {</span>
+      // Overhead with popping a node.
+<span class="nc bnc" id="L243" title="All 2 branches missed.">      if (numTicks &gt;= maxTicks) {</span>
+<span class="nc" id="L244">        return results;</span>
+      }
+<span class="nc" id="L246">      numTicks += 1;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">      if (results.size() &gt;= maxResults) {</span>
+<span class="nc" id="L248">        return results;</span>
+      }
+<span class="nc" id="L250">      SearchState state = fringe.pop();</span>
+<span class="nc bnc" id="L251" title="All 4 branches missed.">      assert state.score &gt; 0.0;</span>
+<span class="nc" id="L252">      IndexedWord currentWord = topologicalVertices.get(state.currentIndex);</span>
+
+      // Push the case where we don't delete
+<span class="nc" id="L255">      int nextIndex = state.currentIndex + 1;</span>
+<span class="nc" id="L256">      int numIters = 0;</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">      while (nextIndex &lt; topologicalVertices.size()) {</span>
+<span class="nc" id="L258">        IndexedWord nextWord = topologicalVertices.get(nextIndex);</span>
+<span class="nc bnc" id="L259" title="All 4 branches missed.">        assert nextWord.index() &gt; 0;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (!state.deletionMask.get(nextWord.index() - 1)) {</span>
+<span class="nc" id="L261">          fringe.push(new SearchState(state.deletionMask, nextIndex, state.tree, null, state, state.score));</span>
+<span class="nc" id="L262">          break;</span>
+        } else {
+<span class="nc" id="L264">          nextIndex += 1;</span>
+        }
+<span class="nc" id="L266">        numIters += 1;</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (numIters &gt; 10000) {</span>
+//          log.error(&quot;logic error (apparent infinite loop); returning&quot;);
+<span class="nc" id="L269">          return results;</span>
+        }
+<span class="nc" id="L271">      }</span>
+
+      // Check if we can delete this subtree
+<span class="nc bnc" id="L274" title="All 2 branches missed.">      boolean canDelete = !state.tree.getFirstRoot().equals(currentWord);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">      for (SemanticGraphEdge edge : state.tree.incomingEdgeIterable(currentWord)) {</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        if (&quot;CD&quot;.equals(edge.getGovernor().tag())) {</span>
+<span class="nc" id="L277">          canDelete = false;</span>
+        } else {
+          // Get token information
+<span class="nc" id="L280">          CoreLabel token = edge.getDependent().backingLabel();</span>
+          OperatorSpec operator;
+          NaturalLogicRelation lexicalRelation;
+<span class="nc" id="L283">          Polarity tokenPolarity = token.get(NaturalLogicAnnotations.PolarityAnnotation.class);</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">          if (tokenPolarity == null) {</span>
+<span class="nc" id="L285">            tokenPolarity = Polarity.DEFAULT;</span>
+          }
+          // Get the relation for this deletion
+<span class="nc bnc" id="L288" title="All 2 branches missed.">          if ((operator = token.get(NaturalLogicAnnotations.OperatorAnnotation.class)) != null) {</span>
+<span class="nc" id="L289">            lexicalRelation = operator.instance.deleteRelation;</span>
+          } else {
+<span class="nc bnc" id="L291" title="All 4 branches missed.">            assert edge.getDependent().index() &gt; 0;</span>
+<span class="nc" id="L292">            lexicalRelation = NaturalLogicRelation.forDependencyDeletion(edge.getRelation().toString(),</span>
+<span class="nc" id="L293">                isSubject.get(edge.getDependent().index() - 1));</span>
+          }
+<span class="nc" id="L295">          NaturalLogicRelation projectedRelation = tokenPolarity.projectLexicalRelation(lexicalRelation);</span>
+          // Make sure this is a valid entailment
+<span class="nc bnc" id="L297" title="All 2 branches missed.">          if (!projectedRelation.applyToTruthValue(truthOfPremise).isTrue()) {</span>
+<span class="nc" id="L298">            canDelete = false;</span>
+          }
+        }
+<span class="nc" id="L301">      }</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">      if (canDelete) {</span>
+        // Register the deletion
+<span class="nc" id="L305">        Lazy&lt;Pair&lt;SemanticGraph,BitSet&gt;&gt; treeWithDeletionsAndNewMask = Lazy.of(() -&gt; {</span>
+<span class="nc" id="L306">          SemanticGraph impl = new SemanticGraph(state.tree);</span>
+<span class="nc" id="L307">          BitSet newMask = state.deletionMask;</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">          for (IndexedWord vertex : state.tree.descendants(currentWord)) {</span>
+<span class="nc" id="L309">            impl.removeVertex(vertex);</span>
+<span class="nc bnc" id="L310" title="All 4 branches missed.">            assert vertex.index() &gt; 0;</span>
+<span class="nc" id="L311">            newMask.set(vertex.index() - 1);</span>
+<span class="nc bnc" id="L312" title="All 4 branches missed.">            assert newMask.get(vertex.index() - 1);</span>
+<span class="nc" id="L313">          }</span>
+<span class="nc" id="L314">          return Pair.makePair(impl, newMask);</span>
+        });
+        // Compute the score of the sentence
+<span class="nc" id="L317">        double newScore = state.score;</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">        for (SemanticGraphEdge edge : state.tree.incomingEdgeIterable(currentWord)) {</span>
+<span class="nc" id="L319">          double multiplier = weights.deletionProbability(edge, state.tree.outgoingEdgeIterable(edge.getGovernor()));</span>
+<span class="nc bnc" id="L320" title="All 4 branches missed.">          assert !Double.isNaN(multiplier);</span>
+<span class="nc bnc" id="L321" title="All 4 branches missed.">          assert !Double.isInfinite(multiplier);</span>
+<span class="nc" id="L322">          newScore *= multiplier;</span>
+<span class="nc" id="L323">        }</span>
+        // Register the result
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (newScore &gt; 0.0) {</span>
+<span class="nc" id="L326">          SemanticGraph resultTree = new SemanticGraph(treeWithDeletionsAndNewMask.get().first);</span>
+<span class="nc bnc" id="L327" title="All 4 branches missed.">          andsToAdd.stream().filter(edge -&gt; resultTree.containsVertex(edge.getGovernor()) &amp;&amp; resultTree.containsVertex(edge.getDependent()))</span>
+<span class="nc" id="L328">              .forEach(edge -&gt; resultTree.addEdge(edge.getGovernor(), edge.getDependent(), edge.getRelation(), Double.NEGATIVE_INFINITY, false));</span>
+<span class="nc" id="L329">          results.add(new SearchResult(resultTree,</span>
+<span class="nc" id="L330">              aggregateDeletedEdges(state, state.tree.incomingEdgeIterable(currentWord), determinerRemovals),</span>
+              newScore));
+
+          // Push the state with this subtree deleted
+<span class="nc" id="L334">          nextIndex = state.currentIndex + 1;</span>
+<span class="nc" id="L335">          numIters = 0;</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">          while (nextIndex &lt; topologicalVertices.size()) {</span>
+<span class="nc" id="L337">            IndexedWord nextWord = topologicalVertices.get(nextIndex);</span>
+<span class="nc" id="L338">            BitSet newMask = treeWithDeletionsAndNewMask.get().second;</span>
+<span class="nc" id="L339">            SemanticGraph treeWithDeletions = treeWithDeletionsAndNewMask.get().first;</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if ( !newMask.get(nextWord.index() - 1) ) {</span>
+<span class="nc bnc" id="L341" title="All 4 branches missed.">              assert treeWithDeletions.containsVertex(topologicalVertices.get(nextIndex));</span>
+<span class="nc" id="L342">              fringe.push(new SearchState(newMask, nextIndex, treeWithDeletions, null, state, newScore));</span>
+<span class="nc" id="L343">              break;</span>
+            } else {
+<span class="nc" id="L345">              nextIndex += 1;</span>
+            }
+<span class="nc" id="L347">            numIters += 1;</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if (numIters &gt; 10000) {</span>
+//              log.error(&quot;logic error (apparent infinite loop); returning&quot;);
+<span class="nc" id="L350">              return results;</span>
+            }
+<span class="nc" id="L352">          }</span>
+        }
+      }
+<span class="nc" id="L355">    }</span>
+
+    // Return
+<span class="nc" id="L358">    return results;</span>
+  }
+
+  /**
+   * Backtrace from a search state, collecting all of the deleted edges used to get there.
+   * @param state The final search state.
+   * @param justDeleted  The edges we have just deleted.
+   * @param otherEdges  Other deletions we want to register
+   * @return A list of deleted edges for that search state.
+   */
+  private static List&lt;String&gt; aggregateDeletedEdges(SearchState state, Iterable&lt;SemanticGraphEdge&gt; justDeleted, Iterable&lt;String&gt; otherEdges) {
+<span class="nc" id="L369">    List&lt;String&gt; rtn = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">    for (SemanticGraphEdge edge : justDeleted) {</span>
+<span class="nc" id="L371">      rtn.add(edge.getRelation().toString());</span>
+<span class="nc" id="L372">    }</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">    for (String edge : otherEdges) {</span>
+<span class="nc" id="L374">      rtn.add(edge);</span>
+<span class="nc" id="L375">    }</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">    while (state != null) {</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">      if (state.lastDeletedEdge != null) {</span>
+<span class="nc" id="L378">        rtn.add(state.lastDeletedEdge);</span>
+      }
+<span class="nc" id="L380">      state = state.source;</span>
+    }
+<span class="nc" id="L382">    return rtn;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

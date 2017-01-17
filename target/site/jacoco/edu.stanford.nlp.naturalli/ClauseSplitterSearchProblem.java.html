@@ -1,0 +1,1028 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClauseSplitterSearchProblem.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.naturalli</a> &gt; <span class="el_source">ClauseSplitterSearchProblem.java</span></div><h1>ClauseSplitterSearchProblem.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.naturalli;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.classify.*;
+import edu.stanford.nlp.international.Language;
+import edu.stanford.nlp.ling.*;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.trees.GrammaticalRelation;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.PriorityQueue;
+import edu.stanford.nlp.naturalli.ClauseSplitter.ClauseClassifierLabel;
+
+import java.io.*;
+import java.util.*;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
+
+/**
+ * &lt;p&gt;
+ *   A search problem for finding clauses in a sentence.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   For usage at test time, load a model from
+ *   {@link ClauseSplitter#load(String)}, and then take the top clauses of a given tree
+ *   with {@link ClauseSplitterSearchProblem#topClauses(double, int)}, yielding a list of
+ *   {@link edu.stanford.nlp.naturalli.SentenceFragment}s.
+ * &lt;/p&gt;
+ * &lt;pre&gt;
+ *   {@code
+ *     ClauseSearcher searcher = ClauseSearcher.factory(&quot;/model/path/&quot;);
+ *     List&lt;SentenceFragment&gt; sentences = searcher.topClauses(threshold);
+ *   }
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ *   For training, see {@link ClauseSplitter#train(Stream, File, File)}.
+ * &lt;/p&gt;
+ *
+ * @author Gabor Angeli
+ */
+<span class="pc bpc" id="L49" title="1 of 2 branches missed.">public class ClauseSplitterSearchProblem  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L52">  private static Redwood.RedwoodChannels log = Redwood.channels(ClauseSplitterSearchProblem.class);</span>
+
+  /**
+   * A specification for clause splits we _always_ want to do. The format is a map from the edge label we are splitting, to
+   * the preference for the type of split we should do. The most preferred is at the front of the list, and then it backs off
+   * to the less and less preferred split types.
+   */
+<span class="fc" id="L59">  protected static final Map&lt;String, List&lt;String&gt;&gt; HARD_SPLITS = Collections.unmodifiableMap(new HashMap&lt;String, List&lt;String&gt;&gt;() {{</span>
+<span class="fc" id="L60">    put(&quot;comp&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L61">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L62">    }});</span>
+<span class="fc" id="L63">    put(&quot;ccomp&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L64">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L65">    }});</span>
+<span class="fc" id="L66">    put(&quot;xcomp&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L67">      add(&quot;clone_dobj&quot;);</span>
+<span class="fc" id="L68">      add(&quot;clone_nsubj&quot;);</span>
+<span class="fc" id="L69">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L70">    }});</span>
+<span class="fc" id="L71">    put(&quot;vmod&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L72">      add(&quot;clone_nsubj&quot;);</span>
+<span class="fc" id="L73">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L74">    }});</span>
+<span class="fc" id="L75">    put(&quot;csubj&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L76">      add(&quot;clone_dobj&quot;);</span>
+<span class="fc" id="L77">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L78">    }});</span>
+<span class="fc" id="L79">    put(&quot;advcl&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L80">      add(&quot;clone_nsubj&quot;);</span>
+<span class="fc" id="L81">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L82">    }});</span>
+<span class="fc" id="L83">    put(&quot;advcl:*&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L84">      add(&quot;clone_nsubj&quot;);</span>
+<span class="fc" id="L85">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L86">    }});</span>
+<span class="fc" id="L87">    put(&quot;conj:*&quot;, new ArrayList&lt;String&gt;() {{</span>
+<span class="fc" id="L88">      add(&quot;clone_nsubj&quot;);</span>
+<span class="fc" id="L89">      add(&quot;clone_dobj&quot;);</span>
+<span class="fc" id="L90">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L91">    }});</span>
+<span class="fc" id="L92">    put(&quot;acl:relcl&quot;, new ArrayList&lt;String&gt;() {{  // no doubt (-&gt; that cats have tails &lt;-)</span>
+<span class="fc" id="L93">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L94">    }});</span>
+<span class="fc" id="L95">    put(&quot;parataxis&quot;, new ArrayList&lt;String&gt;() {{  // no doubt (-&gt; that cats have tails &lt;-)</span>
+<span class="fc" id="L96">      add(&quot;simple&quot;);</span>
+<span class="fc" id="L97">    }});</span>
+<span class="fc" id="L98">  }});</span>
+
+  /**
+   * A set of words which indicate that the complement clause is not factual, or at least not necessarily factual.
+   */
+<span class="fc" id="L103">  protected static final Set&lt;String&gt; INDIRECT_SPEECH_LEMMAS = Collections.unmodifiableSet(new HashSet&lt;String&gt;(){{</span>
+<span class="fc" id="L104">    add(&quot;report&quot;); add(&quot;say&quot;); add(&quot;told&quot;); add(&quot;claim&quot;); add(&quot;assert&quot;); add(&quot;think&quot;); add(&quot;believe&quot;); add(&quot;suppose&quot;);</span>
+<span class="fc" id="L105">  }});</span>
+
+  /**
+   * The tree to search over.
+   */
+  public final SemanticGraph tree;
+  /**
+   * The assumed truth of the original clause.
+   */
+  public final boolean assumedTruth;
+  /**
+   * The length of the sentence, as determined from the tree.
+   */
+  public final int sentenceLength;
+  /**
+   * A mapping from a word to the extra edges that come out of it.
+   */
+<span class="fc" id="L122">  private final Map&lt;IndexedWord, Collection&lt;SemanticGraphEdge&gt;&gt; extraEdgesByGovernor = new HashMap&lt;&gt;();</span>
+  /**
+   * A mapping from a word to the extra edges that to into it.
+   */
+<span class="fc" id="L126">  private final Map&lt;IndexedWord, Collection&lt;SemanticGraphEdge&gt;&gt; extraEdgesByDependent = new HashMap&lt;&gt;();</span>
+  /**
+   * The classifier for whether a particular dependency edge defines a clause boundary.
+   */
+  private final Optional&lt;Classifier&lt;ClauseSplitter.ClauseClassifierLabel, String&gt;&gt; isClauseClassifier;
+  /**
+   * An optional featurizer to use with the clause classifier ({@link ClauseSplitterSearchProblem#isClauseClassifier}).
+   * If that classifier is defined, this should be as well.
+   */
+  private final Optional&lt;Function&lt;Triple&lt;ClauseSplitterSearchProblem.State, ClauseSplitterSearchProblem.Action, ClauseSplitterSearchProblem.State&gt;, Counter&lt;String&gt;&gt;&gt; featurizer;
+
+  /**
+   * A mapping from edges in the tree, to an index.
+   */
+<span class="fc" id="L140">  @SuppressWarnings(&quot;Convert2Diamond&quot;)  // It's lying -- type inference times out with a diamond</span>
+  private final Index&lt;SemanticGraphEdge&gt; edgeToIndex = new HashIndex&lt;SemanticGraphEdge&gt;(ArrayList::new, IdentityHashMap::new);
+
+  /**
+   * A search state.
+   */
+  public class State {
+    public final SemanticGraphEdge edge;
+    public final int edgeIndex;
+    public final SemanticGraphEdge subjectOrNull;
+    public final int distanceFromSubj;
+    public final SemanticGraphEdge objectOrNull;
+    public final Consumer&lt;SemanticGraph&gt; thunk;
+    public boolean isDone;
+
+    public State(SemanticGraphEdge edge, SemanticGraphEdge subjectOrNull, int distanceFromSubj, SemanticGraphEdge objectOrNull,
+<span class="fc" id="L156">                 Consumer&lt;SemanticGraph&gt; thunk, boolean isDone) {</span>
+<span class="fc" id="L157">      this.edge = edge;</span>
+<span class="fc" id="L158">      this.edgeIndex = edgeToIndex.indexOf(edge);</span>
+<span class="fc" id="L159">      this.subjectOrNull = subjectOrNull;</span>
+<span class="fc" id="L160">      this.distanceFromSubj = distanceFromSubj;</span>
+<span class="fc" id="L161">      this.objectOrNull = objectOrNull;</span>
+<span class="fc" id="L162">      this.thunk = thunk;</span>
+<span class="fc" id="L163">      this.isDone = isDone;</span>
+<span class="fc" id="L164">    }</span>
+
+<span class="nc" id="L166">    public State(State source, boolean isDone) {</span>
+<span class="nc" id="L167">      this.edge = source.edge;</span>
+<span class="nc" id="L168">      this.edgeIndex = edgeToIndex.indexOf(edge);</span>
+<span class="nc" id="L169">      this.subjectOrNull = source.subjectOrNull;</span>
+<span class="nc" id="L170">      this.distanceFromSubj = source.distanceFromSubj;</span>
+<span class="nc" id="L171">      this.objectOrNull = source.objectOrNull;</span>
+<span class="nc" id="L172">      this.thunk = source.thunk;</span>
+<span class="nc" id="L173">      this.isDone = isDone;</span>
+<span class="nc" id="L174">    }</span>
+
+    public SemanticGraph originalTree() {
+<span class="nc" id="L177">      return ClauseSplitterSearchProblem.this.tree;</span>
+    }
+
+    public State withIsDone(ClauseClassifierLabel argmax) {
+<span class="fc bfc" id="L181" title="All 2 branches covered.">      if (argmax == ClauseClassifierLabel.CLAUSE_SPLIT) {</span>
+<span class="fc" id="L182">        isDone = true;</span>
+<span class="pc bpc" id="L183" title="1 of 2 branches missed.">      } else if (argmax == ClauseClassifierLabel.CLAUSE_INTERM) {</span>
+<span class="fc" id="L184">        isDone = false;</span>
+      } else {
+<span class="nc" id="L186">        throw new IllegalStateException(&quot;Invalid classifier label for isDone: &quot; + argmax);</span>
+      }
+<span class="fc" id="L188">      return this;</span>
+    }
+  }
+
+  /**
+   * An action being taken; that is, the type of clause splitting going on.
+   */
+  public interface Action {
+    /**
+     * The name of this action.
+     */
+    String signature();
+
+    /**
+     * A check to make sure this is actually a valid action to take, in the context of the given tree.
+     * @param originalTree The _original_ tree we are searching over. This is before any clauses are split off.
+     * @param edge The edge that we are traversing with this clause.
+     * @return True if this is a valid action.
+     */
+    @SuppressWarnings(&quot;UnusedParameters&quot;)
+    default boolean prerequisitesMet(SemanticGraph originalTree, SemanticGraphEdge edge) {
+<span class="nc" id="L209">      return true;</span>
+    }
+
+    /**
+     * Apply this action to the given state.
+     * @param tree The original tree we are applying the action to.
+     * @param source The source state we are mutating from.
+     * @param outgoingEdge The edge we are splitting off as a clause.
+     * @param subjectOrNull The subject of the parent tree, if there is one.
+     * @param ppOrNull The preposition attachment of the parent tree, if there is one.
+     * @return A new state, or {@link Optional#empty()} if this action was not successful.
+     */
+    Optional&lt;State&gt; applyTo(SemanticGraph tree, State source,
+                            SemanticGraphEdge outgoingEdge,
+                            SemanticGraphEdge subjectOrNull,
+                            SemanticGraphEdge ppOrNull);
+  }
+
+  /**
+   * The options used for training the clause searcher.
+   */
+<span class="nc" id="L230">  public static class TrainingOptions {</span>
+<span class="nc" id="L231">    @ArgumentParser.Option(name = &quot;negativeSubsampleRatio&quot;, gloss = &quot;The percent of negative datums to take&quot;)</span>
+    public double negativeSubsampleRatio = 1.00;
+<span class="nc" id="L233">    @ArgumentParser.Option(name = &quot;positiveDatumWeight&quot;, gloss = &quot;The weight to assign every positive datum.&quot;)</span>
+    public float positiveDatumWeight = 100.0f;
+<span class="nc" id="L235">    @ArgumentParser.Option(name = &quot;unknownDatumWeight&quot;, gloss = &quot;The weight to assign every unknown datum (everything extracted with an unconfirmed relation).&quot;)</span>
+    public float unknownDatumWeight = 1.0f;
+<span class="nc" id="L237">    @ArgumentParser.Option(name = &quot;clauseSplitWeight&quot;, gloss = &quot;The weight to assign for clause splitting datums. Higher values push towards higher recall.&quot;)</span>
+    public float clauseSplitWeight = 1.0f;
+<span class="nc" id="L239">    @ArgumentParser.Option(name = &quot;clauseIntermWeight&quot;, gloss = &quot;The weight to assign for intermediate splits. Higher values push towards higher recall.&quot;)</span>
+    public float clauseIntermWeight = 2.0f;
+<span class="nc" id="L241">    @ArgumentParser.Option(name = &quot;seed&quot;, gloss = &quot;The random seed to use&quot;)</span>
+    public int seed = 42;
+<span class="nc" id="L243">    @SuppressWarnings(&quot;unchecked&quot;)</span>
+    @ArgumentParser.Option(name = &quot;classifierFactory&quot;, gloss = &quot;The class of the classifier factory to use for training the various classifiers&quot;)
+    public Class&lt;? extends ClassifierFactory&lt;ClauseSplitter.ClauseClassifierLabel, String, Classifier&lt;ClauseSplitter.ClauseClassifierLabel, String&gt;&gt;&gt; classifierFactory = (Class&lt;? extends ClassifierFactory&lt;ClauseSplitter.ClauseClassifierLabel, String, Classifier&lt;ClauseSplitter.ClauseClassifierLabel, String&gt;&gt;&gt;) ((Object) LinearClassifierFactory.class);
+  }
+
+  /**
+   * Mostly just an alias, but make sure our featurizer is serializable!
+   */
+  public interface Featurizer extends Function&lt;Triple&lt;ClauseSplitterSearchProblem.State, ClauseSplitterSearchProblem.Action, ClauseSplitterSearchProblem.State&gt;, Counter&lt;String&gt;&gt;, Serializable {
+    boolean isSimpleSplit(Counter&lt;String&gt; feats);
+  }
+
+  /**
+   * Create a searcher manually, suppling a dependency tree, an optional classifier for when to split clauses,
+   * and a featurizer for that classifier.
+   * You almost certainly want to use {@link ClauseSplitter#load(String)} instead of this
+   * constructor.
+   *
+   * @param tree               The dependency tree to search over.
+   * @param assumedTruth       The assumed truth of the tree (relevant for natural logic inference). If in doubt, pass in true.
+   * @param isClauseClassifier The classifier for whether a given dependency arc should be a new clause. If this is not given, all arcs are treated as clause separators.
+   * @param featurizer         The featurizer for the classifier. If no featurizer is given, one should be given in {@link ClauseSplitterSearchProblem#search(java.util.function.Predicate, Classifier, Map, java.util.function.Function, int)}, or else the classifier will be useless.
+   * @see ClauseSplitter#load(String)
+   */
+  protected ClauseSplitterSearchProblem(SemanticGraph tree, boolean assumedTruth,
+                                        Optional&lt;Classifier&lt;ClauseSplitter.ClauseClassifierLabel, String&gt;&gt; isClauseClassifier,
+                                        Optional&lt;Function&lt;Triple&lt;ClauseSplitterSearchProblem.State, ClauseSplitterSearchProblem.Action, ClauseSplitterSearchProblem.State&gt;, Counter&lt;String&gt;&gt;&gt; featurizer
+<span class="fc" id="L270">  ) {</span>
+<span class="fc" id="L271">    this.tree = new SemanticGraph(tree);</span>
+<span class="fc" id="L272">    this.assumedTruth = assumedTruth;</span>
+<span class="fc" id="L273">    this.isClauseClassifier = isClauseClassifier;</span>
+<span class="fc" id="L274">    this.featurizer = featurizer;</span>
+    // Index edges
+<span class="fc" id="L276">    this.tree.edgeIterable().forEach(edgeToIndex::addToIndex);</span>
+    // Get length
+<span class="fc" id="L278">    List&lt;IndexedWord&gt; sortedVertices = tree.vertexListSorted();</span>
+<span class="fc" id="L279">    sentenceLength = sortedVertices.get(sortedVertices.size() - 1).index();</span>
+    // Register extra edges
+<span class="fc bfc" id="L281" title="All 2 branches covered.">    for (IndexedWord vertex : sortedVertices) {</span>
+<span class="fc" id="L282">      extraEdgesByGovernor.put(vertex, new ArrayList&lt;&gt;());</span>
+<span class="fc" id="L283">      extraEdgesByDependent.put(vertex, new ArrayList&lt;&gt;());</span>
+<span class="fc" id="L284">    }</span>
+<span class="fc" id="L285">    List&lt;SemanticGraphEdge&gt; extraEdges = Util.cleanTree(this.tree);</span>
+<span class="pc bpc" id="L286" title="2 of 4 branches missed.">    assert Util.isTree(this.tree);</span>
+<span class="pc bpc" id="L287" title="1 of 2 branches missed.">    for (SemanticGraphEdge edge : extraEdges) {</span>
+<span class="nc" id="L288">      extraEdgesByGovernor.get(edge.getGovernor()).add(edge);</span>
+<span class="nc" id="L289">      extraEdgesByDependent.get(edge.getDependent()).add(edge);</span>
+<span class="nc" id="L290">    }</span>
+<span class="fc" id="L291">  }</span>
+
+  /**
+   * Create a clause searcher which searches naively through every possible subtree as a clause.
+   * For an end-user, this is almost certainly not what you want.
+   * However, it is very useful for training time.
+   *
+   * @param tree The dependency tree to search over.
+   * @param assumedTruth The truth of the premise. Almost always True.
+   */
+  public ClauseSplitterSearchProblem(SemanticGraph tree, boolean assumedTruth) {
+<span class="fc" id="L302">    this(tree, assumedTruth, Optional.empty(), Optional.empty());</span>
+<span class="fc" id="L303">  }</span>
+
+  /**
+   * The basic method for splitting off a clause of a tree.
+   * This modifies the tree in place.
+   *
+   * @param tree The tree to split a clause from.
+   * @param toKeep The edge representing the clause to keep.
+   */
+  static void splitToChildOfEdge(SemanticGraph tree, SemanticGraphEdge toKeep) {
+<span class="fc" id="L313">    Queue&lt;IndexedWord&gt; fringe = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L314">    List&lt;IndexedWord&gt; nodesToRemove = new ArrayList&lt;&gt;();</span>
+    // Find nodes to remove
+    // (from the root)
+<span class="fc bfc" id="L317" title="All 2 branches covered.">    for (IndexedWord root : tree.getRoots()) {</span>
+<span class="fc" id="L318">      nodesToRemove.add(root);</span>
+<span class="fc bfc" id="L319" title="All 2 branches covered.">      for (SemanticGraphEdge out : tree.outgoingEdgeIterable(root)) {</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">        if (!out.equals(toKeep)) {</span>
+<span class="fc" id="L321">          fringe.add(out.getDependent());</span>
+        }
+<span class="fc" id="L323">      }</span>
+<span class="fc" id="L324">    }</span>
+    // (recursively)
+<span class="fc bfc" id="L326" title="All 2 branches covered.">    while (!fringe.isEmpty()) {</span>
+<span class="fc" id="L327">      IndexedWord node = fringe.poll();</span>
+<span class="fc" id="L328">      nodesToRemove.add(node);</span>
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">      for (SemanticGraphEdge out : tree.outgoingEdgeIterable(node)) {</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        if (!out.equals(toKeep)) {</span>
+<span class="nc" id="L331">          fringe.add(out.getDependent());</span>
+        }
+<span class="nc" id="L333">      }</span>
+<span class="fc" id="L334">    }</span>
+    // Remove nodes
+<span class="fc" id="L336">    nodesToRemove.forEach(tree::removeVertex);</span>
+    // Set new root
+<span class="fc" id="L338">    tree.setRoot(toKeep.getDependent());</span>
+
+<span class="fc" id="L340">  }</span>
+
+  /**
+   * The basic method for splitting off a clause of a tree.
+   * This modifies the tree in place.
+   * This method addtionally follows ref edges.
+   *
+   * @param tree The tree to split a clause from.
+   * @param toKeep The edge representing the clause to keep.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private void simpleClause(SemanticGraph tree, SemanticGraphEdge toKeep) {
+<span class="fc" id="L352">    splitToChildOfEdge(tree, toKeep);</span>
+
+    // Follow 'ref' edges
+<span class="fc" id="L355">    Map&lt;IndexedWord, IndexedWord&gt; refReplaceMap = new HashMap&lt;&gt;();</span>
+    // (find replacements)
+<span class="fc bfc" id="L357" title="All 2 branches covered.">    for (IndexedWord vertex : tree.vertexSet()) {</span>
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">      for (SemanticGraphEdge edge : extraEdgesByDependent.get(vertex)) {</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        if (&quot;ref&quot;.equals(edge.getRelation().toString()) &amp;&amp;  // it's a ref edge...</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">            !tree.containsVertex(edge.getGovernor())) {     // ...that doesn't already exist in the tree.</span>
+<span class="nc" id="L361">          refReplaceMap.put(vertex, edge.getGovernor());</span>
+        }
+<span class="nc" id="L363">      }</span>
+<span class="fc" id="L364">    }</span>
+    // (do replacements)
+<span class="pc bpc" id="L366" title="1 of 2 branches missed.">    for (Map.Entry&lt;IndexedWord, IndexedWord&gt; entry : refReplaceMap.entrySet()) {</span>
+<span class="nc" id="L367">      Iterator&lt;SemanticGraphEdge&gt; iter = tree.incomingEdgeIterator(entry.getKey());</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">      if (!iter.hasNext()) { continue; }</span>
+<span class="nc" id="L369">      SemanticGraphEdge incomingEdge = iter.next();</span>
+<span class="nc" id="L370">      IndexedWord governor = incomingEdge.getGovernor();</span>
+<span class="nc" id="L371">      tree.removeVertex(entry.getKey());</span>
+<span class="nc" id="L372">      addSubtree(tree, governor, incomingEdge.getRelation().toString(),</span>
+<span class="nc" id="L373">          this.tree, entry.getValue(), this.tree.incomingEdgeList(tree.getFirstRoot()));</span>
+<span class="nc" id="L374">    }</span>
+
+<span class="fc" id="L376">  }</span>
+
+  /**
+   * A helper to add a single word to a given dependency tree
+   * @param toModify The tree to add the word to.
+   * @param root The root of the tree where we should be adding the word.
+   * @param rel The relation to add the word with.
+   * @param coreLabel The word to add.
+   */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  private static void addWord(SemanticGraph toModify, IndexedWord root, String rel, CoreLabel coreLabel) {
+<span class="nc" id="L387">    IndexedWord dependent = new IndexedWord(coreLabel);</span>
+<span class="nc" id="L388">    toModify.addVertex(dependent);</span>
+<span class="nc" id="L389">    toModify.addEdge(root, dependent, GrammaticalRelation.valueOf(Language.English, rel), Double.NEGATIVE_INFINITY, false);</span>
+<span class="nc" id="L390">  }</span>
+
+  /**
+   * A helper to add an entire subtree to a given dependency tree.
+   *
+   * @param toModify The tree to add the subtree to.
+   * @param root The root of the tree where we should be adding the subtree.
+   * @param rel The relation to add the subtree with.
+   * @param originalTree The orignal tree (i.e., {@link ClauseSplitterSearchProblem#tree}).
+   * @param subject The root of the clause to add.
+   * @param ignoredEdges The edges to ignore adding when adding this subtree.
+   */
+  private static void addSubtree(SemanticGraph toModify, IndexedWord root, String rel, SemanticGraph originalTree, IndexedWord subject, Collection&lt;SemanticGraphEdge&gt; ignoredEdges) {
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">    if (toModify.containsVertex(subject)) {</span>
+<span class="nc" id="L404">      return;  // This subtree already exists.</span>
+    }
+<span class="fc" id="L406">    Queue&lt;IndexedWord&gt; fringe = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L407">    Collection&lt;IndexedWord&gt; wordsToAdd = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L408">    Collection&lt;SemanticGraphEdge&gt; edgesToAdd = new ArrayList&lt;&gt;();</span>
+    // Search for subtree to add
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">    for (SemanticGraphEdge edge : originalTree.outgoingEdgeIterable(subject)) {</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">      if (!ignoredEdges.contains(edge)) {</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        if (toModify.containsVertex(edge.getDependent())) {</span>
+          // Case: we're adding a subtree that's not disjoint from toModify. This is bad news.
+<span class="nc" id="L414">          return;</span>
+        }
+<span class="nc" id="L416">        edgesToAdd.add(edge);</span>
+<span class="nc" id="L417">        fringe.add(edge.getDependent());</span>
+      }
+<span class="nc" id="L419">    }</span>
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">    while (!fringe.isEmpty()) {</span>
+<span class="nc" id="L421">      IndexedWord node = fringe.poll();</span>
+<span class="nc" id="L422">      wordsToAdd.add(node);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">      for (SemanticGraphEdge edge : originalTree.outgoingEdgeIterable(node)) {</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">        if (!ignoredEdges.contains(edge)) {</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">          if (toModify.containsVertex(edge.getDependent())) {</span>
+            // Case: we're adding a subtree that's not disjoint from toModify. This is bad news.
+<span class="nc" id="L427">            return;</span>
+          }
+<span class="nc" id="L429">          edgesToAdd.add(edge);</span>
+<span class="nc" id="L430">          fringe.add(edge.getDependent());</span>
+        }
+<span class="nc" id="L432">      }</span>
+<span class="nc" id="L433">    }</span>
+    // Add subtree
+    // (add subject)
+<span class="fc" id="L436">    toModify.addVertex(subject);</span>
+<span class="fc" id="L437">    toModify.addEdge(root, subject, GrammaticalRelation.valueOf(Language.English, rel), Double.NEGATIVE_INFINITY, false);</span>
+
+    // (add nodes)
+<span class="fc" id="L440">    wordsToAdd.forEach(toModify::addVertex);</span>
+    // (add edges)
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">    for (SemanticGraphEdge edge : edgesToAdd) {</span>
+<span class="nc bnc" id="L443" title="All 4 branches missed.">      assert !toModify.incomingEdgeIterator(edge.getDependent()).hasNext();</span>
+<span class="nc" id="L444">      toModify.addEdge(edge.getGovernor(), edge.getDependent(), edge.getRelation(), edge.getWeight(), edge.isExtra());</span>
+<span class="nc" id="L445">    }</span>
+<span class="fc" id="L446">  }</span>
+
+  /**
+   * Strips aux and mark edges when we are splitting into a clause.
+   *
+   * @param toModify The tree we are stripping the edges from.
+   */
+  private static void stripAuxMark(SemanticGraph toModify) {
+<span class="fc" id="L454">    List&lt;SemanticGraphEdge&gt; toClean = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L455" title="All 2 branches covered.">    for (SemanticGraphEdge edge : toModify.outgoingEdgeIterable(toModify.getFirstRoot())) {</span>
+<span class="fc" id="L456">      String rel = edge.getRelation().toString();</span>
+<span class="pc bpc" id="L457" title="1 of 6 branches missed.">      if ((&quot;aux&quot;.equals(rel) || &quot;mark&quot;.equals(rel)) &amp;&amp; !toModify.outgoingEdgeIterator(edge.getDependent()).hasNext()) {</span>
+<span class="fc" id="L458">        toClean.add(edge);</span>
+      }
+<span class="fc" id="L460">    }</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">    for (SemanticGraphEdge edge : toClean) {</span>
+<span class="fc" id="L462">      toModify.removeEdge(edge);</span>
+<span class="fc" id="L463">      toModify.removeVertex(edge.getDependent());</span>
+<span class="fc" id="L464">    }</span>
+<span class="fc" id="L465">  }</span>
+
+
+  /**
+   * Create a mock node, to be added to the dependency tree but which is not part of the original sentence.
+   *
+   * @param toCopy The CoreLabel to copy from initially.
+   * @param word   The new word to add.
+   * @param POS    The new part of speech to add.
+   *
+   * @return A CoreLabel copying most fields from toCopy, but with a new word and POS tag (as well as a new index).
+   */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  private CoreLabel mockNode(CoreLabel toCopy, String word, String POS) {
+<span class="nc" id="L479">    CoreLabel mock = new CoreLabel(toCopy);</span>
+<span class="nc" id="L480">    mock.setWord(word);</span>
+<span class="nc" id="L481">    mock.setLemma(word);</span>
+<span class="nc" id="L482">    mock.setValue(word);</span>
+<span class="nc" id="L483">    mock.setNER(&quot;O&quot;);</span>
+<span class="nc" id="L484">    mock.setTag(POS);</span>
+<span class="nc" id="L485">    mock.setIndex(sentenceLength + 5);</span>
+<span class="nc" id="L486">    return mock;</span>
+  }
+
+  /**
+   * Get the top few clauses from this searcher, cutting off at the given minimum
+   * probability.
+   *
+   * @param thresholdProbability The threshold under which to stop returning clauses. This should be between 0 and 1.
+   * @param maxClauses A hard limit on the number of clauses to return.
+   *
+   * @return The resulting {@link edu.stanford.nlp.naturalli.SentenceFragment} objects, representing the top clauses of the sentence.
+   */
+  public List&lt;SentenceFragment&gt; topClauses(double thresholdProbability, int maxClauses) {
+<span class="nc" id="L499">    List&lt;SentenceFragment&gt; results = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L500">    search(triple -&gt; {</span>
+<span class="nc bnc" id="L501" title="All 4 branches missed.">      assert triple.first &lt;= 0.0;</span>
+<span class="nc" id="L502">      double prob = Math.exp(triple.first);</span>
+<span class="nc bnc" id="L503" title="All 4 branches missed.">      assert prob &lt;= 1.0;</span>
+<span class="nc bnc" id="L504" title="All 4 branches missed.">      assert prob &gt;= 0.0;</span>
+<span class="nc bnc" id="L505" title="All 4 branches missed.">      assert !Double.isNaN(prob);</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">      if (prob &gt;= thresholdProbability) {</span>
+<span class="nc" id="L507">        SentenceFragment fragment = triple.third.get();</span>
+<span class="nc" id="L508">        fragment.score = prob;</span>
+<span class="nc" id="L509">        results.add(fragment);</span>
+<span class="nc" id="L510">        return true;</span>
+      } else {
+<span class="nc" id="L512">        return false;</span>
+      }
+    });
+<span class="nc" id="L515">    return results;</span>
+  }
+
+  /**
+   * Search, using the default weights / featurizer. This is the most common entry method for the raw search,
+   * though {@link ClauseSplitterSearchProblem#topClauses(double, int)} may be a more convenient method for
+   * an end user.
+   *
+   * @param candidateFragments The callback function for results. The return value defines whether to continue searching.
+   */
+  public void search(final Predicate&lt;Triple&lt;Double, List&lt;Counter&lt;String&gt;&gt;, Supplier&lt;SentenceFragment&gt;&gt;&gt; candidateFragments) {
+<span class="nc bnc" id="L526" title="All 2 branches missed.">    if (!isClauseClassifier.isPresent()) {</span>
+<span class="nc" id="L527">      search(candidateFragments,</span>
+          new LinearClassifier&lt;&gt;(new ClassicCounter&lt;&gt;()),
+          HARD_SPLITS,
+<span class="nc bnc" id="L530" title="All 2 branches missed.">          this.featurizer.isPresent() ? this.featurizer.get() : DEFAULT_FEATURIZER,</span>
+          1000);
+    } else {
+<span class="nc bnc" id="L533" title="All 2 branches missed.">      if (!(isClauseClassifier.get() instanceof LinearClassifier)) {</span>
+<span class="nc" id="L534">        throw new IllegalArgumentException(&quot;For now, only linear classifiers are supported&quot;);</span>
+      }
+<span class="nc" id="L536">      search(candidateFragments,</span>
+<span class="nc" id="L537">          isClauseClassifier.get(),</span>
+          HARD_SPLITS,
+<span class="nc" id="L539">          this.featurizer.get(),</span>
+          1000);
+    }
+<span class="nc" id="L542">  }</span>
+
+  /**
+   * Search from the root of the tree.
+   * This function also defines the default action space to use during search.
+   * This is NOT recommended to be used at test time.
+   *
+   * @see edu.stanford.nlp.naturalli.ClauseSplitterSearchProblem#search(Predicate)
+   *
+   * @param candidateFragments The callback function.
+   * @param classifier The classifier for whether an arc should be on the path to a clause split, a clause split itself, or neither.
+   * @param featurizer The featurizer to use during search, to be dot producted with the weights.
+   */
+  public void search(
+      // The output specs
+      final Predicate&lt;Triple&lt;Double, List&lt;Counter&lt;String&gt;&gt;, Supplier&lt;SentenceFragment&gt;&gt;&gt; candidateFragments,
+      // The learning specs
+      final Classifier&lt;ClauseSplitter.ClauseClassifierLabel, String&gt; classifier,
+      final Map&lt;String, List&lt;String&gt;&gt; hardCodedSplits,
+      final Function&lt;Triple&lt;State, Action, State&gt;, Counter&lt;String&gt;&gt; featurizer,
+      final int maxTicks
+  ) {
+<span class="fc" id="L564">    Collection&lt;Action&gt; actionSpace = new ArrayList&lt;&gt;();</span>
+
+    // SIMPLE SPLIT
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">    actionSpace.add(new Action() {</span>
+      @Override
+      public String signature() {
+<span class="fc" id="L570">        return &quot;simple&quot;;</span>
+      }
+
+      @Override
+      public boolean prerequisitesMet(SemanticGraph originalTree, SemanticGraphEdge edge) {
+<span class="fc" id="L575">        char tag = edge.getDependent().tag().charAt(0);</span>
+<span class="pc bpc" id="L576" title="1 of 10 branches missed.">        return !(tag != 'V' &amp;&amp; tag != 'N' &amp;&amp; tag != 'J' &amp;&amp; tag != 'P' &amp;&amp; tag != 'D');</span>
+      }
+
+      @Override
+      public Optional&lt;State&gt; applyTo(SemanticGraph tree, State source, SemanticGraphEdge outgoingEdge, SemanticGraphEdge subjectOrNull, SemanticGraphEdge objectOrNull) {
+<span class="fc bfc" id="L581" title="All 6 branches covered.">        return Optional.of(new State(</span>
+            outgoingEdge,
+            subjectOrNull == null ? source.subjectOrNull : subjectOrNull,
+            subjectOrNull == null ? (source.distanceFromSubj + 1) : 0,
+            objectOrNull == null ? source.objectOrNull : objectOrNull,
+<span class="fc" id="L586">            source.thunk.andThen(toModify -&gt; {</span>
+<span class="pc bpc" id="L587" title="2 of 4 branches missed.">              assert Util.isTree(toModify);</span>
+<span class="fc" id="L588">              simpleClause(toModify, outgoingEdge);</span>
+<span class="pc bpc" id="L589" title="1 of 2 branches missed.">              if (outgoingEdge.getRelation().toString().endsWith(&quot;comp&quot;)) {</span>
+<span class="fc" id="L590">                stripAuxMark(toModify);</span>
+              }
+<span class="pc bpc" id="L592" title="2 of 4 branches missed.">              assert Util.isTree(toModify);</span>
+<span class="fc" id="L593">            }), false</span>
+        ));
+      }
+    });
+
+    // CLONE ROOT
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">    actionSpace.add(new Action() {</span>
+      @Override
+      public String signature() {
+<span class="fc" id="L602">        return &quot;clone_root_as_nsubjpass&quot;;</span>
+      }
+
+      @Override
+      public boolean prerequisitesMet(SemanticGraph originalTree, SemanticGraphEdge edge) {
+        // Only valid if there's a single nontrivial outgoing edge from a node. Otherwise it's a whole can of worms.
+<span class="fc" id="L608">        Iterator&lt;SemanticGraphEdge&gt; iter =  originalTree.outgoingEdgeIterable(edge.getGovernor()).iterator();</span>
+<span class="pc bpc" id="L609" title="1 of 2 branches missed.">        if (!iter.hasNext()) {</span>
+<span class="nc" id="L610">          return false; // what?</span>
+        }
+<span class="fc" id="L612">        boolean nontrivialEdge = false;</span>
+<span class="fc bfc" id="L613" title="All 2 branches covered.">        while (iter.hasNext()) {</span>
+<span class="fc" id="L614">          SemanticGraphEdge outEdge = iter.next();</span>
+<span class="pc bpc" id="L615" title="7 of 9 branches missed.">          switch (outEdge.getRelation().toString()) {</span>
+            case &quot;nn&quot;:
+            case &quot;amod&quot;:
+<span class="nc" id="L618">              break;</span>
+            default:
+<span class="fc bfc" id="L620" title="All 2 branches covered.">              if (nontrivialEdge) { return false; }</span>
+<span class="fc" id="L621">              nontrivialEdge = true;</span>
+          }
+<span class="fc" id="L623">        }</span>
+<span class="fc" id="L624">        return true;</span>
+      }
+
+      @Override
+      public Optional&lt;State&gt; applyTo(SemanticGraph tree, State source, SemanticGraphEdge outgoingEdge, SemanticGraphEdge subjectOrNull, SemanticGraphEdge objectOrNull) {
+<span class="pc bpc" id="L629" title="3 of 6 branches missed.">        return Optional.of(new State(</span>
+            outgoingEdge,
+            subjectOrNull == null ? source.subjectOrNull : subjectOrNull,
+            subjectOrNull == null ? (source.distanceFromSubj + 1) : 0,
+            objectOrNull == null ? source.objectOrNull : objectOrNull,
+<span class="fc" id="L634">            source.thunk.andThen(toModify -&gt; {</span>
+<span class="nc bnc" id="L635" title="All 4 branches missed.">              assert Util.isTree(toModify);</span>
+<span class="nc" id="L636">              simpleClause(toModify, outgoingEdge);</span>
+<span class="nc" id="L637">              addSubtree(toModify, outgoingEdge.getDependent(), &quot;nsubjpass&quot;, tree, outgoingEdge.getGovernor(), Collections.singleton(outgoingEdge));</span>
+//              addWord(toModify, outgoingEdge.getDependent(), &quot;auxpass&quot;, mockNode(outgoingEdge.getDependent().backingLabel(), &quot;is&quot;, &quot;VBZ&quot;));
+<span class="nc bnc" id="L639" title="All 4 branches missed.">              assert Util.isTree(toModify);</span>
+<span class="nc" id="L640">            }), true</span>
+        ));
+      }
+    });
+
+    // COPY SUBJECT
+<span class="pc bpc" id="L646" title="1 of 2 branches missed.">    actionSpace.add(new Action() {</span>
+      @Override
+      public String signature() {
+<span class="fc" id="L649">        return &quot;clone_nsubj&quot;;</span>
+      }
+
+      @Override
+      public boolean prerequisitesMet(SemanticGraph originalTree, SemanticGraphEdge edge) {
+        // Don't split into anything but verbs or nouns
+<span class="fc" id="L655">        char tag = edge.getDependent().tag().charAt(0);</span>
+<span class="fc bfc" id="L656" title="All 4 branches covered.">        if (tag != 'V' &amp;&amp; tag != 'N') { return false; }</span>
+<span class="fc bfc" id="L657" title="All 2 branches covered.">        for (SemanticGraphEdge grandchild : originalTree.outgoingEdgeIterable(edge.getDependent())) {</span>
+<span class="fc bfc" id="L658" title="All 2 branches covered.">          if (grandchild.getRelation().toString().contains(&quot;subj&quot;)) { return false; }</span>
+<span class="fc" id="L659">        }</span>
+<span class="fc" id="L660">        return true;</span>
+      }
+
+      @Override
+      public Optional&lt;State&gt; applyTo(SemanticGraph tree, State source, SemanticGraphEdge outgoingEdge, SemanticGraphEdge subjectOrNull, SemanticGraphEdge objectOrNull) {
+<span class="fc bfc" id="L665" title="All 4 branches covered.">        if (subjectOrNull != null &amp;&amp; !outgoingEdge.equals(subjectOrNull)) {</span>
+<span class="fc bfc" id="L666" title="All 2 branches covered.">          return Optional.of(new State(</span>
+              outgoingEdge,
+              subjectOrNull,
+              0,
+              objectOrNull == null ? source.objectOrNull : objectOrNull,
+<span class="fc" id="L671">              source.thunk.andThen(toModify -&gt; {</span>
+<span class="pc bpc" id="L672" title="2 of 4 branches missed.">                assert Util.isTree(toModify);</span>
+<span class="fc" id="L673">                simpleClause(toModify, outgoingEdge);</span>
+<span class="fc" id="L674">                addSubtree(toModify, outgoingEdge.getDependent(), &quot;nsubj&quot;, tree,</span>
+<span class="fc" id="L675">                    subjectOrNull.getDependent(), Collections.singleton(outgoingEdge));</span>
+<span class="pc bpc" id="L676" title="2 of 4 branches missed.">                assert Util.isTree(toModify);</span>
+<span class="fc" id="L677">                stripAuxMark(toModify);</span>
+<span class="pc bpc" id="L678" title="2 of 4 branches missed.">                assert Util.isTree(toModify);</span>
+<span class="fc" id="L679">              }), false</span>
+          ));
+        } else {
+<span class="fc" id="L682">          return Optional.empty();</span>
+        }
+      }
+    });
+
+    // COPY OBJECT
+<span class="pc bpc" id="L688" title="1 of 2 branches missed.">    actionSpace.add(new Action() {</span>
+      @Override
+      public String signature() {
+<span class="fc" id="L691">        return &quot;clone_dobj&quot;;</span>
+      }
+
+      @Override
+      public boolean prerequisitesMet(SemanticGraph originalTree, SemanticGraphEdge edge) {
+        // Don't split into anything but verbs or nouns
+<span class="fc" id="L697">        char tag = edge.getDependent().tag().charAt(0);</span>
+<span class="fc bfc" id="L698" title="All 4 branches covered.">        if (tag != 'V' &amp;&amp; tag != 'N') { return false; }</span>
+<span class="fc bfc" id="L699" title="All 2 branches covered.">        for (SemanticGraphEdge grandchild : originalTree.outgoingEdgeIterable(edge.getDependent())) {</span>
+<span class="fc bfc" id="L700" title="All 2 branches covered.">          if (grandchild.getRelation().toString().contains(&quot;subj&quot;)) { return false; }</span>
+<span class="fc" id="L701">        }</span>
+<span class="fc" id="L702">        return true;</span>
+      }
+
+      @Override
+      public Optional&lt;State&gt; applyTo(SemanticGraph tree, State source, SemanticGraphEdge outgoingEdge, SemanticGraphEdge subjectOrNull, SemanticGraphEdge objectOrNull) {
+<span class="fc bfc" id="L707" title="All 4 branches covered.">        if (objectOrNull != null &amp;&amp; !outgoingEdge.equals(objectOrNull)) {</span>
+<span class="pc bpc" id="L708" title="2 of 4 branches missed.">          return Optional.of(new State(</span>
+              outgoingEdge,
+              subjectOrNull == null ? source.subjectOrNull : subjectOrNull,
+              subjectOrNull == null ? (source.distanceFromSubj + 1) : 0,
+              objectOrNull,
+<span class="fc" id="L713">              source.thunk.andThen(toModify -&gt; {</span>
+<span class="pc bpc" id="L714" title="2 of 4 branches missed.">                assert Util.isTree(toModify);</span>
+                // Split the clause
+<span class="fc" id="L716">                simpleClause(toModify, outgoingEdge);</span>
+                // Attach the new subject
+<span class="fc" id="L718">                addSubtree(toModify, outgoingEdge.getDependent(), &quot;nsubj&quot;, tree,</span>
+<span class="fc" id="L719">                    objectOrNull.getDependent(), Collections.singleton(outgoingEdge));</span>
+                // Strip bits we don't want
+<span class="pc bpc" id="L721" title="2 of 4 branches missed.">                assert Util.isTree(toModify);</span>
+<span class="fc" id="L722">                stripAuxMark(toModify);</span>
+<span class="pc bpc" id="L723" title="2 of 4 branches missed.">                assert Util.isTree(toModify);</span>
+<span class="fc" id="L724">              }), false</span>
+          ));
+        } else {
+<span class="fc" id="L727">          return Optional.empty();</span>
+        }
+      }
+    });
+
+<span class="fc bfc" id="L732" title="All 2 branches covered.">    for (IndexedWord root : tree.getRoots()) {</span>
+<span class="fc" id="L733">      search(root, candidateFragments, classifier, hardCodedSplits, featurizer, actionSpace, maxTicks);</span>
+<span class="fc" id="L734">    }</span>
+<span class="fc" id="L735">  }</span>
+
+  /**
+   * Re-order the action space based on the specified order of names.
+   */
+  private static Collection&lt;Action&gt; orderActions(Collection&lt;Action&gt; actionSpace, List&lt;String&gt; order) {
+<span class="fc" id="L741">    List&lt;Action&gt; tmp = new ArrayList&lt;&gt;(actionSpace);</span>
+<span class="fc" id="L742">    List&lt;Action&gt; out = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L743" title="All 2 branches covered.">    for (String key : order) {</span>
+<span class="fc" id="L744">      Iterator&lt;Action&gt; iter = tmp.iterator();</span>
+<span class="fc bfc" id="L745" title="All 2 branches covered.">      while (iter.hasNext()) {</span>
+<span class="fc" id="L746">        Action a = iter.next();</span>
+<span class="fc bfc" id="L747" title="All 2 branches covered.">        if (a.signature().equals(key)) {</span>
+<span class="fc" id="L748">          out.add(a);</span>
+<span class="fc" id="L749">          iter.remove();</span>
+        }
+<span class="fc" id="L751">      }</span>
+<span class="fc" id="L752">    }</span>
+<span class="fc" id="L753">    out.addAll(tmp);</span>
+<span class="fc" id="L754">    return out;</span>
+  }
+
+  /**
+   * The core implementation of the search.
+   *
+   * @param root The root word to search from. Traditionally, this is the root of the sentence.
+   * @param candidateFragments The callback for the resulting sentence fragments.
+   *                           This is a predicate of a triple of values.
+   *                           The return value of the predicate determines whether we should continue searching.
+   *                           The triple is a triple of
+   *                           &lt;ol&gt;
+   *                             &lt;li&gt;The log probability of the sentence fragment, according to the featurizer and the weights&lt;/li&gt;
+   *                             &lt;li&gt;The features along the path to this fragment. The last element of this is the features from the most recent step.&lt;/li&gt;
+   *                             &lt;li&gt;The sentence fragment. Because it is relatively expensive to compute the resulting tree, this is returned as a lazy {@link Supplier}.&lt;/li&gt;
+   *                           &lt;/ol&gt;
+   * @param classifier The classifier for whether an arc should be on the path to a clause split, a clause split itself, or neither.
+   * @param featurizer The featurizer to use. Make sure this matches the weights!
+   * @param actionSpace The action space we are allowed to take. Each action defines a means of splitting a clause on a dependency boundary.
+   */
+  protected void search(
+      // The root to search from
+      IndexedWord root,
+      // The output specs
+      final Predicate&lt;Triple&lt;Double, List&lt;Counter&lt;String&gt;&gt;, Supplier&lt;SentenceFragment&gt;&gt;&gt; candidateFragments,
+      // The learning specs
+      final Classifier&lt;ClauseSplitter.ClauseClassifierLabel,String&gt; classifier,
+      Map&lt;String, ? extends List&lt;String&gt;&gt; hardCodedSplits,
+      final Function&lt;Triple&lt;State, Action, State&gt;, Counter&lt;String&gt;&gt; featurizer,
+      final Collection&lt;Action&gt; actionSpace,
+      final int maxTicks
+  ) {
+    // (the fringe)
+<span class="fc" id="L787">    PriorityQueue&lt;Pair&lt;State, List&lt;Counter&lt;String&gt;&gt;&gt;&gt; fringe = new FixedPrioritiesPriorityQueue&lt;&gt;();</span>
+    // (avoid duplicate work)
+<span class="fc" id="L789">    Set&lt;IndexedWord&gt; seenWords = new HashSet&lt;&gt;();</span>
+
+<span class="fc" id="L791">    State firstState = new State(null, null, -9000, null, x -&gt; {</span>
+<span class="fc" id="L792">    }, true);  // First state is implicitly &quot;done&quot;</span>
+<span class="fc" id="L793">    fringe.add(Pair.makePair(firstState, new ArrayList&lt;&gt;(0)), -0.0);</span>
+<span class="fc" id="L794">    int ticks = 0;</span>
+
+<span class="fc bfc" id="L796" title="All 2 branches covered.">    while (!fringe.isEmpty()) {</span>
+<span class="pc bpc" id="L797" title="1 of 2 branches missed.">      if (++ticks &gt; maxTicks) {</span>
+//        log.info(&quot;WARNING! Timed out on search with &quot; + ticks + &quot; ticks&quot;);
+<span class="nc" id="L799">        return;</span>
+      }
+      // Useful variables
+<span class="fc" id="L802">      double logProbSoFar = fringe.getPriority();</span>
+<span class="pc bpc" id="L803" title="2 of 4 branches missed.">      assert logProbSoFar &lt;= 0.0;</span>
+<span class="fc" id="L804">      Pair&lt;State, List&lt;Counter&lt;String&gt;&gt;&gt; lastStatePair = fringe.removeFirst();</span>
+<span class="fc" id="L805">      State lastState = lastStatePair.first;</span>
+<span class="fc" id="L806">      List&lt;Counter&lt;String&gt;&gt; featuresSoFar = lastStatePair.second;</span>
+<span class="fc bfc" id="L807" title="All 2 branches covered.">      IndexedWord rootWord = lastState.edge == null ? root : lastState.edge.getDependent();</span>
+
+      // Register thunk
+<span class="fc bfc" id="L810" title="All 2 branches covered.">      if (lastState.isDone) {</span>
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">        if (!candidateFragments.test(Triple.makeTriple(logProbSoFar, featuresSoFar, () -&gt; {</span>
+<span class="fc" id="L812">          SemanticGraph copy = new SemanticGraph(tree);</span>
+<span class="fc" id="L813">          lastState.thunk.andThen(x -&gt; {</span>
+            // Add the extra edges back in, if they don't break the tree-ness of the extraction
+<span class="fc bfc" id="L815" title="All 2 branches covered.">            for (IndexedWord newTreeRoot : x.getRoots()) {</span>
+<span class="pc bpc" id="L816" title="1 of 2 branches missed.">              if (newTreeRoot != null) {  // what a strange thing to have happen...</span>
+<span class="pc bpc" id="L817" title="1 of 2 branches missed.">                for (SemanticGraphEdge extraEdge : extraEdgesByGovernor.get(newTreeRoot)) {</span>
+<span class="nc bnc" id="L818" title="All 4 branches missed.">                  assert Util.isTree(x);</span>
+                  //noinspection unchecked
+<span class="nc" id="L820">                  addSubtree(x, newTreeRoot, extraEdge.getRelation().toString(), tree, extraEdge.getDependent(), tree.getIncomingEdgesSorted(newTreeRoot));</span>
+<span class="nc bnc" id="L821" title="All 4 branches missed.">                  assert Util.isTree(x);</span>
+<span class="nc" id="L822">                }</span>
+              }
+<span class="fc" id="L824">            }</span>
+<span class="fc" id="L825">          }).accept(copy);</span>
+<span class="fc" id="L826">          return new SentenceFragment(copy, assumedTruth, false);</span>
+        }))) {
+<span class="nc" id="L828">          break;</span>
+        }
+      }
+
+      // Find relevant auxilliary terms
+<span class="fc" id="L833">      SemanticGraphEdge subjOrNull = null;</span>
+<span class="fc" id="L834">      SemanticGraphEdge objOrNull = null;</span>
+<span class="fc bfc" id="L835" title="All 2 branches covered.">      for (SemanticGraphEdge auxEdge : tree.outgoingEdgeIterable(rootWord)) {</span>
+<span class="fc" id="L836">        String relString = auxEdge.getRelation().toString();</span>
+<span class="fc bfc" id="L837" title="All 2 branches covered.">        if (relString.contains(&quot;obj&quot;)) {</span>
+<span class="fc" id="L838">          objOrNull = auxEdge;</span>
+<span class="fc bfc" id="L839" title="All 2 branches covered.">        } else if (relString.contains(&quot;subj&quot;)) {</span>
+<span class="fc" id="L840">          subjOrNull = auxEdge;</span>
+        }
+<span class="fc" id="L842">      }</span>
+
+      // Iterate over children
+      // For each outgoing edge...
+<span class="fc bfc" id="L846" title="All 2 branches covered.">      for (SemanticGraphEdge outgoingEdge : tree.outgoingEdgeIterable(rootWord)) {</span>
+        // Prohibit indirect speech verbs from splitting off clauses
+        // (e.g., 'said', 'think')
+        // This fires if the governor is an indirect speech verb, and the outgoing edge is a ccomp
+<span class="fc bfc" id="L850" title="All 2 branches covered.">        if ( outgoingEdge.getRelation().toString().equals(&quot;ccomp&quot;) &amp;&amp;</span>
+<span class="pc bpc" id="L851" title="3 of 4 branches missed.">             ( (outgoingEdge.getGovernor().lemma() != null &amp;&amp; INDIRECT_SPEECH_LEMMAS.contains(outgoingEdge.getGovernor().lemma())) ||</span>
+<span class="pc bpc" id="L852" title="1 of 2 branches missed.">                INDIRECT_SPEECH_LEMMAS.contains(outgoingEdge.getGovernor().word())) ) {</span>
+<span class="nc" id="L853">          continue;</span>
+        }
+        // Get some variables
+<span class="fc" id="L856">        String outgoingEdgeRelation = outgoingEdge.getRelation().toString();</span>
+<span class="fc" id="L857">        List&lt;String&gt; forcedArcOrder = hardCodedSplits.get(outgoingEdgeRelation);</span>
+<span class="pc bpc" id="L858" title="1 of 4 branches missed.">        if (forcedArcOrder == null &amp;&amp; outgoingEdgeRelation.contains(&quot;:&quot;)) {</span>
+<span class="nc" id="L859">          forcedArcOrder = hardCodedSplits.get(outgoingEdgeRelation.substring(0, outgoingEdgeRelation.indexOf(&quot;:&quot;)) + &quot;:*&quot;);</span>
+        }
+<span class="fc" id="L861">        boolean doneForcedArc = false;</span>
+        // For each action...
+<span class="fc bfc" id="L863" title="All 4 branches covered.">        for (Action action : (forcedArcOrder == null ? actionSpace : orderActions(actionSpace, forcedArcOrder))) {</span>
+          // Check the prerequisite
+<span class="fc bfc" id="L865" title="All 2 branches covered.">          if (!action.prerequisitesMet(tree, outgoingEdge)) {</span>
+<span class="fc" id="L866">            continue;</span>
+          }
+<span class="fc bfc" id="L868" title="All 4 branches covered.">          if (forcedArcOrder != null &amp;&amp; doneForcedArc) {</span>
+<span class="fc" id="L869">            break;</span>
+          }
+          // 1. Compute the child state
+<span class="fc" id="L872">          Optional&lt;State&gt; candidate = action.applyTo(tree, lastState,</span>
+              outgoingEdge, subjOrNull,
+              objOrNull);
+<span class="fc bfc" id="L875" title="All 2 branches covered.">          if (candidate.isPresent()) {</span>
+            double logProbability;
+            ClauseClassifierLabel bestLabel;
+<span class="fc" id="L878">            Counter&lt;String&gt; features = featurizer.apply(Triple.makeTriple(lastState, action, candidate.get()));</span>
+<span class="pc bpc" id="L879" title="1 of 4 branches missed.">            if (forcedArcOrder != null &amp;&amp; !doneForcedArc) {</span>
+<span class="fc" id="L880">              logProbability = 0.0;</span>
+<span class="fc" id="L881">              bestLabel = ClauseClassifierLabel.CLAUSE_SPLIT;</span>
+<span class="fc" id="L882">              doneForcedArc = true;</span>
+<span class="pc bpc" id="L883" title="1 of 2 branches missed.">            } else if (features.containsKey(&quot;__undocumented_junit_no_classifier&quot;)) {</span>
+<span class="fc" id="L884">              logProbability = Double.NEGATIVE_INFINITY;</span>
+<span class="fc" id="L885">              bestLabel = ClauseClassifierLabel.CLAUSE_INTERM;</span>
+            } else {
+<span class="nc" id="L887">              Counter&lt;ClauseClassifierLabel&gt; scores = classifier.scoresOf(new RVFDatum&lt;&gt;(features));</span>
+<span class="nc bnc" id="L888" title="All 2 branches missed.">              if (scores.size() &gt; 0) {</span>
+<span class="nc" id="L889">                Counters.logNormalizeInPlace(scores);</span>
+              }
+<span class="nc" id="L891">              String rel = outgoingEdge.getRelation().toString();</span>
+<span class="nc bnc" id="L892" title="All 4 branches missed.">              if (&quot;nsubj&quot;.equals(rel) || &quot;dobj&quot;.equals(rel)) {</span>
+<span class="nc" id="L893">                scores.remove(ClauseClassifierLabel.NOT_A_CLAUSE);  // Always at least yield on nsubj and dobj</span>
+              }
+<span class="nc" id="L895">              logProbability = Counters.max(scores, Double.NEGATIVE_INFINITY);</span>
+<span class="nc" id="L896">              bestLabel = Counters.argmax(scores, (x, y) -&gt; 0, ClauseClassifierLabel.CLAUSE_SPLIT);</span>
+            }
+
+<span class="pc bpc" id="L899" title="1 of 2 branches missed.">            if (bestLabel != ClauseClassifierLabel.NOT_A_CLAUSE) {</span>
+<span class="fc" id="L900">              Pair&lt;State, List&lt;Counter&lt;String&gt;&gt;&gt; childState = Pair.makePair(candidate.get().withIsDone(bestLabel), new ArrayList&lt;Counter&lt;String&gt;&gt;(featuresSoFar) {{</span>
+<span class="fc" id="L901">                add(features);</span>
+<span class="fc" id="L902">              }});</span>
+              // 2. Register the child state
+<span class="pc bpc" id="L904" title="1 of 2 branches missed.">              if (!seenWords.contains(childState.first.edge.getDependent())) {</span>
+//            log.info(&quot;  pushing &quot; + action.signature() + &quot; with &quot; + argmax.first.edge);
+<span class="fc" id="L906">                fringe.add(childState, logProbability);</span>
+              }
+            }
+          }
+<span class="fc" id="L910">        }</span>
+<span class="fc" id="L911">      }</span>
+
+<span class="fc" id="L913">      seenWords.add(rootWord);</span>
+<span class="fc" id="L914">    }</span>
+//    log.info(&quot;Search finished in &quot; + ticks + &quot; ticks and &quot; + classifierEvals + &quot; classifier evaluations.&quot;);
+<span class="fc" id="L916">  }</span>
+
+
+
+  /**
+   * The default featurizer to use during training.
+   */
+<span class="pc bpc" id="L923" title="1 of 2 branches missed.">  public static final Featurizer DEFAULT_FEATURIZER = new Featurizer() {</span>
+    private static final long serialVersionUID = 4145523451314579506l;
+    @Override
+    public boolean isSimpleSplit(Counter&lt;String&gt; feats) {
+<span class="nc bnc" id="L927" title="All 2 branches missed.">      for (String key : feats.keySet()) {</span>
+<span class="nc bnc" id="L928" title="All 2 branches missed.">        if (key.startsWith(&quot;simple&amp;&quot;)) {</span>
+<span class="nc" id="L929">          return true;</span>
+        }
+<span class="nc" id="L931">      }</span>
+<span class="nc" id="L932">      return false;</span>
+    }
+
+    @Override
+    public Counter&lt;String&gt; apply(Triple&lt;State, Action, State&gt; triple) {
+      // Variables
+<span class="nc" id="L938">      State from = triple.first;</span>
+<span class="nc" id="L939">      Action action = triple.second;</span>
+<span class="nc" id="L940">      State to = triple.third;</span>
+<span class="nc" id="L941">      String signature = action.signature();</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">      String edgeRelTaken = to.edge == null ? &quot;root&quot; : to.edge.getRelation().toString();</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">      String edgeRelShort = to.edge == null ?  &quot;root&quot;  : to.edge.getRelation().getShortName();</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">      if (edgeRelShort.contains(&quot;_&quot;)) {</span>
+<span class="nc" id="L945">        edgeRelShort = edgeRelShort.substring(0, edgeRelShort.indexOf(&quot;_&quot;));</span>
+      }
+
+      // -- Featurize --
+      // Variables to aggregate
+<span class="nc" id="L950">      boolean parentHasSubj = false;</span>
+<span class="nc" id="L951">      boolean parentHasObj = false;</span>
+<span class="nc" id="L952">      boolean childHasSubj = false;</span>
+<span class="nc" id="L953">      boolean childHasObj = false;</span>
+<span class="nc" id="L954">      Counter&lt;String&gt; feats = new ClassicCounter&lt;&gt;();</span>
+
+      // 1. edge taken
+<span class="nc" id="L957">      feats.incrementCount(signature + &quot;&amp;edge:&quot; + edgeRelTaken);</span>
+<span class="nc" id="L958">      feats.incrementCount(signature + &quot;&amp;edge_type:&quot; + edgeRelShort);</span>
+
+      // 2. last edge taken
+<span class="nc bnc" id="L961" title="All 2 branches missed.">      if (from.edge == null) {</span>
+<span class="nc bnc" id="L962" title="All 6 branches missed.">        assert to.edge == null || to.originalTree().getRoots().contains(to.edge.getGovernor());</span>
+<span class="nc" id="L963">        feats.incrementCount(signature + &quot;&amp;at_root&quot;);</span>
+<span class="nc" id="L964">        feats.incrementCount(signature + &quot;&amp;at_root&amp;root_pos:&quot; + to.originalTree().getFirstRoot().tag());</span>
+      } else {
+<span class="nc" id="L966">        feats.incrementCount(signature + &quot;&amp;not_root&quot;);</span>
+<span class="nc" id="L967">        String lastRelShort = from.edge.getRelation().getShortName();</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">        if (lastRelShort.contains(&quot;_&quot;)) {</span>
+<span class="nc" id="L969">          lastRelShort = lastRelShort.substring(0, lastRelShort.indexOf(&quot;_&quot;));</span>
+        }
+<span class="nc" id="L971">        feats.incrementCount(signature + &quot;&amp;last_edge:&quot; + lastRelShort);</span>
+      }
+
+<span class="nc bnc" id="L974" title="All 2 branches missed.">      if (to.edge != null) {</span>
+        // 3. other edges at parent
+<span class="nc bnc" id="L976" title="All 2 branches missed.">        for (SemanticGraphEdge parentNeighbor : from.originalTree().outgoingEdgeIterable(to.edge.getGovernor())) {</span>
+<span class="nc bnc" id="L977" title="All 2 branches missed.">          if (parentNeighbor != to.edge) {</span>
+<span class="nc" id="L978">            String parentNeighborRel = parentNeighbor.getRelation().toString();</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">            if (parentNeighborRel.contains(&quot;subj&quot;)) {</span>
+<span class="nc" id="L980">              parentHasSubj = true;</span>
+            }
+<span class="nc bnc" id="L982" title="All 2 branches missed.">            if (parentNeighborRel.contains(&quot;obj&quot;)) {</span>
+<span class="nc" id="L983">              parentHasObj = true;</span>
+            }
+            // (add feature)
+<span class="nc" id="L986">            feats.incrementCount(signature + &quot;&amp;parent_neighbor:&quot; + parentNeighborRel);</span>
+<span class="nc" id="L987">            feats.incrementCount(signature + &quot;&amp;edge_type:&quot; + edgeRelShort + &quot;&amp;parent_neighbor:&quot; + parentNeighborRel);</span>
+          }
+<span class="nc" id="L989">        }</span>
+
+        // 4. Other edges at child
+<span class="nc" id="L992">        int childNeighborCount = 0;</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        for (SemanticGraphEdge childNeighbor : from.originalTree().outgoingEdgeIterable(to.edge.getDependent())) {</span>
+<span class="nc" id="L994">          String childNeighborRel = childNeighbor.getRelation().toString();</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">          if (childNeighborRel.contains(&quot;subj&quot;)) {</span>
+<span class="nc" id="L996">            childHasSubj = true;</span>
+          }
+<span class="nc bnc" id="L998" title="All 2 branches missed.">          if (childNeighborRel.contains(&quot;obj&quot;)) {</span>
+<span class="nc" id="L999">            childHasObj = true;</span>
+          }
+<span class="nc" id="L1001">          childNeighborCount += 1;</span>
+          // (add feature)
+<span class="nc" id="L1003">          feats.incrementCount(signature + &quot;&amp;child_neighbor:&quot; + childNeighborRel);</span>
+<span class="nc" id="L1004">          feats.incrementCount(signature + &quot;&amp;edge_type:&quot; + edgeRelShort + &quot;&amp;child_neighbor:&quot; + childNeighborRel);</span>
+<span class="nc" id="L1005">        }</span>
+        // 4.1 Number of other edges at child
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">        feats.incrementCount(signature + &quot;&amp;child_neighbor_count:&quot; + (childNeighborCount &lt; 3 ? childNeighborCount : &quot;&gt;2&quot;));</span>
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">        feats.incrementCount(signature + &quot;&amp;edge_type:&quot; + edgeRelShort + &quot;&amp;child_neighbor_count:&quot; + (childNeighborCount &lt; 3 ? childNeighborCount : &quot;&gt;2&quot;));</span>
+
+
+        // 5. Subject/Object stats
+<span class="nc" id="L1012">        feats.incrementCount(signature + &quot;&amp;parent_neighbor_subj:&quot; + parentHasSubj);</span>
+<span class="nc" id="L1013">        feats.incrementCount(signature + &quot;&amp;parent_neighbor_obj:&quot; + parentHasObj);</span>
+<span class="nc" id="L1014">        feats.incrementCount(signature + &quot;&amp;child_neighbor_subj:&quot; + childHasSubj);</span>
+<span class="nc" id="L1015">        feats.incrementCount(signature + &quot;&amp;child_neighbor_obj:&quot; + childHasObj);</span>
+
+        // 6. POS tag info
+<span class="nc" id="L1018">        feats.incrementCount(signature + &quot;&amp;parent_pos:&quot; + to.edge.getGovernor().tag());</span>
+<span class="nc" id="L1019">        feats.incrementCount(signature + &quot;&amp;child_pos:&quot; + to.edge.getDependent().tag());</span>
+<span class="nc" id="L1020">        feats.incrementCount(signature + &quot;&amp;pos_signature:&quot; + to.edge.getGovernor().tag() + &quot;_&quot; + to.edge.getDependent().tag());</span>
+<span class="nc" id="L1021">        feats.incrementCount(signature + &quot;&amp;edge_type:&quot; + edgeRelShort + &quot;&amp;pos_signature:&quot; + to.edge.getGovernor().tag() + &quot;_&quot; + to.edge.getDependent().tag());</span>
+      }
+<span class="nc" id="L1023">      return feats;</span>
+    }
+  };
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

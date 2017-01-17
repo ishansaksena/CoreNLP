@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LinearGrammarSmoother.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">LinearGrammarSmoother.java</span></div><h1>LinearGrammarSmoother.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.Arrays;
+import java.util.Set;
+
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import java.util.function.Function;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Pair;
+
+/**
+ * Implements linear rule smoothing a la Petrov et al. (2006).
+ * 
+ * @author Spence Green
+ *
+ */
+public class LinearGrammarSmoother implements Function&lt;Pair&lt;UnaryGrammar,BinaryGrammar&gt;, Pair&lt;UnaryGrammar,BinaryGrammar&gt;&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L23">  private static Redwood.RedwoodChannels log = Redwood.channels(LinearGrammarSmoother.class);</span>
+
+  private static final boolean DEBUG = false;
+  
+<span class="nc" id="L27">  private double ALPHA = 0.01;</span>
+
+//  private static final String SYNTH_NODE_MARK = &quot;@&quot;;
+//  
+//  private static final Pattern pContext = Pattern.compile(&quot;(\\|.+)$&quot;);
+  
+  // Do not include @ in this list! @ marks synthetic nodes!
+  // Stole these from PennTreebankLanguagePack
+<span class="nc" id="L35">  private final String[] annotationIntroducingChars = {&quot;-&quot;, &quot;=&quot;, &quot;|&quot;, &quot;#&quot;, &quot;^&quot;, &quot;~&quot;, &quot;_&quot;};</span>
+<span class="nc" id="L36">  private final Set&lt;String&gt; annoteChars = Generics.newHashSet(Arrays.asList(annotationIntroducingChars));</span>
+
+  private final TrainOptions trainOptions;
+
+  private final Index&lt;String&gt; stateIndex;
+  private final Index&lt;String&gt; tagIndex;
+
+<span class="nc" id="L43">  public LinearGrammarSmoother(TrainOptions trainOptions, Index&lt;String&gt; stateIndex, Index&lt;String&gt; tagIndex) {</span>
+<span class="nc" id="L44">    this.trainOptions = trainOptions;</span>
+<span class="nc" id="L45">    this.stateIndex = stateIndex;</span>
+<span class="nc" id="L46">    this.tagIndex = tagIndex;</span>
+<span class="nc" id="L47">  }</span>
+
+  /**
+   * Destructively modifies the input and returns it as a convenience.
+   */
+  public Pair&lt;UnaryGrammar,BinaryGrammar&gt; apply(Pair&lt;UnaryGrammar,BinaryGrammar&gt; bgug) {
+    
+<span class="nc" id="L54">    ALPHA = trainOptions.ruleSmoothingAlpha;</span>
+<span class="nc" id="L55">    Counter&lt;String&gt; symWeights = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L56">    Counter&lt;String&gt; symCounts = new ClassicCounter&lt;&gt;();</span>
+
+    //Tally unary rules
+<span class="nc bnc" id="L59" title="All 2 branches missed.">    for (UnaryRule rule : bgug.first()) {</span>
+<span class="nc bnc" id="L60" title="All 2 branches missed.">      if ( ! tagIndex.contains(rule.parent)) {</span>
+<span class="nc" id="L61">        updateCounters(rule, symWeights,symCounts);  </span>
+      }
+<span class="nc" id="L63">    }</span>
+
+    //Tally binary rules
+<span class="nc bnc" id="L66" title="All 2 branches missed.">    for (BinaryRule rule : bgug.second()) {</span>
+<span class="nc" id="L67">      updateCounters(rule, symWeights, symCounts);  </span>
+<span class="nc" id="L68">    }</span>
+
+    //Compute smoothed rule scores, unary
+<span class="nc bnc" id="L71" title="All 2 branches missed.">    for (UnaryRule rule : bgug.first()) {</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">      if ( ! tagIndex.contains(rule.parent)) {</span>
+<span class="nc" id="L73">        rule.score = smoothRuleWeight(rule,symWeights,symCounts);</span>
+      }
+<span class="nc" id="L75">    }</span>
+
+    //Compute smoothed rule scores, binary
+<span class="nc bnc" id="L78" title="All 2 branches missed.">    for (BinaryRule rule : bgug.second()) {</span>
+<span class="nc" id="L79">      rule.score = smoothRuleWeight(rule,symWeights,symCounts);  </span>
+<span class="nc" id="L80">    }</span>
+    
+    if(DEBUG) {
+      System.err.printf(&quot;%s: %d basic symbols in the grammar%n&quot;,this.getClass().getName(),symWeights.keySet().size());
+      for(String s : symWeights.keySet())
+        log.info(s + &quot;,&quot;);
+      log.info();
+    }
+    
+<span class="nc" id="L89">    return bgug;</span>
+  }
+
+
+  private void updateCounters(Rule rule, Counter&lt;String&gt; symWeights,
+      Counter&lt;String&gt; symCounts) {
+<span class="nc" id="L95">    String label = stateIndex.get(rule.parent());</span>
+<span class="nc" id="L96">    String basicCat = basicCategory(label);</span>
+<span class="nc" id="L97">    symWeights.incrementCount(basicCat, Math.exp(rule.score()));</span>
+<span class="nc" id="L98">    symCounts.incrementCount(basicCat);</span>
+<span class="nc" id="L99">  }</span>
+
+
+  private float smoothRuleWeight(Rule rule, Counter&lt;String&gt; symWeights, Counter&lt;String&gt; symCounts) {  
+<span class="nc" id="L103">    String label = stateIndex.get(rule.parent());</span>
+<span class="nc" id="L104">    String basicCat = basicCategory(label);</span>
+
+<span class="nc" id="L106">    double pSum = symWeights.getCount(basicCat);</span>
+<span class="nc" id="L107">    double n = symCounts.getCount(basicCat);</span>
+
+<span class="nc" id="L109">    double pRule = Math.exp(rule.score());</span>
+
+<span class="nc" id="L111">    double pSmooth = (1.0 - ALPHA)*pRule;</span>
+<span class="nc" id="L112">    pSmooth += ALPHA*(pSum / n);</span>
+<span class="nc" id="L113">    pSmooth = Math.log(pSmooth);</span>
+    
+    if(DEBUG)
+      System.err.printf(&quot;%s\t%.4f%n&quot;, rule.toString(),pSmooth);
+
+<span class="nc" id="L118">    return (float) pSmooth;</span>
+  }
+
+
+  private int postBasicCategoryIndex(String category) {
+<span class="nc" id="L123">    boolean sawAtZero = false;</span>
+<span class="nc" id="L124">    String seenAtZero = &quot;\u0000&quot;;</span>
+    int i;
+<span class="nc bnc" id="L126" title="All 2 branches missed.">    for (i = 0; i &lt; category.length(); i++) {</span>
+<span class="nc" id="L127">      String ch = category.substring(i,i+1);</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">      if (annoteChars.contains(ch)) {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (i == 0) {</span>
+<span class="nc" id="L130">          sawAtZero = true;</span>
+<span class="nc" id="L131">          seenAtZero = ch;</span>
+<span class="nc bnc" id="L132" title="All 4 branches missed.">        } else if (sawAtZero &amp;&amp; ch == seenAtZero) {</span>
+<span class="nc" id="L133">          sawAtZero = false;</span>
+        } else {
+          break;
+        }
+      }
+    }
+<span class="nc" id="L139">    return i;</span>
+  }
+
+  public String basicCategory(String category) {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    if (category == null) {</span>
+<span class="nc" id="L144">      return null;</span>
+
+    } else {
+<span class="nc" id="L147">      String basicCat = category.substring(0, postBasicCategoryIndex(category));</span>
+      
+//wsg2011: Tried adding the context of synthetic nodes to the basic category, but this lowered F1.
+//      if(String.valueOf(category.charAt(0)).equals(SYNTH_NODE_MARK)) {
+//        Matcher m = pContext.matcher(category);
+//        if(m.find()) {
+//          String context = m.group(1);
+//          basicCat = basicCat + context;
+//        
+//        } else {
+//          throw new RuntimeException(String.format(&quot;%s: Synthetic label lacks context: %s&quot;,this.getClass().getName(),category));
+//        }
+//      } 
+      
+<span class="nc" id="L161">      return basicCat;</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

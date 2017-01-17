@@ -1,0 +1,568 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NPTmpRetainingTreeNormalizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees</a> &gt; <span class="el_source">NPTmpRetainingTreeNormalizer.java</span></div><h1>NPTmpRetainingTreeNormalizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.trees; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.ling.LabelFactory;
+import java.util.function.Predicate;
+
+import java.io.Reader;
+import java.util.regex.Pattern;
+import java.util.*;
+
+
+/**
+ * Same TreeNormalizer as BobChrisTreeNormalizer, but optionally provides
+ * four extras.  I.e., the class name is now a misnomer.&lt;br&gt;
+ * 1) retains -TMP labels on NP with the new identification NP-TMP,
+ * and provides various options to percolate that option downwards
+ * to the head noun, and perhaps also to inherit this from a PP-TMP.&lt;br&gt;
+ * 2) Annotates S nodes which contain a gapped subject: i.e.,
+ * &lt;code&gt;S &amp;lt; (/^NP-SBJ/ &amp;lt; -NONE-) --&gt; S-G&lt;/code&gt;  &lt;br&gt;
+ * 3) Leave all functional tags on nodes. &lt;br&gt;
+ * 4) Keeps -ADV labels on NP and marks head tag with &amp;`^ADV
+ * &lt;p/&gt;
+ * &lt;i&gt;Performance note:&lt;/i&gt; At one point in time, PCFG labeled F1 results
+ * for the various TEMPORAL options in lexparser were:
+ * 0=86.7, 1=87.49, 2=86.87, 3=87.49, 4=87.48, 5=87.5, 6=87.07.
+ * So, mainly avoid values of 0, 2, and 6.
+ * &lt;p/&gt;
+ * At another point they were:
+ * 0=86.53, 1=87.1, 2=87.14, 3=87.22, 4=87.1, 5=87.13, 6=86.95, 7=87.16
+ *
+ * @author Christopher Manning
+ * @author Dan Klein
+ */
+public class NPTmpRetainingTreeNormalizer extends BobChrisTreeNormalizer  {
+
+  /** A logger for this class */
+<span class="fc" id="L38">  private static Redwood.RedwoodChannels log = Redwood.channels(NPTmpRetainingTreeNormalizer.class);</span>
+
+  private static final long serialVersionUID = 7548777133196579107L;
+
+  public static final int TEMPORAL_NONE = 0;
+  public static final int TEMPORAL_ACL03PCFG = 1;
+  public static final int TEMPORAL_ANY_TMP_PERCOLATED = 2;
+  public static final int TEMPORAL_ALL_TERMINALS = 3;
+  public static final int TEMPORAL_ALL_NP = 4;
+  public static final int TEMPORAL_ALL_NP_AND_PP = 5;
+  public static final int TEMPORAL_NP_AND_PP_WITH_NP_HEAD = 6;
+  public static final int TEMPORAL_ALL_NP_EVEN_UNDER_PP = 7;
+  public static final int TEMPORAL_ALL_NP_PP_ADVP = 8;
+  public static final int TEMPORAL_9 = 9;
+
+  private static final boolean onlyTagAnnotateNstar = true;
+
+<span class="fc" id="L55">  private static final Pattern NPTmpPattern = Pattern.compile(&quot;NP.*-TMP.*&quot;);</span>
+<span class="fc" id="L56">  private static final Pattern PPTmpPattern = Pattern.compile(&quot;PP.*-TMP.*&quot;);</span>
+<span class="fc" id="L57">  private static final Pattern ADVPTmpPattern = Pattern.compile(&quot;ADVP.*-TMP.*&quot;);</span>
+<span class="fc" id="L58">  private static final Pattern TmpPattern = Pattern.compile(&quot;.*-TMP.*&quot;);</span>
+<span class="fc" id="L59">  private static final Pattern NPSbjPattern = Pattern.compile(&quot;NP.*-SBJ.*&quot;);</span>
+<span class="fc" id="L60">  private static final Pattern NPAdvPattern = Pattern.compile(&quot;NP.*-ADV.*&quot;);</span>
+
+  private final int temporalAnnotation;
+  private final boolean doSGappedStuff;
+  private final int leaveItAll;
+  private final boolean doAdverbialNP;
+  private final HeadFinder headFinder;
+
+
+  public NPTmpRetainingTreeNormalizer() {
+<span class="nc" id="L70">    this(TEMPORAL_ACL03PCFG, false);</span>
+<span class="nc" id="L71">  }</span>
+
+  public NPTmpRetainingTreeNormalizer(int temporalAnnotation, boolean doSGappedStuff) {
+<span class="nc" id="L74">    this(temporalAnnotation, doSGappedStuff, 0, false);</span>
+<span class="nc" id="L75">  }</span>
+
+  public NPTmpRetainingTreeNormalizer(int temporalAnnotation, boolean doSGappedStuff, int leaveItAll, boolean doAdverbialNP) {
+<span class="fc" id="L78">    this(temporalAnnotation, doSGappedStuff, leaveItAll, doAdverbialNP, new ModCollinsHeadFinder());</span>
+<span class="fc" id="L79">  }</span>
+
+  /**
+   * Create a TreeNormalizer that maintains some functional annotations,
+   * particularly those involving temporal annotation.
+   *
+   * @param temporalAnnotation One of the constants:
+   *                           TEMPORAL_NONE (no temporal annotation kept on trees),
+   *                           TEMPORAL_ACL03PCFG (temporal annotation on NPs, and percolated down
+   *                           to head of constituent until and including POS tag),
+   *                           TEMPORAL_ANY_TMP_PERCOLATED (temporal annotation on any phrase is
+   *                           kept and percolated via head chain to and including POS tag),
+   *                           TEMPORAL_ALL_TERMINALS (temporal annotation is kept on NPs, and
+   *                           is placed on all POS tag daughters of that NP (but is not
+   *                           percolated down a head chain through phrasal categories),
+   *                           TEMPORAL_ALL_NP (temporal annotation on NPs, and it is percolated
+   *                           down via the head chain, but only through NPs: annotation stops
+   *                           at either a POS tag (which is annotated) or a non-NP head
+   *                           (which isn't annotated)),
+   *                           TEMPORAL_ALL_NP_AND_PP (keeps temporal annotation on NPs and PPs,
+   *                           and it is percolated down via the head chain, but only through
+   *                           NPs: annotation stops at either a POS tag (which is annotated)
+   *                           or a non-NP head (which isn't annotated)).
+   *                           TEMPORAL_NP_AND_PP_WITH_NP_HEAD (like TEMPORAL_ALL_NP_AND_PP
+   *                           except an NP is regarded as the head of a PP)
+   *                           TEMPORAL_ALL_NP_EVEN_UNDER_PP (like TEMPORAL_ALL_NP, but a PP-TMP
+   *                           annotation above an NP is 'passed down' to annotate that NP
+   *                           as temporal (but the PP itself isn't marked))
+   *                           TEMPORAL_ALL_NP_PP_ADVP (keeps temporal annotation on NPs, PPs, and
+   *                           ADVPs
+   *                           and it is percolated down via the head chain, but only through
+   *                           those categories: annotation stops at either a POS tag
+   *                           (which is annotated)
+   *                           or a non-NP/PP/ADVP head (which isn't annotated)),
+   *                           TEMPORAL_9 (annotates like the previous one but
+   *                           does all NP inside node, and their children if
+   *                           pre-pre-terminal rather than only if head).
+   * @param doSGappedStuff     Leave -SBJ marking on subject NP and then mark
+   *                           S-G sentences with a gapped subject.
+   * @param leaveItAll         0 means the usual stripping of functional tags and indices;
+   *                           1 leaves all functional tags but still strips indices;
+   *                           2 leaves everything
+   * @param doAdverbialNP      Leave -ADV functional tag on adverbial NPs and
+   *                           maybe add it to their head
+   * @param headFinder         A head finder that is used with some of the
+   *                           options for temporalAnnotation
+   */
+<span class="fc" id="L126">  public NPTmpRetainingTreeNormalizer(int temporalAnnotation, boolean doSGappedStuff, int leaveItAll, boolean doAdverbialNP, HeadFinder headFinder) {</span>
+<span class="fc" id="L127">    this.temporalAnnotation = temporalAnnotation;</span>
+<span class="fc" id="L128">    this.doSGappedStuff = doSGappedStuff;</span>
+<span class="fc" id="L129">    this.leaveItAll = leaveItAll;</span>
+<span class="fc" id="L130">    this.doAdverbialNP = doAdverbialNP;</span>
+<span class="fc" id="L131">    this.headFinder = headFinder;</span>
+<span class="fc" id="L132">  }</span>
+
+
+  /**
+   * Remove things like hyphened functional tags and equals from the
+   * end of a node label.
+   */
+  @Override
+  protected String cleanUpLabel(String label) {
+<span class="fc bfc" id="L141" title="All 2 branches covered.">    if (label == null) {</span>
+<span class="fc" id="L142">      return &quot;ROOT&quot;;</span>
+      // String constants are always interned
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">    } else if (leaveItAll == 1) {</span>
+<span class="nc" id="L145">      return tlp.categoryAndFunction(label);</span>
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">    } else if (leaveItAll == 2) {</span>
+<span class="nc" id="L147">      return label;</span>
+    } else {
+<span class="fc" id="L149">      boolean nptemp = NPTmpPattern.matcher(label).matches();</span>
+<span class="fc" id="L150">      boolean pptemp = PPTmpPattern.matcher(label).matches();</span>
+<span class="fc" id="L151">      boolean advptemp = ADVPTmpPattern.matcher(label).matches();</span>
+<span class="fc" id="L152">      boolean anytemp = TmpPattern.matcher(label).matches();</span>
+<span class="fc" id="L153">      boolean subj = NPSbjPattern.matcher(label).matches();</span>
+<span class="fc" id="L154">      boolean npadv = NPAdvPattern.matcher(label).matches();</span>
+<span class="fc" id="L155">      label = tlp.basicCategory(label);</span>
+<span class="pc bpc" id="L156" title="1 of 4 branches missed.">      if (anytemp &amp;&amp; temporalAnnotation == TEMPORAL_ANY_TMP_PERCOLATED) {</span>
+<span class="nc" id="L157">        label += &quot;-TMP&quot;;</span>
+<span class="pc bpc" id="L158" title="5 of 12 branches missed.">      } else if (pptemp &amp;&amp; (temporalAnnotation == TEMPORAL_ALL_NP_AND_PP || temporalAnnotation == TEMPORAL_NP_AND_PP_WITH_NP_HEAD || temporalAnnotation == TEMPORAL_ALL_NP_EVEN_UNDER_PP || temporalAnnotation == TEMPORAL_ALL_NP_PP_ADVP || temporalAnnotation == TEMPORAL_9)) {</span>
+<span class="nc" id="L159">        label = label + &quot;-TMP&quot;;</span>
+<span class="pc bpc" id="L160" title="2 of 6 branches missed.">      } else if (advptemp &amp;&amp; (temporalAnnotation == TEMPORAL_ALL_NP_PP_ADVP || temporalAnnotation == TEMPORAL_9)) {</span>
+<span class="nc" id="L161">        label = label + &quot;-TMP&quot;;</span>
+<span class="pc bpc" id="L162" title="1 of 4 branches missed.">      } else if (temporalAnnotation &gt; 0 &amp;&amp; nptemp) {</span>
+<span class="fc" id="L163">        label = label + &quot;-TMP&quot;;</span>
+      }
+<span class="pc bpc" id="L165" title="1 of 4 branches missed.">      if (doAdverbialNP &amp;&amp; npadv) {</span>
+<span class="fc" id="L166">        label = label + &quot;-ADV&quot;;</span>
+      }
+<span class="pc bpc" id="L168" title="3 of 4 branches missed.">      if (doSGappedStuff &amp;&amp; subj) {</span>
+<span class="nc" id="L169">        label = label + &quot;-SBJ&quot;;</span>
+      }
+<span class="fc" id="L171">      return label;</span>
+    }
+  }
+
+
+  private static boolean includesEmptyNPSubj(Tree t) {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L178">      return false;</span>
+    }
+<span class="nc" id="L180">    Tree[] kids = t.children();</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">    if (kids == null) {</span>
+<span class="nc" id="L182">      return false;</span>
+    }
+<span class="nc" id="L184">    boolean foundNullSubj = false;</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">    for (Tree kid : kids) {</span>
+<span class="nc" id="L186">      Tree[] kidkids = kid.children();</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      if (NPSbjPattern.matcher(kid.value()).matches()) {</span>
+<span class="nc" id="L188">        kid.setValue(&quot;NP&quot;);</span>
+<span class="nc bnc" id="L189" title="All 6 branches missed.">        if (kidkids != null &amp;&amp; kidkids.length == 1 &amp;&amp; kidkids[0].value().equals(&quot;-NONE-&quot;)) {</span>
+          // only set flag, since there are 2 a couple of times (errors)
+<span class="nc" id="L191">          foundNullSubj = true;</span>
+        }
+      }
+    }
+<span class="nc" id="L195">    return foundNullSubj;</span>
+  }
+
+
+  /**
+   * Normalize a whole tree -- one can assume that this is the root.
+   * This implementation deletes empty elements (ones with nonterminal
+   * tag label '-NONE-') from the tree.
+   */
+  @Override
+  public Tree normalizeWholeTree(Tree tree, TreeFactory tf) {
+<span class="fc" id="L206">    TreeTransformer transformer1 = t -&gt; {</span>
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">      if (doSGappedStuff) {</span>
+<span class="nc" id="L208">        String lab = t.label().value();</span>
+<span class="nc bnc" id="L209" title="All 4 branches missed.">        if (lab.equals(&quot;S&quot;) &amp;&amp; includesEmptyNPSubj(t)) {</span>
+<span class="nc" id="L210">          LabelFactory lf = t.label().labelFactory();</span>
+          // Note: this changes the tree label, rather than
+          // creating a new tree node.  Beware!
+<span class="nc" id="L213">          t.setLabel(lf.newLabel(t.label().value() + &quot;-G&quot;));</span>
+        }
+      }
+<span class="fc" id="L216">      return t;</span>
+    };
+<span class="fc" id="L218">    Predicate&lt;Tree&gt; subtreeFilter = new Predicate&lt;Tree&gt;() {</span>
+
+      private static final long serialVersionUID = -7250433816896327901L;
+
+      @Override
+      public boolean test(Tree t) {
+<span class="fc" id="L224">        Tree[] kids = t.children();</span>
+<span class="fc" id="L225">        Label l = t.label();</span>
+        // The special Switchboard non-terminals clause.
+        // Note that it deletes IP which other Treebanks might use!
+<span class="pc bpc" id="L228" title="4 of 8 branches missed.">        if (&quot;RS&quot;.equals(t.label().value()) || &quot;RM&quot;.equals(t.label().value()) || &quot;IP&quot;.equals(t.label().value()) || &quot;CODE&quot;.equals(t.label().value())) {</span>
+<span class="nc" id="L229">          return t.isLeaf(); //Prevents deletion of the word &quot;IP&quot;</span>
+        }
+<span class="pc bpc" id="L231" title="5 of 12 branches missed.">        if ((l != null) &amp;&amp; l.value() != null &amp;&amp; (l.value().equals(&quot;-NONE-&quot;)) &amp;&amp; !t.isLeaf() &amp;&amp; kids.length == 1 &amp;&amp; kids[0].isLeaf()) {</span>
+          // Delete empty/trace nodes (ones marked '-NONE-')
+<span class="fc" id="L233">          return false;</span>
+        }
+<span class="fc" id="L235">        return true;</span>
+      }
+    };
+<span class="fc" id="L238">    Predicate&lt;Tree&gt; nodeFilter = new Predicate&lt;Tree&gt;() {</span>
+
+      private static final long serialVersionUID = 9000955019205336311L;
+
+      @Override
+      public boolean test(Tree t) {
+<span class="fc bfc" id="L244" title="All 4 branches covered.">        if (t.isLeaf() || t.isPreTerminal()) {</span>
+<span class="fc" id="L245">          return true;</span>
+        }
+        // The special switchboard non-terminals clause. Try keeping EDITED for now....
+        // if (&quot;EDITED&quot;.equals(t.label().value())) {
+        //   return false;
+        // }
+<span class="fc bfc" id="L251" title="All 2 branches covered.">        if (t.numChildren() != 1) {</span>
+<span class="fc" id="L252">          return true;</span>
+        }
+<span class="pc bpc" id="L254" title="2 of 6 branches missed.">        if (t.label() != null &amp;&amp; t.label().value() != null &amp;&amp; t.label().value().equals(t.children()[0].label().value())) {</span>
+<span class="fc" id="L255">          return false;</span>
+        }
+<span class="fc" id="L257">        return true;</span>
+      }
+    };
+<span class="fc" id="L260">    TreeTransformer transformer2 = t -&gt; {</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">      if (temporalAnnotation == TEMPORAL_ANY_TMP_PERCOLATED) {</span>
+<span class="nc" id="L262">        String lab = t.label().value();</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (TmpPattern.matcher(lab).matches()) {</span>
+<span class="nc" id="L264">          Tree oldT = t;</span>
+          Tree ht;
+          do {
+<span class="nc" id="L267">            ht = headFinder.determineHead(oldT);</span>
+            // special fix for possessives! -- make noun before head
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (ht.label().value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L270">              int j = oldT.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">              if (j &gt; 0) {</span>
+<span class="nc" id="L272">                ht = oldT.getChild(j - 1);</span>
+              }
+            }
+<span class="nc" id="L275">            LabelFactory lf = ht.label().labelFactory();</span>
+            // Note: this changes the tree label, rather than
+            // creating a new tree node.  Beware!
+<span class="nc" id="L278">            ht.setLabel(lf.newLabel(ht.label().value() + &quot;-TMP&quot;));</span>
+<span class="nc" id="L279">            oldT = ht;</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">          } while (!ht.isPreTerminal());</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">          if (lab.startsWith(&quot;PP&quot;)) {</span>
+<span class="nc" id="L282">            ht = headFinder.determineHead(t);</span>
+            // look to right
+<span class="nc" id="L284">            int j = t.objectIndexOf(ht);</span>
+<span class="nc" id="L285">            int sz = t.children().length;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            if (j + 1 &lt; sz) {</span>
+<span class="nc" id="L287">              ht = t.getChild(j + 1);</span>
+            }
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            if (ht.label().value().startsWith(&quot;NP&quot;)) {</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">              while (!ht.isLeaf()) {</span>
+<span class="nc" id="L291">                LabelFactory lf = ht.label().labelFactory();</span>
+                // Note: this changes the tree label, rather than
+                // creating a new tree node.  Beware!
+<span class="nc" id="L294">                ht.setLabel(lf.newLabel(ht.label().value() + &quot;-TMP&quot;));</span>
+<span class="nc" id="L295">                ht = headFinder.determineHead(ht);</span>
+<span class="nc" id="L296">              }</span>
+            }
+          }
+        }
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">      } else if (temporalAnnotation == TEMPORAL_ALL_TERMINALS) {</span>
+<span class="nc" id="L301">        String lab = t.label().value();</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        if (NPTmpPattern.matcher(lab).matches()) {</span>
+          Tree ht;
+<span class="nc" id="L304">          ht = headFinder.determineHead(t);</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">          if (ht.isPreTerminal()) {</span>
+            // change all tags to -TMP
+<span class="nc" id="L307">            LabelFactory lf = ht.label().labelFactory();</span>
+<span class="nc" id="L308">            Tree[] kids = t.children();</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            for (Tree kid : kids) {</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">              if (kid.isPreTerminal()) {</span>
+                // Note: this changes the tree label, rather
+                // than creating a new tree node.  Beware!
+<span class="nc" id="L313">                kid.setLabel(lf.newLabel(kid.value() + &quot;-TMP&quot;));</span>
+              }
+            }
+<span class="nc" id="L316">          } else {</span>
+<span class="nc" id="L317">            Tree oldT = t;</span>
+            do {
+<span class="nc" id="L319">              ht = headFinder.determineHead(oldT);</span>
+<span class="nc" id="L320">              oldT = ht;</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            } while (!ht.isPreTerminal());</span>
+<span class="nc" id="L322">            LabelFactory lf = ht.label().labelFactory();</span>
+            // Note: this changes the tree label, rather than
+            // creating a new tree node.  Beware!
+<span class="nc" id="L325">            ht.setLabel(lf.newLabel(ht.label().value() + &quot;-TMP&quot;));</span>
+          }
+        }
+<span class="pc bpc" id="L328" title="1 of 2 branches missed.">      } else if (temporalAnnotation == TEMPORAL_ALL_NP) {</span>
+<span class="nc" id="L329">        String lab = t.label().value();</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        if (NPTmpPattern.matcher(lab).matches()) {</span>
+<span class="nc" id="L331">          Tree oldT = t;</span>
+          Tree ht;
+          do {
+<span class="nc" id="L334">            ht = headFinder.determineHead(oldT);</span>
+            // special fix for possessives! -- make noun before head
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            if (ht.label().value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L337">              int j = oldT.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">              if (j &gt; 0) {</span>
+<span class="nc" id="L339">                ht = oldT.getChild(j - 1);</span>
+              }
+            }
+<span class="nc bnc" id="L342" title="All 4 branches missed.">            if (ht.isPreTerminal() || ht.value().startsWith(&quot;NP&quot;)) {</span>
+<span class="nc" id="L343">              LabelFactory lf = ht.labelFactory();</span>
+              // Note: this changes the tree label, rather than
+              // creating a new tree node.  Beware!
+<span class="nc" id="L346">              ht.setLabel(lf.newLabel(ht.label().value() + &quot;-TMP&quot;));</span>
+<span class="nc" id="L347">              oldT = ht;</span>
+            }
+<span class="nc bnc" id="L349" title="All 2 branches missed.">          } while (ht.value().startsWith(&quot;NP&quot;));</span>
+        }
+<span class="pc bpc" id="L351" title="3 of 6 branches missed.">      } else if (temporalAnnotation == TEMPORAL_ALL_NP_AND_PP || temporalAnnotation == TEMPORAL_NP_AND_PP_WITH_NP_HEAD || temporalAnnotation == TEMPORAL_ALL_NP_EVEN_UNDER_PP) {</span>
+        // also allow chain to start with PP
+<span class="nc" id="L353">        String lab = t.value();</span>
+<span class="nc bnc" id="L354" title="All 4 branches missed.">        if (NPTmpPattern.matcher(lab).matches() || PPTmpPattern.matcher(lab).matches()) {</span>
+<span class="nc" id="L355">          Tree oldT = t;</span>
+          do {
+<span class="nc" id="L357">            Tree ht = headFinder.determineHead(oldT);</span>
+            // special fix for possessives! -- make noun before head
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            if (ht.value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L360">              int j = oldT.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">              if (j &gt; 0) {</span>
+<span class="nc" id="L362">                ht = oldT.getChild(j - 1);</span>
+              }
+<span class="nc bnc" id="L364" title="All 8 branches missed.">            } else if ((temporalAnnotation == TEMPORAL_NP_AND_PP_WITH_NP_HEAD || temporalAnnotation == TEMPORAL_ALL_NP_EVEN_UNDER_PP) &amp;&amp; (ht.value().equals(&quot;IN&quot;) || ht.value().equals(&quot;TO&quot;))) {</span>
+              // change the head to be NP if possible
+<span class="nc" id="L366">              Tree[] kidlets = oldT.children();</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">              for (int k = kidlets.length - 1; k &gt; 0; k--) {</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">                if (kidlets[k].value().startsWith(&quot;NP&quot;)) {</span>
+<span class="nc" id="L369">                  ht = kidlets[k];</span>
+                }
+              }
+            }
+<span class="nc" id="L373">            LabelFactory lf = ht.labelFactory();</span>
+            // Note: this next bit changes the tree label, rather
+            // than creating a new tree node.  Beware!
+<span class="nc bnc" id="L376" title="All 4 branches missed.">            if (ht.isPreTerminal() || ht.value().startsWith(&quot;NP&quot;)) {</span>
+<span class="nc" id="L377">              ht.setLabel(lf.newLabel(ht.value() + &quot;-TMP&quot;));</span>
+            }
+<span class="nc bnc" id="L379" title="All 4 branches missed.">            if (temporalAnnotation == TEMPORAL_ALL_NP_EVEN_UNDER_PP &amp;&amp; oldT.value().startsWith(&quot;PP&quot;)) {</span>
+<span class="nc" id="L380">              oldT.setLabel(lf.newLabel(tlp.basicCategory(oldT.value())));</span>
+            }
+<span class="nc" id="L382">            oldT = ht;</span>
+<span class="nc bnc" id="L383" title="All 4 branches missed.">          } while (oldT.value().startsWith(&quot;NP&quot;) || oldT.value().startsWith(&quot;PP&quot;));</span>
+        }
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">      } else if (temporalAnnotation == TEMPORAL_ALL_NP_PP_ADVP) {</span>
+        // also allow chain to start with PP or ADVP
+<span class="nc" id="L387">        String lab = t.value();</span>
+<span class="nc bnc" id="L388" title="All 6 branches missed.">        if (NPTmpPattern.matcher(lab).matches() || PPTmpPattern.matcher(lab).matches() || ADVPTmpPattern.matcher(lab).matches()) {</span>
+<span class="nc" id="L389">          Tree oldT = t;</span>
+          do {
+<span class="nc" id="L391">            Tree ht = headFinder.determineHead(oldT);</span>
+            // special fix for possessives! -- make noun before head
+<span class="nc bnc" id="L393" title="All 2 branches missed.">            if (ht.value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L394">              int j = oldT.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">              if (j &gt; 0) {</span>
+<span class="nc" id="L396">                ht = oldT.getChild(j - 1);</span>
+              }
+            }
+            // Note: this next bit changes the tree label, rather
+            // than creating a new tree node.  Beware!
+<span class="nc bnc" id="L401" title="All 4 branches missed.">            if (ht.isPreTerminal() || ht.value().startsWith(&quot;NP&quot;)) {</span>
+<span class="nc" id="L402">              LabelFactory lf = ht.labelFactory();</span>
+<span class="nc" id="L403">              ht.setLabel(lf.newLabel(ht.value() + &quot;-TMP&quot;));</span>
+            }
+<span class="nc" id="L405">            oldT = ht;</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">          } while (oldT.value().startsWith(&quot;NP&quot;));</span>
+        }
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">      } else if (temporalAnnotation == TEMPORAL_9) {</span>
+        // also allow chain to start with PP or ADVP
+<span class="nc" id="L410">        String lab = t.value();</span>
+<span class="nc bnc" id="L411" title="All 6 branches missed.">        if (NPTmpPattern.matcher(lab).matches() || PPTmpPattern.matcher(lab).matches() || ADVPTmpPattern.matcher(lab).matches()) {</span>
+          // log.info(&quot;TMP: Annotating &quot; + t);
+<span class="nc" id="L413">          addTMP9(t);</span>
+        }
+<span class="pc bpc" id="L415" title="1 of 2 branches missed.">      } else if (temporalAnnotation == TEMPORAL_ACL03PCFG) {</span>
+<span class="fc" id="L416">        String lab = t.label().value();</span>
+<span class="pc bpc" id="L417" title="1 of 4 branches missed.">        if (lab != null &amp;&amp; NPTmpPattern.matcher(lab).matches()) {</span>
+<span class="fc" id="L418">          Tree oldT = t;</span>
+          Tree ht;
+          do {
+<span class="fc" id="L421">            ht = headFinder.determineHead(oldT);</span>
+            // special fix for possessives! -- make noun before head
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">            if (ht.label().value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L424">              int j = oldT.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">              if (j &gt; 0) {</span>
+<span class="nc" id="L426">                ht = oldT.getChild(j - 1);</span>
+              }
+            }
+<span class="fc" id="L429">            oldT = ht;</span>
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">          } while (!ht.isPreTerminal());</span>
+<span class="fc bfc" id="L431" title="All 2 branches covered.">          if ( ! onlyTagAnnotateNstar || ht.label().value().startsWith(&quot;N&quot;)) {</span>
+<span class="fc" id="L432">            LabelFactory lf = ht.label().labelFactory();</span>
+            // Note: this changes the tree label, rather than
+            // creating a new tree node.  Beware!
+<span class="fc" id="L435">            ht.setLabel(lf.newLabel(ht.label().value() + &quot;-TMP&quot;));</span>
+          }
+        }
+      }
+<span class="pc bpc" id="L439" title="1 of 2 branches missed.">      if (doAdverbialNP) {</span>
+<span class="fc" id="L440">        String lab = t.value();</span>
+<span class="fc bfc" id="L441" title="All 2 branches covered.">        if (NPAdvPattern.matcher(lab).matches()) {</span>
+<span class="fc" id="L442">          Tree oldT = t;</span>
+          Tree ht;
+          do {
+<span class="fc" id="L445">            ht = headFinder.determineHead(oldT);</span>
+            // special fix for possessives! -- make noun before head
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">            if (ht.label().value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L448">              int j = oldT.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">              if (j &gt; 0) {</span>
+<span class="nc" id="L450">                ht = oldT.getChild(j - 1);</span>
+              }
+            }
+<span class="pc bpc" id="L453" title="1 of 4 branches missed.">            if (ht.isPreTerminal() || ht.value().startsWith(&quot;NP&quot;)) {</span>
+<span class="fc" id="L454">              LabelFactory lf = ht.labelFactory();</span>
+              // Note: this changes the tree label, rather than
+              // creating a new tree node.  Beware!
+<span class="fc" id="L457">              ht.setLabel(lf.newLabel(ht.label().value() + &quot;-ADV&quot;));</span>
+<span class="fc" id="L458">              oldT = ht;</span>
+            }
+<span class="fc bfc" id="L460" title="All 2 branches covered.">          } while (ht.value().startsWith(&quot;NP&quot;));</span>
+        }
+      }
+<span class="fc" id="L463">      return t;</span>
+    };
+    // if there wasn't an empty nonterminal at the top, but an S, wrap it.
+<span class="fc bfc" id="L466" title="All 2 branches covered.">    if (tree.label().value().equals(&quot;S&quot;)) {</span>
+<span class="fc" id="L467">      tree = tf.newTreeNode(&quot;ROOT&quot;, Collections.singletonList(tree));</span>
+    }
+    // repair for the phrasal VB in Switchboard (PTB version 3) that should be a VP
+<span class="fc bfc" id="L470" title="All 2 branches covered.">    for (Tree subtree : tree) {</span>
+<span class="pc bpc" id="L471" title="1 of 4 branches missed.">      if (subtree.isPhrasal() &amp;&amp; &quot;VB&quot;.equals(subtree.label().value())) {</span>
+<span class="nc" id="L472">        subtree.setValue(&quot;VP&quot;);</span>
+      }
+<span class="fc" id="L474">    }</span>
+<span class="fc" id="L475">    tree = tree.transform(transformer1);</span>
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">    if (tree == null) { return null; }</span>
+<span class="fc" id="L477">    tree = tree.prune(subtreeFilter, tf);</span>
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">    if (tree == null) { return null; }</span>
+<span class="fc" id="L479">    tree = tree.spliceOut(nodeFilter, tf);</span>
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">    if (tree == null) { return null; }</span>
+<span class="fc" id="L481">    return tree.transform(transformer2, tf);</span>
+  }
+
+  /**
+   * Add -TMP when not present within an NP
+   * @param tree The tree to add temporal info to.
+   */
+  private void addTMP9(final Tree tree) {
+    // do the head chain under it
+<span class="nc" id="L490">    Tree ht = headFinder.determineHead(tree);</span>
+    // special fix for possessives! -- make noun before head
+<span class="nc bnc" id="L492" title="All 2 branches missed.">    if (ht.value().equals(&quot;POS&quot;)) {</span>
+<span class="nc" id="L493">      int j = tree.objectIndexOf(ht);</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">      if (j &gt; 0) {</span>
+<span class="nc" id="L495">        ht = tree.getChild(j - 1);</span>
+      }
+    }
+    // Note: this next bit changes the tree label, rather
+    // than creating a new tree node.  Beware!
+<span class="nc bnc" id="L500" title="All 4 branches missed.">    if (ht.isPreTerminal() || ht.value().startsWith(&quot;NP&quot;) ||</span>
+<span class="nc bnc" id="L501" title="All 4 branches missed.">        ht.value().startsWith(&quot;PP&quot;) || ht.value().startsWith(&quot;ADVP&quot;)) {</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">      if (!TmpPattern.matcher(ht.value()).matches()) {</span>
+<span class="nc" id="L503">        LabelFactory lf = ht.labelFactory();</span>
+        // log.info(&quot;TMP: Changing &quot; + ht.value() + &quot; to &quot; +
+        //                   ht.value() + &quot;-TMP&quot;);
+<span class="nc" id="L506">        ht.setLabel(lf.newLabel(ht.value() + &quot;-TMP&quot;));</span>
+      }
+<span class="nc bnc" id="L508" title="All 4 branches missed.">      if (ht.value().startsWith(&quot;NP&quot;) || ht.value().startsWith(&quot;PP&quot;) ||</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">          ht.value().startsWith(&quot;ADVP&quot;)) {</span>
+<span class="nc" id="L510">        addTMP9(ht);</span>
+      }
+    }
+    // do the NPs under it (which may or may not be the head chain
+<span class="nc" id="L514">    Tree[] kidlets = tree.children();</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">    for (Tree kidlet : kidlets) {</span>
+<span class="nc" id="L516">      ht = kidlet;</span>
+      LabelFactory lf;
+<span class="nc bnc" id="L518" title="All 4 branches missed.">      if (tree.isPrePreTerminal() &amp;&amp; !TmpPattern.matcher(ht.value()).matches()) {</span>
+        // log.info(&quot;TMP: Changing &quot; + ht.value() + &quot; to &quot; +
+        //                   ht.value() + &quot;-TMP&quot;);
+<span class="nc" id="L521">        lf = ht.labelFactory();</span>
+        // Note: this next bit changes the tree label, rather
+        // than creating a new tree node.  Beware!
+<span class="nc" id="L524">        ht.setLabel(lf.newLabel(ht.value() + &quot;-TMP&quot;));</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">      } else if (ht.value().startsWith(&quot;NP&quot;)) {</span>
+        // don't add -TMP twice!
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        if (!TmpPattern.matcher(ht.value()).matches()) {</span>
+<span class="nc" id="L528">          lf = ht.labelFactory();</span>
+          // log.info(&quot;TMP: Changing &quot; + ht.value() + &quot; to &quot; +
+          //                   ht.value() + &quot;-TMP&quot;);
+          // Note: this next bit changes the tree label, rather
+          // than creating a new tree node.  Beware!
+<span class="nc" id="L533">          ht.setLabel(lf.newLabel(ht.value() + &quot;-TMP&quot;));</span>
+        }
+<span class="nc" id="L535">        addTMP9(ht);</span>
+      }
+    }
+<span class="nc" id="L538">  }</span>
+
+  /** Implementation of TreeReaderFactory, mainly for convenience of
+   *  constructing by reflection.
+   */
+<span class="nc" id="L543">  public static class NPTmpRetainingTreeReaderFactory implements TreeReaderFactory {</span>
+
+    @Override
+    public TreeReader newTreeReader(Reader in) {
+<span class="nc" id="L547">      return new PennTreeReader(in, new LabeledScoredTreeFactory(), new NPTmpRetainingTreeNormalizer());</span>
+    }
+
+  }
+
+  /** Implementation of TreeReaderFactory, mainly for convenience of
+   *  constructing by reflection. This one corresponds to what's currently
+   *  used in englishPCFG accurate unlexicalized parser.
+   */
+<span class="fc" id="L556">  public static class NPTmpAdvRetainingTreeReaderFactory implements TreeReaderFactory {</span>
+
+    @Override
+    public TreeReader newTreeReader(Reader in) {
+<span class="fc" id="L560">      return new PennTreeReader(in, new LabeledScoredTreeFactory(),</span>
+              new NPTmpRetainingTreeNormalizer(NPTmpRetainingTreeNormalizer.TEMPORAL_ACL03PCFG,
+                      false, 0, true));
+    }
+
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

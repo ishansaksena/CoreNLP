@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LabeledChunkIdentifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">LabeledChunkIdentifier.java</span></div><h1>LabeledChunkIdentifier.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline;
+
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Pair;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Identifies chunks based on labels that uses IOB-like encoding
+ * (Erik F. Tjong Kim Sang and Jorn Veenstra, Representing Text Chunks, EACL 1999).
+ * Assumes labels have the form {@code &lt;tag&gt;-&lt;type&gt;},
+ * where the tag is a prefix indicating where in the chunk it is.
+ * Supports various encodings: IO, IOB, IOE, BILOU, SBEIO, []
+ * The type is
+ * Example:  Bill   gave  Xerox Bank   of     America shares
+ * IO:       I-PER  O     I-ORG I-ORG  I-ORG  I-ORG   O
+ * IOB1:     I-PER  O     I-ORG B-ORG  I-ORG  I-ORG   O
+ * IOB2:     B-PER  O     B-ORG B-ORG  I-ORG  I-ORG   O
+ * IOE1:     I-PER  O     E-ORG I-ORG  I-ORG  I-ORG   O
+ * IOE2:     E-PER  O     E-ORG I-ORG  I-ORG  E-ORG   O
+ * BILOU:    U-PER  O     U-ORG B-ORG  I-ORG  L-ORG   O
+ * SBEIO:    S-PER  O     S-ORG B-ORG  I-ORG  E-ORG   O
+ *
+ * @author Angel Chang
+ */
+<span class="nc" id="L31">public class LabeledChunkIdentifier {</span>
+
+  /**
+   * Whether to use or ignore provided tag (the label prefix).
+   */
+<span class="nc" id="L36">  private boolean ignoreProvidedTag = false;</span>
+
+  /**
+   * Label/Type indicating the token is not a part of a chunk.
+   */
+<span class="nc" id="L41">  private String negLabel = &quot;O&quot;;</span>
+
+  /**
+   * What tag to default to if label/type indicate it is part of a chunk
+   *  (used if type does not match negLabel and
+   *    the tag is not provided or ignoreProvidedTag is set).
+   */
+<span class="nc" id="L48">  private String defaultPosTag = &quot;I&quot;;</span>
+
+  /**
+   * What tag to default to if label/type indicate it is not part of a chunk
+   *  (used if type matches negLabel and
+   *    the tag is not provided or ignoreProvidedTag is set).
+   */
+<span class="nc" id="L55">  private String defaultNegTag = &quot;O&quot;;</span>
+
+  /**
+   * Find and annotate chunks.  Returns list of CoreMap (Annotation) objects.
+   *
+   * @param tokens - List of tokens to look for chunks
+   * @param totalTokensOffset - Index of tokens to offset by
+   * @param textKey - Key to use to find the token text
+   * @param labelKey - Key to use to find the token label (to determine if inside chunk or not)
+   * @return List of annotations (each as a CoreMap) representing the chunks of tokens
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;CoreMap&gt; getAnnotatedChunks(List&lt;CoreLabel&gt; tokens, int totalTokensOffset, Class textKey, Class labelKey) {
+<span class="nc" id="L68">    return getAnnotatedChunks(tokens, totalTokensOffset, textKey, labelKey, null, null);</span>
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;CoreMap&gt; getAnnotatedChunks(List&lt;CoreLabel&gt; tokens, int totalTokensOffset, Class textKey, Class labelKey,
+                                          Function&lt;Pair&lt;CoreLabel, CoreLabel&gt;, Boolean&gt; checkTokensCompatible) {
+<span class="nc" id="L74">    return getAnnotatedChunks(tokens, totalTokensOffset, textKey, labelKey, null, null, checkTokensCompatible);</span>
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;CoreMap&gt; getAnnotatedChunks(List&lt;CoreLabel&gt; tokens, int totalTokensOffset,
+                                          Class textKey, Class labelKey,
+                                          Class tokenChunkKey, Class tokenLabelKey) {
+<span class="nc" id="L81">    return getAnnotatedChunks(tokens, totalTokensOffset, textKey, labelKey, tokenChunkKey, tokenLabelKey, null);</span>
+  }
+
+  /**
+   * Find and annotate chunks.  Returns list of CoreMap (Annotation) objects
+   * each representing a chunk with the following annotations set:
+   *   CharacterOffsetBeginAnnotation - set to CharacterOffsetBeginAnnotation of first token in chunk
+   *   CharacterOffsetEndAnnotation - set to CharacterOffsetEndAnnotation of last token in chunk
+   *   TokensAnnotation - List of tokens in this chunk
+   *   TokenBeginAnnotation - Index of first token in chunk (index in original list of tokens)
+   *   TokenEndAnnotation - Index of last token in chunk (index in original list of tokens)
+   *   TextAnnotation - String representing tokens in this chunks (token text separated by space)
+   *
+   * @param tokens - List of tokens to look for chunks
+   * @param totalTokensOffset - Index of tokens to offset by
+   * @param labelKey - Key to use to find the token label (to determine if inside chunk or not)
+   * @param textKey - Key to use to find the token text
+   * @param tokenChunkKey - If not null, each token is annotated with the chunk using this key
+   * @param tokenLabelKey - If not null, each token is annotated with the text associated with the chunk using this key
+   * @param checkTokensCompatible - If not null, additional check to see if this token and the previous are compatible
+   * @return List of annotations (each as a CoreMap) representing the chunks of tokens
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;CoreMap&gt; getAnnotatedChunks(List&lt;CoreLabel&gt; tokens, int totalTokensOffset,
+                                          Class textKey, Class labelKey,
+                                          Class tokenChunkKey, Class tokenLabelKey,
+                                          Function&lt;Pair&lt;CoreLabel, CoreLabel&gt;, Boolean&gt; checkTokensCompatible) {
+<span class="nc" id="L108">    List&lt;CoreMap&gt; chunks = new ArrayList();</span>
+<span class="nc" id="L109">    LabelTagType prevTagType = null;</span>
+<span class="nc" id="L110">    int tokenBegin = -1;</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    for (int i = 0; i &lt; tokens.size(); i++) {</span>
+<span class="nc" id="L112">      CoreLabel token = tokens.get(i);</span>
+<span class="nc" id="L113">      String label = (String) token.get(labelKey);</span>
+<span class="nc" id="L114">      LabelTagType curTagType = getTagType(label);</span>
+<span class="nc" id="L115">      boolean isCompatible = true;</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">      if (checkTokensCompatible != null) {</span>
+<span class="nc" id="L117">        CoreLabel prev = null;</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (i &gt; 0) {</span>
+<span class="nc" id="L119">          prev = tokens.get(i-1);</span>
+        }
+<span class="nc" id="L121">        Pair&lt;CoreLabel,CoreLabel&gt; p = Pair.makePair(token, prev);</span>
+<span class="nc" id="L122">        isCompatible = checkTokensCompatible.apply(p);</span>
+      }
+<span class="nc bnc" id="L124" title="All 4 branches missed.">      if (isEndOfChunk(prevTagType, curTagType) || !isCompatible) {</span>
+<span class="nc" id="L125">        int tokenEnd = i;</span>
+<span class="nc bnc" id="L126" title="All 4 branches missed.">        if (tokenBegin &gt;= 0 &amp;&amp; tokenEnd &gt; tokenBegin) {</span>
+<span class="nc" id="L127">          CoreMap chunk = ChunkAnnotationUtils.getAnnotatedChunk(tokens, tokenBegin, tokenEnd, totalTokensOffset,</span>
+              tokenChunkKey, textKey, tokenLabelKey);
+<span class="nc" id="L129">          chunk.set(labelKey, prevTagType.type);</span>
+<span class="nc" id="L130">          chunks.add(chunk);</span>
+<span class="nc" id="L131">          tokenBegin = -1;</span>
+        }
+      }
+<span class="nc bnc" id="L134" title="All 6 branches missed.">      if (isStartOfChunk(prevTagType, curTagType) || (!isCompatible &amp;&amp; isChunk(curTagType))) {</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (tokenBegin &gt;= 0) {</span>
+<span class="nc" id="L136">          throw new RuntimeException(&quot;New chunk started, prev chunk not ended yet!&quot;);</span>
+        }
+<span class="nc" id="L138">        tokenBegin = i;</span>
+      }
+<span class="nc" id="L140">      prevTagType = curTagType;</span>
+    }
+<span class="nc bnc" id="L142" title="All 2 branches missed.">    if (tokenBegin &gt;= 0) {</span>
+<span class="nc" id="L143">      CoreMap chunk = ChunkAnnotationUtils.getAnnotatedChunk(tokens, tokenBegin, tokens.size(), totalTokensOffset,</span>
+          tokenChunkKey, textKey, tokenLabelKey);
+<span class="nc" id="L145">      chunk.set(labelKey, prevTagType.type);</span>
+<span class="nc" id="L146">      chunks.add(chunk);</span>
+    }
+//    System.out.println(&quot;number of chunks &quot; +  chunks.size());
+<span class="nc" id="L149">    return chunks;</span>
+  }
+
+  /**
+   * Returns whether a chunk ended between the previous and current token.
+   *
+   * @param prevTag - the tag of the previous token
+   * @param prevType - the type of the previous token
+   * @param curTag - the tag of the current token
+   * @param curType - the type of the current token
+   * @return true if the previous token was the last token of a chunk
+   */
+  private static boolean isEndOfChunk(String prevTag, String prevType, String curTag, String curType) {
+<span class="nc" id="L162">    boolean chunkEnd = false;</span>
+
+<span class="nc bnc" id="L164" title="All 4 branches missed.">    if ( &quot;B&quot;.equals(prevTag) &amp;&amp; &quot;B&quot;.equals(curTag) ) { chunkEnd = true; }</span>
+<span class="nc bnc" id="L165" title="All 4 branches missed.">    if ( &quot;B&quot;.equals(prevTag) &amp;&amp; &quot;O&quot;.equals(curTag) ) { chunkEnd = true; }</span>
+<span class="nc bnc" id="L166" title="All 4 branches missed.">    if ( &quot;I&quot;.equals(prevTag) &amp;&amp; &quot;B&quot;.equals(curTag) ) { chunkEnd = true; }</span>
+<span class="nc bnc" id="L167" title="All 4 branches missed.">    if ( &quot;I&quot;.equals(prevTag) &amp;&amp; &quot;O&quot;.equals(curTag) ) { chunkEnd = true; }</span>
+
+<span class="nc bnc" id="L169" title="All 4 branches missed.">    if ( &quot;E&quot;.equals(prevTag) || &quot;L&quot;.equals(prevTag)</span>
+<span class="nc bnc" id="L170" title="All 4 branches missed.">          || &quot;S&quot;.equals(prevTag) || &quot;U&quot;.equals(prevTag)</span>
+<span class="nc bnc" id="L171" title="All 4 branches missed.">          || &quot;[&quot;.equals(prevTag) || &quot;]&quot;.equals(prevTag)) { chunkEnd = true; }</span>
+
+<span class="nc bnc" id="L173" title="All 6 branches missed.">    if (!&quot;O&quot;.equals(prevTag) &amp;&amp; !&quot;.&quot;.equals(prevTag) &amp;&amp; !prevType.equals(curType)) {</span>
+<span class="nc" id="L174">      chunkEnd = true;</span>
+    }
+
+<span class="nc" id="L177">    return chunkEnd;</span>
+  }
+
+  /**
+   * Returns whether a chunk ended between the previous and current token.
+   *
+   * @param prev - the label/tag/type of the previous token
+   * @param cur - the label/tag/type of the current token
+   * @return true if the previous token was the last token of a chunk
+   */
+  public static boolean isEndOfChunk(LabelTagType prev, LabelTagType cur) {
+<span class="nc bnc" id="L188" title="All 2 branches missed.">    if (prev == null) return false;</span>
+<span class="nc" id="L189">    return isEndOfChunk(prev.tag, prev.type, cur.tag, cur.type);</span>
+  }
+
+  /**
+   * Returns whether a chunk started between the previous and current token
+   * @param prevTag - the tag of the previous token
+   * @param prevType - the type of the previous token
+   * @param curTag - the tag of the current token
+   * @param curType - the type of the current token
+   * @return true if the current token was the first token of a chunk
+   */
+  private static boolean isStartOfChunk(String prevTag, String prevType, String curTag, String curType) {
+<span class="nc" id="L201">    boolean chunkStart = false;</span>
+
+<span class="nc bnc" id="L203" title="All 8 branches missed.">    boolean prevTagE = &quot;E&quot;.equals(prevTag) || &quot;L&quot;.equals(prevTag) || &quot;S&quot;.equals(prevTag) || &quot;U&quot;.equals(prevTag);</span>
+<span class="nc bnc" id="L204" title="All 8 branches missed.">    boolean curTagE = &quot;E&quot;.equals(curTag) || &quot;L&quot;.equals(curTag) || &quot;S&quot;.equals(curTag) || &quot;U&quot;.equals(curTag);</span>
+<span class="nc bnc" id="L205" title="All 4 branches missed.">    if ( prevTagE &amp;&amp; curTagE ) { chunkStart = true; }</span>
+<span class="nc bnc" id="L206" title="All 4 branches missed.">    if ( prevTagE &amp;&amp; &quot;I&quot;.equals(curTag) ) { chunkStart = true; }</span>
+<span class="nc bnc" id="L207" title="All 4 branches missed.">    if ( &quot;O&quot;.equals(prevTag) &amp;&amp; curTagE ) { chunkStart = true; }</span>
+<span class="nc bnc" id="L208" title="All 4 branches missed.">    if ( &quot;O&quot;.equals(prevTag) &amp;&amp; &quot;I&quot;.equals(curTag) ) { chunkStart = true; }</span>
+
+<span class="nc bnc" id="L210" title="All 6 branches missed.">    if ( &quot;B&quot;.equals(curTag) || &quot;S&quot;.equals(curTag) || &quot;U&quot;.equals(curTag)</span>
+<span class="nc bnc" id="L211" title="All 4 branches missed.">          || &quot;[&quot;.equals(curTag) || &quot;]&quot;.equals(curTag)) { chunkStart = true; }</span>
+
+<span class="nc bnc" id="L213" title="All 6 branches missed.">    if (!&quot;O&quot;.equals(curTag) &amp;&amp; !&quot;.&quot;.equals(curTag) &amp;&amp; !prevType.equals(curType)) {</span>
+<span class="nc" id="L214">      chunkStart = true;</span>
+    }
+
+<span class="nc" id="L217">    return chunkStart;</span>
+  }
+
+  /**
+   * Returns whether a chunk started between the previous and current token
+   * @param prev - the label/tag/type of the previous token
+   * @param cur - the label/tag/type of the current token
+   * @return true if the current token was the first token of a chunk
+   */
+  public static boolean isStartOfChunk(LabelTagType prev, LabelTagType cur) {
+<span class="nc bnc" id="L227" title="All 2 branches missed.">    if (prev == null) {</span>
+<span class="nc" id="L228">      return isStartOfChunk(&quot;O&quot;, &quot;O&quot;, cur.tag, cur.type);</span>
+    } else {
+<span class="nc" id="L230">      return isStartOfChunk(prev.tag, prev.type, cur.tag, cur.type);</span>
+    }
+  }
+
+  private static boolean isChunk(LabelTagType cur) {
+<span class="nc bnc" id="L235" title="All 4 branches missed.">    return (!&quot;O&quot;.equals(cur.tag) &amp;&amp; !&quot;.&quot;.equals(cur.tag));</span>
+  }
+
+<span class="nc" id="L238">  private static final Pattern labelPattern = Pattern.compile(&quot;^([^-]*)-(.*)$&quot;);</span>
+
+
+  /**
+   * Class representing a label, tag and type.
+   */
+<span class="nc" id="L244">  public static class LabelTagType {</span>
+
+    public String label;
+    public String tag;
+    public String type;
+
+    public LabelTagType(String label, String tag, String type)
+<span class="nc" id="L251">    {</span>
+<span class="nc" id="L252">      this.label = label;</span>
+<span class="nc" id="L253">      this.tag = tag;</span>
+<span class="nc" id="L254">      this.type = type;</span>
+<span class="nc" id="L255">    }</span>
+
+    public boolean typeMatches(LabelTagType other)
+    {
+<span class="nc" id="L259">      return this.type.equals(other.type);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L263">      return '(' + label + ',' + tag + ',' + type + ')';</span>
+    }
+
+  } // end static class LabelTagType
+
+
+  public LabelTagType getTagType(String label) {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    if (label == null) {</span>
+<span class="nc" id="L271">      return new LabelTagType(negLabel, defaultNegTag, negLabel);</span>
+    }
+    String type;
+    String tag;
+<span class="nc" id="L275">    Matcher matcher = labelPattern.matcher(label);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">    if (matcher.matches()) {</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">      if (ignoreProvidedTag) {</span>
+<span class="nc" id="L278">        type = matcher.group(2);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (negLabel.equals(type)) {</span>
+<span class="nc" id="L280">          tag = defaultNegTag;</span>
+        } else {
+<span class="nc" id="L282">          tag = defaultPosTag;</span>
+        }
+      } else {
+<span class="nc" id="L285">        tag = matcher.group(1);</span>
+<span class="nc" id="L286">        type = matcher.group(2);</span>
+      }
+    } else {
+<span class="nc" id="L289">      type = label;</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">      if (negLabel.equals(label)) {</span>
+<span class="nc" id="L291">        tag = defaultNegTag;</span>
+      } else {
+<span class="nc" id="L293">        tag = defaultPosTag;</span>
+      }
+    }
+<span class="nc" id="L296">    return new LabelTagType(label, tag, type);</span>
+  }
+
+  public String getDefaultPosTag() {
+<span class="nc" id="L300">    return defaultPosTag;</span>
+  }
+
+  public void setDefaultPosTag(String defaultPosTag) {
+<span class="nc" id="L304">    this.defaultPosTag = defaultPosTag;</span>
+<span class="nc" id="L305">  }</span>
+
+  public String getDefaultNegTag() {
+<span class="nc" id="L308">    return defaultNegTag;</span>
+  }
+
+  public void setDefaultNegTag(String defaultNegTag) {
+<span class="nc" id="L312">    this.defaultNegTag = defaultNegTag;</span>
+<span class="nc" id="L313">  }</span>
+
+  public String getNegLabel() {
+<span class="nc" id="L316">    return negLabel;</span>
+  }
+
+  public void setNegLabel(String negLabel) {
+<span class="nc" id="L320">    this.negLabel = negLabel;</span>
+<span class="nc" id="L321">  }</span>
+
+  public boolean isIgnoreProvidedTag() {
+<span class="nc" id="L324">    return ignoreProvidedTag;</span>
+  }
+
+  public void setIgnoreProvidedTag(boolean ignoreProvidedTag) {
+<span class="nc" id="L328">    this.ignoreProvidedTag = ignoreProvidedTag;</span>
+<span class="nc" id="L329">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

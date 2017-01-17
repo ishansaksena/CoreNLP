@@ -1,0 +1,426 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SentenceAlgorithms.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.simple</a> &gt; <span class="el_source">SentenceAlgorithms.java</span></div><h1>SentenceAlgorithms.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.simple;
+
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.pipeline.CoreNLPProtos;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.util.*;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * &lt;p&gt;
+ *   A set of common utility algorithms for working with sentences (e.g., finding the head of a span).
+ *   These are not intended to be perfect, or even the canonical version of these algorithms.
+ *   They should only be trusted for prototyping, and more careful attention should be paid in cases
+ *   where the performance of the task is important or the domain is unusual.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   For developers: this class is intended to be where &lt;i&gt;domain independent&lt;/i&gt; and
+ *   &lt;i&gt;broadly useful&lt;/i&gt; functions on a sentence would go, rather than polluting the {@link Sentence}
+ *   class itself.
+ * &lt;/p&gt;
+ *
+ * @author Gabor Angeli
+ */
+public class SentenceAlgorithms {
+
+  /** The underlying {@link Sentence}. */
+  public final Sentence sentence;
+
+  /**
+   * Create a new algorithms object, based off of a sentence.
+   *
+   * @see Sentence#algorithms()
+   */
+<span class="nc" id="L44">  public SentenceAlgorithms(Sentence impl) {</span>
+<span class="nc" id="L45">    this.sentence = impl;</span>
+<span class="nc" id="L46">  }</span>
+
+  /**
+   * Returns a collection of keyphrases, defined as relevant noun phrases and verbs in the sentence.
+   * Each token of the sentence is consumed at most once.
+   *
+   * What counts as a keyphrase is in general quite subjective -- this method is just one possible interpretation
+   * (in particular, Gabor's interpretation).
+   * Please don't rely on this method to produce exactly your interpretation of what a keyphrase is.
+   *
+   * @return A list of spans in the sentence, where each one corresponds to a keyphrase.
+   *
+   * @author Gabor Angeli
+   */
+  public List&lt;Span&gt; keyphraseSpans() {
+    //
+    // Implementation note:
+    //   This is implemented roughly as a finite state automata, looking for sequences of nouns, adjective+nouns, verbs,
+    //   and a few special cases of prepositions.
+    //   The code defines a transition matrix, based on POS tags and lemmas, where at each word we update the valid next
+    //   tags/words based on the current tag/word we see.
+    // Note: The tag 'B' is used for the verb &quot;to be&quot;, rather than the usual 'V' tag.
+    // Note: The tag 'X' is used for proper nouns, rather than the usual 'N' tag.
+    // Note: The tag 'Z' is used for possessives, rather than the usual 'P' tag.
+    //
+
+    // The output
+<span class="nc" id="L73">    List&lt;Span&gt; spans = new ArrayList&lt;&gt;();</span>
+    // The marker for where the last span began
+<span class="nc" id="L75">    int spanBegin = -1;</span>
+    // The expected next states
+<span class="nc" id="L77">    final Set&lt;Character&gt; expectNextTag = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L78">    final Set&lt;String&gt; expectNextLemma = new HashSet&lt;&gt;();</span>
+    // A special marker for when we look-ahead and only accept the last word if
+    // the word after it is ok (e.g., PP attachments).
+<span class="nc" id="L81">    boolean inLookahead = false;</span>
+
+    // The transition matrix, over POS tags.
+<span class="nc" id="L84">    Consumer&lt;Character&gt; updateExpectation = coarseTag -&gt; {</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">      if (coarseTag == 'N') {</span>
+<span class="nc" id="L86">        expectNextTag.clear();</span>
+<span class="nc" id="L87">        expectNextTag.add('N');</span>
+<span class="nc" id="L88">        expectNextTag.add('X');</span>
+<span class="nc" id="L89">        expectNextLemma.clear();</span>
+<span class="nc" id="L90">        expectNextLemma.add(&quot;of&quot;);</span>
+<span class="nc" id="L91">        expectNextLemma.add(&quot;'s&quot;);</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">      } else if (coarseTag == 'G') {</span>
+<span class="nc" id="L93">        expectNextTag.clear();</span>
+<span class="nc" id="L94">        expectNextTag.add('N');  // 'water freezing' is fishy, but 'freezing water' is ok.</span>
+<span class="nc" id="L95">        expectNextLemma.clear();</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">      } else if (coarseTag == 'X') {</span>
+<span class="nc" id="L97">        expectNextTag.clear();</span>
+<span class="nc" id="L98">        expectNextTag.add('X');</span>
+<span class="nc" id="L99">        expectNextLemma.clear();</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">      } else if (coarseTag == 'J') {</span>
+<span class="nc" id="L101">        expectNextTag.clear();</span>
+<span class="nc" id="L102">        expectNextTag.add('N');</span>
+<span class="nc" id="L103">        expectNextTag.add('X');</span>
+<span class="nc" id="L104">        expectNextTag.add('J');</span>
+<span class="nc" id="L105">        expectNextLemma.clear();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">      } else if (coarseTag == 'V') {</span>
+<span class="nc" id="L107">        expectNextTag.clear();</span>
+<span class="nc" id="L108">        expectNextTag.add('V');</span>
+<span class="nc" id="L109">        expectNextLemma.clear();</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">      } else if (coarseTag == 'Z') {</span>
+<span class="nc" id="L111">        expectNextTag.clear();</span>
+<span class="nc" id="L112">        expectNextTag.add('J');</span>
+<span class="nc" id="L113">        expectNextTag.add('N');</span>
+<span class="nc" id="L114">        expectNextLemma.clear();</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">      } else if (coarseTag == 'I') {</span>
+<span class="nc" id="L116">        expectNextTag.clear();</span>
+<span class="nc" id="L117">        expectNextTag.add('N');</span>
+<span class="nc" id="L118">        expectNextTag.add('X');</span>
+<span class="nc" id="L119">        expectNextTag.add('J');</span>
+<span class="nc" id="L120">        expectNextLemma.clear();</span>
+      } else {
+<span class="nc" id="L122">        throw new IllegalStateException(&quot;Cannot update expected next token for POS tag: &quot; + coarseTag);</span>
+      }
+<span class="nc" id="L124">    };</span>
+
+    // Run the FSA:
+<span class="nc bnc" id="L127" title="All 2 branches missed.">    for (int i = 0; i &lt; sentence.length(); ++i) {</span>
+      // Get some variables
+<span class="nc" id="L129">      String tag = sentence.posTag(i);</span>
+<span class="nc" id="L130">      char coarseTag = Character.toUpperCase(tag.charAt(0));</span>
+<span class="nc" id="L131">      String lemma = sentence.lemma(i).toLowerCase();</span>
+      // Tweak the tag
+<span class="nc bnc" id="L133" title="All 4 branches missed.">      if (coarseTag == 'V' &amp;&amp; lemma.equals(&quot;be&quot;)) {</span>
+<span class="nc" id="L134">        coarseTag = 'B';</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">      } else if (tag.startsWith(&quot;NNP&quot;)) {</span>
+<span class="nc" id="L136">        coarseTag = 'X';</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">      } else if (tag.startsWith(&quot;POS&quot;)) {</span>
+<span class="nc" id="L138">        coarseTag = 'Z';</span>
+      }
+      // (don't collapse 'ing' nouns)
+<span class="nc bnc" id="L141" title="All 4 branches missed.">      if (coarseTag == 'N' &amp;&amp; sentence.word(i).endsWith(&quot;ing&quot;)) {</span>
+<span class="nc" id="L142">        coarseTag = 'G';</span>
+      }
+
+      // Transition
+<span class="nc bnc" id="L146" title="All 14 branches missed.">      if (spanBegin &lt; 0 &amp;&amp; !sentence.word(i).equals(&quot;%&quot;) &amp;&amp;</span>
+          (coarseTag == 'N' || coarseTag == 'V' || coarseTag == 'J' || coarseTag == 'X' || coarseTag == 'G')) {
+        // Case: we were not in a span, but we hit a valid start tag.
+<span class="nc" id="L149">        spanBegin = i;</span>
+<span class="nc" id="L150">        updateExpectation.accept(coarseTag);</span>
+<span class="nc" id="L151">        inLookahead = false;</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">      } else if (spanBegin &gt;= 0) {</span>
+        // Case: we're in a span
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (expectNextTag.contains(coarseTag)) {</span>
+          // Case: we hit a valid expected POS tag.
+          //       update the transition matrix.
+<span class="nc" id="L157">          updateExpectation.accept(coarseTag);</span>
+<span class="nc" id="L158">          inLookahead = false;</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        } else if (expectNextLemma.contains(lemma)) {</span>
+          // Case: we hit a valid word. Do something special.
+<span class="nc bnc" id="L161" title="All 10 branches missed.">          switch (lemma) {</span>
+            case &quot;of&quot;:
+              // These prepositions are valid to subsume into a noun phrase.
+              // Update the transition matrix, and mark this as conditionally ok.
+<span class="nc" id="L165">              updateExpectation.accept('I');</span>
+<span class="nc" id="L166">              inLookahead = true;</span>
+<span class="nc" id="L167">              break;</span>
+            case &quot;'s&quot;:
+              // Possessives often denote a longer compound phrase
+<span class="nc" id="L170">              updateExpectation.accept('Z');</span>
+<span class="nc" id="L171">              inLookahead = true;</span>
+<span class="nc" id="L172">              break;</span>
+            default:
+<span class="nc" id="L174">              throw new IllegalStateException(&quot;Unknown special lemma: &quot; + lemma);</span>
+          }
+        } else {
+          // Case: We have transitioned to an 'invalid' state, and therefore the span should end.
+<span class="nc bnc" id="L178" title="All 2 branches missed.">          if (inLookahead) {</span>
+            // If we were in a lookahead token, ignore the last token (as per the lookahead definition)
+<span class="nc" id="L180">            spans.add(Span.fromValues(spanBegin, i - 1));</span>
+          } else {
+            // Otherwise, add the span
+<span class="nc" id="L183">            spans.add(Span.fromValues(spanBegin, i));</span>
+          }
+          // We may also have started a new span.
+          // Check to see if we have started a new span.
+<span class="nc bnc" id="L187" title="All 10 branches missed.">          if (coarseTag == 'N' || coarseTag == 'V' || coarseTag == 'J' || coarseTag == 'X' || coarseTag == 'G') {</span>
+<span class="nc" id="L188">            spanBegin = i;</span>
+<span class="nc" id="L189">            updateExpectation.accept(coarseTag);</span>
+          } else {
+<span class="nc" id="L191">            spanBegin = -1;</span>
+          }
+<span class="nc" id="L193">          inLookahead = false;</span>
+        }
+      }
+    }
+
+    // Add a potential last span
+<span class="nc bnc" id="L199" title="All 2 branches missed.">    if (spanBegin &gt;= 0) {</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">      spans.add(Span.fromValues(spanBegin, inLookahead ? sentence.length() - 1 : sentence.length()));</span>
+    }
+    // Return
+<span class="nc" id="L203">    return spans;</span>
+  }
+
+
+  /**
+   * Get the keyphrases of the sentence as a list of Strings.
+   *
+   * @param toString The function to use to convert a span to a string. The canonical case is Sentence::words
+   * @return A list of keyphrases, as Strings.
+   *
+   * @see edu.stanford.nlp.simple.SentenceAlgorithms#keyphraseSpans()
+   */
+  public List&lt;String&gt; keyphrases(Function&lt;Sentence, List&lt;String&gt;&gt; toString) {
+<span class="nc" id="L216">    return keyphraseSpans().stream().map(x -&gt; StringUtils.join(toString.apply(sentence).subList(x.start(), x.end()), &quot; &quot;)).collect(Collectors.toList());</span>
+  }
+
+  /**
+   * The keyphrases of the sentence, using the words of the sentence to convert a span into a keyphrase.
+   * @return A list of String keyphrases in the sentence.
+   *
+   * @see edu.stanford.nlp.simple.SentenceAlgorithms#keyphraseSpans()
+   */
+  public List&lt;String&gt; keyphrases() {
+<span class="nc" id="L226">    return keyphrases(Sentence::words);</span>
+  }
+
+  /**
+   * Get the index of the head word for a given span, based off of the dependency parse.
+   *
+   * @param tokenSpan The span of tokens we are finding the head of.
+   * @return The head index of the given span of tokens.
+   */
+  public int headOfSpan(Span tokenSpan) {
+    // Error checks
+<span class="nc bnc" id="L237" title="All 2 branches missed.">    if (tokenSpan.size() == 0) {</span>
+<span class="nc" id="L238">      throw new IllegalArgumentException(&quot;Cannot find head word of empty span!&quot;);</span>
+    }
+<span class="nc" id="L240">    List&lt;Optional&lt;Integer&gt;&gt; governors = sentence.governors();</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">    if (tokenSpan.start() &gt;= governors.size()) {</span>
+<span class="nc" id="L242">      throw new IllegalArgumentException(&quot;Span is out of range: &quot; + tokenSpan + &quot;; sentence: &quot; + sentence);</span>
+    }
+<span class="nc bnc" id="L244" title="All 2 branches missed.">    if (tokenSpan.end() &gt; governors.size()) {</span>
+<span class="nc" id="L245">      throw new IllegalArgumentException(&quot;Span is out of range: &quot; + tokenSpan + &quot;; sentence: &quot; + sentence);</span>
+    }
+
+    // Find where to start searching up the dependency tree
+<span class="nc" id="L249">    int candidateStart = tokenSpan.end() - 1;</span>
+    Optional&lt;Integer&gt; parent;
+<span class="nc bnc" id="L251" title="All 2 branches missed.">    while ( !(parent = governors.get(candidateStart)).isPresent() ) {</span>
+<span class="nc" id="L252">      candidateStart -= 1;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">      if (candidateStart &lt; tokenSpan.start()) {</span>
+        // Case: nothing in this span has a head. Default to right-most element.
+<span class="nc" id="L255">        return tokenSpan.end() - 1;</span>
+      }
+    }
+<span class="nc" id="L258">    int candidate = candidateStart;</span>
+
+    // Search up the dependency tree
+<span class="nc" id="L261">    Set&lt;Integer&gt; seen = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L262" title="All 6 branches missed.">    while (parent.isPresent() &amp;&amp; parent.get() &gt;= tokenSpan.start() &amp;&amp; parent.get() &lt; tokenSpan.end()) {</span>
+<span class="nc" id="L263">      candidate = parent.get();</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      if (seen.contains(candidate)) {</span>
+<span class="nc" id="L265">        return candidate;</span>
+      }
+<span class="nc" id="L267">      seen.add(candidate);</span>
+<span class="nc" id="L268">      parent = governors.get(candidate);</span>
+    }
+
+    // Return
+<span class="nc" id="L272">    return candidate;</span>
+  }
+
+  /**
+   * Return all the spans of a sentence. So, for example, a sentence &quot;a b c&quot; would return:
+   * [a], [b], [c], [a b], [b c], [a b c].
+   *
+   * @param selector The function to apply to each token. For example, {@link Sentence#words}.
+   *                 For that example, you can use &lt;code&gt;allSpans(Sentence::words)&lt;/code&gt;.
+   * @param maxLength The maximum length of the spans to extract. The default to extract all spans
+   *                  is to set this to &lt;code&gt;sentence.length()&lt;/code&gt;.
+   * @param &lt;E&gt; The type of the element we are getting.
+   *
+   * @return A streaming iterable of spans for this sentence.
+   */
+  public &lt;E&gt; Iterable&lt;List&lt;E&gt;&gt; allSpans(Function&lt;Sentence, List&lt;E&gt;&gt; selector, int maxLength) {
+<span class="nc" id="L288">    return () -&gt; new Iterator&lt;List&lt;E&gt;&gt;() {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">      private int length = maxLength &gt; sentence.length() ? sentence.length() : maxLength;</span>
+<span class="nc" id="L290">      private int start = 0;</span>
+      @Override
+      public boolean hasNext() {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        return length &gt; 0;</span>
+      }
+      @Override
+      public List&lt;E&gt; next() {
+        // Get the term
+<span class="nc" id="L298">        List&lt;E&gt; rtn = selector.apply(sentence).subList(start, start + length);</span>
+        // Update the state
+<span class="nc" id="L300">        start += 1;</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (start + length &gt; sentence.length()) {</span>
+<span class="nc" id="L302">          length -= 1;</span>
+<span class="nc" id="L303">          start = 0;</span>
+        }
+        // Return
+<span class="nc" id="L306">        return rtn;</span>
+      }
+    };
+  }
+
+  /** @see SentenceAlgorithms#allSpans(Function, int) */
+  public &lt;E&gt; Iterable&lt;List&lt;E&gt;&gt; allSpans(Function&lt;Sentence, List&lt;E&gt;&gt; selector) {
+<span class="nc" id="L313">    return allSpans(selector, sentence.length());</span>
+  }
+
+  /** @see SentenceAlgorithms#allSpans(Function, int) */
+  public Iterable&lt;List&lt;String&gt;&gt; allSpans() {
+<span class="nc" id="L318">    return allSpans(Sentence::words, sentence.length());</span>
+  }
+
+  /**
+   * Select the most common element of the given type in the given span.
+   * This is useful for, e.g., finding the most likely NER span of a given span, or the most
+   * likely POS tag of a given span.
+   * Null entries are removed.
+   *
+   * @param span The span of the sentence to find the mode element in. This must be entirely contained in the sentence.
+   * @param selector The property of the sentence we are getting the mode of. For example, &lt;code&gt;Sentence::posTags&lt;/code&gt;
+   * @param &lt;E&gt; The type of the element we are getting.
+   * @return The most common element of the given property in the sentence.
+   */
+  public &lt;E&gt; E modeInSpan(Span span, Function&lt;Sentence, List&lt;E&gt;&gt; selector) {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">    if (!Span.fromValues(0, sentence.length()).contains(span)) {</span>
+<span class="nc" id="L334">      throw new IllegalArgumentException(&quot;Span must be entirely contained in the sentence: &quot; + span + &quot; (sentence length=&quot; + sentence.length() + &quot;)&quot;);</span>
+    }
+<span class="nc" id="L336">    Counter&lt;E&gt; candidates = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">    for (int i : span) {</span>
+<span class="nc" id="L338">      candidates.incrementCount(selector.apply(sentence).get(i));</span>
+<span class="nc" id="L339">    }</span>
+<span class="nc" id="L340">    candidates.remove(null);</span>
+<span class="nc" id="L341">    return Counters.argmax(candidates);</span>
+  }
+
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;String&gt; dependencyPathBetween(int start, int end, Function&lt;Sentence, List&lt;String&gt;&gt; selector) {
+    // Get paths from a node to the root of the sentence
+<span class="nc" id="L348">    LinkedList&lt;Integer&gt; rootToStart = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L349">    LinkedList&lt;Integer&gt; rootToEnd = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L350">    int startAncestor = start;</span>
+<span class="nc" id="L351">    List&lt;Optional&lt;Integer&gt;&gt; governors = sentence.governors();</span>
+<span class="nc" id="L352">    Set&lt;Integer&gt; seenVertices = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L353" title="All 4 branches missed.">    while (startAncestor &gt;= 0 &amp;&amp; governors.get(startAncestor).isPresent()) {</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">      if (seenVertices.contains(startAncestor)) {</span>
+<span class="nc" id="L355">        return Collections.EMPTY_LIST;</span>
+      }
+<span class="nc" id="L357">      seenVertices.add(startAncestor);</span>
+<span class="nc" id="L358">      rootToStart.addFirst(startAncestor);</span>
+<span class="nc" id="L359">      startAncestor = governors.get(startAncestor).get();</span>
+    }
+<span class="nc bnc" id="L361" title="All 2 branches missed.">    if (startAncestor == -1) {</span>
+<span class="nc" id="L362">      rootToStart.addFirst(-1);</span>
+    }
+<span class="nc" id="L364">    int endAncestor = end;</span>
+<span class="nc" id="L365">    seenVertices.clear();</span>
+<span class="nc bnc" id="L366" title="All 4 branches missed.">    while (endAncestor &gt;= 0 &amp;&amp; governors.get(endAncestor).isPresent()) {</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">      if (seenVertices.contains(endAncestor)) {</span>
+<span class="nc" id="L368">        return Collections.EMPTY_LIST;</span>
+      }
+<span class="nc" id="L370">      seenVertices.add(endAncestor);</span>
+<span class="nc" id="L371">      rootToEnd.addFirst(endAncestor);</span>
+<span class="nc" id="L372">      endAncestor = governors.get(endAncestor).get();</span>
+    }
+<span class="nc bnc" id="L374" title="All 2 branches missed.">    if (endAncestor == -1) {</span>
+<span class="nc" id="L375">      rootToEnd.addFirst(-1);</span>
+    }
+
+    // Get least common node
+<span class="nc bnc" id="L379" title="All 6 branches missed.">    int leastCommonNodeIndex = (rootToStart.size() == 0 || rootToEnd.size() == 0 || !rootToStart.get(0).equals(rootToEnd.get(0))) ? -1 : 0;</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    for (int i = 1; i &lt; Math.min(rootToStart.size(), rootToEnd.size()); ++i) {</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      if (rootToStart.get(i).equals(rootToEnd.get(i))) {</span>
+<span class="nc" id="L382">        leastCommonNodeIndex = i;</span>
+      }
+    }
+
+    // Construct the path
+<span class="nc bnc" id="L387" title="All 2 branches missed.">    if (leastCommonNodeIndex &lt; 0) {</span>
+<span class="nc" id="L388">      return Collections.EMPTY_LIST;</span>
+    }
+<span class="nc" id="L390">    List&lt;String&gt; path = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">    for (int i = rootToStart.size() - 1; i &gt; leastCommonNodeIndex; --i) {</span>
+<span class="nc" id="L392">      path.add(selector.apply(sentence).get(rootToStart.get(i)));</span>
+<span class="nc" id="L393">      path.add(&quot;&lt;-&quot; + sentence.incomingDependencyLabel(rootToStart.get(i)).orElse(&quot;dep&quot;) + &quot;-&quot;);</span>
+    }
+<span class="nc" id="L395">    path.add(selector.apply(sentence).get(rootToStart.get(leastCommonNodeIndex)));</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">    for (int i = leastCommonNodeIndex + 1; i &lt; rootToEnd.size(); ++i) {</span>
+<span class="nc" id="L397">      path.add(&quot;-&quot; + sentence.incomingDependencyLabel(rootToEnd.get(i)).orElse(&quot;dep&quot;) + &quot;-&gt;&quot;);</span>
+<span class="nc" id="L398">      path.add(selector.apply(sentence).get(rootToEnd.get(i)));</span>
+    }
+<span class="nc" id="L400">    return path;</span>
+  }
+
+  public List&lt;String&gt; dependencyPathBetween(int start, int end) {
+<span class="nc" id="L404">    return dependencyPathBetween(start, end, Sentence::words);</span>
+  }
+
+  /**
+   * A funky little helper method to interpret each token of the sentence as an HTML string, and translate it back to text.
+   * Note that this is &lt;b&gt;in place&lt;/b&gt;.
+   */
+  public void unescapeHTML() {
+    // Change in the protobuf
+<span class="nc bnc" id="L413" title="All 2 branches missed.">    for (int i = 0; i &lt; sentence.length(); ++i) {</span>
+<span class="nc" id="L414">      CoreNLPProtos.Token.Builder token = sentence.rawToken(i);</span>
+<span class="nc" id="L415">      token.setWord(StringUtils.unescapeHtml3(token.getWord()));</span>
+<span class="nc" id="L416">      token.setLemma(StringUtils.unescapeHtml3(token.getLemma()));</span>
+    }
+    // Change in the annotation
+<span class="nc" id="L419">    CoreMap cm = sentence.document.asAnnotation().get(CoreAnnotations.SentencesAnnotation.class).get(sentence.sentenceIndex());</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">    for (CoreLabel token : cm.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+<span class="nc" id="L421">      token.setWord(StringUtils.unescapeHtml3(token.word()));</span>
+<span class="nc" id="L422">      token.setLemma(StringUtils.unescapeHtml3(token.lemma()));</span>
+<span class="nc" id="L423">    }</span>
+<span class="nc" id="L424">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

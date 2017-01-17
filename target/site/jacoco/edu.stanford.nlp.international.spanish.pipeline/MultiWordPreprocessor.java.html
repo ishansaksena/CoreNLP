@@ -1,0 +1,669 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MultiWordPreprocessor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.spanish.pipeline</a> &gt; <span class="el_source">MultiWordPreprocessor.java</span></div><h1>MultiWordPreprocessor.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.spanish.pipeline;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.international.spanish.SpanishVerbStripper;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.TwoDimensionalCounter;
+import edu.stanford.nlp.trees.LabeledScoredTreeFactory;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeFactory;
+import edu.stanford.nlp.trees.TreeNormalizer;
+import edu.stanford.nlp.trees.TreeReader;
+import edu.stanford.nlp.trees.TreeReaderFactory;
+import edu.stanford.nlp.trees.international.spanish.SpanishTreeReaderFactory;
+import edu.stanford.nlp.trees.international.spanish.SpanishTreeNormalizer;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.PropertiesUtils;
+import edu.stanford.nlp.util.StringUtils;
+
+/**
+ * Clean up an AnCora treebank which has been processed to expand multi-word
+ * tokens into separate leaves. (This prior splitting task is performed by
+ * {@link SpanishTreeNormalizer} through the {@link SpanishXMLTreeReader}
+ * class).
+ *
+ * @author Jon Gauthier
+ * @author Spence Green (original French version)
+ */
+<span class="nc" id="L35">public final class MultiWordPreprocessor  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L38">  private static Redwood.RedwoodChannels log = Redwood.channels(MultiWordPreprocessor.class);</span>
+
+  private static int nMissingPOS;
+  private static int nMissingPhrasal;
+
+  private static int nFixedPOS;
+  private static int nFixedPhrasal;
+
+  /**
+   * If a multiword token has a part-of-speech tag matching a key of
+   * this map, the constituent heading the split expression should
+   * have a label with the value corresponding to said key.
+   *
+   * e.g., since `(rg, grup.adv)` is in this map, we will eventually
+   * convert
+   *
+   *     (rg cerca_de)
+   *
+   * to
+   *
+   *     (grup.adv (rg cerca) (sp000 de))
+   */
+<span class="nc" id="L60">  private static Map&lt;String, String&gt; phrasalCategoryMap = new HashMap&lt;&gt;();</span>
+  static {
+<span class="nc" id="L62">    phrasalCategoryMap.put(&quot;ao0000&quot;, &quot;grup.a&quot;);</span>
+<span class="nc" id="L63">    phrasalCategoryMap.put(&quot;aq0000&quot;, &quot;grup.a&quot;);</span>
+<span class="nc" id="L64">    phrasalCategoryMap.put(&quot;aqo000&quot;, &quot;grup.a&quot;);</span>
+<span class="nc" id="L65">    phrasalCategoryMap.put(&quot;da0000&quot;, &quot;spec&quot;);</span>
+<span class="nc" id="L66">    phrasalCategoryMap.put(&quot;di0000&quot;, &quot;sn&quot;);</span>
+<span class="nc" id="L67">    phrasalCategoryMap.put(&quot;dn0000&quot;, &quot;spec&quot;);</span>
+<span class="nc" id="L68">    phrasalCategoryMap.put(&quot;dt0000&quot;, &quot;spec&quot;);</span>
+<span class="nc" id="L69">    phrasalCategoryMap.put(&quot;i&quot;, &quot;interjeccio&quot;);</span>
+<span class="nc" id="L70">    phrasalCategoryMap.put(&quot;i00&quot;, &quot;interjeccio&quot;);</span>
+<span class="nc" id="L71">    phrasalCategoryMap.put(&quot;rg&quot;, &quot;grup.adv&quot;);</span>
+<span class="nc" id="L72">    phrasalCategoryMap.put(&quot;rn&quot;, &quot;grup.adv&quot;); // no sólo</span>
+<span class="nc" id="L73">    phrasalCategoryMap.put(&quot;vaip000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L74">    phrasalCategoryMap.put(&quot;vmg0000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L75">    phrasalCategoryMap.put(&quot;vmic000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L76">    phrasalCategoryMap.put(&quot;vmii000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L77">    phrasalCategoryMap.put(&quot;vmif000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L78">    phrasalCategoryMap.put(&quot;vmip000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L79">    phrasalCategoryMap.put(&quot;vmis000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L80">    phrasalCategoryMap.put(&quot;vmm0000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L81">    phrasalCategoryMap.put(&quot;vmn0000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L82">    phrasalCategoryMap.put(&quot;vmp0000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L83">    phrasalCategoryMap.put(&quot;vmsi000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L84">    phrasalCategoryMap.put(&quot;vmsp000&quot;, &quot;grup.verb&quot;);</span>
+<span class="nc" id="L85">    phrasalCategoryMap.put(&quot;zm&quot;, &quot;grup.nom&quot;);</span>
+
+    // New groups (not from AnCora specification)
+<span class="nc" id="L88">    phrasalCategoryMap.put(&quot;cc&quot;, &quot;grup.cc&quot;);</span>
+<span class="nc" id="L89">    phrasalCategoryMap.put(&quot;cs&quot;, &quot;grup.cs&quot;);</span>
+<span class="nc" id="L90">    phrasalCategoryMap.put(&quot;pn000000&quot;, &quot;grup.nom&quot;);</span>
+<span class="nc" id="L91">    phrasalCategoryMap.put(&quot;pi000000&quot;, &quot;grup.pron&quot;);</span>
+<span class="nc" id="L92">    phrasalCategoryMap.put(&quot;pr000000&quot;, &quot;grup.pron&quot;);</span>
+<span class="nc" id="L93">    phrasalCategoryMap.put(&quot;pt000000&quot;, &quot;grup.pron&quot;);</span>
+<span class="nc" id="L94">    phrasalCategoryMap.put(&quot;px000000&quot;, &quot;grup.pron&quot;);</span>
+<span class="nc" id="L95">    phrasalCategoryMap.put(&quot;sp000&quot;, &quot;grup.prep&quot;);</span>
+<span class="nc" id="L96">    phrasalCategoryMap.put(&quot;w&quot;, &quot;grup.w&quot;);</span>
+<span class="nc" id="L97">    phrasalCategoryMap.put(&quot;z&quot;, &quot;grup.z&quot;);</span>
+<span class="nc" id="L98">    phrasalCategoryMap.put(&quot;z0&quot;, &quot;grup.z&quot;);</span>
+<span class="nc" id="L99">    phrasalCategoryMap.put(&quot;zp&quot;, &quot;grup.z&quot;);</span>
+<span class="nc" id="L100">    phrasalCategoryMap.put(&quot;zu&quot;, &quot;grup.z&quot;);</span>
+  }
+
+<span class="nc" id="L103">  private static class ManualUWModel {</span>
+
+<span class="nc" id="L105">    private static Map&lt;String, String&gt; posMap = new HashMap&lt;&gt;();</span>
+    static {
+      // i.e., &quot;metros cúbicos&quot;
+<span class="nc" id="L108">      posMap.put(&quot;cúbico&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L109">      posMap.put(&quot;cúbicos&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L110">      posMap.put(&quot;diagonal&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L111">      posMap.put(&quot;diestro&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L112">      posMap.put(&quot;llevados&quot;, &quot;aq0000&quot;); // llevados a cabo</span>
+<span class="nc" id="L113">      posMap.put(&quot;llevadas&quot;, &quot;aq0000&quot;); // llevadas a cabo</span>
+<span class="nc" id="L114">      posMap.put(&quot;menudo&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L115">      posMap.put(&quot;obstante&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L116">      posMap.put(&quot;rapadas&quot;, &quot;aq0000&quot;); // cabezas rapadas</span>
+<span class="nc" id="L117">      posMap.put(&quot;rasa&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L118">      posMap.put(&quot;súbito&quot;, &quot;aq0000&quot;);</span>
+<span class="nc" id="L119">      posMap.put(&quot;temática&quot;, &quot;aq0000&quot;);</span>
+
+<span class="nc" id="L121">      posMap.put(&quot;tuya&quot;, &quot;px000000&quot;);</span>
+
+      // foreign words
+<span class="nc" id="L124">      posMap.put(&quot;alter&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L125">      posMap.put(&quot;ego&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L126">      posMap.put(&quot;Jet&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L127">      posMap.put(&quot;lag&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L128">      posMap.put(&quot;line&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L129">      posMap.put(&quot;lord&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L130">      posMap.put(&quot;model&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L131">      posMap.put(&quot;mortem&quot;, &quot;nc0s000&quot;); // post-mortem</span>
+<span class="nc" id="L132">      posMap.put(&quot;pater&quot;, &quot;nc0s000&quot;); // pater familias</span>
+<span class="nc" id="L133">      posMap.put(&quot;pipe&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L134">      posMap.put(&quot;play&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L135">      posMap.put(&quot;pollastre&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L136">      posMap.put(&quot;post&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L137">      posMap.put(&quot;power&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L138">      posMap.put(&quot;priori&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L139">      posMap.put(&quot;rock&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L140">      posMap.put(&quot;roll&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L141">      posMap.put(&quot;salubritatis&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L142">      posMap.put(&quot;savoir&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L143">      posMap.put(&quot;service&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L144">      posMap.put(&quot;status&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L145">      posMap.put(&quot;stem&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L146">      posMap.put(&quot;street&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L147">      posMap.put(&quot;task&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L148">      posMap.put(&quot;trio&quot;, &quot;nc0s000&quot;);</span>
+<span class="nc" id="L149">      posMap.put(&quot;zigzag&quot;, &quot;nc0s000&quot;);</span>
+
+      // foreign words (invariable)
+<span class="nc" id="L152">      posMap.put(&quot;mass&quot;, &quot;nc0n000&quot;);</span>
+<span class="nc" id="L153">      posMap.put(&quot;media&quot;, &quot;nc0n000&quot;);</span>
+
+      // foreign words (plural)
+<span class="nc" id="L156">      posMap.put(&quot;options&quot;, &quot;nc0p000&quot;);</span>
+
+      // compound words, other invariables
+<span class="nc" id="L159">      posMap.put(&quot;regañadientes&quot;, &quot;nc0n000&quot;);</span>
+<span class="nc" id="L160">      posMap.put(&quot;sabiendas&quot;, &quot;nc0n000&quot;); // a sabiendas (de)</span>
+
+      // common gender
+<span class="nc" id="L163">      posMap.put(&quot;virgen&quot;, &quot;nc0s000&quot;);</span>
+
+<span class="nc" id="L165">      posMap.put(&quot;merced&quot;, &quot;ncfs000&quot;);</span>
+<span class="nc" id="L166">      posMap.put(&quot;miel&quot;, &quot;ncfs000&quot;);</span>
+<span class="nc" id="L167">      posMap.put(&quot;torera&quot;, &quot;ncfs000&quot;);</span>
+<span class="nc" id="L168">      posMap.put(&quot;ultranza&quot;, &quot;ncfs000&quot;);</span>
+<span class="nc" id="L169">      posMap.put(&quot;vísperas&quot;, &quot;ncfs000&quot;);</span>
+
+<span class="nc" id="L171">      posMap.put(&quot;acecho&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L172">      posMap.put(&quot;alzamiento&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L173">      posMap.put(&quot;bordo&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L174">      posMap.put(&quot;cápita&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L175">      posMap.put(&quot;ciento&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L176">      posMap.put(&quot;cuño&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L177">      posMap.put(&quot;pairo&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L178">      posMap.put(&quot;pese&quot;, &quot;ncms000&quot;); // pese a</span>
+<span class="nc" id="L179">      posMap.put(&quot;pique&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L180">      posMap.put(&quot;pos&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L181">      posMap.put(&quot;postre&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L182">      posMap.put(&quot;pro&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L183">      posMap.put(&quot;ralentí&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L184">      posMap.put(&quot;ras&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L185">      posMap.put(&quot;rebato&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L186">      posMap.put(&quot;torno&quot;, &quot;ncms000&quot;);</span>
+<span class="nc" id="L187">      posMap.put(&quot;través&quot;, &quot;ncms000&quot;);</span>
+
+<span class="nc" id="L189">      posMap.put(&quot;creces&quot;, &quot;ncfp000&quot;);</span>
+<span class="nc" id="L190">      posMap.put(&quot;cuestas&quot;, &quot;ncfp000&quot;);</span>
+<span class="nc" id="L191">      posMap.put(&quot;oídas&quot;, &quot;ncfp000&quot;);</span>
+<span class="nc" id="L192">      posMap.put(&quot;tientas&quot;, &quot;ncfp000&quot;);</span>
+<span class="nc" id="L193">      posMap.put(&quot;trizas&quot;, &quot;ncfp000&quot;);</span>
+<span class="nc" id="L194">      posMap.put(&quot;veras&quot;, &quot;ncfp000&quot;);</span>
+
+<span class="nc" id="L196">      posMap.put(&quot;abuelos&quot;, &quot;ncmp000&quot;);</span>
+<span class="nc" id="L197">      posMap.put(&quot;ambages&quot;, &quot;ncmp000&quot;);</span>
+<span class="nc" id="L198">      posMap.put(&quot;modos&quot;, &quot;ncmp000&quot;);</span>
+<span class="nc" id="L199">      posMap.put(&quot;pedazos&quot;, &quot;ncmp000&quot;);</span>
+
+<span class="nc" id="L201">      posMap.put(&quot;A&quot;, &quot;sps00&quot;);</span>
+
+<span class="nc" id="L203">      posMap.put(&quot;amén&quot;, &quot;rg&quot;); // amén de</span>
+
+<span class="nc" id="L205">      posMap.put(&quot;Bailando&quot;, &quot;vmg0000&quot;);</span>
+<span class="nc" id="L206">      posMap.put(&quot;Soñando&quot;, &quot;vmg0000&quot;);</span>
+<span class="nc" id="L207">      posMap.put(&quot;Teniendo&quot;, &quot;vmg0000&quot;);</span>
+<span class="nc" id="L208">      posMap.put(&quot;echaremos&quot;, &quot;vmif000&quot;);</span>
+<span class="nc" id="L209">      posMap.put(&quot;formaba&quot;, &quot;vmii000&quot;);</span>
+<span class="nc" id="L210">      posMap.put(&quot;Formabas&quot;, &quot;vmii000&quot;);</span>
+<span class="nc" id="L211">      posMap.put(&quot;Forman&quot;, &quot;vmip000&quot;);</span>
+<span class="nc" id="L212">      posMap.put(&quot;perece&quot;, &quot;vmip000&quot;);</span>
+<span class="nc" id="L213">      posMap.put(&quot;PONE&quot;, &quot;vmip000&quot;);</span>
+<span class="nc" id="L214">      posMap.put(&quot;suicídate&quot;, &quot;vmm0000&quot;);</span>
+<span class="nc" id="L215">      posMap.put(&quot;tardar&quot;, &quot;vmn0000&quot;);</span>
+
+<span class="nc" id="L217">      posMap.put(&quot;seiscientas&quot;, &quot;z0&quot;);</span>
+<span class="nc" id="L218">      posMap.put(&quot;trescientas&quot;, &quot;z0&quot;);</span>
+
+<span class="nc" id="L220">      posMap.put(&quot;cc&quot;, &quot;zu&quot;);</span>
+<span class="nc" id="L221">      posMap.put(&quot;km&quot;, &quot;zu&quot;);</span>
+<span class="nc" id="L222">      posMap.put(&quot;kms&quot;, &quot;zu&quot;);</span>
+    }
+
+<span class="nc" id="L225">    private static int nUnknownWordTypes = posMap.size();</span>
+
+<span class="nc" id="L227">    private static final Pattern digit = Pattern.compile(&quot;\\d+&quot;);</span>
+<span class="nc" id="L228">    private static final Pattern participle = Pattern.compile(&quot;[ai]d[oa]$&quot;);</span>
+
+    /**
+     * Names which would be mistakenly marked as function words by
+     * unigram tagger (and which never appear as function words in
+     * multi-word tokens)
+     */
+<span class="nc" id="L235">    private static final Set&lt;String&gt; actuallyNames = new HashSet&lt;&gt;(Arrays.asList(</span>
+            &quot;Avenida&quot;,
+            &quot;Contra&quot;,
+            &quot;Gracias&quot;, // interjection
+            &quot;in&quot;, // preposition; only appears in corpus as &quot;in extremis&quot; (preposition)
+            &quot;Mercado&quot;,
+            &quot;Jesús&quot;, // interjection
+            &quot;Salvo&quot;,
+            &quot;Van&quot; // verb
+    ));
+
+    // Name-looking word that isn't &quot;Al&quot;
+<span class="nc" id="L247">    private static final Pattern otherNamePattern = Pattern.compile(&quot;\\b(Al\\w+|A[^l]\\w*|[B-Z]\\w+)&quot;);</span>
+    // Name-looking word that isn't &quot;A&quot;
+<span class="nc" id="L249">    private static final Pattern otherNamePattern2 = Pattern.compile(&quot;\\b(A\\w+|[B-Z]\\w+)&quot;);</span>
+
+    // Determiners which may also appear as pronouns
+<span class="nc" id="L252">    private static final Pattern pPronounDeterminers = Pattern.compile(&quot;(tod|otr|un)[oa]s?&quot;);</span>
+
+    public static String getOverrideTag(String word, String containingPhrase) {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">      if (containingPhrase == null)</span>
+<span class="nc" id="L256">        return null;</span>
+
+<span class="nc bnc" id="L258" title="All 4 branches missed.">      if (word.equalsIgnoreCase(&quot;este&quot;) &amp;&amp; !containingPhrase.startsWith(word))</span>
+<span class="nc" id="L259">        return &quot;np00000&quot;;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">      else if (word.equals(&quot;contra&quot;)</span>
+<span class="nc bnc" id="L261" title="All 4 branches missed.">        &amp;&amp; (containingPhrase.startsWith(&quot;en contra&quot;) || containingPhrase.startsWith(&quot;En contra&quot;)))</span>
+<span class="nc" id="L262">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L263" title="All 4 branches missed.">      else if (word.equals(&quot;total&quot;) &amp;&amp; containingPhrase.startsWith(&quot;ese&quot;))</span>
+<span class="nc" id="L264">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">      else if (word.equals(&quot;DEL&quot;))</span>
+        // Uses of &quot;Del&quot; in corpus are proper nouns, but uses of &quot;DEL&quot; are
+        // prepositions.. convenient for our purposes
+<span class="nc" id="L268">        return &quot;sp000&quot;;</span>
+<span class="nc bnc" id="L269" title="All 4 branches missed.">      else if (word.equals(&quot;sí&quot;) &amp;&amp; containingPhrase.contains(&quot;por sí&quot;)</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        || containingPhrase.contains(&quot;fuera de sí&quot;))</span>
+<span class="nc" id="L271">        return &quot;pp000000&quot;;</span>
+<span class="nc bnc" id="L272" title="All 4 branches missed.">      else if (pPronounDeterminers.matcher(word).matches() &amp;&amp; containingPhrase.endsWith(word))</span>
+        // Determiners tailing a phrase are pronouns: &quot;sobre todo,&quot; &quot;al otro&quot;, etc.
+<span class="nc" id="L274">        return &quot;pi000000&quot;;</span>
+<span class="nc bnc" id="L275" title="All 4 branches missed.">      else if (word.equals(&quot;cuando&quot;) &amp;&amp; containingPhrase.endsWith(word))</span>
+<span class="nc" id="L276">        return &quot;pi000000&quot;;</span>
+<span class="nc bnc" id="L277" title="All 4 branches missed.">      else if ((word.equalsIgnoreCase(&quot;contra&quot;) &amp;&amp; containingPhrase.endsWith(word)))</span>
+<span class="nc" id="L278">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L279" title="All 4 branches missed.">      else if (word.equals(&quot;salvo&quot;) &amp;&amp; containingPhrase.endsWith(&quot;salvo&quot;))</span>
+<span class="nc" id="L280">        return &quot;aq0000&quot;;</span>
+<span class="nc bnc" id="L281" title="All 4 branches missed.">      else if (word.equals(&quot;mira&quot;) &amp;&amp; containingPhrase.endsWith(word))</span>
+<span class="nc" id="L282">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L283" title="All 4 branches missed.">      else if (word.equals(&quot;pro&quot;) &amp;&amp; containingPhrase.startsWith(&quot;en pro&quot;))</span>
+<span class="nc" id="L284">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L285" title="All 4 branches missed.">      else if (word.equals(&quot;espera&quot;) &amp;&amp; containingPhrase.endsWith(&quot;espera de&quot;))</span>
+<span class="nc" id="L286">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">      else if (word.equals(&quot;Paso&quot;) &amp;&amp; containingPhrase.equals(&quot;El Paso&quot;))</span>
+<span class="nc" id="L288">        return &quot;np00000&quot;;</span>
+<span class="nc bnc" id="L289" title="All 6 branches missed.">      else if (word.equals(&quot;medio&quot;) &amp;&amp; (containingPhrase.endsWith(&quot;medio de&quot;) || containingPhrase.endsWith(&quot;ambiente&quot;)</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">        || containingPhrase.endsWith(&quot;por medio&quot;) || containingPhrase.contains(&quot;por medio&quot;)</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        || containingPhrase.endsWith(&quot;medio&quot;)))</span>
+<span class="nc" id="L292">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L293" title="All 4 branches missed.">      else if (word.equals(&quot;Medio&quot;) &amp;&amp; containingPhrase.contains(&quot;Ambiente&quot;))</span>
+<span class="nc" id="L294">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">      else if (word.equals(&quot;Medio&quot;) &amp;&amp; containingPhrase.equals(&quot;Oriente Medio&quot;))</span>
+<span class="nc" id="L296">        return &quot;aq0000&quot;;</span>
+<span class="nc bnc" id="L297" title="All 4 branches missed.">      else if (word.equals(&quot;media&quot;) &amp;&amp; containingPhrase.equals(&quot;mass media&quot;))</span>
+<span class="nc" id="L298">        return &quot;nc0n000&quot;;</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      else if (word.equals(&quot;cuenta&quot;)) // tomar en cuenta, darse cuenta de, ...</span>
+<span class="nc" id="L300">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L301" title="All 4 branches missed.">      else if (word.equals(&quot;h&quot;) &amp;&amp; containingPhrase.startsWith(&quot;km&quot;))</span>
+<span class="nc" id="L302">        return &quot;zu&quot;;</span>
+<span class="nc bnc" id="L303" title="All 6 branches missed.">      else if (word.equals(&quot;A&quot;) &amp;&amp; (containingPhrase.contains(&quot;-&quot;) || containingPhrase.contains(&quot;,&quot;)</span>
+<span class="nc bnc" id="L304" title="All 4 branches missed.">        || otherNamePattern2.matcher(containingPhrase).find() || containingPhrase.equals(&quot;terminal A&quot;)))</span>
+<span class="nc" id="L305">        return &quot;np00000&quot;;</span>
+<span class="nc bnc" id="L306" title="All 4 branches missed.">      else if (word.equals(&quot;forma&quot;) &amp;&amp; containingPhrase.startsWith(&quot;forma parte&quot;))</span>
+<span class="nc" id="L307">        return &quot;vmip000&quot;;</span>
+<span class="nc bnc" id="L308" title="All 4 branches missed.">      else if (word.equals(&quot;Sin&quot;) &amp;&amp; containingPhrase.contains(&quot;Jaime&quot;))</span>
+<span class="nc" id="L309">        return &quot;np00000&quot;;</span>
+<span class="nc bnc" id="L310" title="All 4 branches missed.">      else if (word.equals(&quot;di&quot;) &amp;&amp; containingPhrase.contains(&quot;di cuenta&quot;))</span>
+<span class="nc" id="L311">        return &quot;vmis000&quot;;</span>
+<span class="nc bnc" id="L312" title="All 4 branches missed.">      else if (word.equals(&quot;demos&quot;) &amp;&amp; containingPhrase.contains(&quot;demos cuenta&quot;))</span>
+<span class="nc" id="L313">        return &quot;vmsp000&quot;;</span>
+<span class="nc bnc" id="L314" title="All 6 branches missed.">      else if ((word.equals(&quot;van&quot;) || word.equals(&quot;den&quot;)) &amp;&amp; containingPhrase.contains(&quot;van den&quot;))</span>
+<span class="nc" id="L315">        return &quot;np00000&quot;;</span>
+
+<span class="nc bnc" id="L317" title="All 2 branches missed.">      if (word.equals(&quot;Al&quot;)) {</span>
+        // &quot;Al&quot; is sometimes a part of name phrases: Arabic names, Al Gore, etc.
+        // Mark it a noun if its containing phrase has some other capitalized word
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (otherNamePattern.matcher(containingPhrase).find())</span>
+<span class="nc" id="L321">          return &quot;np00000&quot;;</span>
+        else
+<span class="nc" id="L323">          return &quot;sp000&quot;;</span>
+      }
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">      if (actuallyNames.contains(word))</span>
+<span class="nc" id="L327">        return &quot;np00000&quot;;</span>
+
+<span class="nc bnc" id="L329" title="All 4 branches missed.">      if (word.equals(&quot;sino&quot;) &amp;&amp; containingPhrase.endsWith(word))</span>
+<span class="nc" id="L330">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L331" title="All 8 branches missed.">      else if (word.equals(&quot;mañana&quot;) || word.equals(&quot;paso&quot;) || word.equals(&quot;monta&quot;) || word.equals(&quot;deriva&quot;)</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        || word.equals(&quot;visto&quot;))</span>
+<span class="nc" id="L333">        return &quot;nc0s000&quot;;</span>
+<span class="nc bnc" id="L334" title="All 4 branches missed.">      else if (word.equals(&quot;frente&quot;) &amp;&amp; containingPhrase.startsWith(&quot;al frente&quot;))</span>
+<span class="nc" id="L335">        return &quot;nc0s000&quot;;</span>
+
+<span class="nc" id="L337">      return null;</span>
+    }
+
+    /**
+     * Match phrases for which unknown words should be assumed to be
+     * common nouns
+     *
+     * - a trancas y barrancas
+     * - en vez de, en pos de
+     * - sin embargo
+     * - merced a
+     * - pese a que
+     */
+<span class="nc" id="L350">    private static final Pattern commonPattern =</span>
+<span class="nc" id="L351">      Pattern.compile(&quot;^al? |^en .+ de$|sin | al?$| que$&quot;,</span>
+                      Pattern.CASE_INSENSITIVE);
+
+    public static String getTag(String word, String containingPhrase) {
+      // Exact matches
+<span class="nc bnc" id="L356" title="All 2 branches missed.">      if (word.equals(&quot;%&quot;))</span>
+<span class="nc" id="L357">        return &quot;ft&quot;;</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">      else if (word.equals(&quot;+&quot;))</span>
+<span class="nc" id="L359">        return &quot;fz&quot;;</span>
+<span class="nc bnc" id="L360" title="All 4 branches missed.">      else if (word.equals(&quot;&amp;&quot;) || word.equals(&quot;@&quot;))</span>
+<span class="nc" id="L361">        return &quot;f0&quot;;</span>
+
+<span class="nc bnc" id="L363" title="All 2 branches missed.">      if(digit.matcher(word).find())</span>
+<span class="nc" id="L364">        return &quot;z0&quot;;</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">      else if (posMap.containsKey(word))</span>
+<span class="nc" id="L366">        return posMap.get(word);</span>
+
+      // Fallbacks
+<span class="nc bnc" id="L369" title="All 2 branches missed.">      if (participle.matcher(word).find())</span>
+<span class="nc" id="L370">        return &quot;aq0000&quot;;</span>
+
+      // One last hint: is the phrase one which we have designated to
+      // contain mostly common nouns?
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      if (commonPattern.matcher(word).matches())</span>
+<span class="nc" id="L375">        return &quot;ncms000&quot;;</span>
+
+      // Now make an educated guess.
+      //log.info(&quot;No POS tag for &quot; + word);
+<span class="nc" id="L379">      return &quot;np00000&quot;;</span>
+    }
+  }
+
+  /**
+   * Source training data for a unigram tagger from the given tree.
+   */
+  public static void updateTagger(TwoDimensionalCounter&lt;String,String&gt; tagger,
+                                  Tree t) {
+<span class="nc" id="L388">    List&lt;CoreLabel&gt; yield = t.taggedLabeledYield();</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">    for (CoreLabel cl : yield) {</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">      if (cl.tag().equals(SpanishTreeNormalizer.MW_TAG))</span>
+<span class="nc" id="L391">        continue;</span>
+
+<span class="nc" id="L393">      tagger.incrementCount(cl.word(), cl.tag());</span>
+<span class="nc" id="L394">    }</span>
+<span class="nc" id="L395">  }</span>
+
+  public static void traverseAndFix(Tree t,
+                                    Tree parent,
+                                    TwoDimensionalCounter&lt;String, String&gt; unigramTagger,
+                                    boolean retainNER) {
+<span class="nc bnc" id="L401" title="All 2 branches missed.">    if(t.isPreTerminal()) {</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">      if(t.value().equals(SpanishTreeNormalizer.MW_TAG)) {</span>
+<span class="nc" id="L403">        nMissingPOS++;</span>
+
+<span class="nc" id="L405">        String pos = inferPOS(t, parent, unigramTagger);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (pos != null) {</span>
+<span class="nc" id="L407">          t.setValue(pos);</span>
+<span class="nc" id="L408">          nFixedPOS++;</span>
+        }
+      }
+
+<span class="nc" id="L412">      return;</span>
+    }
+
+<span class="nc bnc" id="L415" title="All 2 branches missed.">    for(Tree kid : t.children())</span>
+<span class="nc" id="L416">      traverseAndFix(kid, t, unigramTagger, retainNER);</span>
+
+    // Post-order visit
+<span class="nc bnc" id="L419" title="All 2 branches missed.">    if(t.value().startsWith(SpanishTreeNormalizer.MW_PHRASE_TAG)) {</span>
+<span class="nc" id="L420">      nMissingPhrasal++;</span>
+
+<span class="nc" id="L422">      String phrasalCat = inferPhrasalCategory(t, retainNER);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">      if (phrasalCat != null) {</span>
+<span class="nc" id="L424">        t.setValue(phrasalCat);</span>
+<span class="nc" id="L425">        nFixedPhrasal++;</span>
+      }
+    }
+<span class="nc" id="L428">  }</span>
+
+  /**
+   * Get a string representation of the immediate phrase which contains the given node.
+   */
+  private static String getContainingPhrase(Tree t, Tree parent) {
+<span class="nc bnc" id="L434" title="All 2 branches missed.">    if (parent == null)</span>
+<span class="nc" id="L435">      return null;</span>
+
+<span class="nc" id="L437">    List&lt;Label&gt; phraseYield = parent.yield();</span>
+<span class="nc" id="L438">    StringBuilder containingPhrase = new StringBuilder();</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">    for (Label l : phraseYield)</span>
+<span class="nc" id="L440">      containingPhrase.append(l.value()).append(&quot; &quot;);</span>
+
+<span class="nc" id="L442">    return containingPhrase.toString().substring(0, containingPhrase.length() - 1);</span>
+  }
+
+<span class="nc" id="L445">  private static final SpanishVerbStripper verbStripper = SpanishVerbStripper.getInstance();</span>
+
+  /**
+   * Attempt to infer the part of speech of the given preterminal node, which
+   * was created during the expansion of a multi-word token.
+   */
+  private static String inferPOS(Tree t, Tree parent,
+                                 TwoDimensionalCounter&lt;String, String&gt; unigramTagger) {
+<span class="nc" id="L453">    String word = t.firstChild().value();</span>
+<span class="nc" id="L454">    String containingPhraseStr = getContainingPhrase(t, parent);</span>
+
+    // Overrides: let the manual POS model handle a few special cases first
+<span class="nc" id="L457">    String overrideTag = ManualUWModel.getOverrideTag(word, containingPhraseStr);</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">    if (overrideTag != null)</span>
+<span class="nc" id="L459">      return overrideTag;</span>
+
+<span class="nc" id="L461">    Set&lt;String&gt; unigramTaggerKeys = unigramTagger.firstKeySet();</span>
+
+    // Try treating this word as a verb and stripping any clitic
+    // pronouns. If the stripped version exists in the unigram
+    // tagger, then stick with the verb hypothesis
+<span class="nc" id="L466">    SpanishVerbStripper.StrippedVerb strippedVerb = verbStripper.separatePronouns(word);</span>
+<span class="nc bnc" id="L467" title="All 4 branches missed.">    if (strippedVerb != null &amp;&amp; unigramTaggerKeys.contains(strippedVerb.getStem())) {</span>
+<span class="nc" id="L468">      String pos = Counters.argmax(unigramTagger.getCounter(strippedVerb.getStem()));</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">      if (pos.startsWith(&quot;v&quot;))</span>
+<span class="nc" id="L470">        return pos;</span>
+    }
+
+<span class="nc bnc" id="L473" title="All 2 branches missed.">    if (unigramTagger.firstKeySet().contains(word))</span>
+<span class="nc" id="L474">      return Counters.argmax(unigramTagger.getCounter(word), new POSTieBreaker());</span>
+
+<span class="nc" id="L476">    return ManualUWModel.getTag(word, containingPhraseStr);</span>
+  }
+
+  /**
+   * Resolves &quot;ties&quot; between candidate part-of-speech tags encountered by the unigram tagger.
+   */
+<span class="nc" id="L482">  private static class POSTieBreaker implements Comparator&lt;String&gt; {</span>
+    @Override
+    public int compare(String o1, String o2) {
+<span class="nc" id="L485">      boolean firstIsNoun = o1.startsWith(&quot;n&quot;);</span>
+<span class="nc" id="L486">      boolean secondIsNoun = o2.startsWith(&quot;n&quot;);</span>
+
+      // Prefer nouns over everything
+<span class="nc bnc" id="L489" title="All 4 branches missed.">      if (firstIsNoun &amp;&amp; !secondIsNoun)</span>
+<span class="nc" id="L490">        return -1;</span>
+<span class="nc bnc" id="L491" title="All 4 branches missed.">      else if (secondIsNoun &amp;&amp; !firstIsNoun)</span>
+<span class="nc" id="L492">        return 1;</span>
+
+      // No other policies at the moment
+<span class="nc" id="L495">      return 0;</span>
+    }
+  }
+
+  /**
+   * Attempt to infer the phrasal category of the given node, which
+   * heads words which were expanded from a multi-word token.
+   */
+  private static String inferPhrasalCategory(Tree t, boolean retainNER) {
+<span class="nc" id="L504">    String phraseValue = t.value();</span>
+
+    // Retrieve the part-of-speech assigned to the original multi-word
+    // token
+<span class="nc" id="L508">    String originalPos = phraseValue.substring(phraseValue.lastIndexOf('_') + 1);</span>
+
+<span class="nc bnc" id="L510" title="All 2 branches missed.">    if (phrasalCategoryMap.containsKey(originalPos)) {</span>
+<span class="nc" id="L511">      return phrasalCategoryMap.get(originalPos);</span>
+<span class="nc bnc" id="L512" title="All 4 branches missed.">    } else if (originalPos.length() &gt; 0 &amp;&amp; originalPos.charAt(0) == 'n') {</span>
+      // TODO may lead to some funky trees if a child somehow gets an
+      // incorrect tag -- e.g. we may have a `grup.nom` head a `vmis000`
+
+<span class="nc bnc" id="L516" title="All 2 branches missed.">      if (!retainNER)</span>
+<span class="nc" id="L517">        return &quot;grup.nom&quot;;</span>
+
+<span class="nc" id="L519">      char nerTag = phraseValue.charAt(phraseValue.length() - 1);</span>
+<span class="nc bnc" id="L520" title="All 5 branches missed.">      switch (nerTag) {</span>
+      case 'l':
+<span class="nc" id="L522">        return &quot;grup.nom.lug&quot;;</span>
+      case 'o':
+<span class="nc" id="L524">        return &quot;grup.nom.org&quot;;</span>
+      case 'p':
+<span class="nc" id="L526">        return &quot;grup.nom.pers&quot;;</span>
+      case '0':
+<span class="nc" id="L528">        return &quot;grup.nom.otros&quot;;</span>
+      default:
+<span class="nc" id="L530">        return &quot;grup.nom&quot;;</span>
+      }
+    }
+
+    // Fallback: try to infer based on part-of-speech sequence formed by
+    // constituents
+<span class="nc" id="L536">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">    for(Tree kid : t.children())</span>
+<span class="nc" id="L538">      sb.append(kid.value()).append(&quot; &quot;);</span>
+<span class="nc" id="L539">    String posSequence = sb.toString().trim();</span>
+<span class="nc" id="L540">    log.info(&quot;No phrasal cat for: &quot; + posSequence + &quot; (original POS of MWE: &quot; + originalPos + &quot;)&quot;);</span>
+
+    // Give up.
+<span class="nc" id="L543">    return null;</span>
+  }
+
+  private static void resolveDummyTags(File treeFile,
+                                       TwoDimensionalCounter&lt;String, String&gt; unigramTagger,
+                                       boolean retainNER, TreeNormalizer tn) {
+<span class="nc" id="L549">    TreeFactory tf = new LabeledScoredTreeFactory();</span>
+<span class="nc" id="L550">    MultiWordTreeExpander expander = new MultiWordTreeExpander();</span>
+
+    try {
+<span class="nc" id="L553">      BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(treeFile), &quot;UTF-8&quot;));</span>
+<span class="nc" id="L554">      TreeReaderFactory trf = new SpanishTreeReaderFactory();</span>
+<span class="nc" id="L555">      TreeReader tr = trf.newTreeReader(br);</span>
+
+<span class="nc" id="L557">      PrintWriter pw = new PrintWriter(new PrintStream(new FileOutputStream(new File(treeFile + &quot;.fixed&quot;)),false,&quot;UTF-8&quot;));</span>
+
+<span class="nc" id="L559">      int nTrees = 0;</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">      for(Tree t; (t = tr.readTree()) != null;nTrees++) {</span>
+<span class="nc" id="L561">        traverseAndFix(t, null, unigramTagger, retainNER);</span>
+
+        // Now &quot;decompress&quot; further the expanded trees formed by
+        // multiword token splitting
+<span class="nc" id="L565">        t = expander.expandPhrases(t, tn, tf);</span>
+
+<span class="nc bnc" id="L567" title="All 2 branches missed.">        if (tn != null)</span>
+<span class="nc" id="L568">          t = tn.normalizeWholeTree(t, tf);</span>
+
+<span class="nc" id="L570">        pw.println(t.toString());</span>
+      }
+
+<span class="nc" id="L573">      pw.close();</span>
+<span class="nc" id="L574">      tr.close();</span>
+
+<span class="nc" id="L576">      System.out.println(&quot;Processed &quot; +nTrees+ &quot; trees&quot;);</span>
+
+<span class="nc" id="L578">    } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L579">      e.printStackTrace();</span>
+<span class="nc" id="L580">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L581">      e.printStackTrace();</span>
+<span class="nc" id="L582">    } catch (IOException e) {</span>
+<span class="nc" id="L583">      e.printStackTrace();</span>
+<span class="nc" id="L584">    }</span>
+<span class="nc" id="L585">  }</span>
+
+  private static String usage() {
+<span class="nc" id="L588">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L589">    String nl = System.getProperty(&quot;line.separator&quot;);</span>
+<span class="nc" id="L590">    sb.append(String.format(&quot;Usage: java %s [OPTIONS] treebank-file%n&quot;,</span>
+<span class="nc" id="L591">                            MultiWordPreprocessor.class.getName()));</span>
+<span class="nc" id="L592">    sb.append(&quot;Options:&quot;).append(nl);</span>
+<span class="nc" id="L593">    sb.append(&quot;   -help: Print this message&quot;).append(nl);</span>
+<span class="nc" id="L594">    sb.append(&quot;   -ner: Retain NER information in tree constituents (pre-pre-terminal nodes)&quot;).append(nl);</span>
+<span class="nc" id="L595">    sb.append(&quot;   -normalize {true, false}: Run the Spanish tree normalizer (non-aggressive) on the output of the main routine (true by default)&quot;).append(nl);</span>
+<span class="nc" id="L596">    return sb.toString();</span>
+  }
+
+  private static Map&lt;String, Integer&gt; argOptionDefs;
+  static {
+<span class="nc" id="L601">    argOptionDefs = Generics.newHashMap();</span>
+<span class="nc" id="L602">    argOptionDefs.put(&quot;help&quot;, 0);</span>
+<span class="nc" id="L603">    argOptionDefs.put(&quot;ner&quot;, 0);</span>
+<span class="nc" id="L604">    argOptionDefs.put(&quot;normalize&quot;, 1);</span>
+<span class="nc" id="L605">  }</span>
+
+  /**
+   *
+   * @param args
+   */
+  public static void main(String[] args) {
+<span class="nc" id="L612">    Properties options = StringUtils.argsToProperties(args, argOptionDefs);</span>
+<span class="nc bnc" id="L613" title="All 4 branches missed.">    if(!options.containsKey(&quot;&quot;) || options.containsKey(&quot;help&quot;)) {</span>
+<span class="nc" id="L614">      log.info(usage());</span>
+<span class="nc" id="L615">      return;</span>
+    }
+
+<span class="nc" id="L618">    boolean retainNER = PropertiesUtils.getBool(options, &quot;ner&quot;, false);</span>
+<span class="nc" id="L619">    boolean normalize = PropertiesUtils.getBool(options, &quot;normalize&quot;, true);</span>
+
+<span class="nc" id="L621">    final File treeFile = new File(options.getProperty(&quot;&quot;));</span>
+<span class="nc" id="L622">    TwoDimensionalCounter&lt;String,String&gt; labelTerm =</span>
+            new TwoDimensionalCounter&lt;&gt;();
+<span class="nc" id="L624">    TwoDimensionalCounter&lt;String,String&gt; termLabel =</span>
+            new TwoDimensionalCounter&lt;&gt;();
+<span class="nc" id="L626">    TwoDimensionalCounter&lt;String,String&gt; labelPreterm =</span>
+            new TwoDimensionalCounter&lt;&gt;();
+<span class="nc" id="L628">    TwoDimensionalCounter&lt;String,String&gt; pretermLabel =</span>
+            new TwoDimensionalCounter&lt;&gt;();
+
+<span class="nc" id="L631">    TwoDimensionalCounter&lt;String,String&gt; unigramTagger =</span>
+            new TwoDimensionalCounter&lt;&gt;();
+
+    try {
+<span class="nc" id="L635">      BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(treeFile), &quot;UTF-8&quot;));</span>
+<span class="nc" id="L636">      TreeReaderFactory trf = new SpanishTreeReaderFactory();</span>
+<span class="nc" id="L637">      TreeReader tr = trf.newTreeReader(br);</span>
+
+<span class="nc bnc" id="L639" title="All 2 branches missed.">      for(Tree t; (t = tr.readTree()) != null;) {</span>
+<span class="nc" id="L640">        updateTagger(unigramTagger, t);</span>
+      }
+<span class="nc" id="L642">      tr.close(); //Closes the underlying reader</span>
+
+<span class="nc" id="L644">      System.out.println(&quot;Resolving DUMMY tags&quot;);</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">      resolveDummyTags(treeFile, unigramTagger, retainNER,</span>
+                       normalize ? new SpanishTreeNormalizer(true, false, false) : null);
+
+<span class="nc" id="L648">      System.out.println(&quot;#Unknown Word Types: &quot; + ManualUWModel.nUnknownWordTypes);</span>
+<span class="nc" id="L649">      System.out.println(String.format(&quot;#Missing POS: %d (fixed: %d, %.2f%%)&quot;,</span>
+<span class="nc" id="L650">                                       nMissingPOS, nFixedPOS,</span>
+<span class="nc" id="L651">                                       (double) nFixedPOS / nMissingPOS * 100));</span>
+<span class="nc" id="L652">      System.out.println(String.format(&quot;#Missing Phrasal: %d (fixed: %d, %.2f%%)&quot;,</span>
+<span class="nc" id="L653">                                       nMissingPhrasal, nFixedPhrasal,</span>
+<span class="nc" id="L654">                                       (double) nFixedPhrasal / nMissingPhrasal * 100));</span>
+
+<span class="nc" id="L656">      System.out.println(&quot;Done!&quot;);</span>
+
+<span class="nc" id="L658">    } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L659">      e.printStackTrace();</span>
+
+<span class="nc" id="L661">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L662">      e.printStackTrace();</span>
+
+<span class="nc" id="L664">    } catch (IOException e) {</span>
+<span class="nc" id="L665">      e.printStackTrace();</span>
+<span class="nc" id="L666">    }</span>
+<span class="nc" id="L667">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

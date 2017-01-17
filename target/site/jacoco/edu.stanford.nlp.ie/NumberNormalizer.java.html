@@ -1,0 +1,799 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NumberNormalizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">NumberNormalizer.java</span></div><h1>NumberNormalizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie;
+
+import edu.stanford.nlp.ie.regexp.NumberSequenceClassifier;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.tokensregex.Env;
+import edu.stanford.nlp.ling.tokensregex.TokenSequenceMatcher;
+import edu.stanford.nlp.ling.tokensregex.TokenSequencePattern;
+import edu.stanford.nlp.pipeline.ChunkAnnotationUtils;
+import edu.stanford.nlp.pipeline.CoreMapAggregator;
+import edu.stanford.nlp.pipeline.CoreMapAttributeAggregator;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.util.logging.RedwoodConfiguration;
+
+import java.math.BigDecimal;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Provides functions for converting words to numbers
+ * Unlike QuantifiableEntityNormalizer that normalizes various
+ *   types of quantifiable entities like money and dates,
+ * NumberNormalizer only normalizes numeric expressions
+ *   (e.g. one =&amp;gt; 1, two hundred =&amp;gt; 200.0 )
+ *
+ * &lt;br&gt;
+ * This code is somewhat hacked together, so should be reworked.
+ *
+ * &lt;br&gt;
+ * There is a library in perl for parsing english numbers:
+ * http://blog.cordiner.net/2010/01/02/parsing-english-numbers-with-perl/
+ *
+ * &lt;p&gt;
+ * TODO: To be merged into QuantifiableEntityNormalizer.
+ *        It can be used by QuantifiableEntityNormalizer
+ *        to first convert numbers expressed as words
+ *        into numeric quantities before figuring
+ *        out how to do higher level combos
+ *        (like one hundred dollars and five cents)
+ * &lt;br&gt;
+ * TODO: Known to not handle the following:
+ *       oh: two oh one
+ *       non-integers: one and a half, one point five, three fifth
+ *       funky numbers: pi
+ * &lt;br&gt;
+ * TODO: This class is very language dependent
+ *        Should really be AmericanEnglishNumberNormalizer
+ * &lt;br&gt;
+ * TODO: Make things not static
+ *
+ * @author Angel Chang
+ */
+public class NumberNormalizer {
+
+<span class="nc" id="L57">  private NumberNormalizer() {} // static class</span>
+
+  /** A logger for this class */
+<span class="nc" id="L60">  private static final Redwood.RedwoodChannels logger = Redwood.channels(NumberNormalizer.class);</span>
+
+
+  // TODO: make this not static, let different NumberNormalizers use different loggers
+  public static void setVerbose(boolean verbose) {
+<span class="nc bnc" id="L65" title="All 2 branches missed.">    if (verbose) {</span>
+<span class="nc" id="L66">      RedwoodConfiguration.debugLevel().apply();</span>
+    } else {
+<span class="nc" id="L68">      RedwoodConfiguration.errorLevel().apply();</span>
+    }
+<span class="nc" id="L70">  }</span>
+
+  // Need these in order - first must come after 21st
+  //public static final Pattern teOrdinalWords = Pattern.compile(&quot;(?i)(tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|twenty-first|twenty-second|twenty-third|twenty-fourth|twenty-fifth|twenty-sixth|twenty-seventh|twenty-eighth|twenty-ninth|thirtieth|thirty-first|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)&quot;);
+  //static final Pattern teNumOrds = Pattern.compile(&quot;(?i)([23]?1-?st|11-?th|[23]?2-?nd|12-?th|[12]?3-?rd|13-?th|[12]?[4-90]-?th|30-?th)&quot;);
+  //static final Pattern unitNumsPattern = Pattern.compile(&quot;(?i)(one|two|three|four|five|six|seven|eight|nine)&quot;);
+  //static final Pattern uniqueNumsPattern  = Pattern.compile(&quot;(?i)(ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)&quot;);
+  //static final Pattern tensNumsPattern = Pattern.compile(&quot;(?i)(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)&quot;);
+<span class="nc" id="L78">  private static final Pattern numUnitPattern = Pattern.compile(&quot;(?i)(hundred|thousand|million|billion|trillion)&quot;);</span>
+<span class="nc" id="L79">  private static final Pattern numEndUnitPattern = Pattern.compile(&quot;(?i)(gross|dozen|score)&quot;);</span>
+
+  /***********************/
+
+<span class="nc" id="L83">  private static final Pattern numberTermPattern = Pattern.compile(&quot;(?i)(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|thirtieth|fortieth|fiftieth|sixtieth|seventieth|eightieth|ninetieth|hundred?th|thousandth|millionth|billionth|trillionth)&quot;);</span>
+<span class="nc" id="L84">  private static final Pattern numberTermPattern2 = Pattern.compile(&quot;(?i)(&quot; + numberTermPattern.pattern() + &quot;(-&quot; + numberTermPattern.pattern() + &quot;)?)&quot;);</span>
+<span class="nc" id="L85">  private static final Pattern ordinalUnitPattern = Pattern.compile(&quot;(?i)(hundredth|thousandth|millionth)&quot;);</span>
+
+  // private static final String[] unitWords = {&quot;trillion&quot;, &quot;billion&quot;, &quot;million&quot;, &quot;thousand&quot;, &quot;hundred&quot;};
+  // private static final String[] endUnitWords = {&quot;gross&quot;, &quot;dozen&quot;, &quot;score&quot;};
+
+  // Converts numbers in words to numeric form
+  // works through trillions
+<span class="nc" id="L92">  private static final Pattern digitsPattern = Pattern.compile(&quot;\\d+&quot;);</span>
+<span class="nc" id="L93">  private static final Pattern numPattern = Pattern.compile(&quot;[-+]?(?:\\d+(?:,\\d\\d\\d)*(?:\\.\\d*)?|\\.\\d+)&quot;);</span>
+<span class="nc" id="L94">  private static final Pattern numRangePattern = Pattern.compile(&quot;(&quot; + numPattern.pattern() + &quot;)-(&quot; + numPattern.pattern() + &quot;)&quot;);</span>
+  // private static final Pattern[] endUnitWordsPattern = new Pattern[endUnitWords.length];
+  // private static final Pattern[] unitWordsPattern = new Pattern[unitWords.length];
+  // static {
+  //   int i = 0;
+  //   for (String uw:endUnitWords) {
+  //     endUnitWordsPattern[i] = Pattern.compile(&quot;(.*)\\s*&quot; + Pattern.quote(uw) + &quot;\\s*(.*)&quot;);
+  //     i++;
+  //   }
+  //   int ii = 0;
+  //   for (String uw:unitWords) {
+  //     unitWordsPattern[ii] = Pattern.compile(&quot;(.*)\\s*&quot; + Pattern.quote(uw) + &quot;\\s*(.*)&quot;);
+  //     ii++;
+  //   }
+  // }
+
+  // TODO: similar to QuantifiableEntityNormalizer.wordsToValues
+  //       QuantifiableEntityNormalizer also has bn (for billion)
+  //       should consolidate
+  //       here we use Number representation instead of double...
+<span class="nc" id="L114">  private static final  Map&lt;String,Number&gt; word2NumMap = Generics.newHashMap();</span>
+  static
+  {
+    // Special words for numbers
+<span class="nc" id="L118">    word2NumMap.put(&quot;dozen&quot;, 12);</span>
+<span class="nc" id="L119">    word2NumMap.put(&quot;score&quot;, 20);</span>
+<span class="nc" id="L120">    word2NumMap.put(&quot;gross&quot;, 144);</span>
+<span class="nc" id="L121">    word2NumMap.put(&quot;quarter&quot;, 0.25);</span>
+<span class="nc" id="L122">    word2NumMap.put(&quot;half&quot;, 0.5);</span>
+<span class="nc" id="L123">    word2NumMap.put(&quot;oh&quot;, 0);</span>
+<span class="nc" id="L124">    word2NumMap.put(&quot;a&quot;  ,  1);</span>
+<span class="nc" id="L125">    word2NumMap.put(&quot;an&quot;  ,  1);</span>
+
+    // Standard words for numbers
+<span class="nc" id="L128">    word2NumMap.put(&quot;zero&quot;, 0);</span>
+<span class="nc" id="L129">    word2NumMap.put(&quot;one&quot;, 1);</span>
+<span class="nc" id="L130">    word2NumMap.put(&quot;two&quot;,  2);</span>
+<span class="nc" id="L131">    word2NumMap.put(&quot;three&quot;,  3);</span>
+<span class="nc" id="L132">    word2NumMap.put(&quot;four&quot;, 4);</span>
+<span class="nc" id="L133">    word2NumMap.put(&quot;five&quot;,  5);</span>
+<span class="nc" id="L134">    word2NumMap.put(&quot;six&quot;,  6);</span>
+<span class="nc" id="L135">    word2NumMap.put(&quot;seven&quot;, 7);</span>
+<span class="nc" id="L136">    word2NumMap.put(&quot;eight&quot;,  8);</span>
+<span class="nc" id="L137">    word2NumMap.put(&quot;nine&quot;,  9);</span>
+<span class="nc" id="L138">    word2NumMap.put(&quot;ten&quot;, 10);</span>
+<span class="nc" id="L139">    word2NumMap.put(&quot;eleven&quot;, 11);</span>
+<span class="nc" id="L140">    word2NumMap.put(&quot;twelve&quot;,  12);</span>
+<span class="nc" id="L141">    word2NumMap.put(&quot;thirteen&quot;, 13);</span>
+<span class="nc" id="L142">    word2NumMap.put(&quot;fourteen&quot;, 14);</span>
+<span class="nc" id="L143">    word2NumMap.put(&quot;fifteen&quot;,  15);</span>
+<span class="nc" id="L144">    word2NumMap.put(&quot;sixteen&quot;, 16);</span>
+<span class="nc" id="L145">    word2NumMap.put(&quot;seventeen&quot;, 17);</span>
+<span class="nc" id="L146">    word2NumMap.put(&quot;eighteen&quot;,  18);</span>
+<span class="nc" id="L147">    word2NumMap.put(&quot;nineteen&quot;, 19);</span>
+<span class="nc" id="L148">    word2NumMap.put(&quot;twenty&quot;, 20);</span>
+<span class="nc" id="L149">    word2NumMap.put(&quot;thirty&quot;,  30);</span>
+<span class="nc" id="L150">    word2NumMap.put(&quot;forty&quot;, 40);</span>
+<span class="nc" id="L151">    word2NumMap.put(&quot;fifty&quot;, 50);</span>
+<span class="nc" id="L152">    word2NumMap.put(&quot;sixty&quot;,  60);</span>
+<span class="nc" id="L153">    word2NumMap.put(&quot;seventy&quot;, 70);</span>
+<span class="nc" id="L154">    word2NumMap.put(&quot;eighty&quot;, 80);</span>
+<span class="nc" id="L155">    word2NumMap.put(&quot;ninety&quot;,  90);</span>
+<span class="nc" id="L156">    word2NumMap.put(&quot;hundred&quot;, 100);</span>
+<span class="nc" id="L157">    word2NumMap.put(&quot;thousand&quot;, 1000);</span>
+<span class="nc" id="L158">    word2NumMap.put(&quot;million&quot;,  1000000);</span>
+<span class="nc" id="L159">    word2NumMap.put(&quot;billion&quot;, 1000000000);</span>
+<span class="nc" id="L160">    word2NumMap.put(&quot;trillion&quot;, 1000000000000L);</span>
+  }
+
+  // similar to QuantifiableEntityNormalizer.ordinalsToValues
+<span class="nc" id="L164">  private static final Map&lt;String,Number&gt; ordWord2NumMap = Generics.newHashMap();</span>
+  static {
+<span class="nc" id="L166">    ordWord2NumMap.put(&quot;zeroth&quot;, 0);</span>
+<span class="nc" id="L167">    ordWord2NumMap.put(&quot;first&quot;, 1);</span>
+<span class="nc" id="L168">    ordWord2NumMap.put(&quot;second&quot;, 2);</span>
+<span class="nc" id="L169">    ordWord2NumMap.put(&quot;third&quot;, 3);</span>
+<span class="nc" id="L170">    ordWord2NumMap.put(&quot;fourth&quot;, 4);</span>
+<span class="nc" id="L171">    ordWord2NumMap.put(&quot;fifth&quot;, 5);</span>
+<span class="nc" id="L172">    ordWord2NumMap.put(&quot;sixth&quot;, 6);</span>
+<span class="nc" id="L173">    ordWord2NumMap.put(&quot;seventh&quot;, 7);</span>
+<span class="nc" id="L174">    ordWord2NumMap.put(&quot;eighth&quot;, 8);</span>
+<span class="nc" id="L175">    ordWord2NumMap.put(&quot;ninth&quot;, 9);</span>
+<span class="nc" id="L176">    ordWord2NumMap.put(&quot;tenth&quot;, 10);</span>
+<span class="nc" id="L177">    ordWord2NumMap.put(&quot;eleventh&quot;, 11);</span>
+<span class="nc" id="L178">    ordWord2NumMap.put(&quot;twelfth&quot;, 12);</span>
+<span class="nc" id="L179">    ordWord2NumMap.put(&quot;thirteenth&quot;, 13);</span>
+<span class="nc" id="L180">    ordWord2NumMap.put(&quot;fourteenth&quot;, 14);</span>
+<span class="nc" id="L181">    ordWord2NumMap.put(&quot;fifteenth&quot;, 15);</span>
+<span class="nc" id="L182">    ordWord2NumMap.put(&quot;sixteenth&quot;, 16);</span>
+<span class="nc" id="L183">    ordWord2NumMap.put(&quot;seventeenth&quot;, 17);</span>
+<span class="nc" id="L184">    ordWord2NumMap.put(&quot;eighteenth&quot;, 18);</span>
+<span class="nc" id="L185">    ordWord2NumMap.put(&quot;nineteenth&quot;, 19);</span>
+<span class="nc" id="L186">    ordWord2NumMap.put(&quot;twentieth&quot;, 20);</span>
+<span class="nc" id="L187">    ordWord2NumMap.put(&quot;thirtieth&quot;, 30);</span>
+<span class="nc" id="L188">    ordWord2NumMap.put(&quot;fortieth&quot;, 40);</span>
+<span class="nc" id="L189">    ordWord2NumMap.put(&quot;fiftieth&quot;, 50);</span>
+<span class="nc" id="L190">    ordWord2NumMap.put(&quot;sixtieth&quot;, 60);</span>
+<span class="nc" id="L191">    ordWord2NumMap.put(&quot;seventieth&quot;, 70);</span>
+<span class="nc" id="L192">    ordWord2NumMap.put(&quot;eightieth&quot;, 80);</span>
+<span class="nc" id="L193">    ordWord2NumMap.put(&quot;ninetieth&quot;, 90);</span>
+<span class="nc" id="L194">    ordWord2NumMap.put(&quot;hundredth&quot;, 100);</span>
+<span class="nc" id="L195">    ordWord2NumMap.put(&quot;hundreth&quot;, 100); // really a spelling error</span>
+<span class="nc" id="L196">    ordWord2NumMap.put(&quot;thousandth&quot;, 1000);</span>
+<span class="nc" id="L197">    ordWord2NumMap.put(&quot;millionth&quot;, 1000000);</span>
+<span class="nc" id="L198">    ordWord2NumMap.put(&quot;billionth&quot;, 1000000000);</span>
+<span class="nc" id="L199">    ordWord2NumMap.put(&quot;trillionth&quot;, 1000000000000L);</span>
+  }
+
+  // Seems to work better than quantifiable entity normalizer's numeric conversion
+<span class="nc" id="L203">  private static final Pattern alphaPattern = Pattern.compile(&quot;([a-zA-Z]+)&quot;);</span>
+<span class="nc" id="L204">  private static final Pattern wsPattern = Pattern.compile(&quot;\\s+&quot;);</span>
+
+  /**
+   * Fairly generous utility function to convert a string representing
+   * a number (hopefully) to a Number.
+   * Assumes that something else has somehow determined that the string
+   * makes ONE suitable number.
+   * The value of the number is determined by:
+   * 0. Breaking up the string into pieces using whitespace
+   *    (stuff like &quot;and&quot;, &quot;-&quot;, &quot;,&quot; is turned into whitespace);
+   * 1. Determining the numeric value of the pieces;
+   * 2. Finding the numeric value of each piece;
+   * 3. Combining the pieces together to form the overall value:
+   *    a. Find the largest component and its value (X),
+   *    b. Let B = overall value of pieces to the left (recursive),
+   *    c. Let C = overall value of pieces to the right recursive),
+   *    d. The overall value = B*X + C.
+   *
+   * @param str The String to convert
+   * @return numeric value of string
+   */
+  public static Number wordToNumber(String str){
+<span class="nc bnc" id="L226" title="All 2 branches missed.">    if (str.trim().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L227">      return null;</span>
+    }
+
+<span class="nc" id="L230">    boolean neg = false;</span>
+
+<span class="nc" id="L232">    String originalString = str;</span>
+
+    // Trims and lowercases stuff
+<span class="nc" id="L235">    str = str.trim();</span>
+<span class="nc" id="L236">    str = str.toLowerCase();</span>
+
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (str.startsWith(&quot;-&quot;)) {</span>
+<span class="nc" id="L239">      neg = true;</span>
+    }
+
+    // eliminate hyphens, commas, and the word &quot;and&quot;
+<span class="nc" id="L243">    str = str.replaceAll(&quot;\\band\\b&quot;, &quot; &quot;);</span>
+<span class="nc" id="L244">    str = str.replaceAll(&quot;-&quot;, &quot; &quot;);</span>
+<span class="nc" id="L245">    str = str.replaceAll(&quot;(\\d),(\\d)&quot;, &quot;$1$2&quot;);  // Maybe something like 4,233,000 ??</span>
+<span class="nc" id="L246">    str = str.replaceAll(&quot;,&quot;, &quot; &quot;);</span>
+//    str = str.replaceAll(&quot;(\\d)(\\w)&quot;,&quot;$1 $2&quot;);
+
+    // Trims again (do we need this?)
+<span class="nc" id="L250">    str = str.trim();</span>
+
+    // TODO: error checking....
+    //if string starts with &quot;a &quot;, as in &quot;a hundred&quot;, replace it with &quot;one&quot;
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    if (str.startsWith(&quot;a &quot;)) {</span>
+<span class="nc" id="L255">      str = str.replace(&quot;a&quot;, &quot;one&quot;);</span>
+    }
+
+    // cut off some trailing s
+<span class="nc bnc" id="L259" title="All 2 branches missed.">    if (str.endsWith(&quot;sands&quot;)) {</span>
+      // thousands
+<span class="nc" id="L261">      str = str.substring(0, str.length() - 1);</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    } else if (str.endsWith(&quot;ions&quot;)) {</span>
+      // millions, billions, etc
+<span class="nc" id="L264">      str = str.substring(0, str.length() - 1);</span>
+    }
+
+    // now count words
+<span class="nc" id="L268">    String[] fields = wsPattern.split(str);</span>
+<span class="nc" id="L269">    Number[] numFields = new Number[fields.length];</span>
+<span class="nc" id="L270">    int numWords = fields.length;</span>
+
+    // get numeric value of each word piece
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    for (int curIndex = 0; curIndex &lt; numWords; curIndex++) {</span>
+<span class="nc" id="L274">      String curPart = fields[curIndex];</span>
+<span class="nc" id="L275">      Matcher m = alphaPattern.matcher(curPart);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">      if (m.find()) {</span>
+        // Some part of the word has alpha characters
+        Number curNum;
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (word2NumMap.containsKey(curPart)) {</span>
+<span class="nc" id="L280">          curNum = word2NumMap.get(curPart);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        } else if (ordWord2NumMap.containsKey(curPart)) {</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">          if (curIndex == numWords-1){</span>
+<span class="nc" id="L283">            curNum = ordWord2NumMap.get(curPart);</span>
+          } else {
+<span class="nc" id="L285">            throw new NumberFormatException(&quot;Error in wordToNumber function.&quot;);</span>
+          }
+<span class="nc bnc" id="L287" title="All 6 branches missed.">        } else if (curIndex &gt; 0 &amp;&amp; (curPart.endsWith(&quot;ths&quot;) || curPart.endsWith(&quot;rds&quot;))) {</span>
+          // Fractions?
+<span class="nc" id="L289">          curNum = ordWord2NumMap.get(curPart.substring(0, curPart.length()-1));</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">          if (curNum != null) {</span>
+<span class="nc" id="L291">            curNum = 1/curNum.doubleValue();</span>
+          } else {
+<span class="nc" id="L293">            throw new NumberFormatException(&quot;Bad number put into wordToNumber.  Word is: \&quot;&quot; + curPart + &quot;\&quot;, originally part of \&quot;&quot; + originalString + &quot;\&quot;, piece # &quot; + curIndex);</span>
+          }
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        } else if (Character.isDigit(curPart.charAt(0))) {</span>
+<span class="nc bnc" id="L296" title="All 8 branches missed.">          if (curPart.endsWith(&quot;th&quot;) || curPart.endsWith(&quot;rd&quot;) || curPart.endsWith(&quot;nd&quot;) || curPart.endsWith(&quot;st&quot;)) {</span>
+<span class="nc" id="L297">            curPart = curPart.substring(0, curPart.length()-2);</span>
+          }
+<span class="nc bnc" id="L299" title="All 2 branches missed.">          if (digitsPattern.matcher(curPart).matches()) {</span>
+<span class="nc" id="L300">            curNum = Long.parseLong(curPart);</span>
+          } else{
+<span class="nc" id="L302">            throw new NumberFormatException(&quot;Bad number put into wordToNumber.  Word is: \&quot;&quot; + curPart + &quot;\&quot;, originally part of \&quot;&quot; + originalString + &quot;\&quot;, piece # &quot; + curIndex);</span>
+          }
+        } else {
+<span class="nc" id="L305">          throw new NumberFormatException(&quot;Bad number put into wordToNumber.  Word is: \&quot;&quot; + curPart + &quot;\&quot;, originally part of \&quot;&quot; + originalString + &quot;\&quot;, piece # &quot; + curIndex);</span>
+        }
+<span class="nc" id="L307">        numFields[curIndex] = curNum;</span>
+<span class="nc" id="L308">      } else {</span>
+        // Word is all numeric
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (digitsPattern.matcher(curPart).matches()) {</span>
+<span class="nc" id="L311">          numFields[curIndex] = Long.parseLong(curPart);</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        } else if (numPattern.matcher(curPart).matches()) {</span>
+<span class="nc" id="L313">          numFields[curIndex] = new BigDecimal(curPart);</span>
+        } else {
+          // Hmm, strange number
+<span class="nc" id="L316">          throw new NumberFormatException(&quot;Bad number put into wordToNumber.  Word is: \&quot;&quot; + curPart + &quot;\&quot;, originally part of \&quot;&quot; + originalString + &quot;\&quot;, piece # &quot; + curIndex);</span>
+        }
+      }
+    }
+<span class="nc" id="L320">    Number n = wordToNumberRecurse(numFields);</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">    return (neg)? -n.doubleValue():n;</span>
+  }
+
+  private static Number wordToNumberRecurse(Number[] numFields)
+  {
+<span class="nc" id="L326">    return wordToNumberRecurse(numFields, 0, numFields.length);</span>
+  }
+
+  private static Number wordToNumberRecurse(Number[] numFields, int start, int end)
+  {
+    // return solitary number
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (end &lt;= start) return 0;</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">    if (end - start == 1) {</span>
+<span class="nc" id="L334">      return numFields[start];</span>
+    }
+
+    // first, find highest number in string
+<span class="nc" id="L338">    Number highestNum = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L339">    int highestNumIndex = start;</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">    for (int i = start; i &lt; end; i++) {</span>
+<span class="nc" id="L341">      Number curNum = numFields[i];</span>
+<span class="nc bnc" id="L342" title="All 4 branches missed.">      if (curNum != null &amp;&amp; curNum.doubleValue() &gt;= highestNum.doubleValue()){</span>
+<span class="nc" id="L343">        highestNum = curNum;</span>
+<span class="nc" id="L344">        highestNumIndex = i;</span>
+      }
+    }
+
+<span class="nc" id="L348">    Number beforeNum = 1;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">    if (highestNumIndex &gt; start) {</span>
+<span class="nc" id="L350">      beforeNum = wordToNumberRecurse(numFields, start, highestNumIndex);</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">      if (beforeNum == null) beforeNum = 1;</span>
+    }
+<span class="nc" id="L353">    Number afterNum = wordToNumberRecurse(numFields, highestNumIndex+1, end);</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">    if (afterNum == null) afterNum = 0;</span>
+
+    // TODO: Everything is treated as double... losing precision information here
+    //       Sufficient for now
+    //       Should we usually use BigDecimal to do our calculations?
+    //       There are also fractions to consider.
+<span class="nc" id="L360">    Number evaluatedNumber = ((beforeNum.doubleValue() * highestNum.doubleValue()) + afterNum.doubleValue());</span>
+<span class="nc" id="L361">    return evaluatedNumber;</span>
+  }
+
+  public static Env getNewEnv()
+  {
+<span class="nc" id="L366">    Env env = TokenSequencePattern.getNewEnv();</span>
+
+    // Do case insensitive matching
+<span class="nc" id="L369">    env.setDefaultStringPatternFlags(Pattern.CASE_INSENSITIVE);</span>
+
+<span class="nc" id="L371">    initEnv(env);</span>
+<span class="nc" id="L372">    return env;</span>
+  }
+
+  public static void initEnv(Env env)
+  {
+    // Custom binding for numeric values expressions
+<span class="nc" id="L378">    env.bind(&quot;numtype&quot;, CoreAnnotations.NumericTypeAnnotation.class);</span>
+<span class="nc" id="L379">    env.bind(&quot;numvalue&quot;, CoreAnnotations.NumericValueAnnotation.class);</span>
+<span class="nc" id="L380">    env.bind(&quot;numcomptype&quot;, CoreAnnotations.NumericCompositeTypeAnnotation.class);</span>
+<span class="nc" id="L381">    env.bind(&quot;numcompvalue&quot;, CoreAnnotations.NumericCompositeValueAnnotation.class);</span>
+<span class="nc" id="L382">    env.bind(&quot;$NUMCOMPTERM&quot;, &quot; [ { numcomptype::EXISTS } &amp; !{ numcomptype:NUMBER_RANGE } ] &quot;);</span>
+<span class="nc" id="L383">    env.bind(&quot;$NUMTERM&quot;, &quot; [ { numtype::EXISTS } &amp; !{ numtype:NUMBER_RANGE } ] &quot;);</span>
+<span class="nc" id="L384">    env.bind(&quot;$NUMRANGE&quot;, &quot; [ { numtype:NUMBER_RANGE } ] &quot;);</span>
+    // TODO: Improve code to only recognize integers
+<span class="nc" id="L386">    env.bind(&quot;$INTTERM&quot;, &quot; [ { numtype::EXISTS } &amp; !{ numtype:NUMBER_RANGE } &amp; !{ word:/.*\\.\\d+.*/} ] &quot;);</span>
+<span class="nc" id="L387">    env.bind(&quot;$POSINTTERM&quot;, &quot; [ { numvalue&gt;0 } &amp; !{ word:/.*\\.\\d+.*/} ] &quot;);</span>
+<span class="nc" id="L388">    env.bind(&quot;$ORDTERM&quot;, &quot; [ { numtype:ORDINAL } ] &quot;);</span>
+<span class="nc" id="L389">    env.bind(&quot;$BEFORE_WS&quot;, &quot; [ { before:/\\s*/ } | !{ before::EXISTS} ]&quot;);</span>
+<span class="nc" id="L390">    env.bind(&quot;$AFTER_WS&quot;, &quot; [ { after:/\\s*/ } | !{ after::EXISTS} ]&quot;);</span>
+<span class="nc" id="L391">    env.bind(&quot;$BEFORE_AFTER_WS&quot;, &quot; [ $BEFORE_WS &amp; $AFTER_WS ]&quot;);</span>
+<span class="nc" id="L392">  }</span>
+
+<span class="nc" id="L394">  private static final Env env = getNewEnv();</span>
+
+<span class="nc" id="L396">  private static final TokenSequencePattern numberPattern = TokenSequencePattern.compile(</span>
+          env, &quot;$NUMTERM ( [/,/ &amp; $BEFORE_WS]? [$POSINTTERM &amp; $BEFORE_WS]  )* ( [/,/ &amp; $BEFORE_WS]? [/and/ &amp; $BEFORE_WS] [$POSINTTERM &amp; $BEFORE_WS]+ )? &quot;);
+  /**
+   * Find and mark numbers (does not need NumberSequenceClassifier)
+   * Each token is annotated with the numeric value and type
+   * - CoreAnnotations.NumericTypeAnnotation.class: ORDINAL, UNIT (hundred, thousand,..., dozen, gross,...), NUMBER
+   * - CoreAnnotations.NumericValueAnnotation.class: Number representing the numeric value of the token
+   *   ( two thousand =&amp;gt; 2 1000 )
+   *
+   * Tries also to separate individual numbers like four five six,
+   *   while keeping numbers like four hundred and seven together
+   * Annotate tokens belonging to each composite number with
+   * - CoreAnnotations.NumericCompositeTypeAnnotation.class: ORDINAL (1st, 2nd), NUMBER (one hundred)
+   * - CoreAnnotations.NumericCompositeValueAnnotation.class: Number representing the composite numeric value
+   *   ( two thousand =&amp;gt; 2000 2000 )
+   *
+   * Also returns list of CoreMap representing the identified numbers
+   *
+   * The function is overly aggressive in marking possible numbers
+   *  - should either do more checks or use in conjunction with NumberSequenceClassifier
+   *    to avoid marking certain tokens (like second/NN) as numbers...
+   *
+   * @param annotation The annotation structure
+   * @return list of CoreMap representing the identified numbers
+   */
+  public static List&lt;CoreMap&gt; findNumbers(CoreMap annotation)
+  {
+<span class="nc" id="L423">    List&lt;CoreLabel&gt; tokens = annotation.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">    for (CoreLabel token:tokens) {</span>
+<span class="nc" id="L425">      String w = token.word();</span>
+<span class="nc" id="L426">      w = w.trim().toLowerCase();</span>
+
+<span class="nc" id="L428">      if (/*(&quot;CD&quot;.equals(token.get(CoreAnnotations.PartOfSpeechAnnotation.class))  || */</span>
+<span class="nc bnc" id="L429" title="All 4 branches missed.">           NumberNormalizer.numPattern.matcher(w).matches() || NumberNormalizer.numberTermPattern2.matcher(w).matches() ||</span>
+<span class="nc bnc" id="L430" title="All 4 branches missed.">              NumberSequenceClassifier.ORDINAL_PATTERN.matcher(w).matches() || NumberNormalizer.numEndUnitPattern.matcher(w).matches()) {</span>
+        // TODO: first ADVERB and second NN shouldn't be marked as ordinals
+        // But maybe we don't care, this can just mark the potential numbers, something else can disregard those
+        try {
+<span class="nc" id="L434">          token.set(CoreAnnotations.NumericValueAnnotation.class, NumberNormalizer.wordToNumber(w));</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">          if (NumberSequenceClassifier.ORDINAL_PATTERN.matcher(w).find()) {</span>
+<span class="nc" id="L436">            token.set(CoreAnnotations.NumericTypeAnnotation.class, &quot;ORDINAL&quot;);</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">          } else if (NumberNormalizer.numUnitPattern.matcher(w).matches()) {</span>
+<span class="nc" id="L438">            token.set(CoreAnnotations.NumericTypeAnnotation.class, &quot;UNIT&quot;);</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">          } else if (NumberNormalizer.numEndUnitPattern.matcher(w).matches()) {</span>
+<span class="nc" id="L440">            token.set(CoreAnnotations.NumericTypeAnnotation.class, &quot;UNIT&quot;);</span>
+          } else {
+<span class="nc" id="L442">            token.set(CoreAnnotations.NumericTypeAnnotation.class, &quot;NUMBER&quot;);</span>
+          }
+<span class="nc" id="L444">        } catch (Exception ex) {</span>
+<span class="nc" id="L445">          logger.warning(&quot;Error interpreting number &quot; + w + &quot;: &quot; + ex.getMessage());</span>
+<span class="nc" id="L446">        }</span>
+      }
+<span class="nc" id="L448">    }</span>
+    // TODO: Should we allow &quot;,&quot; in written out numbers?
+    // TODO: Handle &quot;-&quot; that is not with token?
+<span class="nc" id="L451">    TokenSequenceMatcher matcher = numberPattern.getMatcher(tokens);</span>
+<span class="nc" id="L452">    List&lt;CoreMap&gt; numbers = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">    while (matcher.find()) {</span>
+      @SuppressWarnings(&quot;unused&quot;)
+<span class="nc" id="L455">      List&lt;CoreMap&gt; matchedTokens = matcher.groupNodes();</span>
+<span class="nc" id="L456">      int numStart = matcher.start();</span>
+<span class="nc" id="L457">      int possibleNumEnd = -1;</span>
+<span class="nc" id="L458">      int lastUnitPos = -1;</span>
+<span class="nc" id="L459">      int possibleNumStart = -1;</span>
+<span class="nc" id="L460">      Number possibleNumEndUnit = null;</span>
+<span class="nc" id="L461">      Number lastUnit = null;</span>
+      // Check if we need to split matched chunk up more
+<span class="nc bnc" id="L463" title="All 2 branches missed.">      for (int i = matcher.start(); i &lt; matcher.end(); i++) {</span>
+<span class="nc" id="L464">        CoreLabel token = tokens.get(i);</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        CoreLabel prev = (i &gt; matcher.start())? tokens.get(i - 1): null;</span>
+<span class="nc" id="L466">        Number num = token.get(CoreAnnotations.NumericValueAnnotation.class);</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        Number prevNum = (prev != null)? prev.get(CoreAnnotations.NumericValueAnnotation.class):null;</span>
+<span class="nc" id="L468">        String w = token.word();</span>
+<span class="nc" id="L469">        w = w.trim().toLowerCase();</span>
+<span class="nc bnc" id="L470" title="All 10 branches missed.">        switch (w) {</span>
+          case &quot;,&quot;:
+<span class="nc bnc" id="L472" title="All 4 branches missed.">            if (lastUnit != null &amp;&amp; lastUnitPos == i - 1) {</span>
+              // OKAY, this may be one big number
+<span class="nc" id="L474">              possibleNumEnd = i;</span>
+<span class="nc" id="L475">              possibleNumEndUnit = lastUnit;</span>
+            } else {
+              // Not one big number
+<span class="nc bnc" id="L478" title="All 2 branches missed.">              if (numStart &lt; i) {</span>
+<span class="nc" id="L479">                numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, i));</span>
+<span class="nc" id="L480">                numStart = i + 1;</span>
+<span class="nc" id="L481">                possibleNumEnd = -1;</span>
+<span class="nc" id="L482">                possibleNumEndUnit = null;</span>
+<span class="nc" id="L483">                lastUnit = null;</span>
+<span class="nc" id="L484">                lastUnitPos = -1;</span>
+              }
+            }
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            if (numStart == i) {</span>
+<span class="nc" id="L488">              numStart = i + 1;</span>
+            }
+            break;
+          case &quot;and&quot;:
+            // Check if number before and was unit
+<span class="nc" id="L493">            String prevWord = prev.word();</span>
+<span class="nc bnc" id="L494" title="All 6 branches missed.">            if (lastUnitPos == i - 1 || (lastUnitPos == i - 2 &amp;&amp; &quot;,&quot;.equals(prevWord))) {</span>
+              // Okay
+            } else {
+              // Two separate numbers
+<span class="nc bnc" id="L498" title="All 2 branches missed.">              if (numStart &lt; possibleNumEnd) {</span>
+<span class="nc" id="L499">                numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, possibleNumEnd));</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                if (possibleNumStart &gt;= possibleNumEnd) {</span>
+<span class="nc" id="L501">                  numStart = possibleNumStart;</span>
+                } else {
+<span class="nc" id="L503">                  numStart = i + 1;</span>
+                }
+<span class="nc bnc" id="L505" title="All 2 branches missed.">              } else if (numStart &lt; i) {</span>
+<span class="nc" id="L506">                numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, i));</span>
+<span class="nc" id="L507">                numStart = i + 1;</span>
+              }
+<span class="nc bnc" id="L509" title="All 2 branches missed.">              if (lastUnitPos &lt; numStart) {</span>
+<span class="nc" id="L510">                lastUnit = null;</span>
+<span class="nc" id="L511">                lastUnitPos = -1;</span>
+              }
+<span class="nc" id="L513">              possibleNumEnd = -1;</span>
+<span class="nc" id="L514">              possibleNumEndUnit = null;</span>
+            }
+<span class="nc" id="L516">            break;</span>
+          default:
+            // NUMBER or ORDINAL
+<span class="nc" id="L519">            String numType = token.get(CoreAnnotations.NumericTypeAnnotation.class);</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">            if (&quot;UNIT&quot;.equals(numType)) {</span>
+              // Compare this unit with previous
+<span class="nc bnc" id="L522" title="All 4 branches missed.">              if (lastUnit == null || lastUnit.longValue() &gt; num.longValue()) {</span>
+                // lastUnit larger than this unit
+                // maybe four thousand two hundred?
+                // OKAY, probably one big number
+              } else {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">                if (numStart &lt; possibleNumEnd) {</span>
+                  // Units are increasing - check if this unit is &gt;= unit before &quot;,&quot; (if so, need to split into chunks)
+                  // Not one big number  ( had a comma )
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                  if (num.longValue() &gt;= possibleNumEndUnit.longValue()) {</span>
+<span class="nc" id="L531">                    numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, possibleNumEnd));</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">                    if (possibleNumStart &gt;= possibleNumEnd) {</span>
+<span class="nc" id="L533">                      numStart = possibleNumStart;</span>
+                    } else {
+<span class="nc" id="L535">                      numStart = i;</span>
+                    }
+<span class="nc" id="L537">                    possibleNumEnd = -1;</span>
+<span class="nc" id="L538">                    possibleNumEndUnit = null;</span>
+                  }
+                } else {
+                  // unit is increasing - can be okay, maybe five hundred thousand?
+                  // what about four hundred five thousand
+                  // unit might also be the same, as in thousand thousand,
+                  // which we convert to million
+                }
+              }
+<span class="nc" id="L547">              lastUnit = num;</span>
+<span class="nc" id="L548">              lastUnitPos = i;</span>
+            } else {
+              // Normal number
+<span class="nc bnc" id="L551" title="All 2 branches missed.">              if (num == null) {</span>
+<span class="nc" id="L552">                logger.warning(&quot;NO NUMBER: &quot; + token.word());</span>
+<span class="nc" id="L553">                continue;</span>
+              }
+<span class="nc bnc" id="L555" title="All 2 branches missed.">              if (prevNum != null) {</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">                if (num.doubleValue() &gt; 0) {</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">                  if (num.doubleValue() &lt; 10) {</span>
+                    // This number is a digit
+                    // Treat following as two separate numbers
+                    //    \d+ [0-9]
+                    //    [one to nine]  [0-9]
+<span class="nc bnc" id="L562" title="All 2 branches missed.">                    if (NumberNormalizer.numPattern.matcher(prev.word()).matches() ||</span>
+<span class="nc bnc" id="L563" title="All 4 branches missed.">                        prevNum.longValue() &lt; 10 || prevNum.longValue() % 10 != 0) {</span>
+                      // two separate numbers
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                      if (numStart &lt; i) {</span>
+<span class="nc" id="L566">                        numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, i));</span>
+                      }
+<span class="nc" id="L568">                      numStart = i;</span>
+<span class="nc" id="L569">                      possibleNumEnd = -1;</span>
+<span class="nc" id="L570">                      possibleNumEndUnit = null;</span>
+<span class="nc" id="L571">                      lastUnit = null;</span>
+<span class="nc" id="L572">                      lastUnitPos = -1;</span>
+                    }
+                  } else {
+<span class="nc" id="L575">                    String prevNumType = prev.get(CoreAnnotations.NumericTypeAnnotation.class);</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                    if (&quot;UNIT&quot;.equals(prevNumType)) {</span>
+                      // OKAY
+<span class="nc bnc" id="L578" title="All 2 branches missed.">                    } else if (!ordinalUnitPattern.matcher(w).matches()) {</span>
+                      // Start of new number
+<span class="nc bnc" id="L580" title="All 2 branches missed.">                      if (numStart &lt; i) {</span>
+<span class="nc" id="L581">                        numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, i));</span>
+                      }
+<span class="nc" id="L583">                      numStart = i;</span>
+<span class="nc" id="L584">                      possibleNumEnd = -1;</span>
+<span class="nc" id="L585">                      possibleNumEndUnit = null;</span>
+<span class="nc" id="L586">                      lastUnit = null;</span>
+<span class="nc" id="L587">                      lastUnitPos = -1;</span>
+                    }
+                  }
+                }
+              }
+<span class="nc bnc" id="L592" title="All 2 branches missed.">              if (&quot;ORDINAL&quot;.equals(numType)) {</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">                if (possibleNumEnd &gt;= 0) {</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">                  if (numStart &lt; possibleNumEnd) {</span>
+<span class="nc" id="L595">                    numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, possibleNumEnd));</span>
+                  }
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                  if (possibleNumStart &gt; possibleNumEnd) {</span>
+<span class="nc" id="L598">                    numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, possibleNumStart, i + 1));</span>
+                  } else {
+<span class="nc" id="L600">                    numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, possibleNumEnd + 1, i + 1));</span>
+                  }
+                } else {
+<span class="nc bnc" id="L603" title="All 2 branches missed.">                  if (numStart &lt; i + 1) {</span>
+<span class="nc" id="L604">                    numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, i + 1));</span>
+                  }
+                }
+<span class="nc" id="L607">                numStart = i + 1;</span>
+<span class="nc" id="L608">                possibleNumEnd = -1;</span>
+<span class="nc" id="L609">                possibleNumEndUnit = null;</span>
+<span class="nc" id="L610">                lastUnit = null;</span>
+<span class="nc" id="L611">                lastUnitPos = -1;</span>
+              }
+<span class="nc bnc" id="L613" title="All 2 branches missed.">              if (possibleNumStart &lt; possibleNumEnd) {</span>
+<span class="nc" id="L614">                possibleNumStart = i;</span>
+              }
+            }
+            break;
+        }
+      }
+<span class="nc bnc" id="L620" title="All 2 branches missed.">      if (numStart &lt; matcher.end()) {</span>
+<span class="nc" id="L621">        numbers.add(ChunkAnnotationUtils.getAnnotatedChunk(annotation, numStart, matcher.end()));</span>
+      }
+<span class="nc" id="L623">    }</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">    for (CoreMap n:numbers) {</span>
+<span class="nc" id="L625">      String exp = n.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">      if (exp.trim().equals(&quot;&quot;)) { continue; }</span>
+<span class="nc" id="L627">      List&lt;CoreLabel&gt; ts = n.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L628">      String label = ts.get(ts.size() - 1).get(CoreAnnotations.NumericTypeAnnotation.class);</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">      if (&quot;UNIT&quot;.equals(label)) {</span>
+<span class="nc" id="L630">        label = &quot;NUMBER&quot;;</span>
+      }
+      try {
+<span class="nc" id="L633">        Number num = NumberNormalizer.wordToNumber(exp);</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        if (num == null) {</span>
+<span class="nc" id="L635">          logger.warning(&quot;NO NUMBER FOR: \&quot;&quot; + exp + &quot;\&quot;&quot;);</span>
+        }
+<span class="nc" id="L637">        n.set(CoreAnnotations.NumericCompositeValueAnnotation.class, num);</span>
+<span class="nc" id="L638">        n.set(CoreAnnotations.NumericCompositeTypeAnnotation.class, label);</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        for (CoreLabel t:ts) {</span>
+<span class="nc" id="L640">          t.set(CoreAnnotations.NumericCompositeValueAnnotation.class, num);</span>
+<span class="nc" id="L641">          t.set(CoreAnnotations.NumericCompositeTypeAnnotation.class, label);</span>
+<span class="nc" id="L642">        }</span>
+<span class="nc" id="L643">      } catch (NumberFormatException ex) {</span>
+<span class="nc" id="L644">        logger.warning(&quot;Invalid number for: \&quot;&quot; + exp + &quot;\&quot;&quot;, ex);</span>
+<span class="nc" id="L645">      }</span>
+<span class="nc" id="L646">    }</span>
+<span class="nc" id="L647">    return numbers;</span>
+  }
+
+  /**
+   * Find and mark number ranges
+   * Ranges are NUM1 [-|to] NUM2 where NUM2 &gt; NUM1
+   *
+   * Each number range is marked with
+   * - CoreAnnotations.NumericTypeAnnotation.class: NUMBER_RANGE
+   * - CoreAnnotations.NumericObjectAnnotation.class: {@code Pair&lt;Number&gt;} representing the start/end of the range
+   *
+   * @param annotation - annotation where numbers have already been identified
+   * @return list of CoreMap representing the identified number ranges
+   */
+<span class="nc" id="L661">  private static final TokenSequencePattern rangePattern = TokenSequencePattern.compile(env, &quot;(?:$NUMCOMPTERM /-|to/ $NUMCOMPTERM) | $NUMRANGE&quot;);</span>
+  public static List&lt;CoreMap&gt; findNumberRanges(CoreMap annotation)
+  {
+<span class="nc" id="L664">    List&lt;CoreMap&gt; numerizedTokens = annotation.get(CoreAnnotations.NumerizedTokensAnnotation.class);</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">    for (CoreMap token:numerizedTokens) {</span>
+<span class="nc" id="L666">      String w = token.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc" id="L667">      w = w.trim().toLowerCase();</span>
+<span class="nc" id="L668">      Matcher rangeMatcher = NumberNormalizer.numRangePattern.matcher(w);</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">      if (rangeMatcher.matches()) {</span>
+        try {
+<span class="nc" id="L671">          String w1 = rangeMatcher.group(1);</span>
+<span class="nc" id="L672">          String w2 = rangeMatcher.group(2);</span>
+<span class="nc" id="L673">          Number v1 = NumberNormalizer.wordToNumber(w1);</span>
+<span class="nc" id="L674">          Number v2 = NumberNormalizer.wordToNumber(w2);</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">          if (v2.doubleValue() &gt; v1.doubleValue()) {</span>
+<span class="nc" id="L676">            token.set(CoreAnnotations.NumericTypeAnnotation.class, &quot;NUMBER_RANGE&quot;);</span>
+<span class="nc" id="L677">            token.set(CoreAnnotations.NumericCompositeTypeAnnotation.class, &quot;NUMBER_RANGE&quot;);</span>
+<span class="nc" id="L678">            Pair&lt;Number,Number&gt; range = new Pair&lt;&gt;(v1, v2);</span>
+<span class="nc" id="L679">            token.set(CoreAnnotations.NumericCompositeObjectAnnotation.class, range);</span>
+          }
+<span class="nc" id="L681">        } catch (Exception ex) {</span>
+<span class="nc" id="L682">          logger.warning(&quot;Error interpreting number range &quot; + w + &quot;: &quot; + ex.getMessage());</span>
+<span class="nc" id="L683">        }</span>
+      }
+<span class="nc" id="L685">    }</span>
+<span class="nc" id="L686">    List&lt;CoreMap&gt; numberRanges = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L687">    TokenSequenceMatcher matcher = rangePattern.getMatcher(numerizedTokens);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">    while (matcher.find()) {</span>
+<span class="nc" id="L689">      List&lt;CoreMap&gt; matched = matcher.groupNodes();</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">      if (matched.size() == 1) {</span>
+<span class="nc" id="L691">        numberRanges.add(matched.get(0));</span>
+      } else {
+<span class="nc" id="L693">        Number v1 = matched.get(0).get(CoreAnnotations.NumericCompositeValueAnnotation.class);</span>
+<span class="nc" id="L694">        Number v2 = matched.get(matched.size()-1).get(CoreAnnotations.NumericCompositeValueAnnotation.class);</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        if (v2.doubleValue() &gt; v1.doubleValue()) {</span>
+<span class="nc" id="L696">          CoreMap newChunk = CoreMapAggregator.getDefaultAggregator().merge(numerizedTokens, matcher.start(), matcher.end());</span>
+<span class="nc" id="L697">          newChunk.set(CoreAnnotations.NumericCompositeTypeAnnotation.class, &quot;NUMBER_RANGE&quot;);</span>
+<span class="nc" id="L698">          Pair&lt;Number,Number&gt; range = new Pair&lt;&gt;(v1, v2);</span>
+<span class="nc" id="L699">          newChunk.set(CoreAnnotations.NumericCompositeObjectAnnotation.class, range);</span>
+<span class="nc" id="L700">          numberRanges.add(newChunk);</span>
+        }
+      }
+<span class="nc" id="L703">    }</span>
+<span class="nc" id="L704">    return numberRanges;</span>
+  }
+
+  /**
+   * Takes annotation and identifies numbers in the annotation
+   * Returns a list of tokens (as CoreMaps) with numbers merged
+   * As by product, also marks each individual token with the TokenBeginAnnotation and TokenEndAnnotation
+   * - this is mainly to make it easier to the rest of the code to figure out what the token offsets are.
+   *
+   * Note that this copies the annotation, since it modifies token offsets in the original
+   * @param annotationRaw The annotation to find numbers in
+   * @return list of CoreMap representing the identified numbers
+   */
+  public static List&lt;CoreMap&gt; findAndMergeNumbers(CoreMap annotationRaw){
+    //copy annotation to preserve its integrity
+<span class="nc" id="L719">    CoreMap annotation = new ArrayCoreMap(annotationRaw);</span>
+    // Find and label numbers
+<span class="nc" id="L721">    List&lt;CoreMap&gt; numbers = NumberNormalizer.findNumbers(annotation);</span>
+<span class="nc" id="L722">    CoreMapAggregator numberAggregator = CoreMapAggregator.getAggregator(CoreMapAttributeAggregator.DEFAULT_NUMERIC_AGGREGATORS, CoreAnnotations.TokensAnnotation.class);</span>
+
+    // We are going to mark the token begin and token end for each token so we can more easily deal with
+    // ensuring correct token offsets for merging
+    //get sentence offset
+<span class="nc" id="L727">    Integer startTokenOffset = annotation.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">    if (startTokenOffset == null) {</span>
+<span class="nc" id="L729">      startTokenOffset = 0;</span>
+    }
+    //set token offsets
+<span class="nc" id="L732">    int i = 0;</span>
+<span class="nc" id="L733">    List&lt;Integer&gt; savedTokenBegins = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L734">    List&lt;Integer&gt; savedTokenEnds = new LinkedList&lt;&gt;();</span>
+<span class="nc bnc" id="L735" title="All 2 branches missed.">    for (CoreMap c:annotation.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+      //set token begin
+<span class="nc bnc" id="L737" title="All 8 branches missed.">      if( (i==0 &amp;&amp; c.get(CoreAnnotations.TokenBeginAnnotation.class) != null) || (i &gt; 0 &amp;&amp; !savedTokenBegins.isEmpty()) ){</span>
+<span class="nc" id="L738">        savedTokenBegins.add(c.get(CoreAnnotations.TokenBeginAnnotation.class));</span>
+      }
+<span class="nc" id="L740">      c.set(CoreAnnotations.TokenBeginAnnotation.class, i+startTokenOffset);</span>
+<span class="nc" id="L741">      i++;</span>
+      //set token end
+<span class="nc bnc" id="L743" title="All 8 branches missed.">      if( (i==1 &amp;&amp; c.get(CoreAnnotations.TokenEndAnnotation.class) != null) || (i &gt; 1 &amp;&amp; !savedTokenEnds.isEmpty()) ){</span>
+<span class="nc" id="L744">        savedTokenEnds.add(c.get(CoreAnnotations.TokenEndAnnotation.class));</span>
+      }
+<span class="nc" id="L746">      c.set(CoreAnnotations.TokenEndAnnotation.class, i+startTokenOffset);</span>
+<span class="nc" id="L747">    }</span>
+    //merge numbers
+<span class="nc" id="L749">    final Integer startTokenOffsetFinal = startTokenOffset;</span>
+<span class="nc" id="L750">    List&lt;CoreMap&gt; mergedNumbers = numberAggregator.merge(annotation.get(CoreAnnotations.TokensAnnotation.class), numbers,</span>
+<span class="nc" id="L751">        in -&gt; Interval.toInterval(</span>
+<span class="nc" id="L752">              in.get(CoreAnnotations.TokenBeginAnnotation.class) - startTokenOffsetFinal,</span>
+<span class="nc" id="L753">              in.get(CoreAnnotations.TokenEndAnnotation.class) - startTokenOffsetFinal)</span>
+    );
+    //restore token offsets
+<span class="nc bnc" id="L756" title="All 4 branches missed.">    if (!savedTokenBegins.isEmpty() &amp;&amp; !savedTokenEnds.isEmpty()) {</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">      for (CoreMap c : mergedNumbers) {</span>
+        // get new indices
+<span class="nc" id="L759">        int newBegin = c.get(CoreAnnotations.TokenBeginAnnotation.class) - startTokenOffset;</span>
+<span class="nc" id="L760">        int newEnd = c.get(CoreAnnotations.TokenEndAnnotation.class) - startTokenOffset;</span>
+        // get token offsets for those indices
+<span class="nc" id="L762">        c.set(CoreAnnotations.TokenBeginAnnotation.class, savedTokenBegins.get(newBegin));</span>
+<span class="nc" id="L763">        c.set(CoreAnnotations.TokenEndAnnotation.class, savedTokenEnds.get(newEnd-1));</span>
+<span class="nc" id="L764">      }</span>
+    }
+    //return
+<span class="nc" id="L767">    return mergedNumbers;</span>
+  }
+
+  public static List&lt;CoreMap&gt; findAndAnnotateNumericExpressions(CoreMap annotation)
+  {
+<span class="nc" id="L772">    List&lt;CoreMap&gt; mergedNumbers = NumberNormalizer.findAndMergeNumbers(annotation);</span>
+<span class="nc" id="L773">    annotation.set(CoreAnnotations.NumerizedTokensAnnotation.class, mergedNumbers);</span>
+<span class="nc" id="L774">    return mergedNumbers;</span>
+  }
+
+  public static List&lt;CoreMap&gt; findAndAnnotateNumericExpressionsWithRanges(CoreMap annotation)
+  {
+<span class="nc" id="L779">    Integer startTokenOffset = annotation.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">    if (startTokenOffset == null) {</span>
+<span class="nc" id="L781">      startTokenOffset = 0;</span>
+    }
+<span class="nc" id="L783">    List&lt;CoreMap&gt; mergedNumbers = NumberNormalizer.findAndMergeNumbers(annotation);</span>
+<span class="nc" id="L784">    annotation.set(CoreAnnotations.NumerizedTokensAnnotation.class, mergedNumbers);</span>
+    // Find and label number ranges
+<span class="nc" id="L786">    List&lt;CoreMap&gt; numberRanges = NumberNormalizer.findNumberRanges(annotation);</span>
+<span class="nc" id="L787">    final Integer startTokenOffsetFinal = startTokenOffset;</span>
+<span class="nc" id="L788">    List&lt;CoreMap&gt; mergedNumbersWithRanges = CollectionUtils.mergeListWithSortedMatchedPreAggregated(</span>
+<span class="nc" id="L789">            annotation.get(CoreAnnotations.NumerizedTokensAnnotation.class), numberRanges,</span>
+<span class="nc" id="L790">        (CoreMap in) -&gt; Interval.toInterval(</span>
+<span class="nc" id="L791">              in.get(CoreAnnotations.TokenBeginAnnotation.class) - startTokenOffsetFinal,</span>
+<span class="nc" id="L792">              in.get(CoreAnnotations.TokenEndAnnotation.class) - startTokenOffsetFinal)</span>
+    );
+<span class="nc" id="L794">    annotation.set(CoreAnnotations.NumerizedTokensAnnotation.class, mergedNumbersWithRanges);</span>
+<span class="nc" id="L795">    return mergedNumbersWithRanges;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,871 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ArgumentParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.util</a> &gt; <span class="el_source">ArgumentParser.java</span></div><h1>ArgumentParser.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.util;
+
+import java.io.File;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.lang.annotation.*;
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.stream.Collectors;
+
+import edu.stanford.nlp.pipeline.Annotator;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+/**
+ * A class to set command line options. To use, create a static class into which you'd like
+ * to put your properties. Then, for each field, set the annotation:
+ *
+ * &lt;pre&gt;&lt;code&gt;
+ *     import edu.stanford.nlp.util.ArgumentParser.Option
+ *
+ *     class Props {
+ *       &amp;#64;Option(name=&quot;anIntOption&quot;, required=false, gloss=&quot;This is an int&quot;)
+ *       public static int anIntOption = 7; // default value is 7
+ *       &amp;#64;Option(name=&quot;anotherOption&quot;, required=false)
+ *       public static File aCastableOption = new File(&quot;/foo&quot;);
+ *     }
+ * &lt;/code&gt;&lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ *   You can then set options with {@link ArgumentParser#fillOptions(String...)},
+ *   or with {@link ArgumentParser#fillOptions(java.util.Properties)}.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   If your default classpath has many classes in it, you can select a subset of them
+ *   by using {@link ArgumentParser#fillOptions(Class[], java.util.Properties)}, or some variant.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ *   A complete toy example looks like this:
+ * &lt;/p&gt;
+ *
+ * &lt;pre&gt;&lt;code&gt;
+ *     import java.util.Properties;
+ *
+ *     import edu.stanford.nlp.util.ArgumentParser;
+ *     import edu.stanford.nlp.util.StringUtils;
+ *
+ *     public class Foo {
+ *
+ *       &amp;#64;ArgumentParser.Option(name=&quot;bar&quot;, gloss=&quot;This is a string option.&quot;, required=true)
+ *       private static String BAR = null;
+ *
+ *       public static void main(String[] args) {
+ *         // Parse the arguments
+ *         Properties props = StringUtils.argsToProperties(args);
+ *         ArgumentParser.fillOptions(new Class[]{ Foo.class, ArgumentParser.class }, props);
+ *
+ *         log.info(INPUT);
+ *       }
+ *     }
+ * &lt;/code&gt;&lt;/pre&gt;
+ *
+ * @author Gabor Angeli
+ */
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">@SuppressWarnings(&quot;HtmlTagCanBeJavadocTag&quot;)</span>
+public class ArgumentParser  {
+
+<span class="nc" id="L75">  private ArgumentParser() {} // static class</span>
+
+  @Documented
+  @Retention(RetentionPolicy.RUNTIME)
+  @Target(ElementType.FIELD)
+  public @interface Option {
+    String name() default &quot;&quot;;
+
+    String gloss() default &quot;&quot;;
+
+    boolean required() default false;
+
+    String alt() default &quot;&quot;;
+  }
+
+  @SuppressWarnings(&quot;MismatchedReadAndWriteOfArray&quot;)
+<span class="fc" id="L91">  private static final String[] IGNORED_JARS = {</span>
+  };
+<span class="fc" id="L93">  private static final Class[] BOOTSTRAP_CLASSES = {</span>
+      ArgumentParser.class,
+  };
+
+  @Option(name = &quot;option_classes&quot;, gloss = &quot;Fill options from these classes&quot;)
+<span class="fc" id="L98">  public static Class&lt;?&gt;[] optionClasses = null;</span>
+  @Option(name = &quot;threads&quot;, gloss = &quot;Number of threads on machine&quot;)
+<span class="fc" id="L100">  public static int threads = Runtime.getRuntime().availableProcessors();</span>
+  @Option(name = &quot;host&quot;, gloss = &quot;Name of computer we are running on&quot;)
+<span class="fc" id="L102">  public static String host = &quot;(unknown)&quot;;</span>
+  @SuppressWarnings(&quot;FieldCanBeLocal&quot;)
+  @Option(name = &quot;strict&quot;, gloss = &quot;If true, make sure that all options passed in are used somewhere&quot;)
+<span class="fc" id="L105">  private static boolean strict = false;</span>
+  @SuppressWarnings(&quot;FieldCanBeLocal&quot;)
+  @Option(name = &quot;exec.verbose&quot;, gloss = &quot;If true, print options as they are set.&quot;)
+<span class="fc" id="L108">  private static boolean verbose = false;</span>
+
+  static {
+    try {
+<span class="fc" id="L112">      host = InetAddress.getLocalHost().getHostName();</span>
+<span class="nc" id="L113">    } catch (Exception ignored) {</span>
+<span class="fc" id="L114">    }</span>
+<span class="fc" id="L115">  }</span>
+
+  /**
+   * A lazy iterator over files, not loading all of them into memory at once.
+   */
+  public static class LazyFileIterator implements Iterator&lt;File&gt; {
+
+    private FilenameFilter filter;
+    private File[] dir;
+<span class="nc" id="L124">    private Stack&lt;File[]&gt; parents = new Stack&lt;&gt;();</span>
+<span class="nc" id="L125">    private Stack&lt;Integer&gt; indices = new Stack&lt;&gt;();</span>
+
+<span class="nc" id="L127">    private int toReturn = -1;</span>
+
+    public LazyFileIterator(File path, final String filter) {
+<span class="nc" id="L130">      this(path, (file, name) -&gt; {</span>
+<span class="nc" id="L131">        String filePath = (file.getPath() + &quot;/&quot; + name);</span>
+<span class="nc bnc" id="L132" title="All 4 branches missed.">        return new File(filePath).isDirectory() || filePath.matches(filter);</span>
+      });
+<span class="nc" id="L134">    }</span>
+
+<span class="nc" id="L136">    public LazyFileIterator(File dir, FilenameFilter filter) {</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">      if (!dir.exists()) throw new IllegalArgumentException(&quot;Could not find directory: &quot; + dir.getPath());</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">      if (!dir.isDirectory()) throw new IllegalArgumentException(&quot;Not a directory: &quot; + dir.getPath());</span>
+<span class="nc" id="L139">      this.filter = filter;</span>
+<span class="nc" id="L140">      this.dir = dir.listFiles(filter);</span>
+<span class="nc" id="L141">      enqueue();</span>
+<span class="nc" id="L142">    }</span>
+
+    private void enqueue() {
+<span class="nc" id="L145">      toReturn += 1;</span>
+<span class="nc bnc" id="L146" title="All 4 branches missed.">      boolean good = (toReturn &lt; dir.length &amp;&amp; !dir[toReturn].isDirectory());</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">      while (!good) {</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (toReturn &gt;= dir.length) {</span>
+          //(case: pop)
+<span class="nc bnc" id="L150" title="All 2 branches missed.">          if (parents.isEmpty()) {</span>
+<span class="nc" id="L151">            toReturn = -1;</span>
+<span class="nc" id="L152">            return;  //this is where we exit</span>
+          } else {
+<span class="nc" id="L154">            dir = parents.pop();</span>
+<span class="nc" id="L155">            toReturn = indices.pop();</span>
+          }
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        } else if (dir[toReturn].isDirectory()) {</span>
+          //(case: push)
+<span class="nc" id="L159">          parents.push(dir);</span>
+<span class="nc" id="L160">          indices.push(toReturn + 1);</span>
+<span class="nc" id="L161">          dir = dir[toReturn].listFiles(filter);</span>
+<span class="nc" id="L162">          toReturn = 0;</span>
+        } else {
+<span class="nc" id="L164">          throw new IllegalStateException(&quot;File is invalid, but in range and not a directory: &quot; + dir[toReturn]);</span>
+        }
+        //(check if good)
+<span class="nc bnc" id="L167" title="All 4 branches missed.">        good = (toReturn &lt; dir.length &amp;&amp; !dir[toReturn].isDirectory());</span>
+      }
+      // if we reach here we found something
+<span class="nc" id="L170">    }</span>
+
+    @Override
+    public boolean hasNext() {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">      return toReturn &gt;= 0;</span>
+    }
+
+    @Override
+    public File next() {
+<span class="nc bnc" id="L179" title="All 4 branches missed.">      if (toReturn &gt;= dir.length || toReturn &lt; 0) {</span>
+<span class="nc" id="L180">        throw new NoSuchElementException(&quot;No more elements!&quot;);</span>
+      }
+<span class="nc" id="L182">      File rtn = dir[toReturn];</span>
+<span class="nc" id="L183">      enqueue();</span>
+<span class="nc" id="L184">      return rtn;</span>
+    }
+
+    @Override
+    public void remove() {
+<span class="nc" id="L189">      throw new IllegalArgumentException(&quot;NOT IMPLEMENTED&quot;);</span>
+    }
+
+  }
+
+
+  /*
+   * ----------
+   * OPTIONS
+   * ----------
+   */
+
+  private static void fillField(Object instance, Field f, String value) {
+    //--Verbose
+<span class="pc bpc" id="L203" title="1 of 2 branches missed.">    if (verbose) {</span>
+<span class="nc" id="L204">      Option opt = f.getAnnotation(Option.class);</span>
+<span class="nc" id="L205">      StringBuilder b = new StringBuilder(&quot;setting &quot;).append(f.getDeclaringClass().getName()).append(&quot;#&quot;).append(f.getName()).append(&quot; &quot;);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">      if (opt != null) {</span>
+<span class="nc" id="L207">        b.append(&quot;[&quot;).append(opt.name()).append(&quot;] &quot;);</span>
+      }
+<span class="nc" id="L209">      b.append(&quot;to: &quot;).append(value);</span>
+<span class="nc" id="L210">      log(b.toString());</span>
+    }
+
+    try {
+      //--Permissions
+<span class="fc" id="L215">      boolean accessState = true;</span>
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">      if (Modifier.isFinal(f.getModifiers())) {</span>
+<span class="nc" id="L217">        runtimeException(&quot;Option cannot be final: &quot; + f);</span>
+      }
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">      if (!f.isAccessible()) {</span>
+<span class="fc" id="L220">        accessState = false;</span>
+<span class="fc" id="L221">        f.setAccessible(true);</span>
+      }
+      //--Set Value
+<span class="fc" id="L224">      Object objVal = MetaClass.cast(value, f.getGenericType());</span>
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">      if (objVal != null) {</span>
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">        if (objVal.getClass().isArray()) {</span>
+          //(case: array)
+<span class="nc" id="L228">          Object[] array = (Object[]) objVal;</span>
+          // error check
+<span class="nc bnc" id="L230" title="All 2 branches missed.">          if (!f.getType().isArray()) {</span>
+<span class="nc" id="L231">            runtimeException(&quot;Setting an array to a non-array field. field: &quot; + f + &quot; value: &quot; + Arrays.toString(array) + &quot; src: &quot; + value);</span>
+          }
+          // create specific array
+<span class="nc" id="L234">          Object toSet = Array.newInstance(f.getType().getComponentType(), array.length);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">          for (int i = 0; i &lt; array.length; i++) {</span>
+<span class="nc" id="L236">            Array.set(toSet, i, array[i]);</span>
+          }
+          // set value
+<span class="nc" id="L239">          f.set(instance, toSet);</span>
+<span class="nc" id="L240">        } else {</span>
+          //case: not array
+<span class="fc" id="L242">          f.set(instance, objVal);</span>
+        }
+      } else {
+<span class="nc" id="L245">        runtimeException(&quot;Cannot assign option field: &quot; + f + &quot; value: &quot; + value + &quot;; invalid type&quot;);</span>
+      }
+      //--Permissions
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">      if (!accessState) {</span>
+<span class="fc" id="L249">        f.setAccessible(false);</span>
+      }
+<span class="nc" id="L251">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L252">      err(e);</span>
+<span class="nc" id="L253">      runtimeException(&quot;Cannot assign option field: &quot; + f.getDeclaringClass().getCanonicalName() + &quot;.&quot; + f.getName() + &quot; value: &quot; + value + &quot; cause: &quot; + e.getMessage());</span>
+<span class="nc" id="L254">    } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L255">      err(e);</span>
+<span class="nc" id="L256">      runtimeException(&quot;Cannot access option field: &quot; + f.getDeclaringClass().getCanonicalName() + &quot;.&quot; + f.getName());</span>
+<span class="nc" id="L257">    } catch (Exception e) {</span>
+<span class="nc" id="L258">      err(e);</span>
+<span class="nc" id="L259">      runtimeException(&quot;Cannot assign option field: &quot; + f.getDeclaringClass().getCanonicalName() + &quot;.&quot; + f.getName() + &quot; value: &quot; + value + &quot; cause: &quot; + e.getMessage());</span>
+<span class="pc" id="L260">    }</span>
+<span class="fc" id="L261">  }</span>
+
+  @SuppressWarnings(&quot;rawtypes&quot;)
+  private static Class filePathToClass(String cpEntry, String path) {
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    if (path.length() &lt;= cpEntry.length()) {</span>
+<span class="nc" id="L266">      throw new IllegalArgumentException(&quot;Illegal path: cp=&quot; + cpEntry</span>
+          + &quot; path=&quot; + path);
+    }
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    if (path.charAt(cpEntry.length()) != '/') {</span>
+<span class="nc" id="L270">      throw new IllegalArgumentException(&quot;Illegal path: cp=&quot; + cpEntry</span>
+          + &quot; path=&quot; + path);
+    }
+<span class="nc" id="L273">    path = path.substring(cpEntry.length() + 1);</span>
+<span class="nc" id="L274">    path = path.replaceAll(&quot;/&quot;, &quot;.&quot;).substring(0, path.length() - 6);</span>
+    try {
+<span class="nc" id="L276">      return Class.forName(path,</span>
+          false,
+<span class="nc" id="L278">          ClassLoader.getSystemClassLoader());</span>
+<span class="nc" id="L279">    } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L280">      throw fail(&quot;Could not load class at path: &quot; + path);</span>
+<span class="nc" id="L281">    } catch (NoClassDefFoundError ex) {</span>
+<span class="nc" id="L282">      warn(&quot;Class at path &quot; + path + &quot; is unloadable&quot;);</span>
+<span class="nc" id="L283">      return null;</span>
+    }
+  }
+
+  private static boolean isIgnored(String path) {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    for (String ignore : IGNORED_JARS) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">      if (path.endsWith(ignore)) {</span>
+<span class="nc" id="L290">        return true;</span>
+      }
+    }
+<span class="nc" id="L293">    return false;</span>
+  }
+
+  private static Class&lt;?&gt;[] getVisibleClasses() {
+    //--Variables
+<span class="nc" id="L298">    List&lt;Class&lt;?&gt;&gt; classes = new ArrayList&lt;&gt;();</span>
+    // (get classpath)
+<span class="nc" id="L300">    String pathSep = System.getProperty(&quot;path.separator&quot;);</span>
+<span class="nc" id="L301">    String[] cp = System.getProperties().getProperty(&quot;java.class.path&quot;,</span>
+<span class="nc" id="L302">        null).split(pathSep);</span>
+    // --Fill Options
+    // (get classes)
+<span class="nc bnc" id="L305" title="All 2 branches missed.">    for (String entry : cp) {</span>
+<span class="nc" id="L306">      log(&quot;Checking cp &quot; + entry);</span>
+      //(should skip?)
+<span class="nc bnc" id="L308" title="All 4 branches missed.">      if (entry.equals(&quot;.&quot;) || entry.trim().length() == 0) {</span>
+<span class="nc" id="L309">        continue;</span>
+      }
+      //(no, don't skip)
+<span class="nc" id="L312">      File f = new File(entry);</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">      if (f.isDirectory()) {</span>
+        // --Case: Files
+<span class="nc" id="L315">        LazyFileIterator iter = new LazyFileIterator(f, &quot;.*class$&quot;);</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+          //(get the associated class)
+<span class="nc" id="L318">          Class&lt;?&gt; clazz = filePathToClass(entry, iter.next().getPath());</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">          if (clazz != null) {</span>
+            //(add the class if it's valid)
+<span class="nc" id="L321">            classes.add(clazz);</span>
+          }
+<span class="nc" id="L323">        }</span>
+<span class="nc" id="L324">      } else //noinspection StatementWithEmptyBody</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (!isIgnored(entry)) {</span>
+        // --Case: Jar
+        try {
+<span class="nc" id="L328">          JarFile jar = new JarFile(f);</span>
+<span class="nc" id="L329">          Enumeration&lt;JarEntry&gt; e = jar.entries();</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">          while (e.hasMoreElements()) {</span>
+            //(for each jar file element)
+<span class="nc" id="L332">            JarEntry jarEntry = e.nextElement();</span>
+<span class="nc" id="L333">            String clazz = jarEntry.getName();</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            if (clazz.matches(&quot;.*class$&quot;)) {</span>
+              //(if it's a class)
+<span class="nc" id="L336">              clazz = clazz.substring(0, clazz.length() - 6)</span>
+<span class="nc" id="L337">                  .replaceAll(&quot;/&quot;, &quot;.&quot;);</span>
+              //(add it)
+              try {
+<span class="nc" id="L340">                classes.add(</span>
+<span class="nc" id="L341">                    Class.forName(clazz,</span>
+                        false,
+<span class="nc" id="L343">                        ClassLoader.getSystemClassLoader()));</span>
+<span class="nc" id="L344">              } catch (ClassNotFoundException ex) {</span>
+<span class="nc" id="L345">                warn(&quot;Could not load class in jar: &quot; + f + &quot; at path: &quot; + clazz);</span>
+<span class="nc" id="L346">              } catch (NoClassDefFoundError ex) {</span>
+<span class="nc" id="L347">                debug(&quot;Could not scan class: &quot; + clazz + &quot; (in jar: &quot; + f + &quot;)&quot;);</span>
+<span class="nc" id="L348">              }</span>
+            }
+<span class="nc" id="L350">          }</span>
+<span class="nc" id="L351">        } catch (IOException e) {</span>
+<span class="nc" id="L352">          warn(&quot;Could not open jar file: &quot; + f + &quot;(are you sure the file exists?)&quot;);</span>
+<span class="nc" id="L353">        }</span>
+      } else {
+        //case: ignored jar
+      }
+    }
+
+<span class="nc" id="L359">    return classes.toArray(new Class&lt;?&gt;[classes.size()]);</span>
+  }
+
+  /**
+   * Get all the declared fields of this class and all super classes.
+   */
+  private static Field[] scrapeFields(Class&lt;?&gt; clazz) throws Exception {
+<span class="fc" id="L366">    List&lt;Field&gt; fields = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L367" title="1 of 4 branches missed.">    while (clazz != null &amp;&amp; !clazz.equals(Object.class)) {</span>
+<span class="fc" id="L368">      fields.addAll(Arrays.asList(clazz.getDeclaredFields()));</span>
+<span class="fc" id="L369">      clazz = clazz.getSuperclass();</span>
+    }
+<span class="fc" id="L371">    return fields.toArray(new Field[fields.size()]);</span>
+  }
+
+  private static String threadRootClass() {
+<span class="nc" id="L375">    StackTraceElement[] trace = Thread.currentThread().getStackTrace();</span>
+<span class="nc" id="L376">    int i = trace.length - 1;</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    while(i &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        (trace[i].getClassName().startsWith(&quot;com.intellij&quot;) ||</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">         trace[i].getClassName().startsWith(&quot;java.&quot;) ||</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">         trace[i].getClassName().startsWith(&quot;sun.&quot;)</span>
+        ) ) {
+<span class="nc" id="L382">      i -= 1;</span>
+    }
+<span class="nc" id="L384">    StackTraceElement elem = trace[i];</span>
+<span class="nc" id="L385">    return elem.getClassName();</span>
+  }
+
+  private static String bufferString(String raw, int minLength) {
+<span class="nc" id="L389">    StringBuilder b = new StringBuilder(raw);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">    for (int i = raw.length(); i &lt; minLength; ++i) {</span>
+<span class="nc" id="L391">      b.append(&quot; &quot;);</span>
+    }
+<span class="nc" id="L393">    return b.toString();</span>
+  }
+
+
+  @SuppressWarnings(&quot;rawtypes&quot;)
+  private static Map&lt;String, Field&gt; fillOptionsImpl(
+          Object[] instances,
+          Class&lt;?&gt;[] classes,
+          Properties options,
+          boolean ensureAllOptions,
+          boolean isBootstrap) {
+
+    // Print usage, if applicable
+<span class="fc bfc" id="L406" title="All 2 branches covered.">    if (!isBootstrap) {</span>
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">      if (&quot;true&quot;.equalsIgnoreCase(options.getProperty(&quot;usage&quot;, &quot;false&quot;)) ||</span>
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">          &quot;true&quot;.equalsIgnoreCase(options.getProperty(&quot;help&quot;, &quot;false&quot;))</span>
+          ) {
+<span class="nc" id="L410">        Set&lt;Class&lt;?&gt;&gt; allClasses = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L411">        Collections.addAll(allClasses, classes);</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        if (instances != null) {</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">          for (Object o : instances) {</span>
+<span class="nc" id="L414">            allClasses.add(o.getClass());</span>
+          }
+        }
+<span class="nc" id="L417">        System.err.println(usage(allClasses.stream().toArray(Class[]::new)));</span>
+<span class="nc" id="L418">        System.exit(0);</span>
+      }
+    }
+
+    //--Create Class-&gt;Object Mapping
+<span class="fc" id="L423">    Map&lt;Class, Object&gt; class2object = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L424" title="All 2 branches covered.">    if (instances != null) {</span>
+<span class="fc bfc" id="L425" title="All 2 branches covered.">      for (int i = 0; i &lt; classes.length; ++i) {</span>
+<span class="pc bpc" id="L426" title="2 of 4 branches missed.">        assert instances[i].getClass() == classes[i];</span>
+<span class="fc" id="L427">        class2object.put(classes[i], instances[i]);</span>
+<span class="fc" id="L428">        Class&lt;?&gt; mySuper = instances[i].getClass().getSuperclass();</span>
+<span class="pc bpc" id="L429" title="1 of 4 branches missed.">        while (mySuper != null &amp;&amp; !mySuper.equals(Object.class)) {</span>
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">          if (!class2object.containsKey(mySuper)) {</span>
+<span class="fc" id="L431">            class2object.put(mySuper, instances[i]);</span>
+          }
+<span class="fc" id="L433">          mySuper = mySuper.getSuperclass();</span>
+        }
+      }
+    }
+
+    //--Get Fillable Options
+<span class="fc" id="L439">    Map&lt;String, Field&gt; canFill = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L440">    Map&lt;String, Pair&lt;Boolean, Boolean&gt;&gt; required = new HashMap&lt;&gt;(); /* &lt;exists, is_set&gt; */</span>
+<span class="fc" id="L441">    Map&lt;String, String&gt; interner = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L442" title="All 2 branches covered.">    for (Class c : classes) {</span>
+      Field[] fields;
+      try {
+<span class="fc" id="L445">        fields = scrapeFields(c);</span>
+<span class="nc" id="L446">      } catch (Throwable e) {</span>
+<span class="nc" id="L447">        debug(&quot;Could not check fields for class: &quot; + c.getName() + &quot;  (caused by &quot; + e.getClass() + &quot;: &quot; + e.getMessage() + &quot;)&quot;);</span>
+<span class="nc" id="L448">        continue;</span>
+<span class="fc" id="L449">      }</span>
+
+<span class="fc" id="L451">      boolean someOptionFilled = false;</span>
+<span class="fc" id="L452">      boolean someOptionFound = false;</span>
+<span class="fc bfc" id="L453" title="All 2 branches covered.">      for (Field f : fields) {</span>
+<span class="fc" id="L454">        Option o = f.getAnnotation(Option.class);</span>
+<span class="fc bfc" id="L455" title="All 2 branches covered.">        if (o != null) {</span>
+<span class="fc" id="L456">          someOptionFound = true;</span>
+          //(check if field is static)
+<span class="fc bfc" id="L458" title="All 4 branches covered.">          if ((f.getModifiers() &amp; Modifier.STATIC) == 0 &amp;&amp; instances == null) {</span>
+<span class="fc" id="L459">            continue;</span>
+          }
+<span class="fc" id="L461">          someOptionFilled = true;</span>
+          //(required marker)
+<span class="fc" id="L463">          Pair&lt;Boolean, Boolean&gt; mark = Pair.makePair(false, false);</span>
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">          if (o.required()) {</span>
+<span class="nc" id="L465">            mark = Pair.makePair(true, false);</span>
+          }
+          //(add main name)
+<span class="fc" id="L468">          String name = o.name().toLowerCase();</span>
+<span class="pc bpc" id="L469" title="1 of 2 branches missed.">          if (name.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L470">            name = f.getName().toLowerCase();</span>
+          }
+<span class="pc bpc" id="L472" title="1 of 2 branches missed.">          if (canFill.containsKey(name)) {</span>
+<span class="nc" id="L473">            String name1 = canFill.get(name).getDeclaringClass().getCanonicalName() + &quot;.&quot; + canFill.get(name).getName();</span>
+<span class="nc" id="L474">            String name2 = f.getDeclaringClass().getCanonicalName() + &quot;.&quot; + f.getName();</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">            if (!name1.equals(name2)) {</span>
+<span class="nc" id="L476">              runtimeException(&quot;Multiple declarations of option &quot; + name + &quot;: &quot; + name1 + &quot; and &quot; + name2);</span>
+            } else {
+<span class="nc" id="L478">              err(&quot;Class is in classpath multiple times: &quot; + canFill.get(name).getDeclaringClass().getCanonicalName());</span>
+            }
+          }
+<span class="fc" id="L481">          canFill.put(name, f);</span>
+<span class="fc" id="L482">          required.put(name, mark);</span>
+<span class="fc" id="L483">          interner.put(name, name);</span>
+          //(add alternate names)
+<span class="pc bpc" id="L485" title="1 of 2 branches missed.">          if (!o.alt().equals(&quot;&quot;)) {</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">            for (String alt : o.alt().split(&quot; *, *&quot;)) {</span>
+<span class="nc" id="L487">              alt = alt.toLowerCase();</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">              if (canFill.containsKey(alt) &amp;&amp; !alt.equals(name))</span>
+<span class="nc" id="L489">                throw new IllegalArgumentException(&quot;Multiple declarations of option &quot; + alt + &quot;: &quot; + canFill.get(alt) + &quot; and &quot; + f);</span>
+<span class="nc" id="L490">              canFill.put(alt, f);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">              if (mark.first) required.put(alt, mark);</span>
+<span class="nc" id="L492">              interner.put(alt, name);</span>
+            }
+          }
+        }
+      }
+      //(check to ensure that something got filled, if any @Option annotation was found)
+<span class="pc bpc" id="L498" title="1 of 4 branches missed.">      if (someOptionFound &amp;&amp; !someOptionFilled) {</span>
+<span class="nc" id="L499">        warn(&quot;found @Option annotations in class &quot; + c + &quot;, but didn't set any of them (all options were instance variables and no instance given?)&quot;);</span>
+      }
+    }
+
+    //--Fill Options
+<span class="fc bfc" id="L504" title="All 2 branches covered.">    for (Map.Entry&lt;Object, Object&gt; entry : options.entrySet()) {</span>
+<span class="fc" id="L505">      String rawKeyStr = entry.getKey().toString();</span>
+<span class="fc" id="L506">      String key = rawKeyStr.toLowerCase();</span>
+      // (get values)
+<span class="fc" id="L508">      String value = entry.getValue().toString();</span>
+<span class="pc bpc" id="L509" title="2 of 4 branches missed.">      assert value != null;</span>
+<span class="fc" id="L510">      Field target = canFill.get(key);</span>
+      // (mark required option as fulfilled)
+<span class="fc" id="L512">      Pair&lt;Boolean, Boolean&gt; mark = required.get(key);</span>
+<span class="pc bpc" id="L513" title="1 of 4 branches missed.">      if (mark != null &amp;&amp; mark.first) {</span>
+<span class="nc" id="L514">        required.put(key, Pair.makePair(true, true));</span>
+      }
+      // (fill the field)
+<span class="fc bfc" id="L517" title="All 2 branches covered.">      if (target != null) {</span>
+        // (case: declared option)
+<span class="fc" id="L519">        fillField(class2object.get(target.getDeclaringClass()), target, value);</span>
+<span class="pc bpc" id="L520" title="1 of 2 branches missed.">      } else if (ensureAllOptions) {</span>
+        // (case: undeclared option)
+        // split the key
+<span class="nc" id="L523">        int lastDotIndex = rawKeyStr.lastIndexOf('.');</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">        if (lastDotIndex &lt; 0) {</span>
+<span class="nc" id="L525">          err(&quot;Unrecognized option: &quot; + key);</span>
+<span class="nc" id="L526">          continue;</span>
+        }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        if (!rawKeyStr.startsWith(&quot;log.&quot;)) {  // ignore Redwood options</span>
+<span class="nc" id="L529">          String className = rawKeyStr.substring(0, lastDotIndex);</span>
+<span class="nc" id="L530">          String fieldName = rawKeyStr.substring(lastDotIndex + 1);</span>
+          // get the class
+<span class="nc" id="L532">          Class clazz = null;</span>
+          try {
+<span class="nc" id="L534">            clazz = ClassLoader.getSystemClassLoader().loadClass(className);</span>
+<span class="nc" id="L535">          } catch (Exception e) {</span>
+<span class="nc" id="L536">            err(&quot;Could not set option: &quot; + entry.getKey() + &quot;; either the option is mistyped, not defined, or the class &quot; + className + &quot; does not exist.&quot;);</span>
+<span class="nc" id="L537">          }</span>
+          // get the field
+<span class="nc bnc" id="L539" title="All 2 branches missed.">          if (clazz != null) {</span>
+            try {
+<span class="nc" id="L541">              target = clazz.getField(fieldName);</span>
+<span class="nc" id="L542">            } catch (Exception e) {</span>
+<span class="nc" id="L543">              err(&quot;Could not set option: &quot; + entry.getKey() + &quot;; no such field: &quot; + fieldName + &quot; in class: &quot; + className);</span>
+<span class="nc" id="L544">            }</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">            if (target != null) {</span>
+<span class="nc" id="L546">              log(&quot;option overrides &quot; + target + &quot; to '&quot; + value + &quot;'&quot;);</span>
+<span class="nc" id="L547">              fillField(class2object.get(target.getDeclaringClass()), target, value);</span>
+            } else {
+<span class="nc" id="L549">              err(&quot;Could not set option: &quot; + entry.getKey() + &quot;; no such field: &quot; + fieldName + &quot; in class: &quot; + className);</span>
+            }
+          }
+        }
+      }
+<span class="fc" id="L554">    }</span>
+
+    //--Ensure Required
+<span class="fc" id="L557">    boolean good = true;</span>
+<span class="fc bfc" id="L558" title="All 2 branches covered.">    for (Map.Entry&lt;String, Pair&lt;Boolean, Boolean&gt;&gt; entry : required.entrySet()) {</span>
+<span class="fc" id="L559">      String key = entry.getKey();</span>
+<span class="fc" id="L560">      Pair&lt;Boolean, Boolean&gt; mark = entry.getValue();</span>
+<span class="pc bpc" id="L561" title="3 of 4 branches missed.">      if (mark.first &amp;&amp; !mark.second) {</span>
+<span class="nc" id="L562">        err(&quot;Missing required option: &quot; + interner.get(key) + &quot;   &lt;in class: &quot; + canFill.get(key).getDeclaringClass() + &quot;&gt;&quot;);</span>
+<span class="nc" id="L563">        required.put(key, Pair.makePair(true, true));  //don't duplicate error messages</span>
+<span class="nc" id="L564">        good = false;</span>
+      }
+<span class="fc" id="L566">    }</span>
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">    if ( ! good) {</span>
+<span class="nc" id="L568">      throw new RuntimeException(&quot;Not able to parse properties!!!&quot;);</span>
+      //System.exit(1);
+    }
+
+<span class="fc" id="L572">    return canFill;</span>
+  }
+
+  private static Map&lt;String, Field&gt; fillOptionsImpl(
+          Object[] instances,
+          Class&lt;?&gt;[] classes,
+          Properties options) {
+<span class="fc" id="L579">    return fillOptionsImpl(instances, classes, options, strict, false);</span>
+  }
+
+
+  /*
+   * ----------
+   * EXECUTION
+   * ----------
+   */
+
+  /**
+   * Populate all static options in the given set of classes, as defined by the given
+   * properties.
+   *
+   * @param classes The classes to populate static {@link Option}-tagged fields in.
+   * @param options The properties to use to fill these fields.
+   */
+  public static void fillOptions(Class&lt;?&gt;[] classes, Properties options) {
+<span class="nc" id="L597">    fillOptionsImpl(null, classes, options);</span>
+<span class="nc" id="L598">  }</span>
+
+
+  /**
+   * Populate with the given properties all static {@link Option}-tagged fields in
+   * the given classes.
+   * Then, populate remaining fields with the given command-line arguments.
+   *
+   * @param optionClasses The classes to populate static {@link Option}-tagged fields in.
+   * @param props The properties to use to fill these fields.
+   * @param args The command-line arguments to use to fill in additional properties.
+   */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  public static void fillOptions(Class&lt;?&gt;[] optionClasses, Properties props, String... args) {
+<span class="nc" id="L612">    ArgumentParser.optionClasses = optionClasses;</span>
+<span class="nc" id="L613">    fillOptions(props, args);</span>
+
+<span class="nc" id="L615">  }</span>
+
+  /**
+   * Populate with the given command-line arguments all static {@link Option}-tagged fields in
+   * the given classes.
+   *
+   * @param classes The classes to populate static {@link Option}-tagged fields in.
+   * @param args The command-line arguments to use to fill in additional properties.
+   */
+  public static void fillOptions(Class&lt;?&gt;[] classes,
+                                 String... args) {
+<span class="fc" id="L626">    Properties options = StringUtils.argsToProperties(args); //get options</span>
+<span class="fc" id="L627">    fillOptionsImpl(null, BOOTSTRAP_CLASSES, options, false, true); //bootstrap</span>
+<span class="fc" id="L628">    fillOptionsImpl(null, classes, options);</span>
+<span class="fc" id="L629">  }</span>
+
+  /**
+   * Populate all static options in the given class, as defined by the given
+   * properties.
+   *
+   * @param clazz The class to populate static {@link Option}-tagged fields in.
+   * @param options The properties to use to fill these fields.
+   */
+  public static void fillOptions(Class&lt;?&gt; clazz, Properties options) {
+<span class="fc" id="L639">    fillOptionsImpl(null, new Class[]{ clazz }, options);</span>
+<span class="fc" id="L640">  }</span>
+
+  /**
+   * Populate all static options in the given class, as defined by the given
+   * command-line arguments.
+   *
+   * @param clazz The class to populate static {@link Option}-tagged fields in.
+   * @param args The command-line arguments to use to fill these fields.
+   */
+  public static void fillOptions(Class&lt;?&gt; clazz,
+                                 String... args) {
+<span class="fc" id="L651">    Class&lt;?&gt;[] classes = new Class&lt;?&gt;[1];</span>
+<span class="fc" id="L652">    classes[0] = clazz;</span>
+<span class="fc" id="L653">    fillOptions(classes, args);</span>
+<span class="fc" id="L654">  }</span>
+
+  /**
+   * Populate with the given properties all static options in all classes in the current classpath.
+   * Note that this may take a while if the classpath is large.
+   *
+   * @param props The properties to use to fill fields in the various classes.
+   */
+  public static void fillOptions(Properties props) {
+<span class="nc" id="L663">    fillOptions(props, StringUtils.EMPTY_STRING_ARRAY);</span>
+<span class="nc" id="L664">  }</span>
+
+  /**
+   * Populate with the given command-line arguments all static options in all
+   * classes in the current classpath.
+   * Note that this may take a while if the classpath is large.
+   *
+   * @param args The command-line arguments to use to fill options.
+   */
+  public static void fillOptions(String... args) {
+<span class="nc" id="L674">    fillOptions(StringUtils.argsToProperties(args), StringUtils.EMPTY_STRING_ARRAY);</span>
+<span class="nc" id="L675">  }</span>
+
+  /**
+   * Populate with the given properties all static options in all classes in the current classpath.
+   * Then, fill in additional properties from the given command-line arguments.
+   * Note that this may take a while if the classpath is large.
+   *
+   * @param props The properties to use to fill fields in the various classes.
+   * @param args The command-line arguments to use to fill in additional properties.
+   */
+  public static void fillOptions(Properties props, String... args) {
+    // todo [cdm 2016]: Isn't this the wrong way round and properties overwrite commandline options? Should be the opposite!
+    //(convert to map)
+<span class="nc" id="L688">    Properties options = StringUtils.argsToProperties(args);</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">    for (String key : props.stringPropertyNames()) {</span>
+<span class="nc" id="L690">      options.setProperty(key, props.getProperty(key));</span>
+<span class="nc" id="L691">    }</span>
+    //(bootstrap)
+<span class="nc" id="L693">    Map&lt;String, Field&gt; bootstrapMap = fillOptionsImpl(null, BOOTSTRAP_CLASSES, options, false, true); //bootstrap</span>
+<span class="nc" id="L694">    bootstrapMap.keySet().forEach(options::remove);</span>
+    //(fill options)
+<span class="nc" id="L696">    Class&lt;?&gt;[] visibleClasses = optionClasses;</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">    if (visibleClasses == null) visibleClasses = getVisibleClasses(); //get classes</span>
+<span class="nc" id="L698">    fillOptionsImpl(null, visibleClasses, options);//fill</span>
+<span class="nc" id="L699">  }</span>
+
+
+  /**
+   * Fill all non-static {@link Option}-tagged fields in the given set of objects with the given
+   * properties.
+   *
+   * @param instances The object instances containing {@link Option}-tagged fields which we should fill.
+   * @param options The properties to use to fill these fields.
+   */
+  public static void fillOptions(Object[] instances, Properties options) {
+<span class="fc" id="L710">    Class[] classes = new Class[instances.length];</span>
+<span class="fc bfc" id="L711" title="All 2 branches covered.">    for (int i = 0; i &lt; classes.length; ++i) { classes[i] = instances[i].getClass(); }</span>
+<span class="fc" id="L712">    fillOptionsImpl(instances, classes, options);</span>
+<span class="fc" id="L713">  }</span>
+
+
+  /**
+   * Fill all non-static {@link Option}-tagged fields in the given set of objects with the given
+   * command-line arguments.
+   *
+   * @param instances The object instances containing {@link Option}-tagged fields which we should fill.
+   * @param args The command-line arguments to use to fill these fields.
+   */
+  public static void fillOptions(Object[] instances,
+                                 String[] args) {
+<span class="fc" id="L725">    Properties options = StringUtils.argsToProperties(args); //get options</span>
+<span class="fc" id="L726">    fillOptionsImpl(null, BOOTSTRAP_CLASSES, options, false, true); //bootstrap</span>
+<span class="fc" id="L727">    Class[] classes = new Class[instances.length];</span>
+<span class="fc bfc" id="L728" title="All 2 branches covered.">    for (int i = 0; i &lt; classes.length; ++i) { classes[i] = instances[i].getClass(); }</span>
+<span class="fc" id="L729">    fillOptionsImpl(instances, classes, options);</span>
+<span class="fc" id="L730">  }</span>
+
+  /**
+   * Fill all non-static {@link Option}-tagged fields in the given object with the given
+   * properties.
+   *
+   * @param instance The object instance containing {@link Option}-tagged fields which we should fill.
+   * @param options The properties to use to fill these fields.
+   */
+  public static void fillOptions(Object instance, Properties options) {
+<span class="fc" id="L740">    fillOptions(new Object[]{ instance }, options);</span>
+<span class="fc" id="L741">  }</span>
+
+
+  /**
+   * Fill all non-static {@link Option}-tagged fields in the given object with the given
+   * command-line arguments.
+   *
+   * @param instance The object instance containing {@link Option}-tagged fields which we should fill.
+   * @param args The command-line arguments to use to fill these fields.
+   */
+  public static void fillOptions(Object instance,
+                                 String[] args) {
+<span class="fc" id="L753">    fillOptions(new Object[]{ instance }, args);</span>
+<span class="fc" id="L754">  }</span>
+
+
+  /**
+   * Fill all the options for a given CoreNLP annotator.
+   * This assumes that the annotator takes properties with a prefix, so that, for example,
+   * if the annotator is {@code parse} then it takes a property {@code parse.maxlen} for instance.
+   *
+   * @param annotator The annotator to fill options for.
+   * @param annotatorName The name of the annotator, for parsing properties.
+   * @param props The properties to fill the options in the annotator with.
+   */
+  public static void fillOptions(Annotator annotator, String annotatorName, Properties props) {
+<span class="nc" id="L767">    ArgumentParser.fillOptions(annotator, props);</span>
+<span class="nc" id="L768">    Properties withoutPrefix = new Properties();</span>
+<span class="nc" id="L769">    String prefixString = annotatorName + '.';</span>
+<span class="nc bnc" id="L770" title="All 2 branches missed.">    for (Map.Entry entry : props.entrySet()) {</span>
+<span class="nc" id="L771">      String key = entry.getKey().toString();</span>
+<span class="nc" id="L772">      withoutPrefix.setProperty(key.replace(prefixString, &quot;&quot;), entry.getValue().toString());</span>
+<span class="nc" id="L773">    }</span>
+<span class="nc" id="L774">    ArgumentParser.fillOptions(annotator, withoutPrefix);</span>
+<span class="nc" id="L775">  }</span>
+
+
+  /**
+   * Return a string describing the usage of the program this method is called from, given the
+   * options declared in the given set of classes.
+   * This will print both the static options, and the non-static options.
+   *
+   * @param optionsClasses The classes defining the options being used by this program.
+   * @return A String describing the usage of the class.
+   */
+  public static String usage(Class[] optionsClasses) {
+<span class="nc" id="L787">    String mainClass = threadRootClass();</span>
+<span class="nc" id="L788">    StringBuilder b = new StringBuilder();</span>
+<span class="nc" id="L789">    b.append(&quot;Usage: &quot;).append(mainClass).append(' ');</span>
+
+<span class="nc" id="L791">    List&lt;Pair&lt;Option, Field&gt;&gt; options = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">    for (Class clazz : optionsClasses) {</span>
+      try {
+<span class="nc" id="L794">        options.addAll(Arrays.stream(scrapeFields(clazz))</span>
+<span class="nc" id="L795">        .map(field -&gt; {</span>
+<span class="nc" id="L796">          Annotation[] annotations = field.getAnnotationsByType(Option.class);</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">          if (annotations.length &gt; 0) {</span>
+<span class="nc" id="L798">            return Pair.makePair((Option) annotations[0], field);</span>
+          } else {
+<span class="nc" id="L800">            return null;</span>
+          }
+        })
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        .filter(x -&gt; x != null)</span>
+<span class="nc" id="L804">        .collect(Collectors.toList()));</span>
+<span class="nc" id="L805">      } catch (Exception e) {</span>
+<span class="nc" id="L806">        return b.append(&quot;&lt;unknown&gt;&quot;).toString();</span>
+<span class="nc" id="L807">      }</span>
+    }
+
+<span class="nc" id="L810">    int longestOptionName = options.stream().map(x -&gt; x.first.name().length()).max(Comparator.comparingInt(x -&gt; x)).orElse(10);</span>
+<span class="nc" id="L811">    int longestOptionType = options.stream().map(x -&gt; x.second.getType().getSimpleName().length()).max(Comparator.comparingInt(x -&gt; x)).orElse(10) + 1;</span>
+
+<span class="nc" id="L813">    options.stream().filter(x -&gt; x.first.required()).forEach(optionPair -&gt; {</span>
+<span class="nc" id="L814">      Option option = optionPair.first;</span>
+<span class="nc" id="L815">      Field  field  = optionPair.second;</span>
+<span class="nc" id="L816">      b.append(&quot;\n\t-&quot;).append(bufferString(option.name(), longestOptionName))</span>
+<span class="nc" id="L817">          .append(&quot;   &lt;&quot;).append(bufferString(field.getType().getSimpleName() + &quot;&gt;&quot;, longestOptionType))</span>
+<span class="nc" id="L818">          .append(&quot;   [required] &quot;)</span>
+<span class="nc" id="L819">          .append(option.gloss());</span>
+<span class="nc" id="L820">    });</span>
+<span class="nc bnc" id="L821" title="All 2 branches missed.">    options.stream().filter(x -&gt; !x.first.required()).forEach(optionPair -&gt; {</span>
+<span class="nc" id="L822">      Option option = optionPair.first;</span>
+<span class="nc" id="L823">      Field field = optionPair.second;</span>
+<span class="nc" id="L824">      b.append(&quot;\n\t-&quot;).append(bufferString(option.name(), longestOptionName))</span>
+<span class="nc" id="L825">          .append(&quot;   &lt;&quot;).append(bufferString(field.getType().getSimpleName() + &quot;&gt;&quot;, longestOptionType))</span>
+<span class="nc" id="L826">          .append(&quot;   &quot;)</span>
+<span class="nc" id="L827">          .append(option.gloss());</span>
+<span class="nc" id="L828">    });</span>
+
+<span class="nc" id="L830">    return b.toString();</span>
+  }
+
+
+  /**
+   * Return a string describing the usage of the program this method is called from, given the
+   * options declared in the given set of objects.
+   * This will print both the static options, and the non-static options.
+   *
+   * @param optionsClasses The objects defining the options being used by this program.
+   * @return A String describing the usage of the class.
+   */
+  public static String usage(Object[] optionsClasses) {
+<span class="nc" id="L843">    return usage(Arrays.stream(optionsClasses).map(Object::getClass).toArray(Class[]::new));</span>
+  }
+
+  /**
+   * Return a string describing the usage of the program this method is called from, given the
+   * options declared in the given class.
+   * This will print both the static options, and the non-static options.
+   *
+   * @param optionsClass The class defining the options being used by this program.
+   * @return A String describing the usage of the class.
+   */
+  public static String usage(Class&lt;?&gt; optionsClass) {
+<span class="nc" id="L855">    return usage(new Class[]{ optionsClass });</span>
+  }
+
+  /**
+   * Return a string describing the usage of the program this method is called from, given the
+   * options declared in the given object.
+   * This will print both the static options, and the non-static options.
+   *
+   * @param optionsClass The object defining the options being used by this program.
+   * @return A String describing the usage of the class.
+   */
+  public static String usage(Object optionsClass) {
+<span class="nc" id="L867">    return usage(new Class[]{ optionsClass.getClass() });</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

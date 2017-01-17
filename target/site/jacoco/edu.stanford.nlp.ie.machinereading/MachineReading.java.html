@@ -1,0 +1,986 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MachineReading.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.machinereading</a> &gt; <span class="el_source">MachineReading.java</span></div><h1>MachineReading.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.machinereading;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+import java.util.logging.ConsoleHandler;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
+
+import edu.stanford.nlp.ie.machinereading.structure.*;
+import edu.stanford.nlp.ie.machinereading.structure.MachineReadingAnnotations.EntityMentionsAnnotation;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.CoreAnnotations.SentencesAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations.TextAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations.TokensAnnotation;
+import edu.stanford.nlp.trees.TreeCoreAnnotations.TreeAnnotation;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.pipeline.StanfordCoreNLP;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.ArgumentParser;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * Main driver for Machine Reading training, annotation, and evaluation. Does
+ * entity, relation, and event extraction for all corpora.
+ *
+ * This code has been adapted for 4 domains, all defined in the edu.stanford.nlp.ie.machinereading.domains package.
+ * For each domain, you need a properties file that is the only command line parameter for MachineReading.
+ * Minimally, for each domain you need to define a reader class that extends the GenericDataSetReader class
+ * and overrides the public Annotation read(String path) method.
+ *
+ * How to run: java edu.stanford.nlp.ie.machinereading.MachineReading -arguments propertiesFile
+ *
+ * This method creates an Annotation with additional objects per sentence: EntityMentions and RelationMentions.
+ * Using these objects, the classifiers that get called from MachineReading train entity and relation extractors.
+ * The simplest example domain currently is in edu.stanford.nlp.ie.machinereading.domains.roth,
+ * which is a simple entity and relation extraction using a dataset created by Dan Roth. The properties file for the domain is at
+ * projects/more/src/edu/stanford/nlp/ie/machinereading/domains/roth/roth.properties
+ *
+ * @author David McCLosky
+ * @author mrsmith
+ * @author Mihai
+ */
+<span class="nc bnc" id="L57" title="All 2 branches missed.">public class MachineReading  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L60">  private static final Redwood.RedwoodChannels log = Redwood.channels(MachineReading.class);</span>
+
+  /** Store command-line args so they can be passed to other classes */
+  private final String[] args;
+
+  /*
+   * class attributes
+   */
+  private GenericDataSetReader reader;
+  private GenericDataSetReader auxReader;
+
+
+  private Extractor entityExtractor;
+  // TODO could add an entityExtractorPostProcessor if we need one
+  private Extractor relationExtractor;
+  private Extractor relationExtractionPostProcessor;
+  private Extractor eventExtractor;
+  private Extractor consistencyChecker;
+
+  private boolean forceRetraining;
+  private boolean forceParseSentences;
+
+
+  /**
+   * Array of pairs of datasets (training, testing)
+   * If cross validation is enabled, the length of this array is the number of folds; otherwise it is 1
+   * The first element in each pair is the training corpus; the second is testing
+   */
+  private Pair&lt;Annotation, Annotation&gt; [] datasets;
+
+  /**
+   * Stores the predictions of the extractors
+   * The first index is the partition number (of length 1 is cross validation is not enabled)
+   * The second index is the task: 0 - entities, 1 - relations, 2 - events
+   * Note: we need to store separate predictions per task because they may not be compatible with each other.
+   *       For example, we may have predicted entities in task 0 but use gold entities for task 1.
+   */
+  private Annotation [][] predictions;
+
+  private Set&lt;ResultsPrinter&gt; entityResultsPrinterSet;
+  private Set&lt;ResultsPrinter&gt; relationResultsPrinterSet;
+  @SuppressWarnings(&quot;unused&quot;)
+  private Set&lt;ResultsPrinter&gt; eventResultsPrinterSet;
+
+  private static final int ENTITY_LEVEL = 0;
+  private static final int RELATION_LEVEL = 1;
+  private static final int EVENT_LEVEL = 2;
+
+
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L110">    MachineReading mr = makeMachineReading(args);</span>
+<span class="nc" id="L111">    mr.run();</span>
+<span class="nc" id="L112">  }</span>
+
+  public static void setLoggerLevel(Level level) {
+<span class="nc" id="L115">    setConsoleLevel(Level.FINEST);</span>
+<span class="nc" id="L116">    MachineReadingProperties.logger.setLevel(level);</span>
+<span class="nc" id="L117">  }</span>
+
+  public static void setConsoleLevel(Level level) {
+    // get the top Logger:
+<span class="nc" id="L121">    Logger topLogger = java.util.logging.Logger.getLogger(&quot;&quot;);</span>
+
+    // Handler for console (reuse it if it already exists)
+<span class="nc" id="L124">    Handler consoleHandler = null;</span>
+    // see if there is already a console handler
+<span class="nc bnc" id="L126" title="All 2 branches missed.">    for (Handler handler : topLogger.getHandlers()) {</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">      if (handler instanceof ConsoleHandler) {</span>
+        // found the console handler
+<span class="nc" id="L129">        consoleHandler = handler;</span>
+<span class="nc" id="L130">        break;</span>
+      }
+    }
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">    if (consoleHandler == null) {</span>
+      // there was no console handler found, create a new one
+<span class="nc" id="L136">      consoleHandler = new ConsoleHandler();</span>
+<span class="nc" id="L137">      topLogger.addHandler(consoleHandler);</span>
+    }
+    // set the console handler level:
+<span class="nc" id="L140">    consoleHandler.setLevel(level);</span>
+<span class="nc" id="L141">    consoleHandler.setFormatter(new SimpleFormatter());</span>
+<span class="nc" id="L142">  }</span>
+
+  /**
+   * Use the makeMachineReading* methods to create MachineReading objects!
+   */
+<span class="nc" id="L147">  private MachineReading(String [] args) {</span>
+<span class="nc" id="L148">    this.args = args;</span>
+<span class="nc" id="L149">  }</span>
+
+<span class="nc" id="L151">  protected MachineReading() {</span>
+<span class="nc" id="L152">    this.args = StringUtils.EMPTY_STRING_ARRAY;</span>
+<span class="nc" id="L153">  }</span>
+
+  /**
+   * Creates a MR object to be used only for annotation purposes (no training)
+   * This is needed in order to integrate MachineReading with BaselineNLProcessor
+   */
+  public static MachineReading makeMachineReadingForAnnotation(
+          GenericDataSetReader reader,
+          Extractor entityExtractor,
+          Extractor relationExtractor,
+          Extractor eventExtractor,
+          Extractor consistencyChecker,
+          Extractor relationPostProcessor,
+          boolean testRelationsUsingPredictedEntities,
+          boolean verbose) {
+<span class="nc" id="L168">    MachineReading mr = new MachineReading();</span>
+
+    // readers needed to assign syntactic heads to predicted entities
+<span class="nc" id="L171">    mr.reader = reader;</span>
+<span class="nc" id="L172">    mr.auxReader = null;</span>
+
+    // no results printers needed
+<span class="nc" id="L175">    mr.entityResultsPrinterSet = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L176">    mr.setRelationResultsPrinterSet(new HashSet&lt;&gt;());</span>
+
+    // create the storage for the generated annotations
+<span class="nc" id="L179">    mr.predictions = new Annotation[3][1];</span>
+
+    // create the entity/relation classifiers
+<span class="nc" id="L182">    mr.entityExtractor = entityExtractor;</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">    MachineReadingProperties.extractEntities = entityExtractor != null;</span>
+<span class="nc" id="L184">    mr.relationExtractor = relationExtractor;</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">    MachineReadingProperties.extractRelations = relationExtractor != null;</span>
+<span class="nc" id="L186">    MachineReadingProperties.testRelationsUsingPredictedEntities = testRelationsUsingPredictedEntities;</span>
+<span class="nc" id="L187">    mr.eventExtractor = eventExtractor;</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">    MachineReadingProperties.extractEvents = eventExtractor != null;</span>
+<span class="nc" id="L189">    mr.consistencyChecker = consistencyChecker;</span>
+<span class="nc" id="L190">    mr.relationExtractionPostProcessor = relationPostProcessor;</span>
+
+<span class="nc bnc" id="L192" title="All 2 branches missed.">    Level level = verbose ? Level.FINEST : Level.SEVERE;</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">    if (entityExtractor != null)</span>
+<span class="nc" id="L194">      entityExtractor.setLoggerLevel(level);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">    if (mr.relationExtractor != null)</span>
+<span class="nc" id="L196">      mr.relationExtractor.setLoggerLevel(level);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">    if (mr.eventExtractor != null)</span>
+<span class="nc" id="L198">      mr.eventExtractor.setLoggerLevel(level);</span>
+
+<span class="nc" id="L200">    return mr;</span>
+  }
+
+  public static MachineReading makeMachineReading(String [] args) throws IOException {
+    // install global parameters
+<span class="nc" id="L205">    MachineReading mr = new MachineReading(args);</span>
+    //TODO:
+<span class="nc" id="L207">    ArgumentParser.fillOptions(MachineReadingProperties.class, args);</span>
+    //Arguments.parse(args, mr);
+<span class="nc" id="L209">    log.info(&quot;PERCENTAGE OF TRAIN: &quot; + MachineReadingProperties.percentageOfTrain);</span>
+
+    // convert args to properties
+<span class="nc" id="L212">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    if (props == null) {</span>
+<span class="nc" id="L214">      throw new RuntimeException(&quot;ERROR: failed to find Properties in the given arguments!&quot;);</span>
+    }
+
+<span class="nc" id="L217">    String logLevel = props.getProperty(&quot;logLevel&quot;, &quot;INFO&quot;);</span>
+<span class="nc" id="L218">    setLoggerLevel(Level.parse(logLevel.toUpperCase()));</span>
+
+    // install reader specific parameters
+<span class="nc" id="L221">    GenericDataSetReader reader = mr.makeReader(props);</span>
+<span class="nc" id="L222">    GenericDataSetReader auxReader = mr.makeAuxReader();</span>
+<span class="nc" id="L223">    Level readerLogLevel = Level.parse(MachineReadingProperties.readerLogLevel.toUpperCase());</span>
+<span class="nc" id="L224">    reader.setLoggerLevel(readerLogLevel);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">    if (auxReader != null) {</span>
+<span class="nc" id="L226">      auxReader.setLoggerLevel(readerLogLevel);</span>
+    }
+<span class="nc" id="L228">    log.info(&quot;The reader log level is set to &quot; + readerLogLevel);</span>
+    //Execution.fillOptions(GenericDataSetReaderProps.class, args);
+    //Arguments.parse(args, reader);
+
+    // create the pre-processing pipeline
+<span class="nc" id="L233">    StanfordCoreNLP pipe = new StanfordCoreNLP(props, false);</span>
+<span class="nc" id="L234">    reader.setProcessor(pipe);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">    if (auxReader != null) {</span>
+<span class="nc" id="L236">      auxReader.setProcessor(pipe);</span>
+    }
+
+    // create the results printers
+<span class="nc" id="L240">    mr.makeResultsPrinters(args);</span>
+
+<span class="nc" id="L242">    return mr;</span>
+  }
+
+  /**
+   * Performs extraction. This will train a new extraction model and evaluate
+   * the model on the test set. Depending on the MachineReading instance's
+   * parameters, it may skip training if a model already exists or skip
+   * evaluation.
+   *
+   * returns results string, can be compared in a utest
+   */
+  public List&lt;String&gt; run() throws Exception {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    this.forceRetraining = ! MachineReadingProperties.loadModel;</span>
+
+<span class="nc bnc" id="L256" title="All 2 branches missed.">    if (MachineReadingProperties.trainOnly) {</span>
+<span class="nc" id="L257">      this.forceRetraining= true;</span>
+    }
+<span class="nc" id="L259">    List&lt;String&gt; retMsg = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L260">    boolean haveSerializedEntityExtractor = serializedModelExists(MachineReadingProperties.serializedEntityExtractorPath);</span>
+<span class="nc" id="L261">    boolean haveSerializedRelationExtractor = serializedModelExists(MachineReadingProperties.serializedRelationExtractorPath);</span>
+<span class="nc" id="L262">    boolean haveSerializedEventExtractor = serializedModelExists(MachineReadingProperties.serializedEventExtractorPath);</span>
+<span class="nc" id="L263">    Annotation training = null;</span>
+<span class="nc" id="L264">    Annotation aux = null;</span>
+<span class="nc bnc" id="L265" title="All 16 branches missed.">    if ((MachineReadingProperties.extractEntities &amp;&amp; !haveSerializedEntityExtractor) ||</span>
+            (MachineReadingProperties.extractRelations &amp;&amp; !haveSerializedRelationExtractor) ||
+            (MachineReadingProperties.extractEvents &amp;&amp; !haveSerializedEventExtractor) ||
+            this.forceRetraining|| MachineReadingProperties.crossValidate){
+      // load training sentences
+<span class="nc" id="L270">      training = loadOrMakeSerializedSentences(MachineReadingProperties.trainPath, reader, new File(MachineReadingProperties.serializedTrainingSentencesPath));</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">      if (auxReader != null) {</span>
+<span class="nc" id="L272">        MachineReadingProperties.logger.severe(&quot;Reading auxiliary dataset from &quot; + MachineReadingProperties.auxDataPath + &quot;...&quot;);</span>
+<span class="nc" id="L273">        aux = loadOrMakeSerializedSentences(MachineReadingProperties.auxDataPath, auxReader, new File(</span>
+                MachineReadingProperties.serializedAuxTrainingSentencesPath));
+<span class="nc" id="L275">        MachineReadingProperties.logger.severe(&quot;Done reading auxiliary dataset.&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L279">    Annotation testing = null;</span>
+<span class="nc bnc" id="L280" title="All 4 branches missed.">    if (!MachineReadingProperties.trainOnly &amp;&amp; !MachineReadingProperties.crossValidate) {</span>
+      // load test sentences
+<span class="nc" id="L282">      File serializedTestSentences = new File(MachineReadingProperties.serializedTestSentencesPath);</span>
+<span class="nc" id="L283">      testing = loadOrMakeSerializedSentences(MachineReadingProperties.testPath, reader, serializedTestSentences);</span>
+    }
+
+    //
+    // create the actual datasets to be used for training and annotation
+    //
+<span class="nc" id="L289">    makeDataSets(training, testing, aux);</span>
+
+    //
+    // process (training + annotate) one partition at a time
+    //
+<span class="nc bnc" id="L294" title="All 2 branches missed.">    for(int partition = 0; partition &lt; datasets.length; partition ++){</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">      assert(datasets.length &gt; partition);</span>
+<span class="nc bnc" id="L296" title="All 4 branches missed.">      assert(datasets[partition] != null);</span>
+<span class="nc bnc" id="L297" title="All 6 branches missed.">      assert(MachineReadingProperties.trainOnly || datasets[partition].second() != null);</span>
+
+      // train all models
+<span class="nc bnc" id="L300" title="All 2 branches missed.">      train(datasets[partition].first(), (MachineReadingProperties.crossValidate ? partition : -1));</span>
+      // annotate using all models
+<span class="nc bnc" id="L302" title="All 2 branches missed.">      if(! MachineReadingProperties.trainOnly){</span>
+<span class="nc" id="L303">        MachineReadingProperties.logger.info(&quot;annotating partition &quot; + partition );</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        annotate(datasets[partition].second(), (MachineReadingProperties.crossValidate ? partition: -1));</span>
+      }
+    }
+
+    //
+    // now report overall results
+    //
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    if(! MachineReadingProperties.trainOnly){</span>
+      // merge test sets for the gold data
+<span class="nc" id="L313">      Annotation gold = new Annotation(&quot;&quot;);</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">      for (Pair&lt;Annotation, Annotation&gt; dataset : datasets)</span>
+<span class="nc" id="L315">        AnnotationUtils.addSentences(gold, dataset.second().get(SentencesAnnotation.class));</span>
+
+      // merge test sets with predicted annotations
+<span class="nc" id="L318">      Annotation[] mergedPredictions = new Annotation[3];</span>
+<span class="nc bnc" id="L319" title="All 4 branches missed.">      assert(predictions != null);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">      for (int taskLevel = 0; taskLevel &lt; mergedPredictions.length; taskLevel++) {</span>
+<span class="nc" id="L321">        mergedPredictions[taskLevel] = new Annotation(&quot;&quot;);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        for(int fold = 0; fold &lt; predictions[taskLevel].length; fold ++){</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">          if (predictions[taskLevel][fold] == null) continue;</span>
+<span class="nc" id="L324">          AnnotationUtils.addSentences(mergedPredictions[taskLevel], predictions[taskLevel][fold].get(CoreAnnotations.SentencesAnnotation.class));</span>
+        }
+      }
+      //
+      // evaluate all tasks: entity, relation, and event recognition
+      //
+<span class="nc bnc" id="L330" title="All 4 branches missed.">      if(MachineReadingProperties.extractEntities &amp;&amp; ! entityResultsPrinterSet.isEmpty()){</span>
+<span class="nc" id="L331">        retMsg.addAll(printTask(&quot;entity extraction&quot;, entityResultsPrinterSet, gold, mergedPredictions[ENTITY_LEVEL]));</span>
+      }
+
+<span class="nc bnc" id="L334" title="All 4 branches missed.">      if(MachineReadingProperties.extractRelations &amp;&amp; ! getRelationResultsPrinterSet().isEmpty()){</span>
+<span class="nc" id="L335">        retMsg.addAll(printTask(&quot;relation extraction&quot;, getRelationResultsPrinterSet(), gold, mergedPredictions[RELATION_LEVEL]));</span>
+      }
+
+      //
+      // Save the sentences with the predicted annotations
+      //
+<span class="nc bnc" id="L341" title="All 4 branches missed.">      if (MachineReadingProperties.extractEntities &amp;&amp; MachineReadingProperties.serializedEntityExtractionResults != null)</span>
+<span class="nc" id="L342">        IOUtils.writeObjectToFile(mergedPredictions[ENTITY_LEVEL], MachineReadingProperties.serializedEntityExtractionResults);</span>
+<span class="nc bnc" id="L343" title="All 4 branches missed.">      if (MachineReadingProperties.extractRelations &amp;&amp; MachineReadingProperties.serializedRelationExtractionResults != null)</span>
+<span class="nc" id="L344">        IOUtils.writeObjectToFile(mergedPredictions[RELATION_LEVEL],MachineReadingProperties.serializedRelationExtractionResults);</span>
+<span class="nc bnc" id="L345" title="All 4 branches missed.">      if (MachineReadingProperties.extractEvents &amp;&amp; MachineReadingProperties.serializedEventExtractionResults != null)</span>
+<span class="nc" id="L346">        IOUtils.writeObjectToFile(mergedPredictions[EVENT_LEVEL],MachineReadingProperties.serializedEventExtractionResults);</span>
+
+    }
+
+<span class="nc" id="L350">    return retMsg;</span>
+  }
+
+  private static List&lt;String&gt; printTask(String taskName, Set&lt;ResultsPrinter&gt; printers, Annotation gold, Annotation pred) {
+<span class="nc" id="L354">    List&lt;String&gt; retMsg = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">    for (ResultsPrinter rp : printers){</span>
+<span class="nc" id="L356">      String msg = rp.printResults(gold, pred);</span>
+<span class="nc" id="L357">      retMsg.add(msg);</span>
+<span class="nc" id="L358">      MachineReadingProperties.logger.severe(&quot;Overall &quot; + taskName + &quot; results, using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L359">    }</span>
+<span class="nc" id="L360">    return retMsg;</span>
+  }
+
+  protected void train(Annotation training, int partition) throws Exception {
+    //
+    // train entity extraction
+    //
+<span class="nc bnc" id="L367" title="All 2 branches missed.">    if (MachineReadingProperties.extractEntities) {</span>
+<span class="nc" id="L368">      MachineReadingProperties.logger.info(&quot;Training entity extraction model(s)&quot;);</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">      if (partition != -1) MachineReadingProperties.logger.info(&quot;In partition #&quot; + partition);</span>
+<span class="nc" id="L370">      String modelName = MachineReadingProperties.serializedEntityExtractorPath;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">      if (partition != -1) modelName += &quot;.&quot; + partition;</span>
+<span class="nc" id="L372">      File modelFile = new File(modelName);</span>
+
+<span class="nc" id="L374">      MachineReadingProperties.logger.fine(&quot;forceRetraining = &quot; + this.forceRetraining+ &quot;, modelFile.exists = &quot; + modelFile.exists());</span>
+<span class="nc bnc" id="L375" title="All 4 branches missed.">      if(! this.forceRetraining&amp;&amp; modelFile.exists()){</span>
+<span class="nc" id="L376">        MachineReadingProperties.logger.info(&quot;Loading entity extraction model from &quot; + modelName + &quot; ...&quot;);</span>
+<span class="nc" id="L377">        entityExtractor = BasicEntityExtractor.load(modelName, MachineReadingProperties.entityClassifier, false);</span>
+      } else {
+<span class="nc" id="L379">        MachineReadingProperties.logger.info(&quot;Training entity extraction model...&quot;);</span>
+<span class="nc" id="L380">        entityExtractor = makeEntityExtractor(MachineReadingProperties.entityClassifier, MachineReadingProperties.entityGazetteerPath);</span>
+<span class="nc" id="L381">        entityExtractor.train(training);</span>
+<span class="nc" id="L382">        MachineReadingProperties.logger.info(&quot;Serializing entity extraction model to &quot; + modelName + &quot; ...&quot;);</span>
+<span class="nc" id="L383">        entityExtractor.save(modelName);</span>
+      }
+    }
+
+    //
+    // train relation extraction
+    //
+<span class="nc bnc" id="L390" title="All 2 branches missed.">    if (MachineReadingProperties.extractRelations) {</span>
+<span class="nc" id="L391">      MachineReadingProperties.logger.info(&quot;Training relation extraction model(s)&quot;);</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">      if (partition != -1)</span>
+<span class="nc" id="L393">        MachineReadingProperties.logger.info(&quot;In partition #&quot; + partition);</span>
+<span class="nc" id="L394">      String modelName = MachineReadingProperties.serializedRelationExtractorPath;</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">      if (partition != -1)</span>
+<span class="nc" id="L396">        modelName += &quot;.&quot; + partition;</span>
+
+<span class="nc bnc" id="L398" title="All 2 branches missed.">      if (MachineReadingProperties.useRelationExtractionModelMerging) {</span>
+<span class="nc" id="L399">        String[] modelNames = MachineReadingProperties.serializedRelationExtractorPath.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (partition != -1) {</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">          for (int i = 0; i &lt; modelNames.length; i++) {</span>
+<span class="nc" id="L402">            modelNames[i] += &quot;.&quot; + partition;</span>
+          }
+        }
+
+<span class="nc" id="L406">        relationExtractor = ExtractorMerger.buildRelationExtractorMerger(modelNames);</span>
+<span class="nc bnc" id="L407" title="All 4 branches missed.">      } else if (!this.forceRetraining&amp;&amp; new File(modelName).exists()) {</span>
+<span class="nc" id="L408">        MachineReadingProperties.logger.info(&quot;Loading relation extraction model from &quot; + modelName + &quot; ...&quot;);</span>
+        //TODO change this to load any type of BasicRelationExtractor
+<span class="nc" id="L410">        relationExtractor = BasicRelationExtractor.load(modelName);</span>
+      } else {
+<span class="nc" id="L412">        RelationFeatureFactory rff = makeRelationFeatureFactory(MachineReadingProperties.relationFeatureFactoryClass, MachineReadingProperties.relationFeatures, MachineReadingProperties.doNotLexicalizeFirstArg);</span>
+<span class="nc" id="L413">        ArgumentParser.fillOptions(rff, args);</span>
+
+<span class="nc" id="L415">        Annotation predicted = null;</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">        if (MachineReadingProperties.trainRelationsUsingPredictedEntities) {</span>
+          // generate predicted entities
+<span class="nc bnc" id="L418" title="All 4 branches missed.">          assert(entityExtractor != null);</span>
+<span class="nc" id="L419">          predicted = AnnotationUtils.deepMentionCopy(training);</span>
+<span class="nc" id="L420">          entityExtractor.annotate(predicted);</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">          for (ResultsPrinter rp : entityResultsPrinterSet){</span>
+<span class="nc" id="L422">            String msg = rp.printResults(training, predicted);</span>
+<span class="nc" id="L423">            MachineReadingProperties.logger.info(&quot;Training relation extraction using predicted entitities: entity scores using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L424">          }</span>
+
+          // change relation mentions to use predicted entity mentions rather than gold ones
+          try {
+<span class="nc" id="L428">            changeGoldRelationArgsToPredicted(predicted);</span>
+<span class="nc" id="L429">          } catch (Exception e) {</span>
+            // we may get here for unknown EntityMentionComparator class
+<span class="nc" id="L431">            throw new RuntimeException(e);</span>
+<span class="nc" id="L432">          }</span>
+        }
+
+        Annotation dataset;
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (MachineReadingProperties.trainRelationsUsingPredictedEntities) {</span>
+<span class="nc" id="L437">          dataset = predicted;</span>
+        } else {
+<span class="nc" id="L439">          dataset = training;</span>
+        }
+
+<span class="nc" id="L442">        Set&lt;String&gt; relationsToSkip = new HashSet&lt;&gt;(StringUtils.split(MachineReadingProperties.relationsToSkipDuringTraining, &quot;,&quot;));</span>
+<span class="nc" id="L443">        List&lt;List&lt;RelationMention&gt;&gt; backedUpRelations = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        if (relationsToSkip.size() &gt; 0) {</span>
+          // we need to backup the relations since removeSkippableRelations modifies dataset in place and we can't duplicate CoreMaps safely (or can we?)
+<span class="nc bnc" id="L446" title="All 2 branches missed.">          for (CoreMap sent : dataset.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L447">            List&lt;RelationMention&gt; relationMentions = sent.get(MachineReadingAnnotations.RelationMentionsAnnotation.class);</span>
+<span class="nc" id="L448">            backedUpRelations.add(relationMentions);</span>
+<span class="nc" id="L449">          }</span>
+
+<span class="nc" id="L451">          removeSkippableRelations(dataset, relationsToSkip);</span>
+        }
+
+        //relationExtractor = new BasicRelationExtractor(rff, MachineReadingProperties.createUnrelatedRelations, makeRelationMentionFactory(MachineReadingProperties.relationMentionFactoryClass));
+<span class="nc" id="L455">        relationExtractor = makeRelationExtractor(MachineReadingProperties.relationClassifier, rff, MachineReadingProperties.createUnrelatedRelations,</span>
+<span class="nc" id="L456">                makeRelationMentionFactory(MachineReadingProperties.relationMentionFactoryClass));</span>
+<span class="nc" id="L457">        ArgumentParser.fillOptions(relationExtractor, args);</span>
+        //Arguments.parse(args,relationExtractor);
+<span class="nc" id="L459">        MachineReadingProperties.logger.info(&quot;Training relation extraction model...&quot;);</span>
+<span class="nc" id="L460">        relationExtractor.train(dataset);</span>
+<span class="nc" id="L461">        MachineReadingProperties.logger.info(&quot;Serializing relation extraction model to &quot; + modelName + &quot; ...&quot;);</span>
+<span class="nc" id="L462">        relationExtractor.save(modelName);</span>
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (relationsToSkip.size() &gt; 0) {</span>
+          // restore backed up relations into dataset
+<span class="nc" id="L466">          int sentenceIndex = 0;</span>
+
+<span class="nc bnc" id="L468" title="All 2 branches missed.">          for (CoreMap sentence : dataset.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L469">            List&lt;RelationMention&gt; relationMentions = backedUpRelations.get(sentenceIndex);</span>
+<span class="nc" id="L470">            sentence.set(MachineReadingAnnotations.RelationMentionsAnnotation.class, relationMentions);</span>
+<span class="nc" id="L471">            sentenceIndex++;</span>
+<span class="nc" id="L472">          }</span>
+        }
+      }
+    }
+
+    //
+    // train event extraction -- currently just works with MSTBasedEventExtractor
+    //
+<span class="nc bnc" id="L480" title="All 2 branches missed.">    if (MachineReadingProperties.extractEvents) {</span>
+<span class="nc" id="L481">      MachineReadingProperties.logger.info(&quot;Training event extraction model(s)&quot;);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">      if (partition != -1) MachineReadingProperties.logger.info(&quot;In partition #&quot; + partition);</span>
+<span class="nc" id="L483">      String modelName = MachineReadingProperties.serializedEventExtractorPath;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">      if (partition != -1) modelName += &quot;.&quot; + partition;</span>
+<span class="nc" id="L485">      File modelFile = new File(modelName);</span>
+
+<span class="nc bnc" id="L487" title="All 4 branches missed.">      if(!this.forceRetraining&amp;&amp; modelFile.exists()) {</span>
+<span class="nc" id="L488">        MachineReadingProperties.logger.info(&quot;Loading event extraction model from &quot; + modelName + &quot; ...&quot;);</span>
+<span class="nc" id="L489">        Method mstLoader = (Class.forName(&quot;MSTBasedEventExtractor&quot;)).getMethod(&quot;load&quot;, String.class);</span>
+<span class="nc" id="L490">        eventExtractor = (Extractor) mstLoader.invoke(null, modelName);</span>
+<span class="nc" id="L491">      } else {</span>
+<span class="nc" id="L492">        Annotation predicted = null;</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        if (MachineReadingProperties.trainEventsUsingPredictedEntities) {</span>
+          // generate predicted entities
+<span class="nc bnc" id="L495" title="All 4 branches missed.">          assert(entityExtractor != null);</span>
+<span class="nc" id="L496">          predicted = AnnotationUtils.deepMentionCopy(training);</span>
+<span class="nc" id="L497">          entityExtractor.annotate(predicted);</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">          for (ResultsPrinter rp : entityResultsPrinterSet){</span>
+<span class="nc" id="L499">            String msg = rp.printResults(training, predicted);</span>
+<span class="nc" id="L500">            MachineReadingProperties.logger.info(&quot;Training event extraction using predicted entitities: entity scores using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L501">          }</span>
+
+          // TODO: need an equivalent of changeGoldRelationArgsToPredicted here?
+        }
+
+<span class="nc" id="L506">        Constructor&lt;?&gt; mstConstructor = (Class.forName(&quot;edu.stanford.nlp.ie.machinereading.MSTBasedEventExtractor&quot;)).getConstructor(boolean.class);</span>
+<span class="nc" id="L507">        eventExtractor = (Extractor) mstConstructor.newInstance(MachineReadingProperties.trainEventsUsingPredictedEntities);</span>
+
+<span class="nc" id="L509">        MachineReadingProperties.logger.info(&quot;Training event extraction model...&quot;);</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (MachineReadingProperties.trainRelationsUsingPredictedEntities) {</span>
+<span class="nc" id="L511">          eventExtractor.train(predicted);</span>
+        } else {
+<span class="nc" id="L513">          eventExtractor.train(training);</span>
+        }
+<span class="nc" id="L515">        MachineReadingProperties.logger.info(&quot;Serializing event extraction model to &quot; + modelName + &quot; ...&quot;);</span>
+<span class="nc" id="L516">        eventExtractor.save(modelName);</span>
+      }
+    }
+<span class="nc" id="L519">  }</span>
+
+  /**
+   * Removes any relations with relation types in relationsToSkip from a dataset.  Dataset is modified in place.
+   */
+  private static void removeSkippableRelations(Annotation dataset, Set&lt;String&gt; relationsToSkip) {
+<span class="nc bnc" id="L525" title="All 4 branches missed.">    if (relationsToSkip == null || relationsToSkip.isEmpty()) {</span>
+<span class="nc" id="L526">      return;</span>
+    }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">    for (CoreMap sent : dataset.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L529">      List&lt;RelationMention&gt; relationMentions = sent.get(MachineReadingAnnotations.RelationMentionsAnnotation.class);</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">      if (relationMentions == null) {</span>
+<span class="nc" id="L531">        continue;</span>
+      }
+<span class="nc" id="L533">      List&lt;RelationMention&gt; newRelationMentions = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">      for (RelationMention rm: relationMentions) {</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (!relationsToSkip.contains(rm.getType())) {</span>
+<span class="nc" id="L536">          newRelationMentions.add(rm);</span>
+        }
+<span class="nc" id="L538">      }</span>
+<span class="nc" id="L539">      sent.set(MachineReadingAnnotations.RelationMentionsAnnotation.class, newRelationMentions);</span>
+<span class="nc" id="L540">    }</span>
+<span class="nc" id="L541">  }</span>
+
+  /**
+   * Replaces all relation arguments with predicted entities
+   */
+  private static void changeGoldRelationArgsToPredicted(Annotation dataset) {
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    for (CoreMap sent : dataset.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L548">      List&lt;EntityMention&gt; entityMentions = sent.get(MachineReadingAnnotations.EntityMentionsAnnotation.class);</span>
+<span class="nc" id="L549">      List&lt;RelationMention&gt; relationMentions = sent.get(MachineReadingAnnotations.RelationMentionsAnnotation.class);</span>
+<span class="nc" id="L550">      List&lt;RelationMention&gt; newRels = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">      for (RelationMention rm : relationMentions) {</span>
+<span class="nc" id="L552">        rm.setSentence(sent);</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">        if (rm.replaceGoldArgsWithPredicted(entityMentions)) {</span>
+<span class="nc" id="L554">          MachineReadingProperties.logger.info(&quot;Successfully mapped all arguments in relation mention: &quot; + rm);</span>
+<span class="nc" id="L555">          newRels.add(rm);</span>
+        } else {
+<span class="nc" id="L557">          MachineReadingProperties.logger.info(&quot;Dropped relation mention due to failed argument mapping: &quot; + rm);</span>
+        }
+<span class="nc" id="L559">      }</span>
+<span class="nc" id="L560">      sent.set(MachineReadingAnnotations.RelationMentionsAnnotation.class, newRels);</span>
+      // we may have added new mentions to the entity list, so let's store it again
+<span class="nc" id="L562">      sent.set(MachineReadingAnnotations.EntityMentionsAnnotation.class, entityMentions);</span>
+<span class="nc" id="L563">    }</span>
+<span class="nc" id="L564">  }</span>
+
+  public Annotation annotate(Annotation testing) {
+<span class="nc" id="L567">    return annotate(testing, -1);</span>
+  }
+
+  protected Annotation annotate(Annotation testing, int partition) {
+<span class="nc bnc" id="L571" title="All 2 branches missed.">    int partitionIndex = (partition != -1 ? partition : 0);</span>
+
+    //
+    // annotate entities
+    //
+<span class="nc bnc" id="L576" title="All 2 branches missed.">    if (MachineReadingProperties.extractEntities) {</span>
+<span class="nc bnc" id="L577" title="All 4 branches missed.">      assert(entityExtractor != null);</span>
+<span class="nc" id="L578">      Annotation predicted = AnnotationUtils.deepMentionCopy(testing);</span>
+<span class="nc" id="L579">      entityExtractor.annotate(predicted);</span>
+
+<span class="nc bnc" id="L581" title="All 2 branches missed.">      for (ResultsPrinter rp : entityResultsPrinterSet){</span>
+<span class="nc" id="L582">        String msg = rp.printResults(testing, predicted);</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">        MachineReadingProperties.logger.info(&quot;Entity extraction results &quot; + (partition != -1 ? &quot;for partition #&quot; + partition : &quot;&quot;) + &quot; using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L584">      }</span>
+<span class="nc" id="L585">      predictions[ENTITY_LEVEL][partitionIndex] = predicted;</span>
+    }
+
+    //
+    // annotate relations
+    //
+<span class="nc bnc" id="L591" title="All 2 branches missed.">    if (MachineReadingProperties.extractRelations) {</span>
+<span class="nc bnc" id="L592" title="All 4 branches missed.">      assert(relationExtractor != null);</span>
+
+<span class="nc bnc" id="L594" title="All 2 branches missed.">      Annotation predicted = (MachineReadingProperties.testRelationsUsingPredictedEntities ? predictions[ENTITY_LEVEL][partitionIndex] : AnnotationUtils.deepMentionCopy(testing));</span>
+      // make sure the entities have the syntactic head and span set. we need this for relation extraction features
+<span class="nc" id="L596">      assignSyntacticHeadToEntities(predicted);</span>
+<span class="nc" id="L597">      relationExtractor.annotate(predicted);</span>
+
+<span class="nc bnc" id="L599" title="All 2 branches missed.">      if (relationExtractionPostProcessor == null) {</span>
+<span class="nc" id="L600">        relationExtractionPostProcessor = makeExtractor(MachineReadingProperties.relationExtractionPostProcessorClass);</span>
+      }
+<span class="nc bnc" id="L602" title="All 2 branches missed.">      if (relationExtractionPostProcessor != null) {</span>
+<span class="nc" id="L603">        MachineReadingProperties.logger.info(&quot;Using relation extraction post processor: &quot; + MachineReadingProperties.relationExtractionPostProcessorClass);</span>
+<span class="nc" id="L604">        relationExtractionPostProcessor.annotate(predicted);</span>
+      }
+
+<span class="nc bnc" id="L607" title="All 2 branches missed.">      for (ResultsPrinter rp : getRelationResultsPrinterSet()){</span>
+<span class="nc" id="L608">        String msg = rp.printResults(testing, predicted);</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        MachineReadingProperties.logger.info(&quot;Relation extraction results &quot; + (partition != -1 ? &quot;for partition #&quot; + partition : &quot;&quot;) + &quot; using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L610">      }</span>
+
+      //
+      // apply the domain-specific consistency checks
+      //
+<span class="nc bnc" id="L615" title="All 2 branches missed.">      if (consistencyChecker == null) {</span>
+<span class="nc" id="L616">        consistencyChecker = makeExtractor(MachineReadingProperties.consistencyCheck);</span>
+      }
+<span class="nc bnc" id="L618" title="All 2 branches missed.">      if (consistencyChecker != null) {</span>
+<span class="nc" id="L619">        MachineReadingProperties.logger.info(&quot;Using consistency checker: &quot; + MachineReadingProperties.consistencyCheck);</span>
+<span class="nc" id="L620">        consistencyChecker.annotate(predicted);</span>
+
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        for (ResultsPrinter rp : entityResultsPrinterSet){</span>
+<span class="nc" id="L623">          String msg = rp.printResults(testing, predicted);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">          MachineReadingProperties.logger.info(&quot;Entity extraction results AFTER consistency checks &quot; + (partition != -1 ? &quot;for partition #&quot; + partition : &quot;&quot;) + &quot; using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L625">        }</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">        for (ResultsPrinter rp : getRelationResultsPrinterSet()){</span>
+<span class="nc" id="L627">          String msg = rp.printResults(testing, predicted);</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">          MachineReadingProperties.logger.info(&quot;Relation extraction results AFTER consistency checks &quot; + (partition != -1 ? &quot;for partition #&quot; + partition : &quot;&quot;) + &quot; using printer &quot; + rp.getClass() + &quot;:\n&quot; + msg);</span>
+<span class="nc" id="L629">        }</span>
+      }
+
+<span class="nc" id="L632">      predictions[RELATION_LEVEL][partitionIndex] = predicted;</span>
+    }
+
+    //
+    // TODO: annotate events
+    //
+
+<span class="nc" id="L639">    return predictions[RELATION_LEVEL][partitionIndex];</span>
+  }
+
+  private void assignSyntacticHeadToEntities(Annotation corpus) {
+<span class="nc bnc" id="L643" title="All 4 branches missed.">    assert(corpus != null);</span>
+<span class="nc bnc" id="L644" title="All 4 branches missed.">    assert(corpus.get(SentencesAnnotation.class) != null);</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">    for(CoreMap sent: corpus.get(SentencesAnnotation.class)){</span>
+<span class="nc" id="L646">      List&lt;CoreLabel&gt; tokens = sent.get(TokensAnnotation.class);</span>
+<span class="nc bnc" id="L647" title="All 4 branches missed.">      assert(tokens != null);</span>
+<span class="nc" id="L648">      Tree tree = sent.get(TreeAnnotation.class);</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">      if (MachineReadingProperties.forceGenerationOfIndexSpans) {</span>
+<span class="nc" id="L650">        tree.indexSpans(0);</span>
+      }
+<span class="nc bnc" id="L652" title="All 4 branches missed.">      assert(tree != null);</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">      if(sent.get(EntityMentionsAnnotation.class) != null){</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">        for(EntityMention e: sent.get(EntityMentionsAnnotation.class)){</span>
+<span class="nc" id="L655">          reader.assignSyntacticHead(e, tree, tokens, true);</span>
+<span class="nc" id="L656">        }</span>
+      }
+<span class="nc" id="L658">    }</span>
+<span class="nc" id="L659">  }</span>
+
+  private static Extractor makeExtractor(Class&lt;Extractor&gt; extractorClass) {
+<span class="nc bnc" id="L662" title="All 2 branches missed.">    if (extractorClass == null) return null;</span>
+    Extractor ex;
+    try {
+<span class="nc" id="L665">      ex = extractorClass.getConstructor().newInstance();</span>
+<span class="nc" id="L666">    } catch (Exception e) {</span>
+<span class="nc" id="L667">      throw new RuntimeException(e);</span>
+<span class="nc" id="L668">    }</span>
+<span class="nc" id="L669">    return ex;</span>
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private void makeDataSets(Annotation training, Annotation testing, Annotation auxDataset) {
+<span class="nc bnc" id="L674" title="All 2 branches missed.">    if(! MachineReadingProperties.crossValidate){</span>
+<span class="nc" id="L675">      datasets = new Pair[1];</span>
+<span class="nc" id="L676">      Annotation trainingEnhanced = training;</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">      if (auxDataset != null) {</span>
+<span class="nc" id="L678">        trainingEnhanced = new Annotation(training.get(TextAnnotation.class));</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">        for(int i = 0; i &lt; AnnotationUtils.sentenceCount(training); i ++){</span>
+<span class="nc" id="L680">          AnnotationUtils.addSentence(trainingEnhanced, AnnotationUtils.getSentence(training, i));</span>
+        }
+<span class="nc bnc" id="L682" title="All 2 branches missed.">        for (int ind = 0; ind &lt; AnnotationUtils.sentenceCount(auxDataset); ind++) {</span>
+<span class="nc" id="L683">          AnnotationUtils.addSentence(trainingEnhanced, AnnotationUtils.getSentence(auxDataset, ind));</span>
+        }
+      }
+<span class="nc" id="L686">      datasets[0] = new Pair&lt;&gt;(trainingEnhanced, testing);</span>
+
+<span class="nc" id="L688">      predictions = new Annotation[3][1];</span>
+<span class="nc" id="L689">    } else {</span>
+<span class="nc bnc" id="L690" title="All 4 branches missed.">      assert(MachineReadingProperties.kfold &gt; 1);</span>
+<span class="nc" id="L691">      datasets = new Pair[MachineReadingProperties.kfold];</span>
+<span class="nc" id="L692">      AnnotationUtils.shuffleSentences(training);</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">      for (int partition = 0; partition &lt;MachineReadingProperties.kfold; partition++) {</span>
+<span class="nc" id="L694">        int begin = AnnotationUtils.sentenceCount(training) * partition / MachineReadingProperties.kfold;</span>
+<span class="nc" id="L695">        int end = AnnotationUtils.sentenceCount(training) * (partition + 1) / MachineReadingProperties.kfold;</span>
+<span class="nc" id="L696">        MachineReadingProperties.logger.info(&quot;Creating partition #&quot; + partition + &quot; using offsets [&quot; + begin + &quot;, &quot; + end + &quot;) out of &quot; + AnnotationUtils.sentenceCount(training));</span>
+<span class="nc" id="L697">        Annotation partitionTrain = new Annotation(&quot;&quot;);</span>
+<span class="nc" id="L698">        Annotation partitionTest = new Annotation(&quot;&quot;);</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">        for(int i = 0; i &lt; AnnotationUtils.sentenceCount(training); i ++){</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">          if(i &lt; begin){</span>
+<span class="nc" id="L701">            AnnotationUtils.addSentence(partitionTrain, AnnotationUtils.getSentence(training, i));</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">          } else if(i &lt; end){</span>
+<span class="nc" id="L703">            AnnotationUtils.addSentence(partitionTest, AnnotationUtils.getSentence(training, i));</span>
+          } else {
+<span class="nc" id="L705">            AnnotationUtils.addSentence(partitionTrain, AnnotationUtils.getSentence(training, i));</span>
+          }
+        }
+
+        // for learning curve experiments
+        // partitionTrain = keepPercentage(partitionTrain, percentageOfTrain);
+<span class="nc" id="L711">        partitionTrain = keepPercentage(partitionTrain, MachineReadingProperties.percentageOfTrain);</span>
+
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (auxDataset != null) {</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">          for (int ind = 0; ind &lt; AnnotationUtils.sentenceCount(auxDataset); ind++) {</span>
+<span class="nc" id="L715">            AnnotationUtils.addSentence(partitionTrain, AnnotationUtils</span>
+<span class="nc" id="L716">                    .getSentence(auxDataset, ind));</span>
+          }
+        }
+<span class="nc" id="L719">        datasets[partition] = new Pair&lt;&gt;(partitionTrain, partitionTest);</span>
+      }
+
+<span class="nc" id="L722">      predictions = new Annotation[3][MachineReadingProperties.kfold];</span>
+    }
+<span class="nc" id="L724">  }</span>
+
+  /** Keeps only the first percentage sentences from the given corpus */
+  private static Annotation keepPercentage(Annotation corpus, double percentage) {
+<span class="nc" id="L728">    log.info(&quot;Using fraction of train: &quot; + percentage);</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">    if (percentage &gt;= 1.0) {</span>
+<span class="nc" id="L730">      return corpus;</span>
+    }
+<span class="nc" id="L732">    Annotation smaller = new Annotation(&quot;&quot;);</span>
+<span class="nc" id="L733">    List&lt;CoreMap&gt; sents = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L734">    List&lt;CoreMap&gt; fullSents = corpus.get(SentencesAnnotation.class);</span>
+<span class="nc" id="L735">    double smallSize = (double) fullSents.size() * percentage;</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">    for (int i = 0; i &lt; smallSize; i ++) {</span>
+<span class="nc" id="L737">      sents.add(fullSents.get(i));</span>
+    }
+<span class="nc" id="L739">    log.info(&quot;TRAIN corpus size reduced from &quot; + fullSents.size() + &quot; to &quot; + sents.size());</span>
+<span class="nc" id="L740">    smaller.set(SentencesAnnotation.class, sents);</span>
+<span class="nc" id="L741">    return smaller;</span>
+  }
+
+  private static boolean serializedModelExists(String prefix) {
+<span class="nc bnc" id="L745" title="All 2 branches missed.">    if (!MachineReadingProperties.crossValidate) {</span>
+<span class="nc" id="L746">      File f = new File(prefix);</span>
+<span class="nc" id="L747">      return f.exists();</span>
+    }
+
+    // in cross validation we serialize models to prefix.&lt;FOLD COUNT&gt;
+<span class="nc bnc" id="L751" title="All 2 branches missed.">    for (int i = 0; i &lt; MachineReadingProperties.kfold; i++) {</span>
+<span class="nc" id="L752">      File f = new File(prefix + &quot;.&quot; + Integer.toString(i));</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">      if (!f.exists()) {</span>
+<span class="nc" id="L754">        return false;</span>
+      }
+    }
+<span class="nc" id="L757">    return true;</span>
+  }
+
+  /**
+   * Creates ResultsPrinter instances based on the resultsPrinters argument
+   * @param args
+   */
+  private void makeResultsPrinters(String[] args) {
+<span class="nc" id="L765">    entityResultsPrinterSet = makeResultsPrinters(MachineReadingProperties.entityResultsPrinters, args);</span>
+<span class="nc" id="L766">    setRelationResultsPrinterSet(makeResultsPrinters(MachineReadingProperties.relationResultsPrinters, args));</span>
+<span class="nc" id="L767">    eventResultsPrinterSet = makeResultsPrinters(MachineReadingProperties.eventResultsPrinters, args);</span>
+<span class="nc" id="L768">  }</span>
+
+  private static Set&lt;ResultsPrinter&gt; makeResultsPrinters(String classes, String[] args) {
+<span class="nc" id="L771">    MachineReadingProperties.logger.info(&quot;Making result printers from &quot; + classes);</span>
+<span class="nc" id="L772">    String[] printerClassNames = classes.trim().split(&quot;,\\s*&quot;);</span>
+<span class="nc" id="L773">    HashSet&lt;ResultsPrinter&gt; printers = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">    for (String printerClassName : printerClassNames) {</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">      if(printerClassName.isEmpty()) continue;</span>
+      ResultsPrinter rp;
+      try {
+<span class="nc" id="L778">        rp = (ResultsPrinter) Class.forName(printerClassName).getConstructor().newInstance();</span>
+<span class="nc" id="L779">        printers.add(rp);</span>
+<span class="nc" id="L780">      } catch (Exception e) {</span>
+<span class="nc" id="L781">        throw new RuntimeException(e);</span>
+<span class="nc" id="L782">      }</span>
+      //Execution.fillOptions(ResultsPrinterProps.class, args);
+      //Arguments.parse(args,rp);
+    }
+<span class="nc" id="L786">    return printers;</span>
+  }
+
+  /**
+   * Constructs the corpus reader class and sets it as the reader for this MachineReading instance.
+   *
+   * @return corpus reader specified by datasetReaderClass
+   */
+  private GenericDataSetReader makeReader(Properties props) {
+    try {
+<span class="nc bnc" id="L796" title="All 2 branches missed.">      if(reader == null){</span>
+        try {
+<span class="nc" id="L798">          reader = MachineReadingProperties.datasetReaderClass.getConstructor(Properties.class).newInstance(props);</span>
+<span class="nc" id="L799">        } catch(java.lang.NoSuchMethodException e) {</span>
+          // if no c'tor with props found let's use the default one
+<span class="nc" id="L801">          reader = MachineReadingProperties.datasetReaderClass.getConstructor().newInstance();</span>
+<span class="nc" id="L802">        }</span>
+      }
+<span class="nc" id="L804">    } catch (Exception e) {</span>
+<span class="nc" id="L805">      throw new RuntimeException(e);</span>
+<span class="nc" id="L806">    }</span>
+
+<span class="nc" id="L808">    reader.setUseNewHeadFinder(MachineReadingProperties.useNewHeadFinder);</span>
+<span class="nc" id="L809">    return reader;</span>
+  }
+
+  /**
+   * Constructs the corpus reader class and sets it as the reader for this MachineReading instance.
+   *
+   * @return corpus reader specified by datasetAuxReaderClass
+   */
+  private GenericDataSetReader makeAuxReader() {
+    try {
+<span class="nc bnc" id="L819" title="All 2 branches missed.">      if (auxReader == null) {</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">        if (MachineReadingProperties.datasetAuxReaderClass != null) {</span>
+<span class="nc" id="L821">          auxReader = MachineReadingProperties.datasetAuxReaderClass.getConstructor().newInstance();</span>
+        }
+      }
+<span class="nc" id="L824">    } catch (Exception e) {</span>
+<span class="nc" id="L825">      throw new RuntimeException(e);</span>
+<span class="nc" id="L826">    }</span>
+<span class="nc" id="L827">    return auxReader;</span>
+  }
+
+  public static Extractor makeEntityExtractor(
+          Class&lt;? extends BasicEntityExtractor&gt; entityExtractorClass,
+          String gazetteerPath) {
+<span class="nc bnc" id="L833" title="All 2 branches missed.">    if (entityExtractorClass == null) return null;</span>
+    BasicEntityExtractor ex;
+    try {
+<span class="nc" id="L836">      ex = entityExtractorClass.getConstructor(String.class).newInstance(gazetteerPath);</span>
+<span class="nc" id="L837">    } catch (Exception e) {</span>
+<span class="nc" id="L838">      throw new RuntimeException(e);</span>
+<span class="nc" id="L839">    }</span>
+<span class="nc" id="L840">    return ex;</span>
+  }
+
+  private static Extractor makeRelationExtractor(
+          Class&lt;? extends BasicRelationExtractor&gt; relationExtractorClass, RelationFeatureFactory featureFac, boolean createUnrelatedRelations, RelationMentionFactory factory) {
+<span class="nc bnc" id="L845" title="All 2 branches missed.">    if (relationExtractorClass == null) return null;</span>
+    BasicRelationExtractor ex;
+    try {
+<span class="nc" id="L848">      ex = relationExtractorClass.getConstructor(RelationFeatureFactory.class, Boolean.class, RelationMentionFactory.class).newInstance(featureFac, createUnrelatedRelations, factory);</span>
+<span class="nc" id="L849">    } catch (Exception e) {</span>
+<span class="nc" id="L850">      throw new RuntimeException(e);</span>
+<span class="nc" id="L851">    }</span>
+<span class="nc" id="L852">    return ex;</span>
+  }
+
+  public static RelationFeatureFactory makeRelationFeatureFactory(
+          Class&lt;? extends RelationFeatureFactory&gt; relationFeatureFactoryClass,
+          String relationFeatureList,
+          boolean doNotLexicalizeFirstArg) {
+<span class="nc bnc" id="L859" title="All 4 branches missed.">    if (relationFeatureList == null || relationFeatureFactoryClass == null)</span>
+<span class="nc" id="L860">      return null;</span>
+<span class="nc" id="L861">    Object[] featureList = new Object [] {relationFeatureList.trim().split(&quot;,\\s*&quot;)};</span>
+    RelationFeatureFactory rff;
+    try {
+<span class="nc" id="L864">      rff = relationFeatureFactoryClass.getConstructor(String[].class).newInstance(featureList);</span>
+<span class="nc" id="L865">      rff.setDoNotLexicalizeFirstArgument(doNotLexicalizeFirstArg);</span>
+<span class="nc" id="L866">    } catch (Exception e) {</span>
+<span class="nc" id="L867">      throw new RuntimeException(e);</span>
+<span class="nc" id="L868">    }</span>
+<span class="nc" id="L869">    return rff;</span>
+  }
+
+  private static RelationMentionFactory makeRelationMentionFactory(
+          Class&lt;RelationMentionFactory&gt; relationMentionFactoryClass) {
+    RelationMentionFactory rmf;
+    try {
+<span class="nc" id="L876">      rmf = relationMentionFactoryClass.getConstructor().newInstance();</span>
+<span class="nc" id="L877">    } catch (Exception e) {</span>
+<span class="nc" id="L878">      throw new RuntimeException(e);</span>
+<span class="nc" id="L879">    }</span>
+<span class="nc" id="L880">    return rmf;</span>
+  }
+
+  /**
+   * Gets the serialized sentences for a data set. If the serialized sentences
+   * are already on disk, it loads them from there. Otherwise, the data set is
+   * read with the corpus reader and the serialized sentences are saved to disk.
+   *
+   * @param sentencesPath Llocation of the raw data set
+   * @param reader The corpus reader
+   * @param serializedSentences Where the serialized sentences should be stored on disk
+   * @return A list of RelationsSentences
+   */
+  private Annotation loadOrMakeSerializedSentences(
+          String sentencesPath, GenericDataSetReader reader,
+          File serializedSentences) throws IOException, ClassNotFoundException {
+    Annotation corpusSentences;
+    // if the serialized file exists, just read it. otherwise read the source
+    // and and save the serialized file to disk
+<span class="nc bnc" id="L899" title="All 6 branches missed.">    if (MachineReadingProperties.serializeCorpora &amp;&amp; serializedSentences.exists() &amp;&amp; !forceParseSentences) {</span>
+<span class="nc" id="L900">      MachineReadingProperties.logger.info(&quot;Loaded serialized sentences from &quot; + serializedSentences.getAbsolutePath() + &quot;...&quot;);</span>
+<span class="nc" id="L901">      corpusSentences = IOUtils.readObjectFromFile(serializedSentences);</span>
+<span class="nc" id="L902">      MachineReadingProperties.logger.info(&quot;Done. Loaded &quot; + corpusSentences.get(CoreAnnotations.SentencesAnnotation.class).size() + &quot; sentences.&quot;);</span>
+    } else {
+      // read the corpus
+<span class="nc" id="L905">      MachineReadingProperties.logger.info(&quot;Parsing corpus sentences...&quot;);</span>
+<span class="nc bnc" id="L906" title="All 2 branches missed.">      if(MachineReadingProperties.serializeCorpora)</span>
+<span class="nc" id="L907">        MachineReadingProperties.logger.info(&quot;These sentences will be serialized to &quot; + serializedSentences.getAbsolutePath());</span>
+<span class="nc" id="L908">      corpusSentences = reader.parse(sentencesPath);</span>
+<span class="nc" id="L909">      MachineReadingProperties.logger.info(&quot;Done. Parsed &quot; + AnnotationUtils.sentenceCount(corpusSentences) + &quot; sentences.&quot;);</span>
+
+      // save corpusSentences
+<span class="nc bnc" id="L912" title="All 2 branches missed.">      if(MachineReadingProperties.serializeCorpora){</span>
+<span class="nc" id="L913">        MachineReadingProperties.logger.info(&quot;Serializing parsed sentences to &quot; + serializedSentences.getAbsolutePath() + &quot;...&quot;);</span>
+<span class="nc" id="L914">        IOUtils.writeObjectToFile(corpusSentences,serializedSentences);</span>
+<span class="nc" id="L915">        MachineReadingProperties.logger.info(&quot;Done. Serialized &quot; + AnnotationUtils.sentenceCount(corpusSentences) + &quot; sentences.&quot;);</span>
+      }
+    }
+<span class="nc" id="L918">    return corpusSentences;</span>
+  }
+
+  public void setExtractEntities(boolean extractEntities) {
+<span class="nc" id="L922">    MachineReadingProperties.extractEntities = extractEntities;</span>
+<span class="nc" id="L923">  }</span>
+
+  public void setExtractRelations(boolean extractRelations) {
+<span class="nc" id="L926">    MachineReadingProperties.extractRelations = extractRelations;</span>
+<span class="nc" id="L927">  }</span>
+
+  public void setExtractEvents(boolean extractEvents) {
+<span class="nc" id="L930">    MachineReadingProperties.extractEvents = extractEvents;</span>
+<span class="nc" id="L931">  }</span>
+
+  public void setForceParseSentences(boolean forceParseSentences) {
+<span class="nc" id="L934">    this.forceParseSentences = forceParseSentences;</span>
+<span class="nc" id="L935">  }</span>
+
+  public void setDatasets(Pair&lt;Annotation, Annotation&gt; [] datasets) {
+<span class="nc" id="L938">    this.datasets = datasets;</span>
+<span class="nc" id="L939">  }</span>
+
+  public Pair&lt;Annotation, Annotation&gt; [] getDatasets() {
+<span class="nc" id="L942">    return datasets;</span>
+  }
+
+  public void setPredictions(Annotation [][] predictions) {
+<span class="nc" id="L946">    this.predictions = predictions;</span>
+<span class="nc" id="L947">  }</span>
+
+  public Annotation [][] getPredictions() {
+<span class="nc" id="L950">    return predictions;</span>
+  }
+
+  public void setReader(GenericDataSetReader reader) {
+<span class="nc" id="L954">    this.reader = reader;</span>
+<span class="nc" id="L955">  }</span>
+
+  public GenericDataSetReader getReader() {
+<span class="nc" id="L958">    return reader;</span>
+  }
+
+  public void setAuxReader(GenericDataSetReader auxReader) {
+<span class="nc" id="L962">    this.auxReader = auxReader;</span>
+<span class="nc" id="L963">  }</span>
+
+  public GenericDataSetReader getAuxReader() {
+<span class="nc" id="L966">    return auxReader;</span>
+  }
+
+  public void setEntityResultsPrinterSet(Set&lt;ResultsPrinter&gt; entityResultsPrinterSet) {
+<span class="nc" id="L970">    this.entityResultsPrinterSet = entityResultsPrinterSet;</span>
+<span class="nc" id="L971">  }</span>
+
+  public Set&lt;ResultsPrinter&gt; getEntityResultsPrinterSet() {
+<span class="nc" id="L974">    return entityResultsPrinterSet;</span>
+  }
+
+  public void setRelationResultsPrinterSet(Set&lt;ResultsPrinter&gt; relationResultsPrinterSet) {
+<span class="nc" id="L978">    this.relationResultsPrinterSet = relationResultsPrinterSet;</span>
+<span class="nc" id="L979">  }</span>
+
+  public Set&lt;ResultsPrinter&gt; getRelationResultsPrinterSet() {
+<span class="nc" id="L982">    return relationResultsPrinterSet;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

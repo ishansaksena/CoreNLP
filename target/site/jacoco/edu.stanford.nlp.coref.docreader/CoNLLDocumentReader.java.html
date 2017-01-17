@@ -1,0 +1,1165 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoNLLDocumentReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.coref.docreader</a> &gt; <span class="el_source">CoNLLDocumentReader.java</span></div><h1>CoNLLDocumentReader.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.coref.docreader;
+
+import java.io.BufferedReader;
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Properties;
+import java.util.Set;
+import java.util.Stack;
+import java.util.logging.Logger;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.coref.CorefCoreAnnotations;
+import edu.stanford.nlp.coref.data.InputDoc;
+import edu.stanford.nlp.coref.data.Mention;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreAnnotations.SentencesAnnotation;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.pipeline.ChunkAnnotationUtils;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.semgraph.SemanticGraphFactory;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.IntCounter;
+import edu.stanford.nlp.trees.GrammaticalStructure;
+import edu.stanford.nlp.trees.HeadFinder;
+import edu.stanford.nlp.trees.LabeledScoredTreeReaderFactory;
+import edu.stanford.nlp.trees.ModCollinsHeadFinder;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeCoreAnnotations;
+import edu.stanford.nlp.trees.TreeCoreAnnotations.TreeAnnotation;
+import edu.stanford.nlp.trees.TreeNormalizer;
+import edu.stanford.nlp.trees.Trees;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseGrammaticalStructure;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseSemanticHeadFinder;
+import edu.stanford.nlp.util.AbstractIterator;
+import edu.stanford.nlp.util.CollectionFactory;
+import edu.stanford.nlp.util.CollectionValuedMap;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Filters;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.IntPair;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.Triple;
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * Read _conll file format from CoNLL2011.  See http://conll.bbn.com/index.php/data.html.
+ *
+ * CoNLL2011 files are in /scr/nlp/data/conll-2011/v0/data/
+ *    dev
+ *    train
+ * Contains *_auto_conll files (auto generated) and _gold_conll (hand labelled), default reads _gold_conll
+ * There is also /scr/nlp/data/conll-2011/v0/conll.trial which has *.conll files (parse has _ at end)
+ *
+ * Column 	Type 	Description
+ * 1   	Document ID 	This is a variation on the document filename
+ * 2   	Part number 	Some files are divided into multiple parts numbered as 000, 001, 002, ... etc.
+ * 3   	Word number
+ * 4   	Word itself
+ * 5   	Part-of-Speech
+ * 6   	Parse bit 	This is the bracketed structure broken before the first open parenthesis in the parse, and the word/part-of-speech leaf replaced with a *. The full parse can be created by substituting the asterix with the &quot;([pos] [word])&quot; string (or leaf) and concatenating the items in the rows of that column.
+ * 7   	Predicate lemma 	The predicate lemma is mentioned for the rows for which we have semantic role information. All other rows are marked with a &quot;-&quot;
+ * 8   	Predicate Frameset ID 	This is the PropBank frameset ID of the predicate in Column 7.
+ * 9   	Word sense 	This is the word sense of the word in Column 3.
+ * 10   	Speaker/Author 	This is the speaker or author name where available. Mostly in Broadcast Conversation and Web Log data.
+ * 11   	Named Entities 	These columns identifies the spans representing various named entities.
+ * 12:N   	Predicate Arguments 	There is one column each of predicate argument structure information for the predicate mentioned in Column 7.
+ * N   	Coreference 	Coreference chain information encoded in a parenthesis structure.
+ *
+ * @author Angel Chang, Heeyoung Lee
+ */
+public class CoNLLDocumentReader implements DocReader  {
+
+  /** A logger for this class */
+<span class="nc" id="L92">  private static Redwood.RedwoodChannels log = Redwood.channels(CoNLLDocumentReader.class);</span>
+
+  private static final int FIELD_LAST = -1;
+
+  private static final int FIELD_DOC_ID = 0;
+  private static final int FIELD_PART_NO = 1;
+  private static final int FIELD_WORD_NO = 2;
+  private static final int FIELD_WORD = 3;
+  private static final int FIELD_POS_TAG = 4;
+  private static final int FIELD_PARSE_BIT = 5;
+//  private static final int FIELD_PRED_LEMMA = 6;
+//  private static final int FIELD_PRED_FRAMESET_ID = 7;
+//  private static final int FIELD_WORD_SENSE = 8;
+  private static final int FIELD_SPEAKER_AUTHOR = 9;
+  private static final int FIELD_NER_TAG = 10;
+//  private static final int FIELD_PRED_ARGS = 11;  // Predicate args follow...
+  private static final int FIELD_COREF = FIELD_LAST;  // Last field
+
+  private static final int FIELDS_MIN = 12;  // There should be at least 13 fields
+
+  private DocumentIterator docIterator;
+//  private String filepath;
+  protected final List&lt;File&gt; fileList;
+  private int curFileIndex;
+  private final Options options;
+
+<span class="nc" id="L118">  public static final Logger logger = Logger.getLogger(CoNLLDocumentReader.class.getName());</span>
+
+<span class="nc" id="L120">  private static final HeadFinder chineseHeadFinder = new ChineseSemanticHeadFinder();</span>
+
+  public CoNLLDocumentReader(String filepath)
+  {
+<span class="nc" id="L124">    this(filepath, new Options());</span>
+<span class="nc" id="L125">  }</span>
+
+  public CoNLLDocumentReader(String filepath, Options options)
+<span class="nc" id="L128">  {</span>
+//    this.filepath = filepath;
+<span class="nc bnc" id="L130" title="All 4 branches missed.">    if (filepath != null &amp;&amp; new File(filepath).exists()) {</span>
+<span class="nc" id="L131">      this.fileList = getFiles(filepath, options.filePattern);</span>
+    } else {
+<span class="nc" id="L133">      this.fileList = Collections.EMPTY_LIST;</span>
+    }
+<span class="nc" id="L135">    this.options = options;</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">    if (options.sortFiles) {</span>
+<span class="nc" id="L137">      Collections.sort(this.fileList);</span>
+    }
+<span class="nc" id="L139">    curFileIndex = 0;</span>
+<span class="nc bnc" id="L140" title="All 6 branches missed.">    if (filepath != null &amp;&amp; new File(filepath).exists() &amp;&amp; options.printConLLLoadingMessage) {</span>
+<span class="nc" id="L141">      logger.info(&quot;Reading &quot; + fileList.size() + &quot; CoNLL files from &quot; + filepath);</span>
+    }
+<span class="nc" id="L143">  }</span>
+
+  private static List&lt;File&gt; getFiles(String filepath, Pattern filter)
+  {
+<span class="nc" id="L147">    Iterable&lt;File&gt; iter = IOUtils.iterFilesRecursive(new File(filepath), filter);</span>
+<span class="nc" id="L148">    List&lt;File&gt; fileList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">    for (File f:iter) {</span>
+<span class="nc" id="L150">      fileList.add(f);</span>
+<span class="nc" id="L151">    }</span>
+<span class="nc" id="L152">    Collections.sort(fileList);</span>
+<span class="nc" id="L153">    return fileList;</span>
+  }
+
+  public void reset() {
+<span class="nc" id="L157">    curFileIndex = 0;</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">    if (docIterator != null) {</span>
+<span class="nc" id="L159">      docIterator.close();</span>
+<span class="nc" id="L160">      docIterator = null;</span>
+    }
+<span class="nc" id="L162">  }</span>
+
+  public CoNLLDocument getNextDocument()
+  {
+    try {
+<span class="nc bnc" id="L167" title="All 2 branches missed.">      if (curFileIndex &gt;= fileList.size()) return null;  // DONE!</span>
+<span class="nc" id="L168">      File curFile = fileList.get(curFileIndex);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">      if (docIterator == null) {</span>
+<span class="nc" id="L170">        docIterator = new DocumentIterator(curFile.getAbsolutePath(), options);</span>
+      }
+<span class="nc bnc" id="L172" title="All 2 branches missed.">      while ( ! docIterator.hasNext()) {</span>
+<span class="nc" id="L173">        Redwood.log(&quot;debug-docreader&quot;, &quot;Processed &quot; + docIterator.docCnt + &quot; documents in &quot; + curFile.getAbsolutePath());</span>
+<span class="nc" id="L174">        docIterator.close();</span>
+<span class="nc" id="L175">        curFileIndex++;</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (curFileIndex &gt;= fileList.size()) {</span>
+<span class="nc" id="L177">          return null;  // DONE!</span>
+        }
+<span class="nc" id="L179">        curFile = fileList.get(curFileIndex);</span>
+<span class="nc" id="L180">        docIterator = new DocumentIterator(curFile.getAbsolutePath(), options);</span>
+      }
+<span class="nc" id="L182">      CoNLLDocument next = docIterator.next();</span>
+<span class="nc" id="L183">      Redwood.log(&quot;debug-docreader&quot;, &quot;Reading document: &quot; + next.getDocumentID()+&quot; part: &quot;+next.getPartNo());</span>
+<span class="nc" id="L184">      return next;</span>
+<span class="nc" id="L185">    } catch (IOException ex) {</span>
+<span class="nc" id="L186">      throw new RuntimeIOException(ex);</span>
+    }
+  }
+
+  public void close()
+  {
+<span class="nc" id="L192">    IOUtils.closeIgnoringExceptions(docIterator);</span>
+<span class="nc" id="L193">  }</span>
+
+<span class="nc" id="L195">  public static class NamedEntityAnnotation implements CoreAnnotation&lt;CoreMap&gt; {</span>
+    public Class&lt;CoreMap&gt; getType() {
+<span class="nc" id="L197">      return CoreMap.class;</span>
+    }
+  }
+
+<span class="nc" id="L201">  public static class CorefMentionAnnotation implements CoreAnnotation&lt;CoreMap&gt; {</span>
+    public Class&lt;CoreMap&gt; getType() {
+<span class="nc" id="L203">      return CoreMap.class;</span>
+    }
+  }
+
+  /** Flags **/
+  public static class Options {
+
+<span class="nc" id="L210">    public boolean printConLLLoadingMessage = true;</span>
+<span class="nc" id="L211">    public boolean useCorefBIOESEncoding = false; // Marks Coref mentions with prefix</span>
+                                                  // B- begin, I- inside, E- end, S- single
+<span class="nc" id="L213">    public boolean annotateTokenCoref = true;    // Annotate token with CorefAnnotation</span>
+                                                 // If token belongs to multiple clusters
+                                                 // coref clusterid are separted by '|'
+<span class="nc" id="L216">    public boolean annotateTokenSpeaker = true;  // Annotate token with SpeakerAnnotation</span>
+<span class="nc" id="L217">    public boolean annotateTokenPos = true;      // Annotate token with PartOfSpeechAnnotation</span>
+<span class="nc" id="L218">    public boolean annotateTokenNer = true;      // Annotate token with NamedEntityTagAnnotation</span>
+
+<span class="nc" id="L220">    public boolean annotateTreeCoref = false;     // Annotate tree with CorefMentionAnnotation</span>
+<span class="nc" id="L221">    public boolean annotateTreeNer = false;       // Annotate tree with NamedEntityAnnotation</span>
+
+<span class="nc" id="L223">    public Locale lang = Locale.ENGLISH;</span>
+
+<span class="nc" id="L225">    public String backgroundNerTag = &quot;O&quot;;        // Background NER tag</span>
+
+    protected String fileFilter;
+    protected Pattern filePattern;
+    protected boolean sortFiles;
+
+    public Options() {
+<span class="nc" id="L232">      this(&quot;.*_gold_conll$&quot;);      // _gold_conll or _auto_conll   or .conll</span>
+<span class="nc" id="L233">    }</span>
+
+<span class="nc" id="L235">    public Options(String filter) {</span>
+<span class="nc" id="L236">      fileFilter = filter;</span>
+<span class="nc" id="L237">      filePattern = Pattern.compile(fileFilter);</span>
+<span class="nc" id="L238">    }</span>
+
+    public void setFilter(String filter) {
+<span class="nc" id="L241">      fileFilter = filter;</span>
+<span class="nc" id="L242">      filePattern = Pattern.compile(fileFilter);</span>
+<span class="nc" id="L243">    }</span>
+  }
+
+<span class="nc" id="L246">  public static class CoNLLDocument implements Serializable {</span>
+    private static final long serialVersionUID = 6287339385357914531L;
+
+    String documentIdPart;
+    public String documentID;
+    String partNo;
+    public String filename;
+
+<span class="nc" id="L254">    public List&lt;List&lt;String[]&gt;&gt; sentenceWordLists = new ArrayList&lt;&gt;();</span>
+
+    Annotation annotation;
+    CollectionValuedMap&lt;String,CoreMap&gt; corefChainMap;
+    List&lt;CoreMap&gt; nerChunks;
+
+    public String getDocumentID() {
+<span class="nc" id="L261">      return documentID;</span>
+    }
+
+    public void setDocumentID(String documentID) {
+<span class="nc" id="L265">      this.documentID = documentID;</span>
+<span class="nc" id="L266">    }</span>
+
+    public String getPartNo() {
+<span class="nc" id="L269">      return partNo;</span>
+    }
+
+    public void setPartNo(String partNo) {
+<span class="nc" id="L273">      this.partNo = partNo;</span>
+<span class="nc" id="L274">    }</span>
+
+    public List&lt;List&lt;String[]&gt;&gt; getSentenceWordLists() {
+<span class="nc" id="L277">      return sentenceWordLists;</span>
+    }
+
+    public void addSentence(List&lt;String[]&gt; sentence) {
+<span class="nc" id="L281">      this.sentenceWordLists.add(sentence);</span>
+<span class="nc" id="L282">    }</span>
+
+    public Annotation getAnnotation() {
+<span class="nc" id="L285">      return annotation;</span>
+    }
+
+    public void setAnnotation(Annotation annotation) {
+<span class="nc" id="L289">      this.annotation = annotation;</span>
+<span class="nc" id="L290">    }</span>
+
+    public CollectionValuedMap&lt;String,CoreMap&gt; getCorefChainMap()
+    {
+<span class="nc" id="L294">      return corefChainMap;</span>
+    }
+  }
+
+  private static String getField(String[] fields, int pos)
+  {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    if (pos == FIELD_LAST) {</span>
+<span class="nc" id="L301">      return fields[fields.length - 1];</span>
+    } else {
+<span class="nc" id="L303">      return fields[pos];</span>
+    }
+  }
+
+  private static String concatField(List&lt;String[]&gt; sentWords, int pos)
+  {
+<span class="nc" id="L309">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">    for (String[] fields:sentWords) {</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">      if (sb.length() &gt; 0) {</span>
+<span class="nc" id="L312">        sb.append(' ');</span>
+      }
+<span class="nc" id="L314">      sb.append(getField(fields, pos));</span>
+<span class="nc" id="L315">    }</span>
+<span class="nc" id="L316">    return sb.toString();</span>
+  }
+
+  /** Helper iterator **/
+<span class="nc bnc" id="L320" title="All 2 branches missed.">  private static class DocumentIterator extends AbstractIterator&lt;CoNLLDocument&gt; implements Closeable {</span>
+
+<span class="nc" id="L322">    private static final Pattern delimiterPattern = Pattern.compile(&quot;\\s+&quot;);</span>
+<span class="nc" id="L323">    private static final LabeledScoredTreeReaderFactory treeReaderFactory =</span>
+            new LabeledScoredTreeReaderFactory((TreeNormalizer) null);
+
+    private final Options options;
+
+    // State
+    String filename;
+    BufferedReader br;
+    CoNLLDocument nextDoc;
+<span class="nc" id="L332">    int lineCnt = 0;</span>
+<span class="nc" id="L333">    int docCnt = 0;</span>
+
+<span class="nc" id="L335">    public DocumentIterator(String filename, Options options) throws IOException {</span>
+<span class="nc" id="L336">      this.options = options;</span>
+<span class="nc" id="L337">      this.filename = filename;</span>
+<span class="nc" id="L338">      this.br = IOUtils.getBufferedFileReader(filename);</span>
+<span class="nc" id="L339">      nextDoc = readNextDocument();</span>
+<span class="nc" id="L340">    }</span>
+
+    @Override
+    public boolean hasNext() {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">      return nextDoc != null;</span>
+    }
+
+    @Override
+    public CoNLLDocument next() {
+<span class="nc bnc" id="L349" title="All 2 branches missed.">      if (nextDoc == null) {</span>
+<span class="nc" id="L350">        throw new NoSuchElementException(&quot;DocumentIterator exhausted.&quot;);</span>
+      }
+<span class="nc" id="L352">      CoNLLDocument curDoc = nextDoc;</span>
+<span class="nc" id="L353">      nextDoc = readNextDocument();</span>
+<span class="nc" id="L354">      return curDoc;</span>
+    }
+
+<span class="nc" id="L357">    private static final Pattern starPattern = Pattern.compile(&quot;\\*&quot;);</span>
+
+    private static Tree wordsToParse(List&lt;String[]&gt; sentWords)
+    {
+<span class="nc" id="L361">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">      for (String[] fields:sentWords) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        if (sb.length() &gt; 0) {</span>
+<span class="nc" id="L364">          sb.append(' ');</span>
+        }
+
+<span class="nc" id="L367">        String str = fields[FIELD_PARSE_BIT].replace(&quot;NOPARSE&quot;, &quot;X&quot;);</span>
+<span class="nc" id="L368">        String tagword = &quot;(&quot; + fields[FIELD_POS_TAG] + &quot; &quot; + fields[FIELD_WORD] + &quot;)&quot;;</span>
+        // Replace stars
+<span class="nc" id="L370">        int si = str.indexOf('*');</span>
+<span class="nc" id="L371">        sb.append(str.substring(0, si));</span>
+<span class="nc" id="L372">        sb.append(tagword);</span>
+<span class="nc" id="L373">        sb.append(str.substring(si+1));</span>
+<span class="nc" id="L374">        si = str.indexOf('*', si+1);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (si &gt;= 0) {</span>
+<span class="nc" id="L376">          logger.warning(&quot; Parse bit with multiple *: &quot; + str);</span>
+        }
+<span class="nc" id="L378">      }</span>
+<span class="nc" id="L379">      String parseStr = sb.toString();</span>
+<span class="nc" id="L380">      return Tree.valueOf(parseStr, treeReaderFactory);</span>
+    }
+
+
+    private static List&lt;Triple&lt;Integer,Integer,String&gt;&gt; getCorefSpans(List&lt;String[]&gt; sentWords)
+    {
+<span class="nc" id="L386">      return getLabelledSpans(sentWords, FIELD_COREF, HYPHEN, true);</span>
+    }
+
+    private static List&lt;Triple&lt;Integer,Integer,String&gt;&gt; getNerSpans(List&lt;String[]&gt; sentWords)
+    {
+<span class="nc" id="L391">      return getLabelledSpans(sentWords, FIELD_NER_TAG, ASTERISK, false);</span>
+    }
+
+
+    private static final String ASTERISK = &quot;*&quot;;
+    private static final String HYPHEN = &quot;-&quot;;
+
+    private static List&lt;Triple&lt;Integer,Integer,String&gt;&gt; getLabelledSpans(List&lt;String[]&gt; sentWords, int fieldIndex,
+                                                                         String defaultMarker, boolean checkEndLabel)
+    {
+<span class="nc" id="L401">      List&lt;Triple&lt;Integer,Integer,String&gt;&gt; spans = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L402">      Stack&lt;Triple&lt;Integer,Integer, String&gt;&gt; openSpans = new Stack&lt;&gt;();</span>
+<span class="nc" id="L403">      boolean removeStar = (ASTERISK.equals(defaultMarker));</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">      for (int wordPos = 0; wordPos &lt; sentWords.size(); wordPos++) {</span>
+<span class="nc" id="L405">        String[] fields = sentWords.get(wordPos);</span>
+<span class="nc" id="L406">        String val = getField(fields, fieldIndex);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        if (!defaultMarker.equals(val)) {</span>
+<span class="nc" id="L408">          int openParenIndex = -1;</span>
+<span class="nc" id="L409">          int lastDelimiterIndex = -1;</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">          for (int j = 0; j &lt; val.length(); j++) {</span>
+<span class="nc" id="L411">            char c = val.charAt(j);</span>
+<span class="nc" id="L412">            boolean isDelimiter = false;</span>
+<span class="nc bnc" id="L413" title="All 6 branches missed.">            if (c == '(' || c == ')' || c == '|') {</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">              if (openParenIndex &gt;= 0) {</span>
+<span class="nc" id="L415">                String s = val.substring(openParenIndex+1, j);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                if (removeStar) {</span>
+<span class="nc" id="L417">                  s = starPattern.matcher(s).replaceAll(&quot;&quot;);</span>
+                }
+<span class="nc" id="L419">                openSpans.push(new Triple&lt;&gt;(wordPos, -1, s));</span>
+<span class="nc" id="L420">                openParenIndex = -1;</span>
+              }
+<span class="nc" id="L422">              isDelimiter = true;</span>
+            }
+<span class="nc bnc" id="L424" title="All 2 branches missed.">            if (c == '(') {</span>
+<span class="nc" id="L425">              openParenIndex = j;</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">            } else if (c == ')') {</span>
+<span class="nc" id="L427">              Triple&lt;Integer, Integer, String&gt; t = openSpans.pop();</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">              if (checkEndLabel) {</span>
+                // NOTE: end parens may cross (usually because mention either start or end on the same token
+                // and it is just an artifact of the ordering
+<span class="nc" id="L431">                String s = val.substring(lastDelimiterIndex+1, j);</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">                if (!s.equals(t.third())) {</span>
+<span class="nc" id="L433">                  Stack&lt;Triple&lt;Integer,Integer, String&gt;&gt; saved = new Stack&lt;&gt;();</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">                  while (!s.equals(t.third())) {</span>
+                    // find correct match
+<span class="nc" id="L436">                    saved.push(t);</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                    if (openSpans.isEmpty()) {</span>
+<span class="nc" id="L438">                      throw new RuntimeException(&quot;Cannot find matching labelled span for &quot; + s);</span>
+                    }
+<span class="nc" id="L440">                    t = openSpans.pop();</span>
+                  }
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                  while (!saved.isEmpty()) {</span>
+<span class="nc" id="L443">                    openSpans.push(saved.pop());</span>
+                  }
+<span class="nc bnc" id="L445" title="All 4 branches missed.">                  assert(s.equals(t.third()));</span>
+                }
+              }
+<span class="nc" id="L448">              t.setSecond(wordPos);</span>
+<span class="nc" id="L449">              spans.add(t);</span>
+            }
+<span class="nc bnc" id="L451" title="All 2 branches missed.">            if (isDelimiter) {</span>
+<span class="nc" id="L452">              lastDelimiterIndex = j;</span>
+            }
+          }
+<span class="nc bnc" id="L455" title="All 2 branches missed.">          if (openParenIndex &gt;= 0) {</span>
+<span class="nc" id="L456">            String s = val.substring(openParenIndex+1, val.length());</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            if (removeStar) {</span>
+<span class="nc" id="L458">              s = starPattern.matcher(s).replaceAll(&quot;&quot;);</span>
+            }
+<span class="nc" id="L460">            openSpans.push(new Triple&lt;&gt;(wordPos, -1, s));</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L464" title="All 2 branches missed.">      if (openSpans.size() != 0) {</span>
+<span class="nc" id="L465">        throw new RuntimeException(&quot;Error extracting labelled spans for column &quot; + fieldIndex + &quot;: &quot;</span>
+<span class="nc" id="L466">                + concatField(sentWords, fieldIndex));</span>
+      }
+<span class="nc" id="L468">      return spans;</span>
+    }
+
+    private CoreMap wordsToSentence(List&lt;String[]&gt; sentWords)
+    {
+<span class="nc" id="L473">      String sentText = concatField(sentWords, FIELD_WORD);</span>
+<span class="nc" id="L474">      Annotation sentence = new Annotation(sentText);</span>
+<span class="nc" id="L475">      Tree tree = wordsToParse(sentWords);</span>
+<span class="nc" id="L476">      sentence.set(TreeCoreAnnotations.TreeAnnotation.class, tree);</span>
+<span class="nc" id="L477">      List&lt;Tree&gt; leaves = tree.getLeaves();</span>
+      // Check leaves == number of words
+<span class="nc bnc" id="L479" title="All 4 branches missed.">      assert(leaves.size() == sentWords.size());</span>
+<span class="nc" id="L480">      List&lt;CoreLabel&gt; tokens = new ArrayList&lt;&gt;(leaves.size());</span>
+<span class="nc" id="L481">      sentence.set(CoreAnnotations.TokensAnnotation.class, tokens);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">      for (int i = 0; i &lt; sentWords.size(); i++) {</span>
+<span class="nc" id="L483">        String[] fields = sentWords.get(i);</span>
+<span class="nc" id="L484">        int wordPos = Integer.parseInt(fields[FIELD_WORD_NO]);</span>
+<span class="nc bnc" id="L485" title="All 4 branches missed.">        assert(wordPos == i);</span>
+<span class="nc" id="L486">        Tree leaf = leaves.get(i);</span>
+<span class="nc" id="L487">        CoreLabel token = (CoreLabel) leaf.label();</span>
+<span class="nc" id="L488">        tokens.add(token);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        if (options.annotateTokenSpeaker) {</span>
+<span class="nc" id="L490">          String speaker = fields[FIELD_SPEAKER_AUTHOR].replace(&quot;_&quot;, &quot; &quot;);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">          if (!HYPHEN.equals(speaker)) {</span>
+<span class="nc" id="L492">            token.set(CoreAnnotations.SpeakerAnnotation.class, speaker);</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L496" title="All 2 branches missed.">      if (options.annotateTokenPos) {</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        for (Tree leaf:leaves) {</span>
+<span class="nc" id="L498">          CoreLabel token = (CoreLabel) leaf.label();</span>
+<span class="nc" id="L499">          token.set(CoreAnnotations.PartOfSpeechAnnotation.class, leaf.parent(tree).value());</span>
+<span class="nc" id="L500">        }</span>
+      }
+<span class="nc bnc" id="L502" title="All 2 branches missed.">      if (options.annotateTokenNer) {</span>
+<span class="nc" id="L503">        List&lt;Triple&lt;Integer,Integer,String&gt;&gt; nerSpans = getNerSpans(sentWords);</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">        for (Triple&lt;Integer,Integer,String&gt; nerSpan:nerSpans) {</span>
+<span class="nc" id="L505">          int startToken = nerSpan.first();</span>
+<span class="nc" id="L506">          int endToken = nerSpan.second(); /* inclusive */</span>
+<span class="nc" id="L507">          String label = nerSpan.third();</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">          for (int i = startToken; i &lt;= endToken; i++) {</span>
+<span class="nc" id="L509">            Tree leaf = leaves.get(i);</span>
+<span class="nc" id="L510">            CoreLabel token = (CoreLabel) leaf.label();</span>
+<span class="nc" id="L511">            String oldLabel = token.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">            if (oldLabel != null) {</span>
+<span class="nc" id="L513">              logger.warning(&quot;Replacing old named entity tag &quot; + oldLabel + &quot; with &quot; + label);</span>
+            }
+<span class="nc" id="L515">            token.set(CoreAnnotations.NamedEntityTagAnnotation.class, label);</span>
+          }
+<span class="nc" id="L517">        }</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        for (CoreLabel token:tokens) {</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">          if (!token.containsKey(CoreAnnotations.NamedEntityTagAnnotation.class)) {</span>
+<span class="nc" id="L520">            token.set(CoreAnnotations.NamedEntityTagAnnotation.class, options.backgroundNerTag);</span>
+          }
+<span class="nc" id="L522">        }</span>
+      }
+<span class="nc bnc" id="L524" title="All 2 branches missed.">      if (options.annotateTokenCoref) {</span>
+<span class="nc" id="L525">        List&lt;Triple&lt;Integer,Integer,String&gt;&gt; corefSpans = getCorefSpans(sentWords);</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">        for (Triple&lt;Integer,Integer,String&gt; corefSpan:corefSpans) {</span>
+<span class="nc" id="L527">          int startToken = corefSpan.first();</span>
+<span class="nc" id="L528">          int endToken = corefSpan.second(); /* inclusive */</span>
+<span class="nc" id="L529">          String label = corefSpan.third();</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">          for (int i = startToken; i &lt;= endToken; i++) {</span>
+<span class="nc" id="L531">            Tree leaf = leaves.get(i);</span>
+<span class="nc" id="L532">            CoreLabel token = (CoreLabel) leaf.label();</span>
+<span class="nc" id="L533">            String curLabel = label;</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            if (options.useCorefBIOESEncoding) {</span>
+              String prefix;
+<span class="nc bnc" id="L536" title="All 2 branches missed.">              if (startToken == endToken) {</span>
+<span class="nc" id="L537">                prefix = &quot;S-&quot;;</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">              } else if (i == startToken) {</span>
+<span class="nc" id="L539">                prefix = &quot;B-&quot;;</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">              } else if (i == endToken) {</span>
+<span class="nc" id="L541">                prefix = &quot;E-&quot;;</span>
+              } else {
+<span class="nc" id="L543">                prefix = &quot;I-&quot;;</span>
+              }
+<span class="nc" id="L545">              curLabel = prefix + label;</span>
+            }
+<span class="nc" id="L547">            String oldLabel = token.get(CorefCoreAnnotations.CorefAnnotation.class);</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            if (oldLabel != null) {</span>
+<span class="nc" id="L549">              curLabel = oldLabel + &quot;|&quot; + curLabel;</span>
+            }
+<span class="nc" id="L551">            token.set(CorefCoreAnnotations.CorefAnnotation.class, curLabel);</span>
+          }
+<span class="nc" id="L553">        }</span>
+      }
+<span class="nc" id="L555">      return sentence;</span>
+    }
+
+    public static Annotation sentencesToDocument(String documentID, List&lt;CoreMap&gt; sentences)
+    {
+<span class="nc" id="L560">      String docText = null;</span>
+<span class="nc" id="L561">      Annotation document = new Annotation(docText);</span>
+<span class="nc" id="L562">      document.set(CoreAnnotations.DocIDAnnotation.class, documentID);</span>
+<span class="nc" id="L563">      document.set(CoreAnnotations.SentencesAnnotation.class, sentences);</span>
+
+
+      // Accumulate docTokens and label sentence with overall token begin/end, and sentence index annotations
+<span class="nc" id="L567">      List&lt;CoreLabel&gt; docTokens = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L568">      int sentenceIndex = 0;</span>
+<span class="nc" id="L569">      int tokenBegin = 0;</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">      for (CoreMap sentenceAnnotation:sentences) {</span>
+<span class="nc" id="L571">        List&lt;CoreLabel&gt; sentenceTokens = sentenceAnnotation.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L572">        docTokens.addAll(sentenceTokens);</span>
+
+<span class="nc" id="L574">        int tokenEnd = tokenBegin + sentenceTokens.size();</span>
+<span class="nc" id="L575">        sentenceAnnotation.set(CoreAnnotations.TokenBeginAnnotation.class, tokenBegin);</span>
+<span class="nc" id="L576">        sentenceAnnotation.set(CoreAnnotations.TokenEndAnnotation.class, tokenEnd);</span>
+<span class="nc" id="L577">        sentenceAnnotation.set(CoreAnnotations.SentenceIndexAnnotation.class, sentenceIndex);</span>
+<span class="nc" id="L578">        sentenceIndex++;</span>
+<span class="nc" id="L579">        tokenBegin = tokenEnd;</span>
+<span class="nc" id="L580">      }</span>
+<span class="nc" id="L581">      document.set(CoreAnnotations.TokensAnnotation.class, docTokens);</span>
+
+      // Put in character offsets
+<span class="nc" id="L584">      int i = 0;</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">      for (CoreLabel token:docTokens) {</span>
+<span class="nc" id="L586">        String tokenText = token.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc" id="L587">        token.set(CoreAnnotations.CharacterOffsetBeginAnnotation.class, i);</span>
+<span class="nc" id="L588">        i+=tokenText.length();</span>
+<span class="nc" id="L589">        token.set(CoreAnnotations.CharacterOffsetEndAnnotation.class, i);</span>
+<span class="nc" id="L590">        i++; // Skip space</span>
+<span class="nc" id="L591">      }</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">      for (CoreMap sentenceAnnotation:sentences) {</span>
+<span class="nc" id="L593">        List&lt;CoreLabel&gt; sentenceTokens = sentenceAnnotation.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L594">        sentenceAnnotation.set(CoreAnnotations.CharacterOffsetBeginAnnotation.class,</span>
+<span class="nc" id="L595">                sentenceTokens.get(0).get(CoreAnnotations.CharacterOffsetBeginAnnotation.class));</span>
+<span class="nc" id="L596">        sentenceAnnotation.set(CoreAnnotations.CharacterOffsetEndAnnotation.class,</span>
+<span class="nc" id="L597">                sentenceTokens.get(sentenceTokens.size()-1).get(CoreAnnotations.CharacterOffsetEndAnnotation.class));</span>
+<span class="nc" id="L598">      }</span>
+
+<span class="nc" id="L600">      return document;</span>
+    }
+
+    private static Tree getLowestCommonAncestor(Tree root, int startToken, int endToken)
+    {
+<span class="nc" id="L605">      Tree leftLeaf = Trees.getLeaf(root, startToken);</span>
+<span class="nc" id="L606">      Tree rightLeaf = Trees.getLeaf(root, endToken);</span>
+      // todo [cdm 2013]: It might be good to climb certain unaries here, like VP or S under NP, but it's not good to climb all unaries (e.g., NP under FRAG)
+<span class="nc" id="L608">      return Trees.getLowestCommonAncestor(leftLeaf, rightLeaf, root);</span>
+    }
+
+    private static Tree getTreeNonTerminal(Tree root, int startToken, int endToken, boolean acceptPreTerminals)
+    {
+<span class="nc" id="L613">      Tree t = getLowestCommonAncestor(root, startToken, endToken);</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">      if (t.isLeaf()) {</span>
+<span class="nc" id="L615">        t = t.parent(root);</span>
+      }
+<span class="nc bnc" id="L617" title="All 4 branches missed.">      if (!acceptPreTerminals &amp;&amp; t.isPreTerminal()) {</span>
+<span class="nc" id="L618">        t = t.parent(root);</span>
+      }
+<span class="nc" id="L620">      return t;</span>
+    }
+
+    public void annotateDocument(CoNLLDocument document)
+    {
+<span class="nc" id="L625">      List&lt;CoreMap&gt; sentences = new ArrayList&lt;&gt;(document.sentenceWordLists.size());</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">      for (List&lt;String[]&gt; sentWords:document.sentenceWordLists) {</span>
+<span class="nc" id="L627">        sentences.add(wordsToSentence(sentWords));</span>
+<span class="nc" id="L628">      }</span>
+
+<span class="nc" id="L630">      Annotation docAnnotation = sentencesToDocument(document.documentIdPart /*document.documentID + &quot;.&quot; + document.partNo */, sentences);</span>
+<span class="nc" id="L631">      document.setAnnotation(docAnnotation);</span>
+
+      // Do this here so we have updated character offsets and all
+<span class="nc" id="L634">      CollectionValuedMap&lt;String, CoreMap&gt; corefChainMap = new CollectionValuedMap&lt;&gt;(CollectionFactory.&lt;CoreMap&gt;arrayListFactory());</span>
+<span class="nc" id="L635">      List&lt;CoreMap&gt; nerChunks = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); i++) {</span>
+<span class="nc" id="L637">        CoreMap sentence = sentences.get(i);</span>
+<span class="nc" id="L638">        Tree tree = sentence.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc" id="L639">        tree.setSpans();</span>
+<span class="nc" id="L640">        List&lt;String[]&gt; sentWords = document.sentenceWordLists.get(i);</span>
+
+        // Get NER chunks
+<span class="nc" id="L643">        List&lt;Triple&lt;Integer,Integer,String&gt;&gt; nerSpans = getNerSpans(sentWords);</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">        for (Triple&lt;Integer,Integer,String&gt; nerSpan:nerSpans) {</span>
+<span class="nc" id="L645">          int startToken = nerSpan.first();</span>
+<span class="nc" id="L646">          int endToken = nerSpan.second(); /* inclusive */</span>
+<span class="nc" id="L647">          String label = nerSpan.third();</span>
+<span class="nc" id="L648">          CoreMap nerChunk = ChunkAnnotationUtils.getAnnotatedChunk(sentence, startToken, endToken+1);</span>
+<span class="nc" id="L649">          nerChunk.set(CoreAnnotations.NamedEntityTagAnnotation.class, label);</span>
+<span class="nc" id="L650">          nerChunk.set(CoreAnnotations.SentenceIndexAnnotation.class, sentence.get(CoreAnnotations.SentenceIndexAnnotation.class));</span>
+<span class="nc" id="L651">          nerChunks.add(nerChunk);</span>
+<span class="nc" id="L652">          Tree t = getTreeNonTerminal(tree, startToken, endToken, true);</span>
+<span class="nc bnc" id="L653" title="All 4 branches missed.">          if (t.getSpan().getSource() == startToken &amp;&amp; t.getSpan().getTarget() == endToken) {</span>
+<span class="nc" id="L654">            nerChunk.set(TreeCoreAnnotations.TreeAnnotation.class, t);</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">            if (options.annotateTreeNer) {</span>
+<span class="nc" id="L656">              Label tlabel = t.label();</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">              if (tlabel instanceof CoreLabel) {</span>
+<span class="nc" id="L658">                ((CoreLabel) tlabel).set(NamedEntityAnnotation.class, nerChunk);</span>
+              }
+            }
+          }
+<span class="nc" id="L662">        }</span>
+
+<span class="nc" id="L664">        List&lt;Triple&lt;Integer,Integer,String&gt;&gt; corefSpans = getCorefSpans(sentWords);</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        for (Triple&lt;Integer,Integer,String&gt; corefSpan:corefSpans) {</span>
+<span class="nc" id="L666">          int startToken = corefSpan.first();</span>
+<span class="nc" id="L667">          int endToken = corefSpan.second(); /* inclusive */</span>
+<span class="nc" id="L668">          String corefId = corefSpan.third();</span>
+<span class="nc" id="L669">          CoreMap mention = ChunkAnnotationUtils.getAnnotatedChunk(sentence, startToken, endToken+1);</span>
+<span class="nc" id="L670">          mention.set(CorefCoreAnnotations.CorefAnnotation.class, corefId);</span>
+<span class="nc" id="L671">          mention.set(CoreAnnotations.SentenceIndexAnnotation.class, sentence.get(CoreAnnotations.SentenceIndexAnnotation.class));</span>
+<span class="nc" id="L672">          corefChainMap.add(corefId, mention);</span>
+<span class="nc" id="L673">          Tree t = getTreeNonTerminal(tree, startToken, endToken, true);</span>
+<span class="nc" id="L674">          mention.set(TreeCoreAnnotations.TreeAnnotation.class, t);</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">          if (options.annotateTreeCoref) {</span>
+<span class="nc" id="L676">            Label tlabel = t.label();</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">            if (tlabel instanceof CoreLabel) {</span>
+<span class="nc" id="L678">              ((CoreLabel) tlabel).set(CorefMentionAnnotation.class, mention);</span>
+            }
+          }
+<span class="nc" id="L681">        }</span>
+
+      }
+<span class="nc" id="L684">      document.corefChainMap = corefChainMap;</span>
+<span class="nc" id="L685">      document.nerChunks = nerChunks;</span>
+<span class="nc" id="L686">    }</span>
+
+    private static final String docStart = &quot;#begin document &quot;;
+<span class="nc" id="L689">    private static final int docStartLength = docStart.length();</span>
+
+    public CoNLLDocument readNextDocument() {
+      try {
+<span class="nc" id="L693">        List&lt;String[]&gt; curSentWords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L694">        CoNLLDocument document = null;</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        for (String line; (line = br.readLine()) != null; ) {</span>
+<span class="nc" id="L696">          lineCnt++;</span>
+<span class="nc" id="L697">          line = line.trim();</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">          if (line.length() != 0) {</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            if (line.startsWith(docStart)) {</span>
+              // Start of new document
+<span class="nc bnc" id="L701" title="All 2 branches missed.">              if (document != null) {</span>
+<span class="nc" id="L702">                logger.warning(&quot;Unexpected begin document at line (\&quot; + filename + \&quot;,\&quot; + lineCnt + \&quot;)&quot;);</span>
+              }
+<span class="nc" id="L704">              document = new CoNLLDocument();</span>
+<span class="nc" id="L705">              document.filename = this.filename;</span>
+<span class="nc" id="L706">              document.documentIdPart = line.substring(docStartLength);</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">            } else if (line.startsWith(&quot;#end document&quot;)) {</span>
+<span class="nc" id="L708">              annotateDocument(document);</span>
+<span class="nc" id="L709">              docCnt++;</span>
+<span class="nc" id="L710">              return document;</span>
+              // End of document
+            } else {
+<span class="nc bnc" id="L713" title="All 4 branches missed.">              assert document != null;</span>
+<span class="nc" id="L714">              String[] fields = delimiterPattern.split(line);</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">              if (fields.length &lt; FIELDS_MIN) {</span>
+<span class="nc" id="L716">                throw new RuntimeException(&quot;Unexpected number of field &quot; + fields.length +</span>
+                        &quot;, expected &gt;= &quot; + FIELDS_MIN + &quot; for line (&quot; + filename + &quot;,&quot; + lineCnt + &quot;): &quot; + line);
+              }
+<span class="nc" id="L719">              String curDocId = fields[FIELD_DOC_ID];</span>
+<span class="nc" id="L720">              String partNo = fields[FIELD_PART_NO];</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">              if (document.getDocumentID() == null) {</span>
+<span class="nc" id="L722">                document.setDocumentID(curDocId);</span>
+<span class="nc" id="L723">                document.setPartNo(partNo);</span>
+              } else {
+                // Check documentID didn't suddenly change on us
+<span class="nc bnc" id="L726" title="All 4 branches missed.">                assert(document.getDocumentID().equals(curDocId));</span>
+<span class="nc bnc" id="L727" title="All 4 branches missed.">                assert(document.getPartNo().equals(partNo));</span>
+              }
+<span class="nc" id="L729">              curSentWords.add(fields);</span>
+<span class="nc" id="L730">            }</span>
+          } else {
+            // Current sentence has ended, new sentence is about to be started
+<span class="nc bnc" id="L733" title="All 2 branches missed.">            if (curSentWords.size() &gt; 0) {</span>
+<span class="nc bnc" id="L734" title="All 4 branches missed.">              assert document != null;</span>
+<span class="nc" id="L735">              document.addSentence(curSentWords);</span>
+<span class="nc" id="L736">              curSentWords = new ArrayList&lt;&gt;();</span>
+            }
+          }
+        }
+<span class="nc" id="L740">      } catch (IOException ex) {</span>
+<span class="nc" id="L741">        throw new RuntimeIOException(ex);</span>
+<span class="nc" id="L742">      }</span>
+<span class="nc" id="L743">      return null;</span>
+    }
+
+    public void close() {
+<span class="nc" id="L747">      IOUtils.closeIgnoringExceptions(br);</span>
+<span class="nc" id="L748">    }</span>
+
+  } // end static class DocumentIterator
+
+  public static void usage()
+  {
+<span class="nc" id="L754">    log.info(&quot;java edu.stanford.nlp.dcoref.CoNLL2011DocumentReader [-ext &lt;extension to match&gt;] -i &lt;inputpath&gt; -o &lt;outputfile&gt;&quot;);</span>
+<span class="nc" id="L755">  }</span>
+
+  public static Pair&lt;Integer,Integer&gt; getMention(Integer index, String corefG, List&lt;CoreLabel&gt; sentenceAnno) {
+
+<span class="nc" id="L759">    Integer i = -1;</span>
+<span class="nc" id="L760">    Integer end = index;</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">    for (CoreLabel newAnno : sentenceAnno) {</span>
+<span class="nc" id="L762">      i += 1;</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">      if (i &gt; index) {</span>
+<span class="nc" id="L764">        String corefS = newAnno.get(CorefCoreAnnotations.CorefAnnotation.class);</span>
+<span class="nc bnc" id="L765" title="All 2 branches missed.">        if (corefS != null) {</span>
+<span class="nc" id="L766">          String[] allC = corefS.split(&quot;\\|&quot;);</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">          if (Arrays.asList(allC).contains(corefG)) {</span>
+<span class="nc" id="L768">            end = i;</span>
+          } else {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+<span class="nc" id="L776">    }</span>
+<span class="nc" id="L777">    return Pair.makePair(index, end);</span>
+  }
+
+  public static boolean include(Map&lt;Pair&lt;Integer,Integer&gt;,String&gt; sentenceInfo,
+                                Pair&lt;Integer,Integer&gt; mention,
+                                String corefG) {
+<span class="nc" id="L783">    Set&lt;Pair&lt;Integer,Integer&gt;&gt; keys = sentenceInfo.keySet();</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">    for (Pair&lt;Integer, Integer&gt; key : keys) {</span>
+<span class="nc" id="L785">      String corefS = sentenceInfo.get(key);</span>
+<span class="nc bnc" id="L786" title="All 4 branches missed.">      if (corefS != null &amp;&amp; corefS.equals(corefG)) {</span>
+<span class="nc bnc" id="L787" title="All 4 branches missed.">        if (key.first &lt; mention.first &amp;&amp; key.second.equals(mention.second)) {</span>
+<span class="nc" id="L788">          return true;</span>
+        }
+      }
+<span class="nc" id="L791">    }</span>
+<span class="nc" id="L792">    return false;</span>
+  }
+
+  public static void writeTabSep(PrintWriter pw, CoreMap sentence, CollectionValuedMap&lt;String,CoreMap&gt; chainmap)
+  {
+<span class="nc" id="L797">    HeadFinder headFinder = new ModCollinsHeadFinder();</span>
+
+<span class="nc" id="L799">    List&lt;CoreLabel&gt; sentenceAnno = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+
+<span class="nc" id="L801">    Tree sentenceTree = sentence.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc" id="L802">    Map&lt;Pair&lt;Integer,Integer&gt;,String&gt; sentenceInfo = Generics.newHashMap();</span>
+
+<span class="nc" id="L804">    Set&lt;Tree&gt; sentenceSubTrees = sentenceTree.subTrees();</span>
+<span class="nc" id="L805">    sentenceTree.setSpans();</span>
+<span class="nc" id="L806">    Map&lt;Pair&lt;Integer,Integer&gt;,Tree&gt; treeSpanMap = Generics.newHashMap();</span>
+<span class="nc" id="L807">    Map&lt;Pair&lt;Integer,Integer&gt;,List&lt;Tree&gt;&gt; wordSpanMap = Generics.newHashMap();</span>
+
+<span class="nc bnc" id="L809" title="All 2 branches missed.">    for (Tree ctree : sentenceSubTrees) {</span>
+<span class="nc" id="L810">      IntPair span = ctree.getSpan();</span>
+<span class="nc bnc" id="L811" title="All 2 branches missed.">      if (span != null) {</span>
+<span class="nc" id="L812">        treeSpanMap.put(Pair.makePair(span.getSource(), span.getTarget()), ctree);</span>
+<span class="nc" id="L813">        wordSpanMap.put(Pair.makePair(span.getSource(), span.getTarget()), ctree.getLeaves());</span>
+      }
+<span class="nc" id="L815">    }</span>
+
+    String[][] finalSentence;
+<span class="nc" id="L818">    finalSentence = new String [sentenceAnno.size()][];</span>
+<span class="nc" id="L819">    Map&lt;Pair&lt;Integer,Integer&gt;,String&gt; allHeads = Generics.newHashMap();</span>
+
+<span class="nc" id="L821">    int index = -1;</span>
+<span class="nc bnc" id="L822" title="All 2 branches missed.">    for (CoreLabel newAnno : sentenceAnno) {</span>
+<span class="nc" id="L823">      index += 1;</span>
+<span class="nc" id="L824">      String word = newAnno.word();</span>
+<span class="nc" id="L825">      String tag = newAnno.tag();</span>
+<span class="nc" id="L826">      String cat = newAnno.ner();</span>
+<span class="nc" id="L827">      String coref = newAnno.get(CorefCoreAnnotations.CorefAnnotation.class);</span>
+<span class="nc" id="L828">      finalSentence[index] = new String[4];</span>
+<span class="nc" id="L829">      finalSentence[index][0] = word;</span>
+<span class="nc" id="L830">      finalSentence[index][1] = tag;</span>
+<span class="nc" id="L831">      finalSentence[index][2] = cat;</span>
+<span class="nc" id="L832">      finalSentence[index][3] = coref;</span>
+
+<span class="nc bnc" id="L834" title="All 2 branches missed.">      if (coref == null) {</span>
+<span class="nc" id="L835">        sentenceInfo.put(Pair.makePair(index, index), coref);</span>
+<span class="nc" id="L836">        finalSentence[index][3] = &quot;O&quot;;</span>
+
+      } else {
+<span class="nc" id="L839">        String[] allC = coref.split(&quot;\\|&quot;);</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        for (String corefG : allC) {</span>
+<span class="nc" id="L841">          Pair&lt;Integer, Integer&gt; mention = getMention(index, corefG, sentenceAnno);</span>
+
+<span class="nc bnc" id="L843" title="All 2 branches missed.">          if ( ! include(sentenceInfo, mention, corefG)) {</span>
+            // find largest NP in mention
+<span class="nc" id="L845">            sentenceInfo.put(mention, corefG);</span>
+<span class="nc" id="L846">            Tree mentionTree = treeSpanMap.get(mention);</span>
+<span class="nc" id="L847">            String head = null;</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            if (mentionTree != null) {</span>
+<span class="nc" id="L849">              head = mentionTree.headTerminal(headFinder).nodeString();</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">            } else if (mention.first.equals(mention.second)) {</span>
+<span class="nc" id="L851">              head = word;</span>
+            }
+<span class="nc" id="L853">            allHeads.put(mention, head);</span>
+          }
+        }
+
+<span class="nc bnc" id="L857" title="All 2 branches missed.">        if (allHeads.values().contains(word)) {</span>
+<span class="nc" id="L858">          finalSentence[index][3] = &quot;MENTION&quot;;</span>
+        } else {
+<span class="nc" id="L860">          finalSentence[index][3] = &quot;O&quot;;</span>
+        }
+      }
+<span class="nc" id="L863">    }</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">    for (int i=0;i&lt;finalSentence.length;i++){</span>
+<span class="nc" id="L865">      String[] wordInfo = finalSentence[i];</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">      if (i&lt;finalSentence.length-1){</span>
+<span class="nc" id="L867">        String[] nextWordInfo = finalSentence[i+1];</span>
+<span class="nc bnc" id="L868" title="All 4 branches missed.">        if (nextWordInfo[3].equals(&quot;MENTION&quot;) &amp;&amp; nextWordInfo[0].equals(&quot;'s&quot;)){</span>
+<span class="nc" id="L869">          wordInfo[3] = &quot;MENTION&quot;;</span>
+<span class="nc" id="L870">          finalSentence[i+1][3] = &quot;O&quot;;</span>
+        }
+      }
+<span class="nc" id="L873">      pw.println(wordInfo[0] + &quot;\t&quot; + wordInfo[1] + &quot;\t&quot; + wordInfo[2] + &quot;\t&quot; + wordInfo[3]);</span>
+    }
+
+<span class="nc" id="L876">    pw.println(&quot;&quot;);</span>
+
+<span class="nc" id="L878">  }</span>
+
+<span class="nc" id="L880">  public static class CorpusStats</span>
+  {
+<span class="nc" id="L882">    IntCounter&lt;String&gt; mentionTreeLabelCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L883">    IntCounter&lt;String&gt; mentionTreeNonPretermLabelCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L884">    IntCounter&lt;String&gt; mentionTreePretermNonPretermNoMatchLabelCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L885">    IntCounter&lt;String&gt; mentionTreeMixedLabelCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L886">    IntCounter&lt;Integer&gt; mentionTokenLengthCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L887">    IntCounter&lt;Integer&gt; nerMentionTokenLengthCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L888">    int mentionExactTreeSpan = 0;</span>
+<span class="nc" id="L889">    int nonPretermSpanMatches = 0;</span>
+<span class="nc" id="L890">    int totalMentions = 0;</span>
+<span class="nc" id="L891">    int nestedNerMentions = 0;</span>
+<span class="nc" id="L892">    int nerMentions = 0;</span>
+
+    public void process(CoNLLDocument doc)
+    {
+<span class="nc" id="L896">      List&lt;CoreMap&gt; sentences = doc.getAnnotation().get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">      for (String id:doc.corefChainMap.keySet()) {</span>
+<span class="nc" id="L898">        Collection&lt;CoreMap&gt; mentions = doc.corefChainMap.get(id);</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        for (CoreMap m:mentions) {</span>
+<span class="nc" id="L900">          CoreMap sent = sentences.get(m.get(CoreAnnotations.SentenceIndexAnnotation.class));</span>
+<span class="nc" id="L901">          Tree root = sent.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc" id="L902">          Tree t = m.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc" id="L903">          Tree npt = t;</span>
+<span class="nc" id="L904">          Tree npt2 = t;</span>
+<span class="nc bnc" id="L905" title="All 2 branches missed.">          if (npt.isPreTerminal()) {</span>
+<span class="nc" id="L906">            npt = npt.parent(root);</span>
+          }
+<span class="nc" id="L908">          int sentTokenStart = sent.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc" id="L909">          int tokenStart = m.get(CoreAnnotations.TokenBeginAnnotation.class) - sentTokenStart;</span>
+<span class="nc" id="L910">          int tokenEnd = m.get(CoreAnnotations.TokenEndAnnotation.class) - sentTokenStart;</span>
+<span class="nc" id="L911">          int length = tokenEnd - tokenStart;</span>
+<span class="nc" id="L912">          mentionTokenLengthCounter.incrementCount(length);</span>
+          // Check if exact span
+<span class="nc" id="L914">          IntPair span = t.getSpan();</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">          if (span != null) {</span>
+<span class="nc bnc" id="L916" title="All 4 branches missed.">            if (span.getSource() == tokenStart &amp;&amp; span.getTarget() == tokenEnd - 1) {</span>
+<span class="nc" id="L917">              mentionExactTreeSpan++;</span>
+            } else {
+<span class="nc" id="L919">              logger.info(&quot;Tree span is &quot; + span + &quot;, tree node is &quot; + t);</span>
+<span class="nc" id="L920">              logger.info(&quot;Mention span is &quot; + tokenStart + &quot; &quot; + (tokenEnd - 1) + &quot;, mention is &quot; + m);</span>
+            }
+          } else {
+<span class="nc" id="L923">            logger.warning(&quot;No span for &quot; + t);</span>
+          }
+<span class="nc" id="L925">          IntPair nptSpan = npt.getSpan();</span>
+<span class="nc bnc" id="L926" title="All 4 branches missed.">          if (nptSpan.getSource() == tokenStart &amp;&amp; nptSpan.getTarget() == tokenEnd - 1) {</span>
+<span class="nc" id="L927">            nonPretermSpanMatches++;</span>
+<span class="nc" id="L928">            npt2 = npt;</span>
+          } else {
+<span class="nc" id="L930">            mentionTreePretermNonPretermNoMatchLabelCounter.incrementCount(t.label().value());</span>
+<span class="nc" id="L931">            logger.info(&quot;NPT: Tree span is &quot; + span + &quot;, tree node is &quot; + npt);</span>
+<span class="nc" id="L932">            logger.info(&quot;NPT: Mention span is &quot; + tokenStart + &quot; &quot; + (tokenEnd - 1) + &quot;, mention is &quot; + m);</span>
+<span class="nc" id="L933">            Label tlabel = t.label();</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">            if (tlabel instanceof CoreLabel) {</span>
+<span class="nc" id="L935">              CoreMap mention = ((CoreLabel) tlabel).get(CorefMentionAnnotation.class);</span>
+<span class="nc" id="L936">              String corefClusterId = mention.get(CorefCoreAnnotations.CorefAnnotation.class);</span>
+<span class="nc" id="L937">              Collection&lt;CoreMap&gt; clusteredMentions = doc.corefChainMap.get(corefClusterId);</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">              for (CoreMap m2:clusteredMentions) {</span>
+<span class="nc" id="L939">                logger.info(&quot;NPT: Clustered mention &quot; + m2.get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L940">              }</span>
+            }
+
+          }
+<span class="nc" id="L944">          totalMentions++;</span>
+<span class="nc" id="L945">          mentionTreeLabelCounter.incrementCount(t.label().value());</span>
+<span class="nc" id="L946">          mentionTreeNonPretermLabelCounter.incrementCount(npt.label().value());</span>
+<span class="nc" id="L947">          mentionTreeMixedLabelCounter.incrementCount(npt2.label().value());</span>
+<span class="nc" id="L948">          Label tlabel = t.label();</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">          if (tlabel instanceof CoreLabel) {</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">            if (((CoreLabel) tlabel).containsKey(NamedEntityAnnotation.class)) {</span>
+              // walk up tree
+<span class="nc" id="L952">              nerMentions++;</span>
+<span class="nc" id="L953">              nerMentionTokenLengthCounter.incrementCount(length);</span>
+
+<span class="nc" id="L955">              Tree parent = t.parent(root);</span>
+<span class="nc bnc" id="L956" title="All 2 branches missed.">              while (parent != null) {</span>
+<span class="nc" id="L957">                Label plabel = parent.label();</span>
+<span class="nc bnc" id="L958" title="All 2 branches missed.">                if (plabel instanceof CoreLabel) {</span>
+<span class="nc bnc" id="L959" title="All 2 branches missed.">                  if (((CoreLabel) plabel).containsKey(NamedEntityAnnotation.class)) {</span>
+<span class="nc" id="L960">                    logger.info(&quot;NER Mention: &quot; + m);</span>
+<span class="nc" id="L961">                    CoreMap parentNerChunk = ((CoreLabel) plabel).get(NamedEntityAnnotation.class);</span>
+<span class="nc" id="L962">                    logger.info(&quot;Nested inside NER Mention: &quot; + parentNerChunk);</span>
+<span class="nc" id="L963">                    logger.info(&quot;Nested inside NER Mention parent node: &quot; + parent);</span>
+<span class="nc" id="L964">                    nestedNerMentions++;</span>
+<span class="nc" id="L965">                    break;</span>
+                  }
+                }
+<span class="nc" id="L968">                parent = parent.parent(root);</span>
+<span class="nc" id="L969">              }</span>
+            }
+          }
+<span class="nc" id="L972">        }</span>
+<span class="nc" id="L973">      }</span>
+<span class="nc" id="L974">    }</span>
+
+    private static void appendFrac(StringBuilder sb, String label, int num, int den)
+    {
+<span class="nc" id="L978">      double frac = ((double) num)/ den;</span>
+<span class="nc" id="L979">      sb.append(label).append(&quot;\t&quot;).append(frac).append(&quot;\t(&quot;).append(num).append(&quot;/&quot;).append(den).append(&quot;)&quot;);</span>
+<span class="nc" id="L980">    }</span>
+
+    private static &lt;E&gt; void appendIntCountStats(StringBuilder sb, String label, IntCounter&lt;E&gt; counts)
+    {
+<span class="nc" id="L984">      sb.append(label).append(&quot;\n&quot;);</span>
+<span class="nc" id="L985">      List&lt;E&gt; sortedKeys = Counters.toSortedList(counts);</span>
+<span class="nc" id="L986">      int total = counts.totalIntCount();</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">      for (E key:sortedKeys) {</span>
+<span class="nc" id="L988">        int count = counts.getIntCount(key);</span>
+<span class="nc" id="L989">        appendFrac(sb, key.toString(), count, total);</span>
+<span class="nc" id="L990">        sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L991">      }</span>
+<span class="nc" id="L992">    }</span>
+
+    public String toString()
+    {
+<span class="nc" id="L996">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L997">      appendIntCountStats(sb, &quot;Mention Tree Labels (no preterminals)&quot;, mentionTreeNonPretermLabelCounter);</span>
+<span class="nc" id="L998">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L999">      appendIntCountStats(sb, &quot;Mention Tree Labels (with preterminals)&quot;, mentionTreeLabelCounter);</span>
+<span class="nc" id="L1000">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1001">      appendIntCountStats(sb, &quot;Mention Tree Labels (preterminals with parent span not match)&quot;, mentionTreePretermNonPretermNoMatchLabelCounter);</span>
+<span class="nc" id="L1002">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1003">      appendIntCountStats(sb, &quot;Mention Tree Labels (mixed)&quot;, mentionTreeMixedLabelCounter);</span>
+<span class="nc" id="L1004">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1005">      appendIntCountStats(sb, &quot;Mention Lengths&quot;, mentionTokenLengthCounter);</span>
+<span class="nc" id="L1006">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1007">      appendFrac(sb, &quot;Mention Exact Non Preterm Tree Span&quot;, nonPretermSpanMatches, totalMentions);</span>
+<span class="nc" id="L1008">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1009">      appendFrac(sb, &quot;Mention Exact Tree Span&quot;, mentionExactTreeSpan, totalMentions);</span>
+<span class="nc" id="L1010">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1011">      appendFrac(sb, &quot;NER&quot;, nerMentions, totalMentions);</span>
+<span class="nc" id="L1012">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1013">      appendFrac(sb, &quot;Nested NER&quot;, nestedNerMentions, totalMentions);</span>
+<span class="nc" id="L1014">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1015">      appendIntCountStats(sb, &quot;NER Mention Lengths&quot;, nerMentionTokenLengthCounter);</span>
+<span class="nc" id="L1016">      return sb.toString();</span>
+    }
+
+  }
+
+  /** Reads and dumps output, mainly for debugging. */
+  public static void main(String[] args) throws IOException {
+<span class="nc" id="L1023">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L1024">    boolean debug = false;</span>
+<span class="nc" id="L1025">    String filepath = props.getProperty(&quot;i&quot;);</span>
+<span class="nc" id="L1026">    String outfile = props.getProperty(&quot;o&quot;);</span>
+<span class="nc bnc" id="L1027" title="All 4 branches missed.">    if (filepath == null || outfile == null) {</span>
+<span class="nc" id="L1028">      usage();</span>
+<span class="nc" id="L1029">      System.exit(-1);</span>
+    }
+<span class="nc" id="L1031">    PrintWriter fout = new PrintWriter(outfile);</span>
+<span class="nc" id="L1032">    logger.info(&quot;Writing to &quot; + outfile);</span>
+<span class="nc" id="L1033">    String ext = props.getProperty(&quot;ext&quot;);</span>
+    Options options;
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">    if (ext != null) {</span>
+<span class="nc" id="L1036">      options = new Options(&quot;.*&quot; + ext + &quot;$&quot;);</span>
+    } else {
+<span class="nc" id="L1038">      options = new Options();</span>
+    }
+<span class="nc" id="L1040">    options.annotateTreeCoref = true;</span>
+<span class="nc" id="L1041">    options.annotateTreeNer = true;</span>
+<span class="nc" id="L1042">    CorpusStats corpusStats = new CorpusStats();</span>
+<span class="nc" id="L1043">    CoNLLDocumentReader reader = new CoNLLDocumentReader(filepath, options);</span>
+<span class="nc" id="L1044">    int docCnt = 0;</span>
+<span class="nc" id="L1045">    int sentCnt = 0;</span>
+<span class="nc" id="L1046">    int tokenCnt = 0;</span>
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">    for (CoNLLDocument doc; (doc = reader.getNextDocument()) != null; ) {</span>
+<span class="nc" id="L1048">      corpusStats.process(doc);</span>
+<span class="nc" id="L1049">      docCnt++;</span>
+<span class="nc" id="L1050">      Annotation anno = doc.getAnnotation();</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">      if (debug) System.out.println(&quot;Document &quot; + docCnt + &quot;: &quot; + anno.get(CoreAnnotations.DocIDAnnotation.class));</span>
+<span class="nc bnc" id="L1052" title="All 2 branches missed.">      for (CoreMap sentence:anno.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">        if (debug) System.out.println(&quot;Parse: &quot; + sentence.get(TreeCoreAnnotations.TreeAnnotation.class));</span>
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">        if (debug) System.out.println(&quot;Sentence Tokens: &quot; + StringUtils.join(sentence.get(CoreAnnotations.TokensAnnotation.class), &quot;,&quot;));</span>
+<span class="nc" id="L1055">        writeTabSep(fout,sentence,doc.corefChainMap);</span>
+<span class="nc" id="L1056">        sentCnt++;</span>
+<span class="nc" id="L1057">        tokenCnt += sentence.get(CoreAnnotations.TokensAnnotation.class).size();</span>
+<span class="nc" id="L1058">      }</span>
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">      if (debug) {</span>
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        for (CoreMap ner:doc.nerChunks) {</span>
+<span class="nc" id="L1061">          System.out.println(&quot;NER Chunk: &quot; + ner);</span>
+<span class="nc" id="L1062">        }</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">        for (String id:doc.corefChainMap.keySet()) {</span>
+<span class="nc" id="L1064">          System.out.println(&quot;Coref: &quot; + id + &quot; = &quot; + StringUtils.join(doc.corefChainMap.get(id), &quot;;&quot;));</span>
+<span class="nc" id="L1065">        }</span>
+      }
+<span class="nc" id="L1067">    }</span>
+<span class="nc" id="L1068">    fout.close();</span>
+<span class="nc" id="L1069">    System.out.println(&quot;Total document count: &quot; + docCnt);</span>
+<span class="nc" id="L1070">    System.out.println(&quot;Total sentence count: &quot; + sentCnt);</span>
+<span class="nc" id="L1071">    System.out.println(&quot;Total token count: &quot; + tokenCnt);</span>
+<span class="nc" id="L1072">    System.out.println(corpusStats);</span>
+<span class="nc" id="L1073">  }</span>
+
+  @Override
+  public InputDoc nextDoc() {
+<span class="nc" id="L1077">    CoNLLDocument conllDoc = getNextDocument();</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">    if (conllDoc == null) return null;</span>
+
+<span class="nc" id="L1080">    Annotation anno = conllDoc.getAnnotation();</span>
+
+    // conll doc has constituency tree but doesn't have dependency tree
+<span class="nc" id="L1083">    setDependencyTree(anno);</span>
+
+<span class="nc" id="L1085">    List&lt;List&lt;Mention&gt;&gt; allGoldMentions = extractGoldMentions(conllDoc);</span>
+
+    // store some useful information in docInfo for later
+<span class="nc" id="L1088">    Map&lt;String, String&gt; docInfo = makeDocInfo(conllDoc);</span>
+
+    // TODO: need to add some doc info from conllDoc
+<span class="nc" id="L1091">    return new InputDoc(anno, docInfo, allGoldMentions, conllDoc);</span>
+  }
+
+  // store any useful information for later (as features, debug, etc)
+  private Map&lt;String, String&gt; makeDocInfo(CoNLLDocument conllDoc) {
+<span class="nc" id="L1096">    Map&lt;String, String&gt; docInfo = Generics.newHashMap();</span>
+<span class="nc" id="L1097">    docInfo.put(&quot;DOC_ID&quot;, conllDoc.documentID);</span>
+<span class="nc" id="L1098">    docInfo.put(&quot;DOC_PART&quot;, conllDoc.partNo);</span>
+<span class="nc" id="L1099">    docInfo.put(&quot;DOC_ID_PART&quot;, conllDoc.documentIdPart);</span>
+<span class="nc" id="L1100">    docInfo.put(&quot;DOC_FILE&quot;, conllDoc.filename);</span>
+
+<span class="nc" id="L1102">    return docInfo;</span>
+  }
+
+  private void setDependencyTree(Annotation anno) {
+<span class="nc" id="L1106">    List&lt;CoreMap&gt; sentences = anno.get(SentencesAnnotation.class);</span>
+
+<span class="nc bnc" id="L1108" title="All 2 branches missed.">    for(CoreMap sentence : sentences) {</span>
+<span class="nc" id="L1109">      Tree tree = sentence.get(TreeAnnotation.class);</span>
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">      if (tree==null) continue;</span>
+
+<span class="nc" id="L1112">      SemanticGraph deps = null;</span>
+<span class="nc" id="L1113">      SemanticGraph basicDeps = null;</span>
+
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">      if (options.lang == Locale.CHINESE) {</span>
+<span class="nc" id="L1116">        final boolean threadSafe = true;</span>
+
+<span class="nc" id="L1118">        deps = SemanticGraphFactory.makeFromTree(</span>
+<span class="nc" id="L1119">            new ChineseGrammaticalStructure(tree, Filters.acceptFilter(), chineseHeadFinder),</span>
+            SemanticGraphFactory.Mode.COLLAPSED,
+            GrammaticalStructure.Extras.NONE,
+                null);
+
+<span class="nc" id="L1124">        basicDeps = SemanticGraphFactory.makeFromTree(</span>
+<span class="nc" id="L1125">            new ChineseGrammaticalStructure(tree, Filters.acceptFilter(), chineseHeadFinder),</span>
+            SemanticGraphFactory.Mode.BASIC,
+            GrammaticalStructure.Extras.NONE,
+                null);
+<span class="nc" id="L1129">      } else {</span>
+<span class="nc" id="L1130">        deps = SemanticGraphFactory.generateEnhancedDependencies(tree);</span>
+<span class="nc" id="L1131">        basicDeps = SemanticGraphFactory.generateUncollapsedDependencies(tree);</span>
+      }
+
+<span class="nc" id="L1134">      sentence.set(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class, basicDeps);</span>
+<span class="nc" id="L1135">      sentence.set(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class, deps);</span>
+<span class="nc" id="L1136">    }</span>
+
+<span class="nc" id="L1138">  }</span>
+
+  // extract gold mentions (mention span, mention ID, cluster ID)
+  public List&lt;List&lt;Mention&gt;&gt; extractGoldMentions(CoNLLDocument conllDoc) {
+<span class="nc" id="L1142">    List&lt;CoreMap&gt; sentences = conllDoc.getAnnotation().get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc" id="L1143">    List&lt;List&lt;Mention&gt;&gt; allGoldMentions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1144">    CollectionValuedMap&lt;String,CoreMap&gt; corefChainMap = conllDoc.getCorefChainMap();</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); i++) {</span>
+<span class="nc" id="L1146">      allGoldMentions.add(new ArrayList&lt;&gt;());</span>
+    }
+<span class="nc bnc" id="L1148" title="All 2 branches missed.">    for (String corefIdStr : corefChainMap.keySet()) {</span>
+<span class="nc" id="L1149">      int id = Integer.parseInt(corefIdStr);</span>
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">      for (CoreMap m : corefChainMap.get(corefIdStr)) {</span>
+<span class="nc" id="L1151">        Mention mention = new Mention();</span>
+
+<span class="nc" id="L1153">        mention.goldCorefClusterID = id;</span>
+<span class="nc" id="L1154">        int sentIndex = m.get(CoreAnnotations.SentenceIndexAnnotation.class);</span>
+<span class="nc" id="L1155">        CoreMap sent = sentences.get(sentIndex);</span>
+<span class="nc" id="L1156">        mention.startIndex = m.get(CoreAnnotations.TokenBeginAnnotation.class) - sent.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc" id="L1157">        mention.endIndex = m.get(CoreAnnotations.TokenEndAnnotation.class) - sent.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc" id="L1158">        mention.originalSpan = m.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L1159">        allGoldMentions.get(sentIndex).add(mention);</span>
+<span class="nc" id="L1160">      }</span>
+<span class="nc" id="L1161">    }</span>
+<span class="nc" id="L1162">    return allGoldMentions;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

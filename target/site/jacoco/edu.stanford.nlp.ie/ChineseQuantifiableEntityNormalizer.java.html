@@ -1,0 +1,949 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ChineseQuantifiableEntityNormalizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">ChineseQuantifiableEntityNormalizer.java</span></div><h1>ChineseQuantifiableEntityNormalizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie;
+
+import edu.stanford.nlp.ie.regexp.ChineseNumberSequenceClassifier;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static java.lang.System.err;
+
+/**
+ * A Chinese correspondence of the {@link QuantifiableEntityNormalizer} that normalizes NUMBER, DATE, TIME,
+ * MONEY, PERCENT and ORDINAL amounts expressed in Chinese.
+ *
+ * Note that this class is originally designed for the Chinese KBP Challenge, so it only
+ * supports minimal functionalities. This needs to be completed in the future.
+ *
+ * @author Yuhao Zhang
+ * @author Peng Qi
+ */
+<span class="nc" id="L30">public class ChineseQuantifiableEntityNormalizer {</span>
+
+<span class="nc" id="L32">  private static Redwood.RedwoodChannels log = Redwood.channels(ChineseQuantifiableEntityNormalizer.class);</span>
+
+  private static final boolean DEBUG = false;
+
+<span class="nc" id="L36">  public static String BACKGROUND_SYMBOL = SeqClassifierFlags.DEFAULT_BACKGROUND_SYMBOL;</span>
+
+  private static final Set&lt;String&gt; quantifiable;  //Entity types that are quantifiable
+  private static final ClassicCounter&lt;String&gt; wordsToValues;
+  private static final ClassicCounter&lt;String&gt; quantityUnitToValues;
+  private static final Map&lt;String, Character&gt; multiCharCurrencyWords; // used by money
+  private static final Map&lt;String, Character&gt; oneCharCurrencyWords; // used by money
+
+  private static final Map&lt;String, String&gt; fullDigitToHalfDigit;
+
+  private static final Map&lt;String, Integer&gt; yearModifiers;
+  private static final Map&lt;String, Integer&gt; monthDayModifiers;
+
+  private static final String LITERAL_DECIMAL_POINT = &quot;点&quot;;
+
+  // Patterns we need
+  // TODO (yuhao): here we are not considering 1) negative numbers, 2) Chinese traditional characters
+<span class="nc" id="L53">  private static final Pattern ARABIC_NUMBERS_PATTERN = Pattern.compile(&quot;[\\d\\.]+&quot;);</span>
+  // This is the all-literal-number-characters sequence, excluding unit characters like 十 or 万
+<span class="nc" id="L55">  private static final Pattern CHINESE_LITERAL_NUMBER_SEQUENCE_PATTERN = Pattern.compile(&quot;[一二三四五六七八九零〇]+&quot;);</span>
+  // The decimal part of a float number should be exactly literal number sequence without units
+<span class="nc" id="L57">  private static final Pattern CHINESE_LITERAL_DECIMAL_PATTERN = CHINESE_LITERAL_NUMBER_SEQUENCE_PATTERN;</span>
+
+  // Used by quantity modifiers
+  private static final String greaterEqualThreeWords = &quot;(?:大|多|高)于或者?等于&quot;;
+  private static final String lessEqualThreeWords = &quot;(?:小|少|低)于或者?等于&quot;;
+
+  private static final String greaterEqualTwoWords = &quot;(?:大|多)于等于|不(?:少|小|低)于&quot;;
+  private static final String lessEqualTwoWords = &quot;(?:小|少)于等于|不(?:大|少|高)于|不超过&quot;;
+  private static final String approxTwoWords = &quot;大(?:概|约|致)(?:是|为)|大概其&quot;;
+
+  private static final String greaterThanOneWord = &quot;(?:大|多|高)于|(?:超|高|多)过&quot;;;
+  private static final String lessThanOneWord = &quot;(?:小|少|低)于|不(?:到|够|足)&quot;;
+  private static final String approxOneWord = &quot;大(?:约|概|致)|接?近|差不多|几乎|左右|上下|约(?:为|略)&quot;;
+
+  // All the tags we need
+  private static final String NUMBER_TAG = &quot;NUMBER&quot;;
+  private static final String DATE_TAG = &quot;DATE&quot;;
+  private static final String TIME_TAG = &quot;TIME&quot;;
+  private static final String MONEY_TAG = &quot;MONEY&quot;;
+  private static final String ORDINAL_TAG = &quot;ORDINAL&quot;;
+  private static final String PERCENT_TAG = &quot;PERCENT&quot;;
+
+  // static initialization of useful properties
+  static {
+<span class="nc" id="L81">    quantifiable = Generics.newHashSet();</span>
+<span class="nc" id="L82">    quantifiable.add(NUMBER_TAG);</span>
+<span class="nc" id="L83">    quantifiable.add(DATE_TAG);</span>
+<span class="nc" id="L84">    quantifiable.add(TIME_TAG);</span>
+<span class="nc" id="L85">    quantifiable.add(MONEY_TAG);</span>
+<span class="nc" id="L86">    quantifiable.add(PERCENT_TAG);</span>
+<span class="nc" id="L87">    quantifiable.add(ORDINAL_TAG);</span>
+
+<span class="nc" id="L89">    quantityUnitToValues = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L90">    quantityUnitToValues.setCount(&quot;十&quot;, 10.0);</span>
+<span class="nc" id="L91">    quantityUnitToValues.setCount(&quot;百&quot;, 100.0);</span>
+<span class="nc" id="L92">    quantityUnitToValues.setCount(&quot;千&quot;, 1000.0);</span>
+<span class="nc" id="L93">    quantityUnitToValues.setCount(&quot;万&quot;, 10000.0);</span>
+<span class="nc" id="L94">    quantityUnitToValues.setCount(&quot;亿&quot;, 100000000.0);</span>
+
+<span class="nc" id="L96">    wordsToValues = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L97">    wordsToValues.setCount(&quot;零&quot;, 0.0);</span>
+<span class="nc" id="L98">    wordsToValues.setCount(&quot;〇&quot;, 0.0);</span>
+<span class="nc" id="L99">    wordsToValues.setCount(&quot;一&quot;, 1.0);</span>
+<span class="nc" id="L100">    wordsToValues.setCount(&quot;二&quot;, 2.0);</span>
+<span class="nc" id="L101">    wordsToValues.setCount(&quot;两&quot;, 2.0);</span>
+<span class="nc" id="L102">    wordsToValues.setCount(&quot;三&quot;, 3.0);</span>
+<span class="nc" id="L103">    wordsToValues.setCount(&quot;四&quot;, 4.0);</span>
+<span class="nc" id="L104">    wordsToValues.setCount(&quot;五&quot;, 5.0);</span>
+<span class="nc" id="L105">    wordsToValues.setCount(&quot;六&quot;, 6.0);</span>
+<span class="nc" id="L106">    wordsToValues.setCount(&quot;七&quot;, 7.0);</span>
+<span class="nc" id="L107">    wordsToValues.setCount(&quot;八&quot;, 8.0);</span>
+<span class="nc" id="L108">    wordsToValues.setCount(&quot;九&quot;, 9.0);</span>
+<span class="nc" id="L109">    wordsToValues.addAll(quantityUnitToValues); // all units are also quantifiable individually</span>
+
+<span class="nc" id="L111">    multiCharCurrencyWords = Generics.newHashMap();</span>
+<span class="nc" id="L112">    multiCharCurrencyWords.put(&quot;美元&quot;, '$');</span>
+<span class="nc" id="L113">    multiCharCurrencyWords.put(&quot;美分&quot;, '$');</span>
+<span class="nc" id="L114">    multiCharCurrencyWords.put(&quot;英镑&quot;, '£');</span>
+<span class="nc" id="L115">    multiCharCurrencyWords.put(&quot;先令&quot;, '£');</span>
+<span class="nc" id="L116">    multiCharCurrencyWords.put(&quot;便士&quot;, '£');</span>
+<span class="nc" id="L117">    multiCharCurrencyWords.put(&quot;欧元&quot;, '€');</span>
+<span class="nc" id="L118">    multiCharCurrencyWords.put(&quot;日元&quot;, '¥');</span>
+<span class="nc" id="L119">    multiCharCurrencyWords.put(&quot;韩元&quot;, '₩');</span>
+
+<span class="nc" id="L121">    oneCharCurrencyWords = Generics.newHashMap();</span>
+<span class="nc" id="L122">    oneCharCurrencyWords.put(&quot;刀&quot;, '$');</span>
+<span class="nc" id="L123">    oneCharCurrencyWords.put(&quot;镑&quot;, '£');</span>
+<span class="nc" id="L124">    oneCharCurrencyWords.put(&quot;元&quot;, '元');   // We follow the tradition in English to use 元 instead of ¥ for RMB</span>
+    // For all other currency, we use default currency symbol $
+
+<span class="nc" id="L127">    yearModifiers = Generics.newHashMap();</span>
+<span class="nc" id="L128">    yearModifiers.put(&quot;前&quot;, -2);</span>
+<span class="nc" id="L129">    yearModifiers.put(&quot;去&quot;, -1);</span>
+<span class="nc" id="L130">    yearModifiers.put(&quot;上&quot;, -1);</span>
+<span class="nc" id="L131">    yearModifiers.put(&quot;今&quot;, 0);</span>
+<span class="nc" id="L132">    yearModifiers.put(&quot;同&quot;, 0);</span>
+<span class="nc" id="L133">    yearModifiers.put(&quot;此&quot;, 0);</span>
+<span class="nc" id="L134">    yearModifiers.put(&quot;该&quot;, 0);</span>
+<span class="nc" id="L135">    yearModifiers.put(&quot;本&quot;, 0);</span>
+<span class="nc" id="L136">    yearModifiers.put(&quot;明&quot;, 1);</span>
+<span class="nc" id="L137">    yearModifiers.put(&quot;来&quot;, 1);</span>
+<span class="nc" id="L138">    yearModifiers.put(&quot;下&quot;, 1);</span>
+<span class="nc" id="L139">    yearModifiers.put(&quot;后&quot;, 2);</span>
+
+<span class="nc" id="L141">    monthDayModifiers = Generics.newHashMap();</span>
+<span class="nc" id="L142">    monthDayModifiers.put(&quot;昨&quot;, -1);</span>
+<span class="nc" id="L143">    monthDayModifiers.put(&quot;上&quot;, -1);</span>
+<span class="nc" id="L144">    monthDayModifiers.put(&quot;今&quot;, 0);</span>
+<span class="nc" id="L145">    monthDayModifiers.put(&quot;同&quot;, 0);</span>
+<span class="nc" id="L146">    monthDayModifiers.put(&quot;此&quot;, 0);</span>
+<span class="nc" id="L147">    monthDayModifiers.put(&quot;该&quot;, 0);</span>
+<span class="nc" id="L148">    monthDayModifiers.put(&quot;本&quot;, 0);</span>
+<span class="nc" id="L149">    monthDayModifiers.put(&quot;来&quot;, 1);</span>
+<span class="nc" id="L150">    monthDayModifiers.put(&quot;明&quot;, 1);</span>
+<span class="nc" id="L151">    monthDayModifiers.put(&quot;下&quot;, 1);</span>
+
+<span class="nc" id="L153">    fullDigitToHalfDigit = Generics.newHashMap();</span>
+<span class="nc" id="L154">    fullDigitToHalfDigit.put(&quot;１&quot;, &quot;1&quot;);</span>
+<span class="nc" id="L155">    fullDigitToHalfDigit.put(&quot;２&quot;, &quot;2&quot;);</span>
+<span class="nc" id="L156">    fullDigitToHalfDigit.put(&quot;３&quot;, &quot;3&quot;);</span>
+<span class="nc" id="L157">    fullDigitToHalfDigit.put(&quot;４&quot;, &quot;4&quot;);</span>
+<span class="nc" id="L158">    fullDigitToHalfDigit.put(&quot;５&quot;, &quot;5&quot;);</span>
+<span class="nc" id="L159">    fullDigitToHalfDigit.put(&quot;６&quot;, &quot;6&quot;);</span>
+<span class="nc" id="L160">    fullDigitToHalfDigit.put(&quot;７&quot;, &quot;7&quot;);</span>
+<span class="nc" id="L161">    fullDigitToHalfDigit.put(&quot;８&quot;, &quot;8&quot;);</span>
+<span class="nc" id="L162">    fullDigitToHalfDigit.put(&quot;９&quot;, &quot;9&quot;);</span>
+<span class="nc" id="L163">    fullDigitToHalfDigit.put(&quot;０&quot;, &quot;0&quot;);</span>
+  }
+
+  // Patterns used by DATE and TIME (must be after the static initializers to make use of the modifiers)
+  private static final String CHINESE_DATE_NUMERALS_PATTERN = &quot;[一二三四五六七八九零十〇]&quot;;
+  private static final String CHINESE_AND_ARABIC_NUMERALS_PATTERN = &quot;[一二三四五六七八九零十〇\\d]&quot;;
+<span class="nc" id="L169">  private static final String YEAR_MODIFIER_PATTERN = &quot;[&quot; + String.join(&quot;&quot;, yearModifiers.keySet()) + &quot;]&quot;;</span>
+<span class="nc" id="L170">  private static final String MONTH_DAY_MODIFIER_PATTERN = &quot;[&quot; + String.join(&quot;&quot;, monthDayModifiers.keySet()) + &quot;]&quot;;</span>
+
+<span class="nc" id="L172">  private static final String BASIC_DD_PATTERN = &quot;(&quot;</span>
+          + CHINESE_AND_ARABIC_NUMERALS_PATTERN + &quot;{1,3}|&quot; + MONTH_DAY_MODIFIER_PATTERN + &quot;)[日号&amp;&amp;[^年月]]?&quot;;
+<span class="nc" id="L174">  private static final String BASIC_MMDD_PATTERN = &quot;(&quot; + CHINESE_AND_ARABIC_NUMERALS_PATTERN + &quot;{1,2}|&quot;</span>
+          + MONTH_DAY_MODIFIER_PATTERN + &quot;)(?:月份?|\\-|/|\\.)(?:&quot; + BASIC_DD_PATTERN + &quot;)?&quot;;
+<span class="nc" id="L176">  private static final String BASIC_YYYYMMDD_PATTERN = &quot;(&quot; + CHINESE_AND_ARABIC_NUMERALS_PATTERN + &quot;{2,4}|&quot;</span>
+          + YEAR_MODIFIER_PATTERN + &quot;)(?:年[份度]?|\\-|/|\\.)?&quot; + &quot;(?:&quot; + BASIC_MMDD_PATTERN + &quot;)?&quot;;
+  private static final String ENGLISH_MMDDYYYY_PATTERN = &quot;(\\d{1,2})[/\\-\\.](\\d{1,2})(?:[/\\-\\.](\\d{4}))?&quot;;
+
+  private static final String RELATIVE_TIME_PATTERN = &quot;([昨今明])[天晨晚夜早]&quot;;
+  private static final String BIRTH_DECADE_PATTERN = &quot;(&quot; + CHINESE_AND_ARABIC_NUMERALS_PATTERN + &quot;[0零〇5五])后&quot;;
+
+  /**
+   * Identifies contiguous MONEY, TIME, DATE, or PERCENT entities
+   * and tags each of their constituents with a &quot;normalizedQuantity&quot;
+   * label which contains the appropriate normalized string corresponding to
+   * the full quantity.
+   * Unlike the English normalizer, this method currently does not support
+   * concatenation or SUTime.
+   *
+   * @param list A list of {@link CoreMap}s representing a single document.
+   *             Note: We assume the NERs has been labelled and the labels
+   *             will be updated in place.
+   * @param document
+   * @param sentence
+   * @param &lt;E&gt;
+   */
+  public static &lt;E extends CoreMap&gt; void addNormalizedQuantitiesToEntities(List&lt;E&gt; list, CoreMap document, CoreMap sentence) {
+
+    // Fix the NER sequence if necessay
+<span class="nc" id="L201">    fixupNerBeforeNormalization(list);</span>
+
+    // Now that NER tags has been fixed up, we do another pass to add the normalization
+<span class="nc" id="L204">    String prevNerTag = BACKGROUND_SYMBOL;</span>
+<span class="nc" id="L205">    int beforeIndex = -1;</span>
+<span class="nc" id="L206">    ArrayList&lt;E&gt; collector = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">    for (int i = 0, sz = list.size(); i &lt;= sz; i++) {</span>
+      // we should always keep list.size() unchanged inside the loop
+<span class="nc" id="L209">      E wi = null;</span>
+<span class="nc" id="L210">      String currNerTag = null;</span>
+<span class="nc" id="L211">      String nextWord = &quot;&quot;;</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">      if(i &lt; sz) {</span>
+<span class="nc" id="L213">        wi = list.get(i);</span>
+        if(DEBUG) {
+          log.info(&quot;addNormalizedQuantitiesToEntities: wi=&quot; + wi + &quot;, collector=&quot; + collector);
+        }
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        if(i+1 &lt; sz) {</span>
+<span class="nc" id="L218">          nextWord = list.get(i+1).get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">          if(nextWord == null) {</span>
+<span class="nc" id="L220">            nextWord = &quot;&quot;;</span>
+          }
+        }
+        // We assume NERs have been set by previous NER taggers
+<span class="nc" id="L224">        currNerTag = wi.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+        // TODO: may need to detect TIME modifier here?
+      }
+<span class="nc bnc" id="L227" title="All 2 branches missed.">      E wprev = (i &gt; 0) ? list.get(i-1) : null;</span>
+      // if the current wi is a non-continuation and the last one was a
+      // quantity, we close and process the last segment.
+      // TODO: also need to check compatibility as the English normalizer does
+<span class="nc bnc" id="L231" title="All 6 branches missed.">      if((currNerTag == null || !currNerTag.equals(prevNerTag)) &amp;&amp; quantifiable.contains(prevNerTag)) {</span>
+<span class="nc" id="L232">        String modifier = null;</span>
+        // Need different handling for different tags
+<span class="nc bnc" id="L234" title="All 10 branches missed.">        switch (prevNerTag) {</span>
+          case TIME_TAG:
+            // TODO: add TIME
+<span class="nc" id="L237">            break;</span>
+          case DATE_TAG:
+<span class="nc" id="L239">            processEntity(collector, prevNerTag, modifier, nextWord, document);</span>
+<span class="nc" id="L240">            break;</span>
+          default:
+<span class="nc bnc" id="L242" title="All 4 branches missed.">            if(prevNerTag.equals(NUMBER_TAG) || prevNerTag.equals(PERCENT_TAG) ||</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">                prevNerTag.equals(MONEY_TAG)) {</span>
+              // we are doing for prev tag so afterIndex should really be i
+<span class="nc" id="L245">              modifier = detectQuantityModifier(list, beforeIndex, i);</span>
+            }
+<span class="nc" id="L247">            processEntity(collector, prevNerTag, modifier, nextWord);</span>
+            break;
+        }
+<span class="nc" id="L250">        collector = new ArrayList&lt;&gt;();</span>
+      }
+
+      // If currNerTag is quantifiable, we add it into collector
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if(quantifiable.contains(currNerTag)) {</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if(collector.isEmpty()) {</span>
+<span class="nc" id="L256">          beforeIndex = i - 1;</span>
+        }
+<span class="nc" id="L258">        collector.add(wi);</span>
+      }
+      // move on and update prev pointer
+<span class="nc" id="L261">      prevNerTag = currNerTag;</span>
+    }
+<span class="nc" id="L263">  }</span>
+
+  /**
+   * Detect the quantity modifiers ahead of a numeric string. This method will look at three words ahead
+   * and one word afterwards at most. Examples of modifiers are &quot;大约&quot;, &quot;多于&quot;.
+   *
+   * @param list
+   * @param beforeIndex
+   * @param afterIndex
+   * @param &lt;E&gt;
+   * @return
+   */
+  private static &lt;E extends CoreMap&gt; String detectQuantityModifier(List&lt;E&gt; list, int beforeIndex, int afterIndex) {
+<span class="nc bnc" id="L276" title="All 2 branches missed.">    String prev = (beforeIndex &gt;= 0) ? list.get(beforeIndex).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">    String prev2 = (beforeIndex - 1 &gt;= 0) ? list.get(beforeIndex - 1).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    String prev3 = (beforeIndex - 2 &gt;= 0) ? list.get(beforeIndex - 2).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc" id="L279">    int sz = list.size();</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    String next = (afterIndex &lt; sz) ? list.get(afterIndex).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+
+    if (DEBUG) {
+      // output space for clarity
+      log.info(&quot;Quantifiable modifiers: previous: &quot; + prev3 + ' ' + prev2+ ' ' + prev);
+      log.info(&quot;Quantifiable modifiers: next: &quot; + next);
+    }
+
+    // Actually spaces won't be used for Chinese
+<span class="nc" id="L289">    String longPrev = prev3 + prev2 + prev;</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">    if (longPrev.matches(lessEqualThreeWords)) { return &quot;&lt;=&quot;; }</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">    if (longPrev.matches(greaterEqualThreeWords)) { return &quot;&gt;=&quot;; }</span>
+
+<span class="nc" id="L293">    longPrev = prev2 + prev;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">    if (longPrev.matches(greaterEqualTwoWords)) { return &quot;&gt;=&quot;; }</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">    if (longPrev.matches(lessEqualTwoWords)) { return &quot;&lt;=&quot;; }</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">    if (longPrev.matches(approxTwoWords)) { return &quot;~&quot;; }</span>
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">    if (prev.matches(greaterThanOneWord)) { return &quot;&gt;&quot;; }</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">    if (prev.matches(lessThanOneWord)) { return &quot;&lt;&quot;; }</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    if (prev.matches(approxOneWord)) { return &quot;~&quot;; }</span>
+
+<span class="nc bnc" id="L302" title="All 2 branches missed.">    if (next.matches(approxOneWord)) { return &quot;~&quot;; }</span>
+
+    // As backup, we also check whether prev matches a two-word pattern, just in case the segmenter fails
+    // This happens to &lt;= or &gt;= patterns sometime as observed.
+<span class="nc bnc" id="L306" title="All 2 branches missed.">    if (prev.matches(greaterEqualTwoWords)) { return &quot;&gt;=&quot;; }</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    if (prev.matches(lessEqualTwoWords)) { return &quot;&lt;=&quot;; }</span>
+
+    // otherwise, not modifier detected and return null
+    if (DEBUG) { err.println(&quot;Quantifiable: not a quantity modifier&quot;); }
+<span class="nc" id="L311">    return null;</span>
+  }
+
+  private static &lt;E extends CoreMap&gt; List&lt;E&gt; processEntity(List&lt;E&gt; l,
+           String entityType, String compModifier, String nextWord) {
+<span class="nc" id="L316">    return processEntity(l, entityType, compModifier, nextWord, null);</span>
+  }
+
+  /**
+   * Process an entity given the NER tag, extracted modifier and the next word in the document.
+   * The normalized quantity will be written in place.
+   *
+   * @param l A collector that collects annotations for the entity.
+   * @param entityType Quantifiable NER tag.
+   * @param compModifier The extracted modifier around the entity of interest. Different NER tags should
+   *                    have different extraction rules.
+   * @param nextWord Next word in the document.
+   * @param document Reference to the document.
+   * @param &lt;E&gt;
+   * @return
+   */
+  private static &lt;E extends CoreMap&gt; List&lt;E&gt; processEntity(List&lt;E&gt; l,
+            String entityType, String compModifier, String nextWord, CoreMap document) {
+    if(DEBUG) {
+      log.info(&quot;ChineseQuantifiableEntityNormalizer.processEntity: &quot; + l);
+    }
+    // convert the entity annotations into a string
+<span class="nc" id="L338">    String s = singleEntityToString(l);</span>
+<span class="nc" id="L339">    StringBuilder sb = new StringBuilder();</span>
+    // convert all full digits to half digits
+<span class="nc bnc" id="L341" title="All 2 branches missed.">    for (int i = 0, sz = s.length(); i &lt; sz; i++) {</span>
+<span class="nc" id="L342">      String ch = s.substring(i, i+1);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">      if (fullDigitToHalfDigit.containsKey(ch)) {</span>
+<span class="nc" id="L344">        ch = fullDigitToHalfDigit.get(ch);</span>
+      }
+<span class="nc" id="L346">      sb.append(ch);</span>
+    }
+<span class="nc" id="L348">    s = sb.toString();</span>
+    if(DEBUG) {
+      log.info(&quot;Quantifiable: Processing entity string &quot; + s);
+    }
+<span class="nc" id="L352">    String p = null;</span>
+<span class="nc bnc" id="L353" title="All 25 branches missed.">    switch (entityType) {</span>
+      case NUMBER_TAG:
+<span class="nc" id="L355">        p = &quot;&quot;;</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        if (compModifier != null) {</span>
+<span class="nc" id="L357">          p = compModifier;</span>
+        }
+<span class="nc" id="L359">        String q = normalizedNumberString(s, nextWord, 1.0);</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        if (q != null) {</span>
+<span class="nc" id="L361">          p = p.concat(q);</span>
+        } else {
+<span class="nc" id="L363">          p = null;</span>
+        }
+<span class="nc" id="L365">        break;</span>
+      case ORDINAL_TAG:
+        // ordinal won't have modifier
+<span class="nc" id="L368">        p = normalizedOrdinalString(s, nextWord);</span>
+<span class="nc" id="L369">        break;</span>
+      case PERCENT_TAG:
+<span class="nc" id="L371">        p = normalizedPercentString(s, nextWord);</span>
+<span class="nc" id="L372">        break;</span>
+      case MONEY_TAG:
+<span class="nc" id="L374">        p = &quot;&quot;;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (compModifier != null) {</span>
+<span class="nc" id="L376">          p = compModifier;</span>
+        }
+<span class="nc" id="L378">        q = normalizedMoneyString(s, nextWord);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (q != null) {</span>
+<span class="nc" id="L380">          p = p.concat(q);</span>
+        } else {
+<span class="nc" id="L382">          p = null;</span>
+        }
+<span class="nc" id="L384">        break;</span>
+      case DATE_TAG:
+<span class="nc bnc" id="L386" title="All 4 branches missed.">        if (s.matches(BASIC_YYYYMMDD_PATTERN) || s.matches(BASIC_MMDD_PATTERN)</span>
+<span class="nc bnc" id="L387" title="All 4 branches missed.">                || s.matches(ENGLISH_MMDDYYYY_PATTERN) || s.matches(BASIC_DD_PATTERN)</span>
+<span class="nc bnc" id="L388" title="All 4 branches missed.">                || s.matches(RELATIVE_TIME_PATTERN) || s.matches(BIRTH_DECADE_PATTERN)) {</span>
+<span class="nc" id="L389">          String docdate = document.get(CoreAnnotations.DocDateAnnotation.class);</span>
+<span class="nc" id="L390">          p = normalizeDateString(s, docdate);</span>
+<span class="nc" id="L391">        }</span>
+        break;
+      case TIME_TAG:
+        break;
+    }
+    if (DEBUG) {
+      err.println(&quot;Quantifiable: Processed '&quot; + s + &quot;' as '&quot; + p + '\'');
+    }
+    // Write the normalized NER values in place
+<span class="nc bnc" id="L400" title="All 2 branches missed.">    for (E wi : l) {</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">      if (p != null) {</span>
+        if (DEBUG) {
+          log.info(&quot;Changing normalized NER from &quot; + wi.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + &quot; to &quot; + p);
+        }
+<span class="nc" id="L405">        wi.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, p);</span>
+      }
+<span class="nc" id="L407">    }</span>
+    // This return value is not necessarily useful as the labelling is done in place.
+<span class="nc" id="L409">    return l;</span>
+  }
+
+  /**
+   * Normalize a money string. A currency symbol will be added accordingly.
+   * The assumption is that the money string will be clean enough: either lead by a currency sign (like $),
+   * or trailed by a currency word. Otherwise we give up normalization.
+   *
+   * @param s
+   * @param nextWord
+   * @return
+   */
+  private static String normalizedMoneyString(String s, String nextWord) {
+    if (DEBUG) {
+      log.info(&quot;normalizedMoneyString: Normalizing &quot; + s);
+    }
+    // default multiplier is 1
+<span class="nc" id="L426">    double multiplier = 1.0;</span>
+
+<span class="nc" id="L428">    char currencySign = '$'; // by default we use $, following English</span>
+<span class="nc" id="L429">    boolean notMatched = true;</span>
+    // We check multiCharCurrencyWords first
+<span class="nc bnc" id="L431" title="All 2 branches missed.">    for (String currencyWord : multiCharCurrencyWords.keySet()) {</span>
+<span class="nc bnc" id="L432" title="All 4 branches missed.">      if(notMatched &amp;&amp; StringUtils.find(s, currencyWord)) {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if(currencyWord.equals(&quot;美分&quot;)) {</span>
+<span class="nc" id="L434">          multiplier = 0.01;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        } else if(currencyWord.equals(&quot;先令&quot;)) {</span>
+<span class="nc" id="L436">          multiplier = 0.05;</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        } else if(currencyWord.equals(&quot;便士&quot;)) {</span>
+<span class="nc" id="L438">          multiplier = 1.0/240;</span>
+        }
+<span class="nc" id="L440">        s = s.replaceAll(currencyWord, &quot;&quot;);</span>
+<span class="nc" id="L441">        currencySign = multiCharCurrencyWords.get(currencyWord);</span>
+<span class="nc" id="L442">        notMatched = false;</span>
+      }
+<span class="nc" id="L444">    }</span>
+    // Then we check oneCharCurrencyWords
+<span class="nc bnc" id="L446" title="All 2 branches missed.">    if(notMatched) {</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">      for(String currencyWord : oneCharCurrencyWords.keySet()) {</span>
+<span class="nc bnc" id="L448" title="All 4 branches missed.">        if(notMatched &amp;&amp; StringUtils.find(s, currencyWord)) {</span>
+          // TODO: change multiplier
+<span class="nc" id="L450">          s = s.replaceAll(currencyWord, &quot;&quot;);</span>
+<span class="nc" id="L451">          currencySign = oneCharCurrencyWords.get(currencyWord);</span>
+<span class="nc" id="L452">          notMatched = false;</span>
+        }
+<span class="nc" id="L454">      }</span>
+    }
+    // We check all other currency cases if we miss both dictionaries above
+<span class="nc bnc" id="L457" title="All 2 branches missed.">    if(notMatched) {</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">      for(String currencyWord : ChineseNumberSequenceClassifier.CURRENCY_WORDS_VALUES) {</span>
+<span class="nc bnc" id="L459" title="All 4 branches missed.">        if(notMatched &amp;&amp; StringUtils.find(s, currencyWord)) {</span>
+<span class="nc" id="L460">          s = s.replaceAll(currencyWord, &quot;&quot;);</span>
+<span class="nc" id="L461">          break;</span>
+        }
+      }
+    }
+
+    // Now we assert the string should be all numbers
+<span class="nc" id="L467">    String value = normalizedNumberString(s, nextWord, multiplier);</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">    if(value == null) {</span>
+      if(DEBUG) {
+        log.info(&quot;normalizedMoneyString: Failed to parse number &quot; + s);
+      }
+<span class="nc" id="L472">      return null;</span>
+    } else {
+<span class="nc" id="L474">      return currencySign + value;</span>
+    }
+  }
+
+  /**
+   * Normalize a percent string. We handle both % and ‰.
+   *
+   * @param s
+   * @param nextWord
+   * @return
+   */
+  private static String normalizedPercentString(String s, String nextWord) {
+<span class="nc" id="L486">    String ns = &quot;&quot;;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">    if(s.startsWith(&quot;百分之&quot;)) {</span>
+<span class="nc" id="L488">      ns = normalizedNumberString(s.substring(3), nextWord, 1.0);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">      if(ns != null) {</span>
+<span class="nc" id="L490">        ns += &quot;%&quot;;</span>
+      }
+<span class="nc bnc" id="L492" title="All 2 branches missed.">    } else if (s.startsWith(&quot;千分之&quot;)) {</span>
+<span class="nc" id="L493">      ns = normalizedNumberString(s.substring(3), nextWord, 1.0);</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">      if(ns != null) {</span>
+<span class="nc" id="L495">        ns += &quot;‰&quot;;</span>
+      }
+<span class="nc bnc" id="L497" title="All 2 branches missed.">    } else if (s.endsWith(&quot;%&quot;)) {</span>
+      // we also handle the case where the percent ends with a % character
+<span class="nc" id="L499">      ns = normalizedNumberString(s.substring(0, s.length()-1), nextWord, 1.0);</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">      if(ns != null) {</span>
+<span class="nc" id="L501">        ns += &quot;%&quot;;</span>
+      }
+<span class="nc bnc" id="L503" title="All 2 branches missed.">    } else if (s.endsWith(&quot;‰&quot;)) {</span>
+<span class="nc" id="L504">      ns = normalizedNumberString(s.substring(0, s.length()-1), nextWord, 1.0);</span>
+<span class="nc" id="L505">      ns += &quot;‰&quot;;</span>
+    } else {
+      // otherwise we assume the entire percent is a number
+<span class="nc" id="L508">      ns = normalizedNumberString(s, nextWord, 1.0);</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">      if(ns != null) {</span>
+<span class="nc" id="L510">        ns += &quot;%&quot;;</span>
+      }
+    }
+<span class="nc" id="L513">    return ns;</span>
+  }
+
+  /**
+   * Normalize an ordinal string.
+   * If the string starts with &quot;第&quot;, we assume the number is followed; otherwise
+   * we assume the entire body is a number.
+   *
+   * @param s
+   * @param nextWord
+   * @return
+   */
+  private static String normalizedOrdinalString(String s, String nextWord) {
+<span class="nc bnc" id="L526" title="All 2 branches missed.">    if(s.startsWith(&quot;第&quot;)) {</span>
+<span class="nc" id="L527">      return normalizedNumberString(s.substring(1), nextWord, 1.0);</span>
+    } else {
+<span class="nc" id="L529">      return normalizedNumberString(s, nextWord, 1.0);</span>
+    }
+  }
+
+  /**
+   * Normalize a string into the corresponding standard numerical values (in String form).
+   * Note that this can only handle a string of pure numerical expressions, like
+   * &quot;两万三千零七十二点五六&quot; or &quot;23072.56&quot;. Other NERs like MONEY or DATE needs to be handled
+   * in their own methods.
+   * In any case we fail, this method will just return a null.
+   *
+   * @param s The string input.
+   * @param nextWord The next word in sequence. This is likely to be useless for Chinese.
+   * @param multiplier A multiplier to make things simple for callers
+   * @return
+   */
+  private static String normalizedNumberString(String s, String nextWord, double multiplier) {
+    // First remove unnecessary characters in the string
+<span class="nc" id="L547">    s = s.trim();</span>
+<span class="nc" id="L548">    s = s.replaceAll(&quot;[ \t\n\0\f\r,]&quot;, &quot;&quot;); // remove all unnecessary characters</span>
+    // In case of pure arabic numbers, return the straight value of it
+<span class="nc bnc" id="L550" title="All 2 branches missed.">    if(ARABIC_NUMBERS_PATTERN.matcher(s).matches()) {</span>
+<span class="nc" id="L551">      return prettyNumber(String.format(&quot;%f&quot;, multiplier * Double.valueOf(s)));</span>
+    }
+    // If this is not all arabic, we assume it to be either Chinese literal or mix of Chinese literal and arabic
+    // We handle decimal point first
+<span class="nc" id="L555">    int decimalIndex = s.indexOf(LITERAL_DECIMAL_POINT);</span>
+<span class="nc" id="L556">    Double decimalValue = Double.valueOf(0);</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">    if(decimalIndex != -1) {</span>
+      // handle decimal part
+      if(DEBUG) {
+        log.info(&quot;Normalizing decimal part: &quot; + s.substring(decimalIndex+1));
+      }
+<span class="nc" id="L562">      decimalValue = normalizeLiteralDecimalString(s.substring(decimalIndex+1));</span>
+      // if fails at parsing decimal value, return null
+<span class="nc bnc" id="L564" title="All 2 branches missed.">      if(decimalValue == null) {</span>
+<span class="nc" id="L565">        return null;</span>
+      }
+      // update s to be the integer part
+<span class="nc" id="L568">      s = s.substring(0, decimalIndex);</span>
+    }
+    if(DEBUG) {
+      log.info(&quot;Normalizing integer part: &quot; + s);
+    }
+<span class="nc" id="L573">    Double integerValue = recurNormalizeLiteralIntegerString(s);</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">    if(integerValue == null) {</span>
+<span class="nc" id="L575">      return null;</span>
+    }
+    // both decimal and integer part are parsable, we combine them to form the final result
+    // the formatting of numbers in Java is really annoying
+<span class="nc" id="L579">    return prettyNumber(String.format(&quot;%f&quot;, multiplier * Double.valueOf(integerValue.doubleValue() + decimalValue.doubleValue())));</span>
+  }
+
+  /**
+   * Recursively parse a integer String expressed in either Chinese or a mix of Chinese and arabic numbers.
+   *
+   * @param s
+   * @return
+   */
+  private static Double recurNormalizeLiteralIntegerString(String s) {
+    // If empty, return 0
+<span class="nc bnc" id="L590" title="All 2 branches missed.">    if(s.isEmpty()) {</span>
+<span class="nc" id="L591">      return Double.valueOf(0);</span>
+    }
+
+    // TODO: check if it is valid. It is possible that this is a vague number like &quot;五六十&quot; which cannot be parsed by current implementation.
+
+    // In case of pure arabic numbers, return the straight value of it
+<span class="nc bnc" id="L597" title="All 2 branches missed.">    if(ARABIC_NUMBERS_PATTERN.matcher(s).matches()) {</span>
+<span class="nc" id="L598">      return Double.valueOf(s);</span>
+    }
+    //If s has more than 1 char and first char is 零 or 〇, it is likely
+    // to be useless
+<span class="nc bnc" id="L602" title="All 6 branches missed.">    if(s.length() &gt; 1 &amp;&amp; (s.startsWith(&quot;零&quot;) || s.startsWith(&quot;〇&quot;))) {</span>
+<span class="nc" id="L603">      s = s.substring(1);</span>
+    }
+    //If there is only one char left and we can quantify it, we return the value of it
+<span class="nc bnc" id="L606" title="All 4 branches missed.">    if(s.length() == 1 &amp;&amp; wordsToValues.containsKey(s)) {</span>
+<span class="nc" id="L607">      return Double.valueOf(wordsToValues.getCount(s));</span>
+    }
+
+    // Now parse the integer, making use of the compositionality of Chinese literal numbers
+    Double value;
+<span class="nc" id="L612">    value = compositeAtUnitIfExists(s, &quot;亿&quot;);</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">    if(value != null) {</span>
+<span class="nc" id="L614">      return value;</span>
+    } else {
+<span class="nc" id="L616">      value = compositeAtUnitIfExists(s, &quot;万&quot;);</span>
+    }
+<span class="nc bnc" id="L618" title="All 2 branches missed.">    if(value != null) {</span>
+<span class="nc" id="L619">      return value;</span>
+    } else {
+<span class="nc" id="L621">      value = compositeAtUnitIfExists(s, &quot;千&quot;);</span>
+    }
+<span class="nc bnc" id="L623" title="All 2 branches missed.">    if(value != null) {</span>
+<span class="nc" id="L624">      return value;</span>
+    } else {
+<span class="nc" id="L626">      value = compositeAtUnitIfExists(s, &quot;百&quot;);</span>
+    }
+<span class="nc bnc" id="L628" title="All 2 branches missed.">    if(value != null) {</span>
+<span class="nc" id="L629">      return value;</span>
+    } else {
+<span class="nc" id="L631">      value = compositeAtUnitIfExists(s, &quot;十&quot;);</span>
+    }
+<span class="nc bnc" id="L633" title="All 2 branches missed.">    if(value != null) {</span>
+<span class="nc" id="L634">      return value;</span>
+    }
+    // otherwise we fail to parse and just return null
+<span class="nc" id="L637">    return null;</span>
+  }
+
+  /**
+   * Check if a unit exists in the literal string. If so, parse it by making use of
+   * the compositionality; otherwise return null.
+   *
+   * @param s
+   * @param unit
+   * @return
+   */
+  private static Double compositeAtUnitIfExists(String s, String unit) {
+    // invalid unit
+<span class="nc bnc" id="L650" title="All 2 branches missed.">    if(!quantityUnitToValues.containsKey(unit)) {</span>
+<span class="nc" id="L651">      return null;</span>
+    }
+<span class="nc" id="L653">    int idx = s.indexOf(unit);</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">    if(idx != -1) {</span>
+<span class="nc" id="L655">      Double first = Double.valueOf(1.0);</span>
+      // Here we need special handling for 十 and 百 when they occur as the first char
+      // As in Chinese 十二 is very common, 百二十 is sometimes valid as well.
+<span class="nc bnc" id="L658" title="All 6 branches missed.">      if((&quot;十&quot;.equals(unit) || &quot;百&quot;.equals(unit)) &amp;&amp; idx == 0) {</span>
+        // do nothing
+      } else {
+        // otherwise we try to parse the value before the unit
+<span class="nc" id="L662">        first = recurNormalizeLiteralIntegerString(s.substring(0,idx));</span>
+      }
+<span class="nc" id="L664">      Double second = recurNormalizeLiteralIntegerString(s.substring(idx+1));</span>
+
+<span class="nc bnc" id="L666" title="All 4 branches missed.">      if(first != null &amp;&amp; second != null) {</span>
+<span class="nc" id="L667">        return Double.valueOf(first.doubleValue() * quantityUnitToValues.getCount(unit) + second.doubleValue());</span>
+      }
+    }
+    // return null if unit is not present or fails to parse
+<span class="nc" id="L671">    return null;</span>
+  }
+
+  /**
+   * Normalize decimal part of the string. Note that this only handles Chinese literal expressions.
+   * @param s
+   * @return
+   */
+  private static Double normalizeLiteralDecimalString(String s) {
+    // if s is empty return 0
+<span class="nc bnc" id="L681" title="All 2 branches missed.">    if(s.isEmpty()) {</span>
+<span class="nc" id="L682">      return Double.valueOf(0);</span>
+    }
+    // if s is not valid Chinese literal decimal expressions, return null
+<span class="nc bnc" id="L685" title="All 2 branches missed.">    if(!CHINESE_LITERAL_DECIMAL_PATTERN.matcher(s).matches()) {</span>
+<span class="nc" id="L686">      return null;</span>
+    }
+    // after checking we assume the decimal part should be correct
+<span class="nc" id="L689">    double decimalValue = 0;</span>
+<span class="nc" id="L690">    double base = 1;</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">    for(int i=0, sz=s.length(); i&lt;sz; i++) {</span>
+      // update base
+<span class="nc" id="L693">      base *= 0.1;</span>
+<span class="nc" id="L694">      String c = Character.toString(s.charAt(i));</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">      if(!wordsToValues.containsKey(c)) {</span>
+        // some uncatchable character is present, return null
+<span class="nc" id="L697">        return null;</span>
+      }
+<span class="nc" id="L699">      double v = wordsToValues.getCount(c);</span>
+<span class="nc" id="L700">      decimalValue += v * base;</span>
+    }
+<span class="nc" id="L702">    return Double.valueOf(decimalValue);</span>
+  }
+
+  private static String normalizeMonthOrDay(String s, String context) {
+<span class="nc" id="L706">    int ctx = -1;</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">    if (!context.equals(&quot;XX&quot;))</span>
+<span class="nc" id="L708">      ctx = Integer.valueOf(context);</span>
+
+<span class="nc bnc" id="L710" title="All 2 branches missed.">    if (monthDayModifiers.containsKey(s)) {</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">      if (ctx &gt;= 0)</span>
+        // todo: this is unsafe as it's not bound-checked for validity
+<span class="nc" id="L713">        return String.format(&quot;%02d&quot;, ctx + monthDayModifiers.get(s));</span>
+      else
+<span class="nc" id="L715">        return &quot;XX&quot;;</span>
+    } else {
+      String candidate;
+
+<span class="nc bnc" id="L719" title="All 2 branches missed.">      if (s == null) {</span>
+<span class="nc" id="L720">        return &quot;XX&quot;;</span>
+      } else {
+
+<span class="nc bnc" id="L723" title="All 2 branches missed.">        if (s.matches(CHINESE_DATE_NUMERALS_PATTERN + &quot;+&quot;))</span>
+<span class="nc" id="L724">          candidate = prettyNumber(String.format(&quot;%f&quot;, recurNormalizeLiteralIntegerString(s)));</span>
+        else
+<span class="nc" id="L726">          candidate = s;</span>
+      }
+
+<span class="nc bnc" id="L729" title="All 2 branches missed.">      if (candidate.length() &lt; 2)</span>
+<span class="nc" id="L730">        candidate = &quot;0&quot; + candidate;</span>
+
+<span class="nc" id="L732">      return candidate;</span>
+    }
+  }
+
+  private static String normalizeYear(String s, String contextYear) {
+<span class="nc" id="L737">    return normalizeYear(s, contextYear, false);</span>
+  }
+
+  private static String normalizeYear(String s, String contextYear, boolean strict) {
+<span class="nc" id="L741">    int ctx = -1;</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">    if (!contextYear.equals(&quot;XXXX&quot;))</span>
+<span class="nc" id="L743">      ctx = Integer.valueOf(contextYear);</span>
+
+<span class="nc bnc" id="L745" title="All 2 branches missed.">    if (yearModifiers.containsKey(s)) {</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">      if (ctx &gt;= 0)</span>
+<span class="nc" id="L747">        return String.format(&quot;%d&quot;, ctx + yearModifiers.get(s));</span>
+      else
+<span class="nc" id="L749">        return &quot;XXXX&quot;;</span>
+    } else {
+      String candidate;
+<span class="nc" id="L752">      StringBuilder yearcandidate = new StringBuilder();</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">      for (int i = 0; i &lt; s.length(); i++) {</span>
+<span class="nc" id="L754">        String t = &quot;&quot; + s.charAt(i);</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        if (CHINESE_LITERAL_DECIMAL_PATTERN.matcher(t).matches()) {</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">          if (wordsToValues.containsKey(t))</span>
+<span class="nc" id="L757">            yearcandidate.append((int) wordsToValues.getCount(t));</span>
+          else
+            // something unexpected happened
+<span class="nc" id="L760">            return null;</span>
+        } else
+<span class="nc" id="L762">          yearcandidate.append(t);</span>
+      }
+
+<span class="nc" id="L765">      candidate = yearcandidate.toString();</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">      if (candidate.length() != 2) {</span>
+<span class="nc" id="L767">        return candidate;</span>
+      }
+
+<span class="nc bnc" id="L770" title="All 2 branches missed.">      if (ctx &lt; 0) {</span>
+        // use the current year as reference point for two digit year normalization by default
+<span class="nc" id="L772">        ctx = Integer.valueOf(new SimpleDateFormat(&quot;yyyy&quot;).format(new Date()));</span>
+      }
+
+      // note: this is a very crude heuristic for determining actual year from two digit expressions
+<span class="nc" id="L776">      int cand = Integer.valueOf(candidate);</span>
+
+<span class="nc bnc" id="L778" title="All 6 branches missed.">      if ((strict &amp;&amp; cand &gt;= (ctx % 100)) || cand &gt; (ctx % 100 + 10)) {</span>
+        // referring to the previous century
+<span class="nc" id="L780">        cand += (ctx / 100 - 1) * 100;</span>
+      } else {
+        // referring to the same century
+<span class="nc" id="L783">        cand += (ctx / 100) * 100;</span>
+      }
+
+<span class="nc" id="L786">      return String.format(&quot;%d&quot;, cand);</span>
+    }
+  }
+
+  /**
+   * Normalizes date strings.
+   * @param s Input date string
+   * @param ctxdate Context date (usually doc_date)
+   * @return Normalized Timex expression of the input date string
+     */
+  public static String normalizeDateString(String s, String ctxdate) {
+    // TODO [pengqi]: need to handle basic localization (&quot;在七月二日到[八日]间&quot;)
+    // TODO [pengqi]: need to handle literal numeral dates (usually used in events, e.g. &quot;三一五&quot; for 03-15)
+    // TODO [pengqi]: might need to add a pattern for centuries (&quot;上世纪90年代&quot;)?
+
+    Pattern p;
+    Matcher m;
+<span class="nc" id="L803">    String ctxyear = &quot;XXXX&quot;, ctxmonth = &quot;XX&quot;, ctxday = &quot;XX&quot;;</span>
+
+    // set up context date
+<span class="nc bnc" id="L806" title="All 2 branches missed.">    if (ctxdate != null) {</span>
+<span class="nc" id="L807">      p = Pattern.compile(&quot;^&quot; + BASIC_YYYYMMDD_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L808">      m = p.matcher(ctxdate);</span>
+
+<span class="nc bnc" id="L810" title="All 4 branches missed.">      if (m.find() &amp;&amp; m.groupCount() == 3) {</span>
+<span class="nc" id="L811">        ctxyear = m.group(1);</span>
+<span class="nc" id="L812">        ctxmonth = m.group(2);</span>
+<span class="nc" id="L813">        ctxday = m.group(3);</span>
+      }
+    }
+
+<span class="nc" id="L817">    p = Pattern.compile(&quot;^&quot; + BIRTH_DECADE_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L818">    m = p.matcher(s);</span>
+
+<span class="nc bnc" id="L820" title="All 4 branches missed.">    if (m.find() &amp;&amp; m.groupCount() == 1) {</span>
+<span class="nc" id="L821">      StringBuilder res = new StringBuilder();</span>
+
+<span class="nc" id="L823">      res.append(normalizeYear(m.group(1), ctxyear, true).substring(0, 3) + &quot;X&quot;);</span>
+<span class="nc" id="L824">      res.append(&quot;-XX-XX&quot;);</span>
+
+<span class="nc" id="L826">      return res.toString();</span>
+    }
+
+<span class="nc" id="L829">    p = Pattern.compile(&quot;^&quot; + RELATIVE_TIME_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L830">    m = p.matcher(s);</span>
+
+<span class="nc bnc" id="L832" title="All 4 branches missed.">    if (m.find() &amp;&amp; m.groupCount() == 1) {</span>
+<span class="nc" id="L833">      StringBuilder res = new StringBuilder();</span>
+
+<span class="nc" id="L835">      res.append(ctxyear);</span>
+<span class="nc" id="L836">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L837">      res.append(ctxmonth);</span>
+<span class="nc" id="L838">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L839">      res.append(normalizeMonthOrDay(m.group(1), ctxday));</span>
+
+<span class="nc" id="L841">      return res.toString();</span>
+    }
+
+<span class="nc" id="L844">    p = Pattern.compile(&quot;^&quot; + BASIC_YYYYMMDD_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L845">    m = p.matcher(s);</span>
+
+<span class="nc bnc" id="L847" title="All 4 branches missed.">    if (m.find() &amp;&amp; m.groupCount() == 3) {</span>
+<span class="nc" id="L848">      StringBuilder res = new StringBuilder();</span>
+
+<span class="nc" id="L850">      res.append(normalizeYear(m.group(1), ctxyear));</span>
+<span class="nc" id="L851">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L852">      res.append(normalizeMonthOrDay(m.group(2), ctxmonth));</span>
+<span class="nc" id="L853">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L854">      res.append(normalizeMonthOrDay(m.group(3), ctxday));</span>
+
+<span class="nc" id="L856">      return res.toString();</span>
+    }
+
+<span class="nc" id="L859">    p = Pattern.compile(&quot;^&quot; + BASIC_MMDD_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L860">    m = p.matcher(s);</span>
+
+<span class="nc bnc" id="L862" title="All 4 branches missed.">    if (m.find() &amp;&amp; m.groupCount() == 2) {</span>
+<span class="nc" id="L863">      StringBuilder res = new StringBuilder();</span>
+
+<span class="nc" id="L865">      res.append(ctxyear);</span>
+<span class="nc" id="L866">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L867">      res.append(normalizeMonthOrDay(m.group(1), ctxmonth));</span>
+<span class="nc" id="L868">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L869">      res.append(normalizeMonthOrDay(m.group(2), ctxday));</span>
+
+<span class="nc" id="L871">      return res.toString();</span>
+    }
+
+<span class="nc" id="L874">    p = Pattern.compile(&quot;^&quot; + BASIC_DD_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L875">    m = p.matcher(s);</span>
+
+<span class="nc bnc" id="L877" title="All 4 branches missed.">    if (m.find() &amp;&amp; m.groupCount() == 1) {</span>
+<span class="nc" id="L878">      StringBuilder res = new StringBuilder();</span>
+
+<span class="nc" id="L880">      res.append(ctxyear);</span>
+<span class="nc" id="L881">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L882">      res.append(ctxmonth);</span>
+<span class="nc" id="L883">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L884">      res.append(normalizeMonthOrDay(m.group(1), ctxday));</span>
+
+<span class="nc" id="L886">      return res.toString();</span>
+    }
+
+<span class="nc" id="L889">    p = Pattern.compile(&quot;^&quot; + ENGLISH_MMDDYYYY_PATTERN + &quot;$&quot;);</span>
+<span class="nc" id="L890">    m = p.matcher(s);</span>
+
+<span class="nc bnc" id="L892" title="All 4 branches missed.">    if (m.find() &amp;&amp; m.groupCount() == 3) {</span>
+<span class="nc" id="L893">      StringBuilder res = new StringBuilder();</span>
+
+<span class="nc bnc" id="L895" title="All 2 branches missed.">      if (m.group(3) == null)</span>
+<span class="nc" id="L896">        res.append(ctxyear);</span>
+      else
+<span class="nc" id="L898">        res.append(normalizeYear(m.group(3), ctxyear));</span>
+<span class="nc" id="L899">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L900">      res.append(normalizeMonthOrDay(m.group(1), ctxmonth));</span>
+<span class="nc" id="L901">      res.append(&quot;-&quot;);</span>
+<span class="nc" id="L902">      res.append(normalizeMonthOrDay(m.group(2), ctxday));</span>
+
+<span class="nc" id="L904">      return res.toString();</span>
+    }
+
+<span class="nc" id="L907">    return s;</span>
+  }
+
+  /**
+   * Concatenate entity annotations to a String. Note that Chinese does not use space to separate
+   * tokens so we will follow this convention here.
+   *
+   * @param l
+   * @param &lt;E&gt;
+   * @return
+   */
+  public static &lt;E extends CoreMap&gt; String singleEntityToString(List&lt;E&gt; l) {
+<span class="nc" id="L919">    String entityType = l.get(0).get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc" id="L920">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">    for (E w : l) {</span>
+<span class="nc bnc" id="L922" title="All 2 branches missed.">      if(!w.get(CoreAnnotations.NamedEntityTagAnnotation.class).equals(entityType)) {</span>
+<span class="nc" id="L923">        log.fatal(&quot;Incontinuous NER tags detected in entity: &quot; + l);</span>
+      }
+<span class="nc" id="L925">      sb.append(w.get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L926">    }</span>
+<span class="nc" id="L927">    return sb.toString();</span>
+  }
+
+  public static String prettyNumber(String s) {
+<span class="nc bnc" id="L931" title="All 2 branches missed.">    if(s == null) {</span>
+<span class="nc" id="L932">      return null;</span>
+    }
+<span class="nc bnc" id="L934" title="All 2 branches missed.">    s = s.indexOf(&quot;.&quot;) &lt; 0 ? s : s.replaceAll(&quot;0*$&quot;, &quot;&quot;).replaceAll(&quot;\\.$&quot;, &quot;&quot;);</span>
+<span class="nc" id="L935">    return s;</span>
+  }
+
+
+  /**
+   * Fix up the NER sequence in case this is necessary.
+   *
+   * @param list
+   * @param &lt;E&gt;
+   */
+  public static &lt;E extends CoreMap&gt; void fixupNerBeforeNormalization(List&lt;E&gt; list) {
+<span class="nc" id="L946">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

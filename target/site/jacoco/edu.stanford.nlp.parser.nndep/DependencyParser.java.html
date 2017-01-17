@@ -1,0 +1,1300 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DependencyParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.nndep</a> &gt; <span class="el_source">DependencyParser.java</span></div><h1>DependencyParser.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.nndep;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.international.Language;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.process.DocumentPreprocessor;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.IntCounter;
+import edu.stanford.nlp.tagger.maxent.MaxentTagger;
+import edu.stanford.nlp.trees.EnglishGrammaticalRelations;
+import edu.stanford.nlp.trees.EnglishGrammaticalStructure;
+import edu.stanford.nlp.trees.GrammaticalRelation;
+import edu.stanford.nlp.trees.GrammaticalStructure;
+import edu.stanford.nlp.trees.TreeGraphNode;
+import edu.stanford.nlp.trees.TypedDependency;
+import edu.stanford.nlp.trees.UniversalEnglishGrammaticalRelations;
+import edu.stanford.nlp.trees.UniversalEnglishGrammaticalStructure;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseGrammaticalRelations;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseGrammaticalStructure;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.Timing;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.Writer;
+import java.util.*;
+
+import static java.util.stream.Collectors.toList;
+
+/**
+ * This class defines a transition-based dependency parser which makes
+ * use of a classifier powered by a neural network. The neural network
+ * accepts distributed representation inputs: dense, continuous
+ * representations of words, their part of speech tags, and the labels
+ * which connect words in a partial dependency parse.
+ *
+ * &lt;p&gt;
+ * This is an implementation of the method described in
+ *
+ * &lt;blockquote&gt;
+ *   Danqi Chen and Christopher Manning. A Fast and Accurate Dependency
+ *   Parser Using Neural Networks. In EMNLP 2014.
+ * &lt;/blockquote&gt;
+ *
+ * &lt;p&gt;
+ * New models can be trained from the command line; see {@link #main}
+ * for details on training options. This parser will also output
+ * CoNLL-X format predictions; again see {@link #main} for available
+ * options.
+ *
+ * &lt;p&gt;
+ * This parser can also be used programmatically. The easiest way to
+ * prepare the parser with a pre-trained model is to call
+ * {@link #loadFromModelFile(String)}. Then call
+ * {@link #predict(edu.stanford.nlp.util.CoreMap)} on the returned
+ * parser instance in order to get new parses.
+ *
+ * @author Danqi Chen (danqi@cs.stanford.edu)
+ * @author Jon Gauthier
+ */
+public class DependencyParser  {
+
+  /** A logger for this class */
+<span class="nc" id="L77">  private static Redwood.RedwoodChannels log = Redwood.channels(DependencyParser.class);</span>
+  public static final String DEFAULT_MODEL = &quot;edu/stanford/nlp/models/parser/nndep/english_UD.gz&quot;;
+
+  /**
+   * Words, parts of speech, and dependency relation labels which were
+   * observed in our corpus / stored in the model
+   *
+   * @see #genDictionaries(java.util.List, java.util.List)
+   */
+  private List&lt;String&gt; knownWords, knownPos, knownLabels;
+
+  /** Return the set of part-of-speech tags of this parser. We normalize it a bit to help it match what
+   *  other parsers use.
+   *
+   *  @return Set of POS tags
+   */
+  public Set&lt;String&gt; getPosSet() {
+<span class="nc" id="L94">    Set&lt;String&gt; foo = Generics.newHashSet(knownPos);</span>
+    // Don't really understand why these ones are there, but remove them. [CDM 2016]
+<span class="nc" id="L96">    foo.remove(&quot;-NULL-&quot;);</span>
+<span class="nc" id="L97">    foo.remove(&quot;-UNKNOWN-&quot;);</span>
+<span class="nc" id="L98">    foo.remove(&quot;-ROOT-&quot;);</span>
+    // but our other models do include an EOS tag
+<span class="nc" id="L100">    foo.add(&quot;.$$.&quot;);</span>
+<span class="nc" id="L101">    return Collections.unmodifiableSet(foo);</span>
+  }
+
+  /**
+   * Mapping from word / POS / dependency relation label to integer ID
+   */
+  private Map&lt;String, Integer&gt; wordIDs, posIDs, labelIDs;
+
+  private List&lt;Integer&gt; preComputed;
+
+  /**
+   * Given a particular parser configuration, this classifier will
+   * predict the best transition to make next.
+   *
+   * The {@link edu.stanford.nlp.parser.nndep.Classifier} class
+   * handles both training and inference.
+   */
+  private Classifier classifier;
+  private ParsingSystem system;
+
+  private final Config config;
+
+  /**
+   * Language used to generate
+   * {@link edu.stanford.nlp.trees.GrammaticalRelation} instances.
+   */
+  private final Language language;
+
+  DependencyParser() {
+<span class="nc" id="L130">    this(new Properties());</span>
+<span class="nc" id="L131">  }</span>
+
+<span class="nc" id="L133">  public DependencyParser(Properties properties) {</span>
+<span class="nc" id="L134">    config = new Config(properties);</span>
+
+    // Convert Languages.Language instance to
+    // GrammaticalLanguage.Language
+<span class="nc" id="L138">    this.language = config.language;</span>
+<span class="nc" id="L139">  }</span>
+
+  /**
+   * Get an integer ID for the given word. This ID can be used to index
+   * into the embeddings {@link Classifier#E}.
+   *
+   * @return An ID for the given word, or an ID referring to a generic
+   *         &quot;unknown&quot; word if the word is unknown
+   */
+  public int getWordID(String s) {
+<span class="nc bnc" id="L149" title="All 2 branches missed.">      return wordIDs.containsKey(s) ? wordIDs.get(s) : wordIDs.get(Config.UNKNOWN);</span>
+  }
+
+  public int getPosID(String s) {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      return posIDs.containsKey(s) ? posIDs.get(s) : posIDs.get(Config.UNKNOWN);</span>
+  }
+
+  public int getLabelID(String s) {
+<span class="nc" id="L157">    return labelIDs.get(s);</span>
+  }
+
+  public List&lt;Integer&gt; getFeatures(Configuration c) {
+    // Presize the arrays for very slight speed gain. Hardcoded, but so is the current feature list.
+<span class="nc" id="L162">    List&lt;Integer&gt; fWord = new ArrayList&lt;&gt;(18);</span>
+<span class="nc" id="L163">    List&lt;Integer&gt; fPos = new ArrayList&lt;&gt;(18);</span>
+<span class="nc" id="L164">    List&lt;Integer&gt; fLabel = new ArrayList&lt;&gt;(12);</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">    for (int j = 2; j &gt;= 0; --j) {</span>
+<span class="nc" id="L166">      int index = c.getStack(j);</span>
+<span class="nc" id="L167">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L168">      fPos.add(getPosID(c.getPOS(index)));</span>
+    }
+<span class="nc bnc" id="L170" title="All 2 branches missed.">    for (int j = 0; j &lt;= 2; ++j) {</span>
+<span class="nc" id="L171">      int index = c.getBuffer(j);</span>
+<span class="nc" id="L172">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L173">      fPos.add(getPosID(c.getPOS(index)));</span>
+    }
+<span class="nc bnc" id="L175" title="All 2 branches missed.">    for (int j = 0; j &lt;= 1; ++j) {</span>
+<span class="nc" id="L176">      int k = c.getStack(j);</span>
+<span class="nc" id="L177">      int index = c.getLeftChild(k);</span>
+<span class="nc" id="L178">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L179">      fPos.add(getPosID(c.getPOS(index)));</span>
+<span class="nc" id="L180">      fLabel.add(getLabelID(c.getLabel(index)));</span>
+
+<span class="nc" id="L182">      index = c.getRightChild(k);</span>
+<span class="nc" id="L183">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L184">      fPos.add(getPosID(c.getPOS(index)));</span>
+<span class="nc" id="L185">      fLabel.add(getLabelID(c.getLabel(index)));</span>
+
+<span class="nc" id="L187">      index = c.getLeftChild(k, 2);</span>
+<span class="nc" id="L188">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L189">      fPos.add(getPosID(c.getPOS(index)));</span>
+<span class="nc" id="L190">      fLabel.add(getLabelID(c.getLabel(index)));</span>
+
+<span class="nc" id="L192">      index = c.getRightChild(k, 2);</span>
+<span class="nc" id="L193">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L194">      fPos.add(getPosID(c.getPOS(index)));</span>
+<span class="nc" id="L195">      fLabel.add(getLabelID(c.getLabel(index)));</span>
+
+<span class="nc" id="L197">      index = c.getLeftChild(c.getLeftChild(k));</span>
+<span class="nc" id="L198">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L199">      fPos.add(getPosID(c.getPOS(index)));</span>
+<span class="nc" id="L200">      fLabel.add(getLabelID(c.getLabel(index)));</span>
+
+<span class="nc" id="L202">      index = c.getRightChild(c.getRightChild(k));</span>
+<span class="nc" id="L203">      fWord.add(getWordID(c.getWord(index)));</span>
+<span class="nc" id="L204">      fPos.add(getPosID(c.getPOS(index)));</span>
+<span class="nc" id="L205">      fLabel.add(getLabelID(c.getLabel(index)));</span>
+    }
+
+<span class="nc" id="L208">    List&lt;Integer&gt; feature = new ArrayList&lt;&gt;(48);</span>
+<span class="nc" id="L209">    feature.addAll(fWord);</span>
+<span class="nc" id="L210">    feature.addAll(fPos);</span>
+<span class="nc" id="L211">    feature.addAll(fLabel);</span>
+<span class="nc" id="L212">    return feature;</span>
+  }
+
+  private static final int POS_OFFSET = 18;
+  private static final int DEP_OFFSET = 36;
+  private static final int STACK_OFFSET = 6;
+  private static final int STACK_NUMBER = 6;
+
+  private int[] getFeatureArray(Configuration c) {
+<span class="nc" id="L221">    int[] feature = new int[config.numTokens];  // positions 0-17 hold fWord, 18-35 hold fPos, 36-47 hold fLabel</span>
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    for (int j = 2; j &gt;= 0; --j) {</span>
+<span class="nc" id="L224">      int index = c.getStack(j);</span>
+<span class="nc" id="L225">      feature[2-j] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L226">      feature[POS_OFFSET + (2-j)] = getPosID(c.getPOS(index));</span>
+    }
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">    for (int j = 0; j &lt;= 2; ++j) {</span>
+<span class="nc" id="L230">      int index = c.getBuffer(j);</span>
+<span class="nc" id="L231">      feature[3 + j] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L232">      feature[POS_OFFSET + 3 + j] = getPosID(c.getPOS(index));</span>
+    }
+
+<span class="nc bnc" id="L235" title="All 2 branches missed.">    for (int j = 0; j &lt;= 1; ++j) {</span>
+<span class="nc" id="L236">      int k = c.getStack(j);</span>
+
+<span class="nc" id="L238">      int index = c.getLeftChild(k);</span>
+<span class="nc" id="L239">      feature[STACK_OFFSET + j * STACK_NUMBER] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L240">      feature[POS_OFFSET + STACK_OFFSET + j * STACK_NUMBER] = getPosID(c.getPOS(index));</span>
+<span class="nc" id="L241">      feature[DEP_OFFSET + j * STACK_NUMBER] = getLabelID(c.getLabel(index));</span>
+
+<span class="nc" id="L243">      index = c.getRightChild(k);</span>
+<span class="nc" id="L244">      feature[STACK_OFFSET + j * STACK_NUMBER + 1] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L245">      feature[POS_OFFSET + STACK_OFFSET + j * STACK_NUMBER + 1] = getPosID(c.getPOS(index));</span>
+<span class="nc" id="L246">      feature[DEP_OFFSET + j * STACK_NUMBER + 1] = getLabelID(c.getLabel(index));</span>
+
+<span class="nc" id="L248">      index = c.getLeftChild(k, 2);</span>
+<span class="nc" id="L249">      feature[STACK_OFFSET + j * STACK_NUMBER + 2] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L250">      feature[POS_OFFSET + STACK_OFFSET + j * STACK_NUMBER + 2] = getPosID(c.getPOS(index));</span>
+<span class="nc" id="L251">      feature[DEP_OFFSET + j * STACK_NUMBER + 2] = getLabelID(c.getLabel(index));</span>
+
+<span class="nc" id="L253">      index = c.getRightChild(k, 2);</span>
+<span class="nc" id="L254">      feature[STACK_OFFSET + j * STACK_NUMBER + 3] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L255">      feature[POS_OFFSET + STACK_OFFSET + j * STACK_NUMBER + 3] = getPosID(c.getPOS(index));</span>
+<span class="nc" id="L256">      feature[DEP_OFFSET + j * STACK_NUMBER + 3] = getLabelID(c.getLabel(index));</span>
+
+<span class="nc" id="L258">      index = c.getLeftChild(c.getLeftChild(k));</span>
+<span class="nc" id="L259">      feature[STACK_OFFSET + j * STACK_NUMBER + 4] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L260">      feature[POS_OFFSET + STACK_OFFSET + j * STACK_NUMBER + 4] = getPosID(c.getPOS(index));</span>
+<span class="nc" id="L261">      feature[DEP_OFFSET + j * STACK_NUMBER + 4] = getLabelID(c.getLabel(index));</span>
+
+<span class="nc" id="L263">      index = c.getRightChild(c.getRightChild(k));</span>
+<span class="nc" id="L264">      feature[STACK_OFFSET + j * STACK_NUMBER + 5] = getWordID(c.getWord(index));</span>
+<span class="nc" id="L265">      feature[POS_OFFSET + STACK_OFFSET + j * STACK_NUMBER + 5] = getPosID(c.getPOS(index));</span>
+<span class="nc" id="L266">      feature[DEP_OFFSET + j * STACK_NUMBER + 5] = getLabelID(c.getLabel(index));</span>
+    }
+
+<span class="nc" id="L269">    return feature;</span>
+  }
+
+  public Dataset genTrainExamples(List&lt;CoreMap&gt; sents, List&lt;DependencyTree&gt; trees) {
+<span class="nc" id="L273">    int numTrans = system.numTransitions();</span>
+<span class="nc" id="L274">    Dataset ret = new Dataset(config.numTokens, numTrans);</span>
+
+<span class="nc" id="L276">    Counter&lt;Integer&gt; tokPosCount = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L277">    log.info(Config.SEPARATOR);</span>
+<span class="nc" id="L278">    log.info(&quot;Generate training examples...&quot;);</span>
+
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    for (int i = 0; i &lt; sents.size(); ++i) {</span>
+
+<span class="nc bnc" id="L282" title="All 2 branches missed.">      if (i &gt; 0) {</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (i % 1000 == 0)</span>
+<span class="nc" id="L284">          log.info(i + &quot; &quot;);</span>
+<span class="nc bnc" id="L285" title="All 4 branches missed.">        if (i % 10000 == 0 || i == sents.size() - 1)</span>
+<span class="nc" id="L286">          log.info();</span>
+      }
+
+<span class="nc bnc" id="L289" title="All 2 branches missed.">      if (trees.get(i).isProjective()) {</span>
+<span class="nc" id="L290">        Configuration c = system.initialConfiguration(sents.get(i));</span>
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        while (!system.isTerminal(c)) {</span>
+<span class="nc" id="L293">          String oracle = system.getOracle(c, trees.get(i));</span>
+<span class="nc" id="L294">          List&lt;Integer&gt; feature = getFeatures(c);</span>
+<span class="nc" id="L295">          List&lt;Integer&gt; label = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">          for (int j = 0; j &lt; numTrans; ++j) {</span>
+<span class="nc" id="L297">            String str = system.transitions.get(j);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if (str.equals(oracle)) label.add(1);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            else if (system.canApply(c, str)) label.add(0);</span>
+<span class="nc" id="L300">            else label.add(-1);</span>
+          }
+
+<span class="nc" id="L303">          ret.addExample(feature, label);</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">          for (int j = 0; j &lt; feature.size(); ++j)</span>
+<span class="nc" id="L305">            tokPosCount.incrementCount(feature.get(j) * feature.size() + j);</span>
+<span class="nc" id="L306">          system.apply(c, oracle);</span>
+<span class="nc" id="L307">        }</span>
+      }
+    }
+<span class="nc" id="L310">    log.info(&quot;#Train Examples: &quot; + ret.n);</span>
+
+<span class="nc" id="L312">    List&lt;Integer&gt; sortedTokens = Counters.toSortedList(tokPosCount, false);</span>
+<span class="nc" id="L313">    preComputed = new ArrayList&lt;&gt;(sortedTokens.subList(0, Math.min(config.numPreComputed, sortedTokens.size())));</span>
+
+<span class="nc" id="L315">    return ret;</span>
+  }
+
+  /**
+   * Generate unique integer IDs for all known words / part-of-speech
+   * tags / dependency relation labels.
+   *
+   * All three of the aforementioned types are assigned IDs from a
+   * continuous range of integers; all IDs 0 &lt;= ID &lt; n_w are word IDs,
+   * all IDs n_w &lt;= ID &lt; n_w + n_pos are POS tag IDs, and so on.
+   */
+  private void generateIDs() {
+<span class="nc" id="L327">    wordIDs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L328">    posIDs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L329">    labelIDs = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L331">    int index = 0;</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    for (String word : knownWords)</span>
+<span class="nc" id="L333">      wordIDs.put(word, (index++));</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">    for (String pos : knownPos)</span>
+<span class="nc" id="L335">      posIDs.put(pos, (index++));</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    for (String label : knownLabels)</span>
+<span class="nc" id="L337">      labelIDs.put(label, (index++));</span>
+<span class="nc" id="L338">  }</span>
+
+  /**
+   * Scan a corpus and store all words, part-of-speech tags, and
+   * dependency relation labels observed. Prepare other structures
+   * which support word / POS / label lookup at train- / run-time.
+   */
+  private void genDictionaries(List&lt;CoreMap&gt; sents, List&lt;DependencyTree&gt; trees) {
+    // Collect all words (!), etc. in lists, tacking on one sentence
+    // after the other
+<span class="nc" id="L348">    List&lt;String&gt; word = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L349">    List&lt;String&gt; pos = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L350">    List&lt;String&gt; label = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L352" title="All 2 branches missed.">    for (CoreMap sentence : sents) {</span>
+<span class="nc" id="L353">      List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+
+<span class="nc bnc" id="L355" title="All 2 branches missed.">      for (CoreLabel token : tokens) {</span>
+<span class="nc" id="L356">        word.add(token.word());</span>
+<span class="nc" id="L357">        pos.add(token.tag());</span>
+<span class="nc" id="L358">      }</span>
+<span class="nc" id="L359">    }</span>
+
+<span class="nc" id="L361">    String rootLabel = null;</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    for (DependencyTree tree : trees)</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">      for (int k = 1; k &lt;= tree.n; ++k)</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (tree.getHead(k) == 0)</span>
+<span class="nc" id="L365">          rootLabel = tree.getLabel(k);</span>
+        else
+<span class="nc" id="L367">          label.add(tree.getLabel(k));</span>
+
+    // Generate &quot;dictionaries,&quot; possibly with frequency cutoff
+<span class="nc" id="L370">    knownWords = Util.generateDict(word, config.wordCutOff);</span>
+<span class="nc" id="L371">    knownPos = Util.generateDict(pos);</span>
+<span class="nc" id="L372">    knownLabels = Util.generateDict(label);</span>
+<span class="nc" id="L373">    knownLabels.add(0, rootLabel);</span>
+
+    // Avoid the case that rootLabel equals to one of the other labels
+<span class="nc bnc" id="L376" title="All 2 branches missed.">    for (int k = 1; k &lt; knownLabels.size(); ++ k)</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">      if (knownLabels.get(k).equals(rootLabel)) {</span>
+<span class="nc" id="L378">        knownLabels.remove(k);</span>
+<span class="nc" id="L379">        break;</span>
+      }
+
+<span class="nc" id="L382">    knownWords.add(0, Config.UNKNOWN);</span>
+<span class="nc" id="L383">    knownWords.add(1, Config.NULL);</span>
+<span class="nc" id="L384">    knownWords.add(2, Config.ROOT);</span>
+
+<span class="nc" id="L386">    knownPos.add(0, Config.UNKNOWN);</span>
+<span class="nc" id="L387">    knownPos.add(1, Config.NULL);</span>
+<span class="nc" id="L388">    knownPos.add(2, Config.ROOT);</span>
+
+<span class="nc" id="L390">    knownLabels.add(0, Config.NULL);</span>
+<span class="nc" id="L391">    generateIDs();</span>
+
+<span class="nc" id="L393">    log.info(Config.SEPARATOR);</span>
+<span class="nc" id="L394">    log.info(&quot;#Word: &quot; + knownWords.size());</span>
+<span class="nc" id="L395">    log.info(&quot;#POS:&quot; + knownPos.size());</span>
+<span class="nc" id="L396">    log.info(&quot;#Label: &quot; + knownLabels.size());</span>
+<span class="nc" id="L397">  }</span>
+
+  public void writeModelFile(String modelFile) {
+    try {
+<span class="nc" id="L401">      double[][] W1 = classifier.getW1();</span>
+<span class="nc" id="L402">      double[] b1 = classifier.getb1();</span>
+<span class="nc" id="L403">      double[][] W2 = classifier.getW2();</span>
+<span class="nc" id="L404">      double[][] E = classifier.getE();</span>
+
+<span class="nc" id="L406">      Writer output = IOUtils.getPrintWriter(modelFile);</span>
+
+<span class="nc" id="L408">      output.write(&quot;dict=&quot; + knownWords.size() + &quot;\n&quot;);</span>
+<span class="nc" id="L409">      output.write(&quot;pos=&quot; + knownPos.size() + &quot;\n&quot;);</span>
+<span class="nc" id="L410">      output.write(&quot;label=&quot; + knownLabels.size() + &quot;\n&quot;);</span>
+<span class="nc" id="L411">      output.write(&quot;embeddingSize=&quot; + E[0].length + &quot;\n&quot;);</span>
+<span class="nc" id="L412">      output.write(&quot;hiddenSize=&quot; + b1.length + &quot;\n&quot;);</span>
+<span class="nc" id="L413">      output.write(&quot;numTokens=&quot; + (W1[0].length / E[0].length) + &quot;\n&quot;);</span>
+<span class="nc" id="L414">      output.write(&quot;preComputed=&quot; + preComputed.size() + &quot;\n&quot;);</span>
+
+<span class="nc" id="L416">      int index = 0;</span>
+
+      // First write word / POS / label embeddings
+<span class="nc bnc" id="L419" title="All 2 branches missed.">      for (String word : knownWords) {</span>
+<span class="nc" id="L420">        index = writeEmbedding(E[index], output, index, word);</span>
+<span class="nc" id="L421">      }</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">      for (String pos : knownPos) {</span>
+<span class="nc" id="L423">        index = writeEmbedding(E[index], output, index, pos);</span>
+<span class="nc" id="L424">      }</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">      for (String label : knownLabels) {</span>
+<span class="nc" id="L426">        index = writeEmbedding(E[index], output, index, label);</span>
+<span class="nc" id="L427">      }</span>
+
+      // Now write classifier weights
+<span class="nc bnc" id="L430" title="All 2 branches missed.">      for (int j = 0; j &lt; W1[0].length; ++j)</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        for (int i = 0; i &lt; W1.length; ++i) {</span>
+<span class="nc" id="L432">          output.write(String.valueOf(W1[i][j]));</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">          if (i == W1.length - 1)</span>
+<span class="nc" id="L434">            output.write(&quot;\n&quot;);</span>
+          else
+<span class="nc" id="L436">            output.write(&quot; &quot;);</span>
+        }
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      for (int i = 0; i &lt; b1.length; ++i) {</span>
+<span class="nc" id="L439">        output.write(String.valueOf(b1[i]));</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        if (i == b1.length - 1)</span>
+<span class="nc" id="L441">          output.write(&quot;\n&quot;);</span>
+        else
+<span class="nc" id="L443">          output.write(&quot; &quot;);</span>
+      }
+<span class="nc bnc" id="L445" title="All 2 branches missed.">      for (int j = 0; j &lt; W2[0].length; ++j)</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        for (int i = 0; i &lt; W2.length; ++i) {</span>
+<span class="nc" id="L447">          output.write(String.valueOf(W2[i][j]));</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">          if (i == W2.length - 1)</span>
+<span class="nc" id="L449">            output.write(&quot;\n&quot;);</span>
+          else
+<span class="nc" id="L451">            output.write(&quot; &quot;);</span>
+        }
+
+      // Finish with pre-computation info
+<span class="nc bnc" id="L455" title="All 2 branches missed.">      for (int i = 0; i &lt; preComputed.size(); ++i) {</span>
+<span class="nc" id="L456">        output.write(String.valueOf(preComputed.get(i)));</span>
+<span class="nc bnc" id="L457" title="All 4 branches missed.">        if ((i + 1) % 100 == 0 || i == preComputed.size() - 1)</span>
+<span class="nc" id="L458">          output.write(&quot;\n&quot;);</span>
+        else
+<span class="nc" id="L460">          output.write(&quot; &quot;);</span>
+      }
+
+<span class="nc" id="L463">      output.close();</span>
+<span class="nc" id="L464">    } catch (IOException e) {</span>
+<span class="nc" id="L465">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L466">    }</span>
+<span class="nc" id="L467">  }</span>
+
+  private static int writeEmbedding(double[] doubles, Writer output, int index, String word) throws IOException {
+<span class="nc" id="L470">    output.write(word);</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">    for (double aDouble : doubles) {</span>
+<span class="nc" id="L472">      output.write(&quot; &quot; + aDouble);</span>
+    }
+<span class="nc" id="L474">    output.write(&quot;\n&quot;);</span>
+<span class="nc" id="L475">    index = index + 1;</span>
+<span class="nc" id="L476">    return index;</span>
+  }
+
+  /**
+   * Convenience method; see {@link #loadFromModelFile(String, java.util.Properties)}.
+   *
+   * @see #loadFromModelFile(String, java.util.Properties)
+   */
+  public static DependencyParser loadFromModelFile(String modelFile) {
+<span class="nc" id="L485">    return loadFromModelFile(modelFile, null);</span>
+  }
+
+  /**
+   * Load a saved parser model.
+   *
+   * @param modelFile       Path to serialized model (may be GZipped)
+   * @param extraProperties Extra test-time properties not already associated with model (may be null)
+   *
+   * @return Loaded and initialized (see {@link #initialize(boolean)} model
+   */
+  public static DependencyParser loadFromModelFile(String modelFile, Properties extraProperties) {
+<span class="nc bnc" id="L497" title="All 2 branches missed.">    DependencyParser parser = extraProperties == null ? new DependencyParser() : new DependencyParser(extraProperties);</span>
+<span class="nc" id="L498">    parser.loadModelFile(modelFile, false);</span>
+<span class="nc" id="L499">    return parser;</span>
+  }
+
+  /** Load a parser model file, printing out some messages about the grammar in the file.
+   *
+   *  @param modelFile The file (classpath resource, etc.) to load the model from.
+   */
+  public void loadModelFile(String modelFile) {
+<span class="nc" id="L507">    loadModelFile(modelFile, true);</span>
+<span class="nc" id="L508">  }</span>
+
+  private void loadModelFile(String modelFile, boolean verbose) {
+<span class="nc" id="L511">    Timing t = new Timing();</span>
+    try {
+
+<span class="nc" id="L514">      log.info(&quot;Loading depparse model file: &quot; + modelFile + &quot; ... &quot;);</span>
+      String s;
+<span class="nc" id="L516">      BufferedReader input = IOUtils.readerFromString(modelFile);</span>
+
+<span class="nc" id="L518">      s = input.readLine();</span>
+<span class="nc" id="L519">      int nDict = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L520">      s = input.readLine();</span>
+<span class="nc" id="L521">      int nPOS = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L522">      s = input.readLine();</span>
+<span class="nc" id="L523">      int nLabel = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L524">      s = input.readLine();</span>
+<span class="nc" id="L525">      int eSize = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L526">      s = input.readLine();</span>
+<span class="nc" id="L527">      int hSize = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L528">      s = input.readLine();</span>
+<span class="nc" id="L529">      int nTokens = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L530">      s = input.readLine();</span>
+<span class="nc" id="L531">      int nPreComputed = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+
+<span class="nc" id="L533">      knownWords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L534">      knownPos = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L535">      knownLabels = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L536">      double[][] E = new double[nDict + nPOS + nLabel][eSize];</span>
+      String[] splits;
+<span class="nc" id="L538">      int index = 0;</span>
+
+<span class="nc bnc" id="L540" title="All 2 branches missed.">      for (int k = 0; k &lt; nDict; ++k) {</span>
+<span class="nc" id="L541">        s = input.readLine();</span>
+<span class="nc" id="L542">        splits = s.split(&quot; &quot;);</span>
+<span class="nc" id="L543">        knownWords.add(splits[0]);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        for (int i = 0; i &lt; eSize; ++i)</span>
+<span class="nc" id="L545">          E[index][i] = Double.parseDouble(splits[i + 1]);</span>
+<span class="nc" id="L546">        index = index + 1;</span>
+      }
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      for (int k = 0; k &lt; nPOS; ++k) {</span>
+<span class="nc" id="L549">        s = input.readLine();</span>
+<span class="nc" id="L550">        splits = s.split(&quot; &quot;);</span>
+<span class="nc" id="L551">        knownPos.add(splits[0]);</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        for (int i = 0; i &lt; eSize; ++i)</span>
+<span class="nc" id="L553">          E[index][i] = Double.parseDouble(splits[i + 1]);</span>
+<span class="nc" id="L554">        index = index + 1;</span>
+      }
+<span class="nc bnc" id="L556" title="All 2 branches missed.">      for (int k = 0; k &lt; nLabel; ++k) {</span>
+<span class="nc" id="L557">        s = input.readLine();</span>
+<span class="nc" id="L558">        splits = s.split(&quot; &quot;);</span>
+<span class="nc" id="L559">        knownLabels.add(splits[0]);</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        for (int i = 0; i &lt; eSize; ++i)</span>
+<span class="nc" id="L561">          E[index][i] = Double.parseDouble(splits[i + 1]);</span>
+<span class="nc" id="L562">        index = index + 1;</span>
+      }
+<span class="nc" id="L564">      generateIDs();</span>
+
+<span class="nc" id="L566">      double[][] W1 = new double[hSize][eSize * nTokens];</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">      for (int j = 0; j &lt; W1[0].length; ++j) {</span>
+<span class="nc" id="L568">        s = input.readLine();</span>
+<span class="nc" id="L569">        splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        for (int i = 0; i &lt; W1.length; ++i)</span>
+<span class="nc" id="L571">          W1[i][j] = Double.parseDouble(splits[i]);</span>
+      }
+
+<span class="nc" id="L574">      double[] b1 = new double[hSize];</span>
+<span class="nc" id="L575">      s = input.readLine();</span>
+<span class="nc" id="L576">      splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">      for (int i = 0; i &lt; b1.length; ++i)</span>
+<span class="nc" id="L578">        b1[i] = Double.parseDouble(splits[i]);</span>
+
+<span class="nc" id="L580">      double[][] W2 = new double[nLabel * 2 - 1][hSize];</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">      for (int j = 0; j &lt; W2[0].length; ++j) {</span>
+<span class="nc" id="L582">        s = input.readLine();</span>
+<span class="nc" id="L583">        splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        for (int i = 0; i &lt; W2.length; ++i)</span>
+<span class="nc" id="L585">          W2[i][j] = Double.parseDouble(splits[i]);</span>
+      }
+
+<span class="nc" id="L588">      preComputed = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">      while (preComputed.size() &lt; nPreComputed) {</span>
+<span class="nc" id="L590">        s = input.readLine();</span>
+<span class="nc" id="L591">        splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        for (String split : splits) {</span>
+<span class="nc" id="L593">          preComputed.add(Integer.parseInt(split));</span>
+        }
+      }
+<span class="nc" id="L596">      input.close();</span>
+<span class="nc" id="L597">      config.hiddenSize = hSize;</span>
+<span class="nc" id="L598">      config.embeddingSize = eSize;</span>
+<span class="nc" id="L599">      classifier = new Classifier(config, E, W1, b1, W2, preComputed);</span>
+<span class="nc" id="L600">    } catch (IOException e) {</span>
+<span class="nc" id="L601">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L602">    }</span>
+
+    // initialize the loaded parser
+<span class="nc" id="L605">    initialize(verbose);</span>
+<span class="nc" id="L606">    t.done(log, &quot;Initializing dependency parser&quot;);</span>
+<span class="nc" id="L607">  }</span>
+
+  // TODO this should be a function which returns the embeddings array + embedID
+  // otherwise the class needlessly carries around the extra baggage of `embeddings`
+  // (never again used) for the entire training process
+  private double[][] readEmbedFile(String embedFile, Map&lt;String, Integer&gt; embedID) {
+
+<span class="nc" id="L614">    double[][] embeddings = null;</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">    if (embedFile != null) {</span>
+<span class="nc" id="L616">      BufferedReader input = null;</span>
+      try {
+<span class="nc" id="L618">        input = IOUtils.readerFromString(embedFile);</span>
+<span class="nc" id="L619">        List&lt;String&gt; lines = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        for (String s; (s = input.readLine()) != null; ) {</span>
+<span class="nc" id="L621">          lines.add(s);</span>
+        }
+
+<span class="nc" id="L624">        int nWords = lines.size();</span>
+<span class="nc" id="L625">        String[] splits = lines.get(0).split(&quot;\\s+&quot;);</span>
+
+<span class="nc" id="L627">        int dim = splits.length - 1;</span>
+<span class="nc" id="L628">        embeddings = new double[nWords][dim];</span>
+<span class="nc" id="L629">        log.info(&quot;Embedding File &quot; + embedFile + &quot;: #Words = &quot; + nWords + &quot;, dim = &quot; + dim);</span>
+
+<span class="nc bnc" id="L631" title="All 2 branches missed.">        if (dim != config.embeddingSize)</span>
+<span class="nc" id="L632">            throw new IllegalArgumentException(&quot;The dimension of embedding file does not match config.embeddingSize&quot;);</span>
+
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        for (int i = 0; i &lt; lines.size(); ++i) {</span>
+<span class="nc" id="L635">          splits = lines.get(i).split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L636">          embedID.put(splits[0], i);</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">          for (int j = 0; j &lt; dim; ++j)</span>
+<span class="nc" id="L638">            embeddings[i][j] = Double.parseDouble(splits[j + 1]);</span>
+        }
+<span class="nc" id="L640">      } catch (IOException e) {</span>
+<span class="nc" id="L641">        throw new RuntimeIOException(e);</span>
+      } finally {
+<span class="nc" id="L643">        IOUtils.closeIgnoringExceptions(input);</span>
+<span class="nc" id="L644">      }</span>
+<span class="nc" id="L645">      embeddings = Util.scaling(embeddings, 0, 1.0);</span>
+    }
+<span class="nc" id="L647">    return embeddings;</span>
+  }
+
+  /**
+   * Train a new dependency parser model.
+   *
+   * @param trainFile Training data
+   * @param devFile Development data (used for regular UAS evaluation
+   *                of model)
+   * @param modelFile String to which model should be saved
+   * @param embedFile File containing word embeddings for words used in
+   *                  training corpus
+   */
+  public void train(String trainFile, String devFile, String modelFile, String embedFile, String preModel) {
+<span class="nc" id="L661">    log.info(&quot;Train File: &quot; + trainFile);</span>
+<span class="nc" id="L662">    log.info(&quot;Dev File: &quot; + devFile);</span>
+<span class="nc" id="L663">    log.info(&quot;Model File: &quot; + modelFile);</span>
+<span class="nc" id="L664">    log.info(&quot;Embedding File: &quot; + embedFile);</span>
+<span class="nc" id="L665">    log.info(&quot;Pre-trained Model File: &quot; + preModel);</span>
+
+<span class="nc" id="L667">    List&lt;CoreMap&gt; trainSents = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L668">    List&lt;DependencyTree&gt; trainTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L669">    Util.loadConllFile(trainFile, trainSents, trainTrees, config.unlabeled, config.cPOS);</span>
+<span class="nc" id="L670">    Util.printTreeStats(&quot;Train&quot;, trainTrees);</span>
+
+<span class="nc" id="L672">    List&lt;CoreMap&gt; devSents = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L673">    List&lt;DependencyTree&gt; devTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">    if (devFile != null) {</span>
+<span class="nc" id="L675">      Util.loadConllFile(devFile, devSents, devTrees, config.unlabeled, config.cPOS);</span>
+<span class="nc" id="L676">      Util.printTreeStats(&quot;Dev&quot;, devTrees);</span>
+    }
+<span class="nc" id="L678">    genDictionaries(trainSents, trainTrees);</span>
+
+    //NOTE: remove -NULL-, and the pass it to ParsingSystem
+<span class="nc" id="L681">    List&lt;String&gt; lDict = new ArrayList&lt;&gt;(knownLabels);</span>
+<span class="nc" id="L682">    lDict.remove(0);</span>
+<span class="nc" id="L683">    system = new ArcStandard(config.tlp, lDict, true);</span>
+
+    // Initialize a classifier; prepare for training
+<span class="nc" id="L686">    setupClassifierForTraining(trainSents, trainTrees, embedFile, preModel);</span>
+
+<span class="nc" id="L688">    log.info(Config.SEPARATOR);</span>
+<span class="nc" id="L689">    config.printParameters();</span>
+
+<span class="nc" id="L691">    long startTime = System.currentTimeMillis();</span>
+    /**
+     * Track the best UAS performance we've seen.
+     */
+<span class="nc" id="L695">    double bestUAS = 0;</span>
+
+<span class="nc bnc" id="L697" title="All 2 branches missed.">    for (int iter = 0; iter &lt; config.maxIter; ++iter) {</span>
+<span class="nc" id="L698">      log.info(&quot;##### Iteration &quot; + iter);</span>
+
+<span class="nc" id="L700">      Classifier.Cost cost = classifier.computeCostFunction(config.batchSize, config.regParameter, config.dropProb);</span>
+<span class="nc" id="L701">      log.info(&quot;Cost = &quot; + cost.getCost() + &quot;, Correct(%) = &quot; + cost.getPercentCorrect());</span>
+<span class="nc" id="L702">      classifier.takeAdaGradientStep(cost, config.adaAlpha, config.adaEps);</span>
+
+<span class="nc" id="L704">      log.info(&quot;Elapsed Time: &quot; + (System.currentTimeMillis() - startTime) / 1000.0 + &quot; (s)&quot;);</span>
+
+      // UAS evaluation
+<span class="nc bnc" id="L707" title="All 4 branches missed.">      if (devFile != null &amp;&amp; iter % config.evalPerIter == 0) {</span>
+        // Redo precomputation with updated weights. This is only
+        // necessary because we're updating weights -- for normal
+        // prediction, we just do this once in #initialize
+<span class="nc" id="L711">        classifier.preCompute();</span>
+
+<span class="nc" id="L713">        List&lt;DependencyTree&gt; predicted = devSents.stream().map(this::predictInner).collect(toList());</span>
+
+<span class="nc bnc" id="L715" title="All 2 branches missed.">        double uas = config.noPunc ? system.getUASnoPunc(devSents, predicted, devTrees) : system.getUAS(devSents, predicted, devTrees);</span>
+<span class="nc" id="L716">        log.info(&quot;UAS: &quot; + uas);</span>
+
+<span class="nc bnc" id="L718" title="All 4 branches missed.">        if (config.saveIntermediate &amp;&amp; uas &gt; bestUAS) {</span>
+<span class="nc" id="L719">          System.err.printf(&quot;Exceeds best previous UAS of %f. Saving model file..%n&quot;, bestUAS);</span>
+
+<span class="nc" id="L721">          bestUAS = uas;</span>
+<span class="nc" id="L722">          writeModelFile(modelFile);</span>
+        }
+      }
+
+      // Clear gradients
+<span class="nc bnc" id="L727" title="All 4 branches missed.">      if (config.clearGradientsPerIter &gt; 0 &amp;&amp; iter % config.clearGradientsPerIter == 0) {</span>
+<span class="nc" id="L728">        log.info(&quot;Clearing gradient histories..&quot;);</span>
+<span class="nc" id="L729">        classifier.clearGradientHistories();</span>
+      }
+    }
+
+<span class="nc" id="L733">    classifier.finalizeTraining();</span>
+
+<span class="nc bnc" id="L735" title="All 2 branches missed.">    if (devFile != null) {</span>
+      // Do final UAS evaluation and save if final model beats the
+      // best intermediate one
+<span class="nc" id="L738">      List&lt;DependencyTree&gt; predicted = devSents.stream().map(this::predictInner).collect(toList());</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">      double uas = config.noPunc ? system.getUASnoPunc(devSents, predicted, devTrees) : system.getUAS(devSents, predicted, devTrees);</span>
+
+<span class="nc bnc" id="L741" title="All 2 branches missed.">      if (uas &gt; bestUAS) {</span>
+<span class="nc" id="L742">        System.err.printf(&quot;Final model UAS: %f%n&quot;, uas);</span>
+<span class="nc" id="L743">        System.err.printf(&quot;Exceeds best previous UAS of %f. Saving model file..%n&quot;, bestUAS);</span>
+
+<span class="nc" id="L745">        writeModelFile(modelFile);</span>
+      }
+<span class="nc" id="L747">    } else {</span>
+<span class="nc" id="L748">      writeModelFile(modelFile);</span>
+    }
+<span class="nc" id="L750">  }</span>
+
+  /**
+  * @see #train(String, String, String, String, String)
+  */
+  public void train(String trainFile, String devFile, String modelFile, String embedFile) {
+<span class="nc" id="L756">    train(trainFile, devFile, modelFile, embedFile, null);</span>
+<span class="nc" id="L757">  }</span>
+
+  /**
+   * @see #train(String, String, String, String)
+   */
+  public void train(String trainFile, String devFile, String modelFile) {
+<span class="nc" id="L763">    train(trainFile, devFile, modelFile, null);</span>
+<span class="nc" id="L764">  }</span>
+
+  /**
+   * @see #train(String, String, String)
+   */
+  public void train(String trainFile, String modelFile) {
+<span class="nc" id="L770">    train(trainFile, null, modelFile);</span>
+<span class="nc" id="L771">  }</span>
+
+  /**
+   * Prepare a classifier for training with the given dataset.
+   */
+  private void setupClassifierForTraining(List&lt;CoreMap&gt; trainSents, List&lt;DependencyTree&gt; trainTrees, String embedFile, String preModel) {
+<span class="nc" id="L777">    double[][] E = new double[knownWords.size() + knownPos.size() + knownLabels.size()][config.embeddingSize];</span>
+<span class="nc" id="L778">    double[][] W1 = new double[config.hiddenSize][config.embeddingSize * config.numTokens];</span>
+<span class="nc" id="L779">    double[] b1 = new double[config.hiddenSize];</span>
+<span class="nc" id="L780">    double[][] W2 = new double[system.numTransitions()][config.hiddenSize];</span>
+
+    // Randomly initialize weight matrices / vectors
+<span class="nc" id="L783">    Random random = Util.getRandom();</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">    for (int i = 0; i &lt; W1.length; ++i)</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">      for (int j = 0; j &lt; W1[i].length; ++j)</span>
+<span class="nc" id="L786">        W1[i][j] = random.nextDouble() * 2 * config.initRange - config.initRange;</span>
+
+<span class="nc bnc" id="L788" title="All 2 branches missed.">    for (int i = 0; i &lt; b1.length; ++i)</span>
+<span class="nc" id="L789">      b1[i] = random.nextDouble() * 2 * config.initRange - config.initRange;</span>
+
+<span class="nc bnc" id="L791" title="All 2 branches missed.">    for (int i = 0; i &lt; W2.length; ++i)</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">      for (int j = 0; j &lt; W2[i].length; ++j)</span>
+<span class="nc" id="L793">        W2[i][j] = random.nextDouble() * 2 * config.initRange - config.initRange;</span>
+
+    // Read embeddings into `embedID`, `embeddings`
+<span class="nc" id="L796">     Map&lt;String, Integer&gt; embedID = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L797">     double[][] embeddings = readEmbedFile(embedFile, embedID);</span>
+
+    // Try to match loaded embeddings with words in dictionary
+<span class="nc" id="L800">    int foundEmbed = 0;</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">    for (int i = 0; i &lt; E.length; ++i) {</span>
+<span class="nc" id="L802">      int index = -1;</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">      if (i &lt; knownWords.size()) {</span>
+<span class="nc" id="L804">        String str = knownWords.get(i);</span>
+        //NOTE: exact match first, and then try lower case..
+<span class="nc bnc" id="L806" title="All 2 branches missed.">        if (embedID.containsKey(str)) index = embedID.get(str);</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">        else if (embedID.containsKey(str.toLowerCase())) index = embedID.get(str.toLowerCase());</span>
+      }
+<span class="nc bnc" id="L809" title="All 2 branches missed.">      if (index &gt;= 0) {</span>
+<span class="nc" id="L810">        ++foundEmbed;</span>
+<span class="nc" id="L811">        System.arraycopy(embeddings[index], 0, E[i], 0, E[i].length);</span>
+      } else {
+<span class="nc bnc" id="L813" title="All 2 branches missed.">        for (int j = 0; j &lt; E[i].length; ++j)</span>
+          //E[i][j] = random.nextDouble() * config.initRange * 2 - config.initRange;
+          //E[i][j] = random.nextDouble() * 0.2 - 0.1;
+          //E[i][j] = random.nextGaussian() * Math.sqrt(0.1);
+<span class="nc" id="L817">          E[i][j] = random.nextDouble() * 0.02 - 0.01;</span>
+      }
+    }
+<span class="nc" id="L820">    log.info(&quot;Found embeddings: &quot; + foundEmbed + &quot; / &quot; + knownWords.size());</span>
+
+<span class="nc bnc" id="L822" title="All 2 branches missed.">    if (preModel != null) {</span>
+        try {
+<span class="nc" id="L824">          log.info(&quot;Loading pre-trained model file: &quot; + preModel + &quot; ... &quot;);</span>
+          String s;
+<span class="nc" id="L826">          BufferedReader input = IOUtils.readerFromString(preModel);</span>
+
+<span class="nc" id="L828">          s = input.readLine();</span>
+<span class="nc" id="L829">          int nDict = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L830">          s = input.readLine();</span>
+<span class="nc" id="L831">          int nPOS = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L832">          s = input.readLine();</span>
+<span class="nc" id="L833">          int nLabel = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L834">          s = input.readLine();</span>
+<span class="nc" id="L835">          int eSize = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L836">          s = input.readLine();</span>
+<span class="nc" id="L837">          int hSize = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L838">          s = input.readLine();</span>
+<span class="nc" id="L839">          int nTokens = Integer.parseInt(s.substring(s.indexOf('=') + 1));</span>
+<span class="nc" id="L840">          s = input.readLine();</span>
+
+          String[] splits;
+<span class="nc bnc" id="L843" title="All 2 branches missed.">          for (int k = 0; k &lt; nDict; ++k) {</span>
+<span class="nc" id="L844">            s = input.readLine();</span>
+<span class="nc" id="L845">            splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L846" title="All 4 branches missed.">            if (wordIDs.containsKey(splits[0]) &amp;&amp; eSize == config.embeddingSize) {</span>
+<span class="nc" id="L847">              int index = getWordID(splits[0]);</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">              for (int i = 0; i &lt; eSize; ++i)</span>
+<span class="nc" id="L849">                E[index][i] = Double.parseDouble(splits[i + 1]);</span>
+            }
+          }
+
+<span class="nc bnc" id="L853" title="All 2 branches missed.">          for (int k = 0; k &lt; nPOS; ++k) {</span>
+<span class="nc" id="L854">            s = input.readLine();</span>
+<span class="nc" id="L855">            splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L856" title="All 4 branches missed.">            if (posIDs.containsKey(splits[0]) &amp;&amp; eSize == config.embeddingSize) {</span>
+<span class="nc" id="L857">              int index = getPosID(splits[0]);</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">              for (int i = 0; i &lt; eSize; ++i)</span>
+<span class="nc" id="L859">                E[index][i] = Double.parseDouble(splits[i + 1]);</span>
+            }
+          }
+
+<span class="nc bnc" id="L863" title="All 2 branches missed.">          for (int k = 0; k &lt; nLabel; ++k) {</span>
+<span class="nc" id="L864">            s = input.readLine();</span>
+<span class="nc" id="L865">            splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L866" title="All 4 branches missed.">            if (labelIDs.containsKey(splits[0]) &amp;&amp; eSize == config.embeddingSize) {</span>
+<span class="nc" id="L867">              int index = getLabelID(splits[0]);</span>
+<span class="nc bnc" id="L868" title="All 2 branches missed.">              for (int i = 0; i &lt; eSize; ++i)</span>
+<span class="nc" id="L869">                E[index][i] = Double.parseDouble(splits[i + 1]);</span>
+            }
+          }
+
+<span class="nc bnc" id="L873" title="All 6 branches missed.">          boolean copyLayer1 = hSize == config.hiddenSize &amp;&amp; config.embeddingSize == eSize &amp;&amp; config.numTokens == nTokens;</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">          if (copyLayer1) {</span>
+<span class="nc" id="L875">            log.info(&quot;Copying parameters W1 &amp;&amp; b1...&quot;);</span>
+          }
+<span class="nc bnc" id="L877" title="All 2 branches missed.">          for (int j = 0; j &lt; eSize * nTokens; ++j) {</span>
+<span class="nc" id="L878">            s = input.readLine();</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">            if (copyLayer1) {</span>
+<span class="nc" id="L880">              splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">              for (int i = 0; i &lt; hSize; ++i)</span>
+<span class="nc" id="L882">                    W1[i][j] = Double.parseDouble(splits[i]);</span>
+            }
+          }
+
+<span class="nc" id="L886">          s = input.readLine();</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">          if (copyLayer1) {</span>
+<span class="nc" id="L888">            splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">            for (int i = 0; i &lt; hSize; ++i)</span>
+<span class="nc" id="L890">              b1[i] = Double.parseDouble(splits[i]);</span>
+          }
+
+<span class="nc bnc" id="L893" title="All 4 branches missed.">          boolean copyLayer2 = (nLabel * 2 - 1 == system.numTransitions()) &amp;&amp; hSize == config.hiddenSize;</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">          if (copyLayer2)</span>
+<span class="nc" id="L895">            log.info(&quot;Copying parameters W2...&quot;);</span>
+<span class="nc bnc" id="L896" title="All 2 branches missed.">          for (int j = 0; j &lt; hSize; ++j) {</span>
+<span class="nc" id="L897">              s = input.readLine();</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">              if (copyLayer2) {</span>
+<span class="nc" id="L899">                splits = s.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L900" title="All 2 branches missed.">                for (int i = 0; i &lt; nLabel * 2 - 1; ++i)</span>
+<span class="nc" id="L901">                  W2[i][j] = Double.parseDouble(splits[i]);</span>
+              }
+          }
+<span class="nc" id="L904">          input.close();</span>
+<span class="nc" id="L905">        } catch (IOException e) {</span>
+<span class="nc" id="L906">          throw new RuntimeIOException(e);</span>
+<span class="nc" id="L907">        }</span>
+    }
+<span class="nc" id="L909">    Dataset trainSet = genTrainExamples(trainSents, trainTrees);</span>
+<span class="nc" id="L910">    classifier = new Classifier(config, trainSet, E, W1, b1, W2, preComputed);</span>
+<span class="nc" id="L911">  }</span>
+
+  /**
+   * Determine the dependency parse of the given sentence.
+   * &lt;p&gt;
+   * This &quot;inner&quot; method returns a structure unique to this package; use {@link #predict(edu.stanford.nlp.util.CoreMap)}
+   * for general parsing purposes.
+   */
+  private DependencyTree predictInner(CoreMap sentence) {
+<span class="nc" id="L920">    int numTrans = system.numTransitions();</span>
+
+<span class="nc" id="L922">    Configuration c = system.initialConfiguration(sentence);</span>
+<span class="nc bnc" id="L923" title="All 2 branches missed.">    while (!system.isTerminal(c)) {</span>
+<span class="nc bnc" id="L924" title="All 2 branches missed.">      if (Thread.interrupted()) {  // Allow interrupting</span>
+<span class="nc" id="L925">        throw new RuntimeInterruptedException();</span>
+      }
+<span class="nc" id="L927">      double[] scores = classifier.computeScores(getFeatureArray(c));</span>
+
+<span class="nc" id="L929">      double optScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L930">      String optTrans = null;</span>
+
+<span class="nc bnc" id="L932" title="All 2 branches missed.">      for (int j = 0; j &lt; numTrans; ++j) {</span>
+<span class="nc bnc" id="L933" title="All 4 branches missed.">        if (scores[j] &gt; optScore &amp;&amp; system.canApply(c, system.transitions.get(j))) {</span>
+<span class="nc" id="L934">          optScore = scores[j];</span>
+<span class="nc" id="L935">          optTrans = system.transitions.get(j);</span>
+        }
+      }
+<span class="nc" id="L938">      system.apply(c, optTrans);</span>
+<span class="nc" id="L939">    }</span>
+<span class="nc" id="L940">    return c.tree;</span>
+  }
+
+  /**
+   * Determine the dependency parse of the given sentence using the loaded model.
+   * You must first load a parser before calling this method.
+   *
+   * @throws java.lang.IllegalStateException If parser has not yet been loaded and initialized
+   *         (see {@link #initialize(boolean)}
+   */
+  public GrammaticalStructure predict(CoreMap sentence) {
+<span class="nc bnc" id="L951" title="All 2 branches missed.">    if (system == null)</span>
+<span class="nc" id="L952">      throw new IllegalStateException(&quot;Parser has not been  &quot; +</span>
+          &quot;loaded and initialized; first load a model.&quot;);
+
+<span class="nc" id="L955">    DependencyTree result = predictInner(sentence);</span>
+
+    // The rest of this method is just busy-work to convert the
+    // package-local representation into a CoreNLP-standard
+    // GrammaticalStructure.
+
+<span class="nc" id="L961">    List&lt;CoreLabel&gt; tokens = sentence.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L962">    List&lt;TypedDependency&gt; dependencies = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L964">    IndexedWord root = new IndexedWord(new Word(&quot;ROOT&quot;));</span>
+<span class="nc" id="L965">    root.set(CoreAnnotations.IndexAnnotation.class, 0);</span>
+
+<span class="nc bnc" id="L967" title="All 2 branches missed.">    for (int i = 1; i &lt;= result.n; i++) {</span>
+<span class="nc" id="L968">      int head = result.getHead(i);</span>
+<span class="nc" id="L969">      String label = result.getLabel(i);</span>
+
+<span class="nc" id="L971">      IndexedWord thisWord = new IndexedWord(tokens.get(i - 1));</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">      IndexedWord headWord = head == 0 ? root</span>
+<span class="nc" id="L973">                                       : new IndexedWord(tokens.get(head - 1));</span>
+
+<span class="nc bnc" id="L975" title="All 2 branches missed.">      GrammaticalRelation relation = head == 0</span>
+                                     ? GrammaticalRelation.ROOT
+<span class="nc" id="L977">                                     : makeGrammaticalRelation(label);</span>
+
+<span class="nc" id="L979">      dependencies.add(new TypedDependency(relation, headWord, thisWord));</span>
+    }
+
+    // Build GrammaticalStructure
+    // TODO ideally submodule should just return GrammaticalStructure
+<span class="nc" id="L984">    TreeGraphNode rootNode = new TreeGraphNode(root);</span>
+<span class="nc" id="L985">    return makeGrammaticalStructure(dependencies, rootNode);</span>
+  }
+
+  private GrammaticalRelation makeGrammaticalRelation(String label) {
+    GrammaticalRelation stored;
+
+<span class="nc bnc" id="L991" title="All 4 branches missed.">    switch (language) {</span>
+      case English:
+<span class="nc" id="L993">        stored = EnglishGrammaticalRelations.shortNameToGRel.get(label);</span>
+<span class="nc bnc" id="L994" title="All 2 branches missed.">        if (stored != null)</span>
+<span class="nc" id="L995">          return stored;</span>
+        break;
+      case UniversalEnglish:
+<span class="nc" id="L998">        stored = UniversalEnglishGrammaticalRelations.shortNameToGRel.get(label);</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">        if (stored != null)</span>
+<span class="nc" id="L1000">          return stored;</span>
+        break;
+      case Chinese:
+<span class="nc" id="L1003">        stored = ChineseGrammaticalRelations.shortNameToGRel.get(label);</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">        if (stored != null)</span>
+<span class="nc" id="L1005">          return stored;</span>
+        break;
+    }
+
+<span class="nc" id="L1009">    return new GrammaticalRelation(language, label, null, GrammaticalRelation.DEPENDENT);</span>
+  }
+
+  private GrammaticalStructure makeGrammaticalStructure(List&lt;TypedDependency&gt; dependencies, TreeGraphNode rootNode) {
+<span class="nc bnc" id="L1013" title="All 4 branches missed.">    switch (language) {</span>
+<span class="nc" id="L1014">      case English: return new EnglishGrammaticalStructure(dependencies, rootNode);</span>
+<span class="nc" id="L1015">      case UniversalEnglish: return new UniversalEnglishGrammaticalStructure(dependencies, rootNode);</span>
+<span class="nc" id="L1016">      case Chinese: return new ChineseGrammaticalStructure(dependencies, rootNode);</span>
+
+      // TODO suboptimal: default to UniversalEnglishGrammaticalStructure return
+<span class="nc" id="L1019">      default: return new UniversalEnglishGrammaticalStructure(dependencies, rootNode);</span>
+    }
+  }
+
+  /**
+   * Convenience method for {@link #predict(edu.stanford.nlp.util.CoreMap)}. The tokens of the provided sentence must
+   * also have tag annotations (the parser requires part-of-speech tags).
+   *
+   * @see #predict(edu.stanford.nlp.util.CoreMap)
+   */
+  public GrammaticalStructure predict(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L1030">    CoreLabel sentenceLabel = new CoreLabel();</span>
+<span class="nc" id="L1031">    List&lt;CoreLabel&gt; tokens = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L1033">    int i = 1;</span>
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">    for (HasWord wd : sentence) {</span>
+      CoreLabel label;
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">      if (wd instanceof CoreLabel) {</span>
+<span class="nc" id="L1037">        label = (CoreLabel) wd;</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">        if (label.tag() == null)</span>
+<span class="nc" id="L1039">          throw new IllegalArgumentException(&quot;Parser requires words &quot; +</span>
+              &quot;with part-of-speech tag annotations&quot;);
+      } else {
+<span class="nc" id="L1042">        label = new CoreLabel();</span>
+<span class="nc" id="L1043">        label.setValue(wd.word());</span>
+<span class="nc" id="L1044">        label.setWord(wd.word());</span>
+
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">        if (!(wd instanceof HasTag))</span>
+<span class="nc" id="L1047">          throw new IllegalArgumentException(&quot;Parser requires words &quot; +</span>
+              &quot;with part-of-speech tag annotations&quot;);
+
+<span class="nc" id="L1050">        label.setTag(((HasTag) wd).tag());</span>
+      }
+
+<span class="nc" id="L1053">      label.setIndex(i);</span>
+<span class="nc" id="L1054">      i++;</span>
+
+<span class="nc" id="L1056">      tokens.add(label);</span>
+<span class="nc" id="L1057">    }</span>
+
+<span class="nc" id="L1059">    sentenceLabel.set(CoreAnnotations.TokensAnnotation.class, tokens);</span>
+
+<span class="nc" id="L1061">    return predict(sentenceLabel);</span>
+  }
+
+  //TODO: support sentence-only files as input
+
+  /** Run the parser in the modelFile on a testFile and perhaps save output.
+   *
+   *  @param testFile File to parse. In CoNLL-X format. Assumed to have gold answers included.
+   *  @param outFile File to write results to in CoNLL-X format.  If null, no output is written
+   *  @return The LAS score on the dataset
+   */
+  public double testCoNLL(String testFile, String outFile) {
+<span class="nc" id="L1073">    log.info(&quot;Test File: &quot; + testFile);</span>
+<span class="nc" id="L1074">    Timing timer = new Timing();</span>
+<span class="nc" id="L1075">    List&lt;CoreMap&gt; testSents = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1076">    List&lt;DependencyTree&gt; testTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1077">    Util.loadConllFile(testFile, testSents, testTrees, config.unlabeled, config.cPOS);</span>
+
+    // count how much to parse
+<span class="nc" id="L1080">    int numWords = 0;</span>
+<span class="nc" id="L1081">    int numOOVWords = 0;</span>
+<span class="nc" id="L1082">    int numSentences = 0;</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">    for (CoreMap testSent : testSents) {</span>
+<span class="nc" id="L1084">      numSentences += 1;</span>
+<span class="nc" id="L1085">      List&lt;CoreLabel&gt; tokens = testSent.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L1086" title="All 2 branches missed.">      for (CoreLabel token : tokens) {</span>
+<span class="nc" id="L1087">        String word = token.word();</span>
+<span class="nc" id="L1088">        numWords += 1;</span>
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">        if (!wordIDs.containsKey(word))</span>
+<span class="nc" id="L1090">          numOOVWords += 1;</span>
+<span class="nc" id="L1091">      }</span>
+<span class="nc" id="L1092">    }</span>
+<span class="nc" id="L1093">    System.err.printf(&quot;OOV Words: %d / %d = %.2f%%\n&quot;, numOOVWords, numWords, numOOVWords * 100.0 / numWords);</span>
+
+<span class="nc" id="L1095">    List&lt;DependencyTree&gt; predicted = testSents.stream().map(this::predictInner).collect(toList());</span>
+<span class="nc" id="L1096">    Map&lt;String, Double&gt; result = system.evaluate(testSents, predicted, testTrees);</span>
+
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">    double uas = config.noPunc ? result.get(&quot;UASnoPunc&quot;) : result.get(&quot;UAS&quot;);</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">    double las = config.noPunc ? result.get(&quot;LASnoPunc&quot;) : result.get(&quot;LAS&quot;);</span>
+<span class="nc" id="L1100">    System.err.printf(&quot;UAS = %.4f%n&quot;, uas);</span>
+<span class="nc" id="L1101">    System.err.printf(&quot;LAS = %.4f%n&quot;, las);</span>
+
+<span class="nc" id="L1103">    long millis = timer.stop();</span>
+<span class="nc" id="L1104">    double wordspersec = numWords / (((double) millis) / 1000);</span>
+<span class="nc" id="L1105">    double sentspersec = numSentences / (((double) millis) / 1000);</span>
+<span class="nc" id="L1106">    System.err.printf(&quot;%s parsed %d words in %d sentences in %.1fs at %.1f w/s, %.1f sent/s.%n&quot;,</span>
+<span class="nc" id="L1107">            StringUtils.getShortClassName(this), numWords, numSentences, millis / 1000.0, wordspersec, sentspersec);</span>
+
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">    if (outFile != null) {</span>
+<span class="nc" id="L1110">        Util.writeConllFile(outFile, testSents, predicted);</span>
+    }
+<span class="nc" id="L1112">    return las;</span>
+  }
+
+  private void parseTextFile(BufferedReader input, PrintWriter output) {
+<span class="nc" id="L1116">    DocumentPreprocessor preprocessor = new DocumentPreprocessor(input);</span>
+<span class="nc" id="L1117">    preprocessor.setSentenceFinalPuncWords(config.tlp.sentenceFinalPunctuationWords());</span>
+<span class="nc" id="L1118">    preprocessor.setEscaper(config.escaper);</span>
+<span class="nc" id="L1119">    preprocessor.setSentenceDelimiter(config.sentenceDelimiter);</span>
+<span class="nc" id="L1120">    preprocessor.setTokenizerFactory(config.tlp.getTokenizerFactory());</span>
+
+<span class="nc" id="L1122">    Timing timer = new Timing();</span>
+
+<span class="nc" id="L1124">    MaxentTagger tagger = new MaxentTagger(config.tagger);</span>
+<span class="nc" id="L1125">    List&lt;List&lt;TaggedWord&gt;&gt; tagged = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1126" title="All 2 branches missed.">    for (List&lt;HasWord&gt; sentence : preprocessor) {</span>
+<span class="nc" id="L1127">      tagged.add(tagger.tagSentence(sentence));</span>
+<span class="nc" id="L1128">    }</span>
+
+<span class="nc" id="L1130">    System.err.printf(&quot;Tagging completed in %.2f sec.%n&quot;,</span>
+<span class="nc" id="L1131">        timer.stop() / 1000.0);</span>
+
+<span class="nc" id="L1133">    timer.start();</span>
+
+<span class="nc" id="L1135">    int numSentences = 0;</span>
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">    for (List&lt;TaggedWord&gt; taggedSentence : tagged) {</span>
+<span class="nc" id="L1137">      GrammaticalStructure parse = predict(taggedSentence);</span>
+
+<span class="nc" id="L1139">      Collection&lt;TypedDependency&gt; deps = parse.typedDependencies();</span>
+<span class="nc bnc" id="L1140" title="All 2 branches missed.">      for (TypedDependency dep : deps)</span>
+<span class="nc" id="L1141">        output.println(dep);</span>
+<span class="nc" id="L1142">      output.println();</span>
+
+<span class="nc" id="L1144">      numSentences++;</span>
+<span class="nc" id="L1145">    }</span>
+
+<span class="nc" id="L1147">    long millis = timer.stop();</span>
+<span class="nc" id="L1148">    double seconds = millis / 1000.0;</span>
+<span class="nc" id="L1149">    System.err.printf(&quot;Parsed %d sentences in %.2f seconds (%.2f sents/sec).%n&quot;,</span>
+<span class="nc" id="L1150">        numSentences, seconds, numSentences / seconds);</span>
+<span class="nc" id="L1151">  }</span>
+
+  /**
+   * Prepare for parsing after a model has been loaded.
+   */
+  private void initialize(boolean verbose) {
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">    if (knownLabels == null)</span>
+<span class="nc" id="L1158">      throw new IllegalStateException(&quot;Model has not been loaded or trained&quot;);</span>
+
+    // NOTE: remove -NULL-, and then pass the label set to the ParsingSystem
+<span class="nc" id="L1161">    List&lt;String&gt; lDict = new ArrayList&lt;&gt;(knownLabels);</span>
+<span class="nc" id="L1162">    lDict.remove(0);</span>
+
+<span class="nc" id="L1164">    system = new ArcStandard(config.tlp, lDict, verbose);</span>
+
+    // Pre-compute matrix multiplications
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">    if (config.numPreComputed &gt; 0) {</span>
+<span class="nc" id="L1168">      classifier.preCompute();</span>
+    }
+<span class="nc" id="L1170">  }</span>
+
+  /**
+   * Explicitly specifies the number of arguments expected with
+   * particular command line options.
+   */
+<span class="nc" id="L1176">  private static final Map&lt;String, Integer&gt; numArgs = new HashMap&lt;&gt;();</span>
+  static {
+<span class="nc" id="L1178">    numArgs.put(&quot;textFile&quot;, 1);</span>
+<span class="nc" id="L1179">    numArgs.put(&quot;outFile&quot;, 1);</span>
+<span class="nc" id="L1180">  }</span>
+
+  /**
+   * A main program for training, testing and using the parser.
+   *
+   * &lt;p&gt;
+   * You can use this program to train new parsers from treebank data,
+   * evaluate on test treebank data, or parse raw text input.
+   *
+   * &lt;p&gt;
+   * Sample usages:
+   * &lt;ul&gt;
+   *   &lt;li&gt;
+   *     &lt;strong&gt;Train a parser with CoNLL treebank data:&lt;/strong&gt;
+   *     {@code java edu.stanford.nlp.parser.nndep.DependencyParser -trainFile trainPath -devFile devPath -embedFile wordEmbeddingFile -embeddingSize wordEmbeddingDimensionality -model modelOutputFile.txt.gz}
+   *   &lt;/li&gt;
+   *   &lt;li&gt;
+   *     &lt;strong&gt;Parse raw text from a file:&lt;/strong&gt;
+   *     {@code java edu.stanford.nlp.parser.nndep.DependencyParser -model modelOutputFile.txt.gz -textFile rawTextToParse -outFile dependenciesOutputFile.txt}
+   *   &lt;/li&gt;
+   *   &lt;li&gt;
+   *     &lt;strong&gt;Parse raw text from standard input, writing to standard output:&lt;/strong&gt;
+   *     {@code java edu.stanford.nlp.parser.nndep.DependencyParser -model modelOutputFile.txt.gz -textFile - -outFile -}
+   *   &lt;/li&gt;
+   * &lt;/ul&gt;
+   *
+   * &lt;p&gt;
+   * See below for more information on all of these training / test options and more.
+   *
+   * &lt;p&gt;
+   * Input / output options:
+   * &lt;table&gt;
+   *   &lt;tr&gt;&lt;th&gt;Option&lt;/th&gt;&lt;th&gt;Required for training&lt;/th&gt;&lt;th&gt;Required for testing / parsing&lt;/th&gt;&lt;th&gt;Description&lt;/th&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;devFile&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;Optional&lt;/td&gt;&lt;td&gt;No&lt;/td&gt;&lt;td&gt;Path to a development-set treebank in &lt;a href=&quot;http://ilk.uvt.nl/conll/#dataformat&quot;&gt;CoNLL-X format&lt;/a&gt;. If provided, the &lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;embedFile&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;Optional (highly recommended!)&lt;/td&gt;&lt;td&gt;No&lt;/td&gt;&lt;td&gt;A word embedding file, containing distributed representations of English words. Each line of the provided file should contain a single word followed by the elements of the corresponding word embedding (space-delimited). It is not absolutely necessary that all words in the treebank be covered by this embedding file, though the parser's performance will generally improve if you are able to provide better embeddings for more words.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;model&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;Yes&lt;/td&gt;&lt;td&gt;Yes&lt;/td&gt;&lt;td&gt;Path to a model file. If the path ends in &lt;tt&gt;.gz&lt;/tt&gt;, the model will be read as a Gzipped model file. During training, we write to this path; at test time we read a pre-trained model from this path.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;textFile&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;No&lt;/td&gt;&lt;td&gt;Yes (or &lt;tt&gt;testFile&lt;/tt&gt;)&lt;/td&gt;&lt;td&gt;Path to a plaintext file containing sentences to be parsed.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;testFile&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;No&lt;/td&gt;&lt;td&gt;Yes (or &lt;tt&gt;textFile&lt;/tt&gt;)&lt;/td&gt;&lt;td&gt;Path to a test-set treebank in &lt;a href=&quot;http://ilk.uvt.nl/conll/#dataformat&quot;&gt;CoNLL-X format&lt;/a&gt; for final evaluation of the parser.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;trainFile&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;Yes&lt;/td&gt;&lt;td&gt;No&lt;/td&gt;&lt;td&gt;Path to a training treebank in &lt;a href=&quot;http://ilk.uvt.nl/conll/#dataformat&quot;&gt;CoNLL-X format&lt;/a&gt;&lt;/td&gt;&lt;/tr&gt;
+   * &lt;/table&gt;
+   *
+   * Training options:
+   * &lt;table&gt;
+   *   &lt;tr&gt;&lt;th&gt;Option&lt;/th&gt;&lt;th&gt;Default&lt;/th&gt;&lt;th&gt;Description&lt;/th&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;adaAlpha&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;0.01&lt;/td&gt;&lt;td&gt;Global learning rate for AdaGrad training&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;adaEps&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;1e-6&lt;/td&gt;&lt;td&gt;Epsilon value added to the denominator of AdaGrad update expression for numerical stability&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;batchSize&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;10000&lt;/td&gt;&lt;td&gt;Size of mini-batch used for training&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;clearGradientsPerIter&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;0&lt;/td&gt;&lt;td&gt;Clear AdaGrad gradient histories every &lt;em&gt;n&lt;/em&gt; iterations. If zero, no gradient clearing is performed.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;dropProb&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;0.5&lt;/td&gt;&lt;td&gt;Dropout probability. For each training example we randomly choose some amount of units to disable in the neural network classifier. This parameter controls the proportion of units &quot;dropped out.&quot;&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;embeddingSize&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;50&lt;/td&gt;&lt;td&gt;Dimensionality of word embeddings provided&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;evalPerIter&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;100&lt;/td&gt;&lt;td&gt;Run full UAS (unlabeled attachment score) evaluation every time we finish this number of iterations. (Only valid if a development treebank is provided with &lt;tt&gt;&amp;#8209;devFile&lt;/tt&gt;.)&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;hiddenSize&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;200&lt;/td&gt;&lt;td&gt;Dimensionality of hidden layer in neural network classifier&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;initRange&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;0.01&lt;/td&gt;&lt;td&gt;Bounds of range within which weight matrix elements should be initialized. Each element is drawn from a uniform distribution over the range &lt;tt&gt;[-initRange, initRange]&lt;/tt&gt;.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;maxIter&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;20000&lt;/td&gt;&lt;td&gt;Number of training iterations to complete before stopping and saving the final model.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;numPreComputed&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;100000&lt;/td&gt;&lt;td&gt;The parser pre-computes hidden-layer unit activations for particular inputs words at both training and testing time in order to speed up feedforward computation in the neural network. This parameter determines how many words for which we should compute hidden-layer activations.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;regParameter&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;1e-8&lt;/td&gt;&lt;td&gt;Regularization parameter for training&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;saveIntermediate&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;&lt;tt&gt;true&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;If &lt;tt&gt;true&lt;/tt&gt;, continually save the model version which gets the highest UAS value on the dev set. (Only valid if a development treebank is provided with &lt;tt&gt;&amp;#8209;devFile&lt;/tt&gt;.)&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;trainingThreads&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;Number of threads to use during training. Note that depending on training batch size, it may be unwise to simply choose the maximum amount of threads for your machine. On our 16-core test machines: a batch size of 10,000 runs fastest with around 6 threads; a batch size of 100,000 runs best with around 10 threads.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;wordCutOff&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;The parser can optionally ignore rare words by simply choosing an arbitrary &quot;unknown&quot; feature representation for words that appear with frequency less than &lt;em&gt;n&lt;/em&gt; in the corpus. This &lt;em&gt;n&lt;/em&gt; is controlled by the &lt;tt&gt;wordCutOff&lt;/tt&gt; parameter.&lt;/td&gt;&lt;/tr&gt;
+   * &lt;/table&gt;
+   *
+   * Runtime parsing options:
+   * &lt;table&gt;
+   *   &lt;tr&gt;&lt;th&gt;Option&lt;/th&gt;&lt;th&gt;Default&lt;/th&gt;&lt;th&gt;Description&lt;/th&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;escaper&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Only applicable for testing with &lt;tt&gt;-textFile&lt;/tt&gt;. If provided, use this word-escaper when parsing raw sentences. (Should be a fully-qualified class name like &lt;tt&gt;edu.stanford.nlp.trees.international.arabic.ATBEscaper&lt;/tt&gt;.)&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;numPreComputed&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;100000&lt;/td&gt;&lt;td&gt;The parser pre-computes hidden-layer unit activations for particular inputs words at both training and testing time in order to speed up feedforward computation in the neural network. This parameter determines how many words for which we should compute hidden-layer activations.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;sentenceDelimiter&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;N/A&lt;/td&gt;&lt;td&gt;Only applicable for testing with &lt;tt&gt;-textFile&lt;/tt&gt;.  If provided, assume that the given &lt;tt&gt;textFile&lt;/tt&gt; has already been sentence-split, and that sentences are separated by this delimiter.&lt;/td&gt;&lt;/tr&gt;
+   *   &lt;tr&gt;&lt;td&gt;&lt;tt&gt;&amp;#8209;tagger.model&lt;/tt&gt;&lt;/td&gt;&lt;td&gt;edu/stanford/nlp/models/pos-tagger/english-left3words/english-left3words-distsim.tagger&lt;/td&gt;&lt;td&gt;Only applicable for testing with &lt;tt&gt;-textFile&lt;/tt&gt;. Path to a part-of-speech tagger to use to pre-tag the raw sentences before parsing.&lt;/td&gt;&lt;/tr&gt;
+   * &lt;/table&gt;
+   */
+  public static void main(String[] args) {
+<span class="nc" id="L1251">    Properties props = StringUtils.argsToProperties(args, numArgs);</span>
+<span class="nc" id="L1252">    DependencyParser parser = new DependencyParser(props);</span>
+
+    // Train with CoNLL-X data
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">    if (props.containsKey(&quot;trainFile&quot;))</span>
+<span class="nc" id="L1256">      parser.train(props.getProperty(&quot;trainFile&quot;), props.getProperty(&quot;devFile&quot;), props.getProperty(&quot;model&quot;),</span>
+<span class="nc" id="L1257">          props.getProperty(&quot;embedFile&quot;), props.getProperty(&quot;preModel&quot;));</span>
+
+<span class="nc" id="L1259">    boolean loaded = false;</span>
+    // Test with CoNLL-X data
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">    if (props.containsKey(&quot;testFile&quot;)) {</span>
+<span class="nc" id="L1262">      parser.loadModelFile(props.getProperty(&quot;model&quot;));</span>
+<span class="nc" id="L1263">      loaded = true;</span>
+<span class="nc" id="L1264">      parser.testCoNLL(props.getProperty(&quot;testFile&quot;), props.getProperty(&quot;outFile&quot;));</span>
+    }
+
+    // Parse raw text data
+<span class="nc bnc" id="L1268" title="All 2 branches missed.">    if (props.containsKey(&quot;textFile&quot;)) {</span>
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">      if (!loaded) {</span>
+<span class="nc" id="L1270">        parser.loadModelFile(props.getProperty(&quot;model&quot;));</span>
+<span class="nc" id="L1271">        loaded = true;</span>
+      }
+
+<span class="nc" id="L1274">      String encoding = parser.config.tlp.getEncoding();</span>
+<span class="nc" id="L1275">      String inputFilename = props.getProperty(&quot;textFile&quot;);</span>
+      BufferedReader input;
+      try {
+<span class="nc bnc" id="L1278" title="All 2 branches missed.">        input = inputFilename.equals(&quot;-&quot;)</span>
+<span class="nc" id="L1279">                ? IOUtils.readerFromStdin(encoding)</span>
+<span class="nc" id="L1280">                : IOUtils.readerFromString(inputFilename, encoding);</span>
+<span class="nc" id="L1281">      } catch (IOException e) {</span>
+<span class="nc" id="L1282">        throw new RuntimeIOException(&quot;No input file provided (use -textFile)&quot;, e);</span>
+<span class="nc" id="L1283">      }</span>
+
+<span class="nc" id="L1285">      String outputFilename = props.getProperty(&quot;outFile&quot;);</span>
+      PrintWriter output;
+      try {
+<span class="nc bnc" id="L1288" title="All 4 branches missed.">        output = outputFilename == null || outputFilename.equals(&quot;-&quot;)</span>
+<span class="nc" id="L1289">            ? IOUtils.encodedOutputStreamPrintWriter(System.out, encoding, true)</span>
+<span class="nc" id="L1290">            : IOUtils.getPrintWriter(outputFilename, encoding);</span>
+<span class="nc" id="L1291">      } catch (IOException e) {</span>
+<span class="nc" id="L1292">        throw new RuntimeIOException(&quot;Error opening output file&quot;, e);</span>
+<span class="nc" id="L1293">      }</span>
+
+<span class="nc" id="L1295">      parser.parseTextFile(input, output);</span>
+    }
+<span class="nc" id="L1297">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

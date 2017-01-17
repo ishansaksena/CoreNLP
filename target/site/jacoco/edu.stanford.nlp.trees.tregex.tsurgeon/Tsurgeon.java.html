@@ -1,0 +1,658 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Tsurgeon.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees.tregex.tsurgeon</a> &gt; <span class="el_source">Tsurgeon.java</span></div><h1>Tsurgeon.java</h1><pre class="source lang-java linenums">// Tsurgeon
+// Copyright (c) 2004-2016 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    Support/Questions: parser-user@lists.stanford.edu
+//    Licensing: parser-support@lists.stanford.edu
+//    http://nlp.stanford.edu/software/tregex.html
+
+package edu.stanford.nlp.trees.tregex.tsurgeon;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.trees.tregex.Macros;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.TregexPatternCompiler;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.ReflectionLoading;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+import java.io.*;
+import java.util.stream.Collectors;
+
+/** Tsurgeon provides a way of editing trees based on a set of operations that
+ *  are applied to tree locations matching a tregex pattern.
+ *  A simple example from the command-line:
+ *  &lt;blockquote&gt;
+ * java edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon -treeFile aTree
+ *        exciseNP renameVerb
+ * &lt;/blockquote&gt;
+ * The file {@code aTree} has Penn Treebank (S-expression) format trees.
+ * The other (here, two) files have Tsurgeon operations.  These consist of
+ * a list of pairs of a tregex expression on one or more
+ * lines, a blank line, and then some number of lines of Tsurgeon operations and then
+ * another blank line.
+ * &lt;p&gt;
+ * Tsurgeon uses the Tregex engine to match tree patterns on trees;
+ * for more information on Tregex's tree-matching functionality,
+ * syntax, and semantics, please see the documentation for the
+ * {@link TregexPattern} class.
+ * &lt;p&gt;
+
+ * If you want to use Tsurgeon as an API, the relevant method is
+ * {@link #processPattern}.  You will also need to look at the
+ * {@link TsurgeonPattern} class and the {@link Tsurgeon#parseOperation} method.
+ * &lt;p&gt;
+ * Here's the simplest form of invocation on a single Tree:
+ * &lt;pre&gt;
+ * Tree t = Tree.valueOf(&quot;(ROOT (S (NP (NP (NNP Bank)) (PP (IN of) (NP (NNP America)))) (VP (VBD called)) (. .)))&quot;);
+ * TregexPattern pat = TregexPattern.compile(&quot;NP &lt;1 (NP &lt;&lt; Bank) &lt;2 PP=remove&quot;);
+ * TsurgeonPattern surgery = Tsurgeon.parseOperation(&quot;excise remove remove&quot;);
+ * Tsurgeon.processPattern(pat, surgery, t).pennPrint();
+ * &lt;/pre&gt;
+ * &lt;p&gt;
+ * Here is another sample invocation:
+ * &lt;pre&gt;
+ * TregexPattern matchPattern = TregexPattern.compile(&quot;SQ=sq &lt; (/^WH/ $++ VP)&quot;);
+ * List&lt;TsurgeonPattern&gt; ps = new ArrayList&lt;TsurgeonPattern&gt;();
+ *
+ * TsurgeonPattern p = Tsurgeon.parseOperation(&quot;relabel sq S&quot;);
+ *
+ * ps.add(p);
+ *
+ * Treebank lTrees;
+ * List&lt;Tree&gt; result = Tsurgeon.processPatternOnTrees(matchPattern,Tsurgeon.collectOperations(ps),lTrees);
+ * &lt;/pre&gt;
+ * &lt;p&gt;
+ * &lt;i&gt;Note:&lt;/i&gt; If you want to apply multiple surgery patterns, you
+ * will not want to call processPatternOnTrees, for each individual
+ * pattern.  Rather, you should either call processPatternsOnTree and
+ * loop through the trees yourself, or, as above, use
+ * {@code collectOperations} to collect all the surgery patterns
+ * into one TsurgeonPattern, and then to call processPatternOnTrees.
+ * Either of these latter methods is much faster.
+ * &lt;/p&gt;&lt;p&gt;
+ * The parser also has the ability to collect multiple
+ * TsurgeonPatterns into one pattern by itself by enclosing each
+ * pattern in {@code [ ... ]}.  For example,
+ * &lt;br&gt;
+ * {@code Tsurgeon.parseOperation(&quot;[relabel foo BAR] [prune bar]&quot;)}
+ * &lt;/p&gt;&lt;p&gt;
+ * For more information on using Tsurgeon from the command line,
+ * see the {@link #main} method and the package Javadoc.
+ *
+ * @author Roger Levy
+ */
+public class Tsurgeon  {
+
+  /** A logger for this class */
+<span class="fc" id="L115">  private static final Redwood.RedwoodChannels log = Redwood.channels(Tsurgeon.class);</span>
+
+  private static final boolean DEBUG = false;
+  static boolean verbose; // = false;
+
+<span class="fc" id="L120">  private static final Pattern emptyLinePattern = Pattern.compile(&quot;^\\s*$&quot;);</span>
+  private static final String commentIntroducingCharacter = &quot;%&quot;;
+<span class="fc" id="L122">  private static final Pattern commentPattern = Pattern.compile(&quot;(?&lt;!\\\\)%.*$&quot;);</span>
+<span class="fc" id="L123">  private static final Pattern escapedCommentCharacterPattern = Pattern.compile(&quot;\\\\&quot; + commentIntroducingCharacter);</span>
+
+<span class="nc" id="L125">  private Tsurgeon() {} // not an instantiable class</span>
+
+  /** Usage: java edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon [-s] -treeFile file-with-trees [-po matching-pattern operation] operation-file-1 operation-file-2 ... operation-file-n
+   *
+   * &lt;h4&gt;Arguments:&lt;/h4&gt;
+   *
+   * Each argument should be the name of a transformation file that contains a list of pattern
+   * and transformation operation list pairs.  That is, it is a sequence of pairs of a
+   * {@link TregexPattern} pattern on one or more lines, then a
+   * blank line (empty or whitespace), then a list of transformation operations one per line
+   * (as specified by &lt;b&gt;Legal operation syntax&lt;/b&gt; below) to apply when the pattern is matched,
+   * and then another blank line (empty or whitespace).
+   * Note the need for blank lines: The code crashes if they are not present as separators
+   * (although the blank line at the end of the file can be omitted).
+   * The script file can include comment lines, either whole comment lines or
+   * trailing comments introduced by %, which extend to the end of line.  A needed percent
+   * mark can be escaped by a preceding backslash.
+   * &lt;p&gt;
+   * For example, if you want to excise an SBARQ node whenever it is the parent of an SQ node,
+   * and relabel the SQ node to S, your transformation file would look like this:
+   *
+   * &lt;blockquote&gt;
+   * &lt;code&gt;
+   *    SBARQ=n1 &lt; SQ=n2&lt;br&gt;
+   *    &lt;br&gt;
+   *    excise n1 n1&lt;br&gt;
+   *    relabel n2 S
+   * &lt;/code&gt;
+   * &lt;/blockquote&gt;
+   *
+   * &lt;h4&gt;Options:&lt;/h4&gt;
+   * &lt;ul&gt;
+   *   &lt;li&gt;{@code -treeFile &lt;filename&gt;}  specify the name of the file that has the trees you want to transform.
+   *   &lt;li&gt;{@code -po &lt;matchPattern&gt; &lt;operation&gt;}  Apply a single operation to every tree using the specified match pattern and the specified operation.  Use this option
+   *   when you want to quickly try the effect of one pattern/surgery combination, and are too lazy to write a transformation file.
+   *   &lt;li&gt;{@code -s} Print each output tree on one line (default is pretty-printing).
+   *   &lt;li&gt;{@code -m} For every tree that had a matching pattern, print &quot;before&quot; (prepended as &quot;Operated on:&quot;) and &quot;after&quot; (prepended as &quot;Result:&quot;).  Unoperated on trees just pass through the transducer as usual.
+   *   &lt;li&gt;{@code -encoding X} Uses character set X for input and output of trees.
+   *   &lt;li&gt;{@code -macros &lt;filename&gt;} A file of macros to use on the tregex pattern.  Macros should be one per line, with original and replacement separated by tabs.
+   *   &lt;li&gt;{@code -hf &lt;headFinder-class-name&gt;} use the specified {@link HeadFinder} class to determine headship relations.
+   *   &lt;li&gt;{@code -hfArg &lt;string&gt;} pass a string argument in to the {@link HeadFinder} class's constructor.  {@code -hfArg} can be used multiple times to pass in multiple arguments.
+   *   &lt;li&gt; {@code -trf &lt;TreeReaderFactory-class-name&gt;} use the specified {@link TreeReaderFactory} class to read trees from files.
+   * &lt;/ul&gt;
+   *
+   * &lt;h4&gt;Legal operation syntax:&lt;/h4&gt;
+   *
+   * &lt;ul&gt;
+   *
+   * &lt;li&gt;{@code delete &lt;name&gt;}  deletes the node and everything below it.
+   *
+   * &lt;li&gt;{@code prune &lt;name&gt;}  Like delete, but if, after the pruning, the parent has no children anymore, the parent is pruned too.  Pruning continues to affect all ancestors until one is found with remaining children.  This may result in a null tree.
+   *
+   * &lt;li&gt;{@code excise &lt;name1&gt; &lt;name2&gt;}
+   *   The name1 node should either dominate or be the same as the name2 node.  This excises out everything from
+   * name1 to name2.  All the children of name2 go into the parent of name1, where name1 was.
+   *
+   * &lt;li&gt;{@code relabel &lt;name&gt; &lt;new-label&gt;} Relabels the node to have the new label. &lt;br&gt;
+   * There are three possible forms: &lt;br&gt;
+   * {@code relabel nodeX VP} - for changing a node label to an
+   * alphanumeric string &lt;br&gt;
+   * {@code relabel nodeX /''/} - for relabeling a node to
+   * something that isn't a valid identifier without quoting &lt;br&gt;
+   *
+   * {@code relabel nodeX /^VB(.*)$/verb\\/$1/} - for regular
+   * expression based relabeling. In this case, all matches of the
+   * regular expression against the node label are replaced with the
+   * replacement String.  This has the semantics of Java/Perl's
+   * replaceAll: you may use capturing groups and put them in
+   * replacements with $n. For example, if the pattern is /foo/bar/
+   * and the node matched is &quot;foo&quot;, the replaceAll semantics result in
+   * &quot;barbar&quot;.  If the pattern is /^foo(.*)$/bar$1/ and node matched is
+   * &quot;foofoo&quot;, relabel will result in &quot;barfoo&quot;.  &lt;br&gt;
+   *
+   * When using the regex replacement method, you can also use the
+   * sequences ={node} and %{var} in the replacement string to use
+   * captured nodes or variable strings in the replacement string.
+   * For example, if the Tregex pattern was &quot;duck=bar&quot; and the relabel
+   * is /foo/={bar}/, &quot;foofoo&quot; will be replaced with &quot;duckduck&quot;. &lt;br&gt;
+   *
+   * To concatenate two nodes named in the tregex pattern, for
+   * example, you can use the pattern /^.*$/={foo}={bar}/.  Note that
+   * the ^.*$ is necessary to make sure the regex pattern only matches
+   * and replaces once on the entire node name. &lt;br&gt;
+   *
+   * To get an &quot;=&quot; or a &quot;%&quot; in the replacement, using \ escaping.
+   * Also, as in the example you can escape a slash in the middle of
+   * the second and third forms with \\/ and \\\\. &lt;br&gt;
+   *
+   * &lt;li&gt;{@code insert &lt;name&gt; &lt;position&gt;} or {@code insert &lt;tree&gt; &lt;position&gt;}
+   *   inserts the named node or tree into the position specified.
+   *
+   * &lt;li&gt;{@code move &lt;name&gt; &lt;position&gt;} moves the named node into the specified position.
+   * &lt;p&gt;Right now the  only ways to specify position are:
+   * &lt;p&gt;
+   *      {@code $+ &lt;name&gt;}     the left sister of the named node&lt;br&gt;
+   *      {@code $- &lt;name&gt;}     the right sister of the named node&lt;br&gt;
+   *      {@code &gt;i &lt;name&gt;} the i_th daughter of the named node&lt;br&gt;
+   *      {@code &gt;-i &lt;name&gt;} the i_th daughter, counting from the right, of the named node.
+   *
+   * &lt;li&gt;{@code replace &lt;name1&gt; &lt;name2&gt;}
+   *     deletes name1 and inserts a copy of name2 in its place.
+   *
+   * &lt;li&gt;{@code replace &lt;name&gt; &lt;tree&gt; &lt;tree2&gt;...}
+   *     deletes name and inserts the new tree(s) in its place.  If
+   *     more than one replacement tree is given, each of the new
+   *     subtrees will be added in order where the old tree was.
+   *     Multiple subtrees at the root is an illegal operation and
+   *     will throw an exception.
+   *
+   * &lt;li&gt;{@code createSubtree &lt;auxiliary-tree-or-label&gt; &lt;name1&gt; [&lt;name2&gt;]}
+   *     Create a subtree out of all the nodes from {@code &lt;name1&gt;} through
+   *     {@code &lt;name2&gt;}. The subtree is moved to the foot of the given
+   *     auxiliary tree, and the tree is inserted where the nodes of
+   *     the subtree used to reside. If a simple label is provided as
+   *     the first argument, the subtree is given a single parent with
+   *     a name corresponding to the label.  To limit the operation to
+   *     just one node, elide {@code &lt;name2&gt;}.
+   *
+   * &lt;li&gt;{@code adjoin &lt;auxiliary_tree&gt; &lt;name&gt;} Adjoins the specified auxiliary tree into the named node.
+   *     The daughters of the target node will become the daughters of the foot of the auxiliary tree.
+   * &lt;li&gt;{@code adjoinH &lt;auxiliary_tree&gt; &lt;name&gt;} Similar to adjoin, but preserves the target node
+   *     and makes it the root of {@code &lt;tree&gt;}. (It is still accessible as {@code name}.  The root of the
+   *     auxiliary tree is ignored.)
+   *
+   * &lt;li&gt; {@code adjoinF &lt;auxiliary_tree&gt; &lt;name&gt;} Similar to adjoin,
+   *     but preserves the target node and makes it the foot of {@code &lt;tree&gt;}.
+   *     (It is still accessible as {@code name}, and retains its status as parent of its children.
+   *     The root of the auxiliary tree is ignored.)
+   *
+   * &lt;li&gt; &lt;dt&gt;{@code coindex &lt;name1&gt; &lt;name2&gt; ... &lt;nameM&gt;} Puts a (Penn Treebank style)
+   *     coindexation suffix of the form &quot;-N&quot; on each of nodes name_1 through name_m.  The value of N will be
+   *     automatically generated in reference to the existing coindexations in the tree, so that there is never
+   *     an accidental clash of indices across things that are not meant to be coindexed.
+   *
+   * &lt;/ul&gt;
+   *
+   * &lt;p&gt;
+   * In the context of {@code adjoin}, {@code adjoinH},
+   * {@code adjoinF}, and {@code createSubtree}, an auxiliary
+   * tree is a tree in Penn Treebank format with {@code @} on
+   * exactly one of the leaves denoting the foot of the tree.
+   * The operations which use the foot use the labeled node.
+   * For example:
+   * &lt;/p&gt;
+   * &lt;blockquote&gt;
+   * Tsurgeon: {@code adjoin (FOO (BAR@)) foo} &lt;br&gt;
+   * Tregex: {@code B=foo} &lt;br&gt;
+   * Input: {@code (A (B 1 2))}
+   * Output: {@code (A (FOO (BAR 1 2)))}
+   * &lt;/blockquote&gt;
+   * &lt;p&gt;
+   * Tsurgeon applies the same operation to the same tree for as long
+   * as the given tregex operation matches.  This means that infinite
+   * loops are very easy to cause.  One common situation where this comes up
+   * is with an insert operation will repeats infinitely many times
+   * unless you add an expression to the tregex that matches against
+   * the inserted pattern.  For example, this pattern will infinite loop:
+   * &lt;/p&gt;
+   * &lt;blockquote&gt;
+   * &lt;code&gt;
+   *   TregexPattern tregex = TregexPattern.compile(&quot;S=node &amp;lt;&amp;lt; NP&quot;); &lt;br&gt;
+   *   TsurgeonPattern tsurgeon = Tsurgeon.parseOperation(&quot;insert (NP foo) &gt;-1 node&quot;);
+   * &lt;/code&gt;
+   * &lt;/blockquote&gt;
+   * &lt;p&gt;
+   * This pattern, though, will terminate:
+   * &lt;/p&gt;
+   * &lt;blockquote&gt;
+   * &lt;code&gt;
+   *   TregexPattern tregex = TregexPattern.compile(&quot;S=node &amp;lt;&amp;lt; NP !&amp;lt;&amp;lt; foo&quot;); &lt;br&gt;
+   *   TsurgeonPattern tsurgeon = Tsurgeon.parseOperation(&quot;insert (NP foo) &gt;-1 node&quot;);
+   * &lt;/code&gt;
+   * &lt;/blockquote&gt;
+   *
+   * &lt;p&gt;
+   * Tsurgeon has (very) limited support for conditional statements.
+   * If a pattern is prefaced with
+   * {@code if exists &lt;name&gt;},
+   * the rest of the pattern will only execute if
+   * the named node was found in the corresponding TregexMatcher.
+   * &lt;/p&gt;
+   *
+   * @param args a list of names of files each of which contains a single tregex matching pattern plus a list, one per line,
+   *        of transformation operations to apply to the matched pattern.
+   * @throws Exception If an I/O or pattern syntax error
+   */
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L312">    String headFinderClassName = null;</span>
+<span class="nc" id="L313">    String headFinderOption = &quot;-hf&quot;;</span>
+<span class="nc" id="L314">    String[] headFinderArgs = null;</span>
+<span class="nc" id="L315">    String headFinderArgOption = &quot;-hfArg&quot;;</span>
+<span class="nc" id="L316">    String encoding = &quot;UTF-8&quot;;</span>
+<span class="nc" id="L317">    String encodingOption = &quot;-encoding&quot;;</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">    if(args.length==0) {</span>
+<span class="nc" id="L319">      log.info(&quot;Usage: java edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon [-s] -treeFile &lt;file-with-trees&gt; [-po &lt;matching-pattern&gt; &lt;operation&gt;] &lt;operation-file-1&gt; &lt;operation-file-2&gt; ... &lt;operation-file-n&gt;&quot;);</span>
+<span class="nc" id="L320">      System.exit(0);</span>
+    }
+    String treePrintFormats;
+<span class="nc" id="L323">    String singleLineOption = &quot;-s&quot;;</span>
+<span class="nc" id="L324">    String verboseOption = &quot;-v&quot;;</span>
+<span class="nc" id="L325">    String matchedOption = &quot;-m&quot;; // if set, then print original form of trees that are matched &amp; thus operated on</span>
+<span class="nc" id="L326">    String patternOperationOption = &quot;-po&quot;;</span>
+<span class="nc" id="L327">    String treeFileOption = &quot;-treeFile&quot;;</span>
+<span class="nc" id="L328">    String trfOption = &quot;-trf&quot;;</span>
+<span class="nc" id="L329">    String macroOption = &quot;-macros&quot;;</span>
+<span class="nc" id="L330">    String macroFilename = &quot;&quot;;</span>
+<span class="nc" id="L331">    Map&lt;String,Integer&gt; flagMap = Generics.newHashMap();</span>
+<span class="nc" id="L332">    flagMap.put(patternOperationOption,2);</span>
+<span class="nc" id="L333">    flagMap.put(treeFileOption,1);</span>
+<span class="nc" id="L334">    flagMap.put(trfOption,1);</span>
+<span class="nc" id="L335">    flagMap.put(singleLineOption,0);</span>
+<span class="nc" id="L336">    flagMap.put(encodingOption,1);</span>
+<span class="nc" id="L337">    flagMap.put(headFinderOption,1);</span>
+<span class="nc" id="L338">    flagMap.put(macroOption, 1);</span>
+<span class="nc" id="L339">    Map&lt;String,String[]&gt; argsMap = StringUtils.argsToMap(args,flagMap);</span>
+<span class="nc" id="L340">    args = argsMap.get(null);</span>
+
+<span class="nc bnc" id="L342" title="All 2 branches missed.">    if(argsMap.containsKey(headFinderOption)) headFinderClassName = argsMap.get(headFinderOption)[0];</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">    if(argsMap.containsKey(headFinderArgOption)) headFinderArgs = argsMap.get(headFinderArgOption);</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    if(argsMap.containsKey(verboseOption))      verbose = true;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    if(argsMap.containsKey(singleLineOption))   treePrintFormats = &quot;oneline,&quot;;   else treePrintFormats = &quot;penn,&quot;;</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">    if(argsMap.containsKey(encodingOption)) encoding = argsMap.get(encodingOption)[0];</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">    if(argsMap.containsKey(macroOption)) macroFilename = argsMap.get(macroOption)[0];</span>
+
+<span class="nc" id="L349">    TreePrint tp = new TreePrint(treePrintFormats, new PennTreebankLanguagePack());</span>
+<span class="nc" id="L350">    PrintWriter pwOut = new PrintWriter(new OutputStreamWriter(System.out, encoding), true);</span>
+
+    TreeReaderFactory trf;
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    if (argsMap.containsKey(trfOption)) {</span>
+<span class="nc" id="L354">      String trfClass = argsMap.get(trfOption)[0];</span>
+<span class="nc" id="L355">      trf = ReflectionLoading.loadByReflection(trfClass);</span>
+<span class="nc" id="L356">    } else {</span>
+<span class="nc" id="L357">      trf = new TregexPattern.TRegexTreeReaderFactory();</span>
+    }
+
+<span class="nc" id="L360">    Treebank trees = new DiskTreebank(trf, encoding);</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">    if (argsMap.containsKey(treeFileOption)) {</span>
+<span class="nc" id="L362">      trees.loadPath(argsMap.get(treeFileOption)[0]);</span>
+    }
+<span class="nc bnc" id="L364" title="All 2 branches missed.">    if (trees.isEmpty()) {</span>
+<span class="nc" id="L365">      log.info(&quot;Warning: No trees specified to operate on.  Use -treeFile path option.&quot;);</span>
+    }
+
+    TregexPatternCompiler compiler;
+<span class="nc bnc" id="L369" title="All 2 branches missed.">    if (headFinderClassName == null) {</span>
+<span class="nc" id="L370">      compiler = new TregexPatternCompiler();</span>
+    } else {
+      HeadFinder hf;
+<span class="nc bnc" id="L373" title="All 2 branches missed.">      if (headFinderArgs == null) {</span>
+<span class="nc" id="L374">        hf = ReflectionLoading.loadByReflection(headFinderClassName);</span>
+      } else {
+<span class="nc" id="L376">        hf = ReflectionLoading.loadByReflection(headFinderClassName, (Object[]) headFinderArgs);</span>
+      }
+<span class="nc" id="L378">      compiler = new TregexPatternCompiler(hf);</span>
+    }
+<span class="nc" id="L380">    Macros.addAllMacros(compiler, macroFilename, encoding);</span>
+
+<span class="nc" id="L382">    List&lt;Pair&lt;TregexPattern,TsurgeonPattern&gt;&gt; ops = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">    if (argsMap.containsKey(patternOperationOption)) {</span>
+<span class="nc" id="L384">      TregexPattern matchPattern = compiler.compile(argsMap.get(patternOperationOption)[0]);</span>
+<span class="nc" id="L385">      TsurgeonPattern p = parseOperation(argsMap.get(patternOperationOption)[1]);</span>
+<span class="nc" id="L386">      ops.add(new Pair&lt;&gt;(matchPattern,p));</span>
+<span class="nc" id="L387">    } else {</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">      for (String arg : args) {</span>
+<span class="nc" id="L389">        List&lt;Pair&lt;TregexPattern,TsurgeonPattern&gt;&gt; pairs = getOperationsFromFile(arg, encoding, compiler);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        for (Pair&lt;TregexPattern,TsurgeonPattern&gt; pair : pairs) {</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">          if (verbose) {</span>
+<span class="nc" id="L392">            log.info(pair.second());</span>
+          }
+<span class="nc" id="L394">          ops.add(pair);</span>
+<span class="nc" id="L395">        }</span>
+      }
+    }
+
+<span class="nc bnc" id="L399" title="All 2 branches missed.">    for (Tree t : trees ) {</span>
+<span class="nc" id="L400">      Tree original = t.deepCopy();</span>
+<span class="nc" id="L401">      Tree result = processPatternsOnTree(ops, t);</span>
+<span class="nc bnc" id="L402" title="All 4 branches missed.">      if (argsMap.containsKey(matchedOption) &amp;&amp; matchedOnTree) {</span>
+<span class="nc" id="L403">        pwOut.println(&quot;Operated on: &quot;);</span>
+<span class="nc" id="L404">        displayTree(original,tp,pwOut);</span>
+<span class="nc" id="L405">        pwOut.println(&quot;Result: &quot;);</span>
+      }
+<span class="nc" id="L407">      displayTree(result,tp,pwOut);</span>
+<span class="nc" id="L408">    }</span>
+<span class="nc" id="L409">  }</span>
+
+  private static void displayTree(Tree t, TreePrint tp, PrintWriter pw) {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">    if (t==null) {</span>
+<span class="nc" id="L413">      pw.println(&quot;null&quot;);</span>
+    } else {
+<span class="nc" id="L415">      tp.printTree(t,pw);</span>
+    }
+<span class="nc" id="L417">  }</span>
+
+  /**
+   * Parses a tsurgeon script text input and compiles a tregex pattern and a list
+   * of tsurgeon operations into a pair.
+   *
+   * @param reader Reader to read patterns from
+   * @return A pair of a tregex and tsurgeon pattern read from a file, or {@code null}
+   *    when the operations present in the Reader have been exhausted
+   * @throws IOException If any IO problem
+   */
+  public static Pair&lt;TregexPattern, TsurgeonPattern&gt; getOperationFromReader(BufferedReader reader, TregexPatternCompiler compiler) throws IOException {
+<span class="nc" id="L429">    String patternString = getTregexPatternFromReader(reader);</span>
+    // log.info(&quot;Read tregex pattern: &quot; + patternString);
+<span class="nc bnc" id="L431" title="All 2 branches missed.">    if (patternString.isEmpty()) {</span>
+<span class="nc" id="L432">      return null;</span>
+    }
+<span class="nc" id="L434">    TregexPattern matchPattern = compiler.compile(patternString);</span>
+
+<span class="nc" id="L436">    TsurgeonPattern collectedPattern = getTsurgeonOperationsFromReader(reader);</span>
+<span class="nc" id="L437">    return new Pair&lt;&gt;(matchPattern,collectedPattern);</span>
+  }
+
+  /**
+   * Assumes that we are at the beginning of a tsurgeon script file and gets the string for the
+   * tregex pattern leading the file.
+   *
+   * @return tregex pattern string. May be empty, never null
+   * @throws IOException If the usual kinds of IO errors occur
+   */
+  public static String getTregexPatternFromReader(BufferedReader reader) throws IOException {
+<span class="nc" id="L448">    StringBuilder matchString = new StringBuilder();</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">    for (String thisLine; (thisLine = reader.readLine()) != null; ) {</span>
+<span class="nc bnc" id="L450" title="All 4 branches missed.">      if (matchString.length() &gt; 0 &amp;&amp; emptyLinePattern.matcher(thisLine).matches()) {</span>
+        // A blank line after getting some real content (not just comments or nothing)
+<span class="nc" id="L452">        break;</span>
+      }
+<span class="nc" id="L454">      thisLine = removeComments(thisLine);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">      if ( ! emptyLinePattern.matcher(thisLine).matches()) {</span>
+<span class="nc" id="L456">        matchString.append(thisLine);</span>
+      }
+    }
+<span class="nc" id="L459">    return matchString.toString();</span>
+  }
+
+  /**
+   * Assumes the given reader has only tsurgeon operations (not a tregex pattern), and parses
+   * these out, collecting them into one operation.  Stops on a whitespace line.
+   *
+   * @throws IOException If the usual kinds of IO errors occur
+   */
+  public static TsurgeonPattern getTsurgeonOperationsFromReader(BufferedReader reader) throws IOException {
+<span class="nc" id="L469">    List&lt;TsurgeonPattern&gt; operations = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">    for (String thisLine; (thisLine = reader.readLine()) != null; ) {</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">      if (emptyLinePattern.matcher(thisLine).matches()) {</span>
+<span class="nc" id="L472">        break;</span>
+      }
+<span class="nc" id="L474">      thisLine = removeComments(thisLine);</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">      if (emptyLinePattern.matcher(thisLine).matches()) {</span>
+<span class="nc" id="L476">        continue;</span>
+      }
+      // log.info(&quot;Read tsurgeon op: &quot; + thisLine);
+<span class="nc" id="L479">      operations.add(parseOperation(thisLine));</span>
+    }
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">    if (operations.isEmpty()) {</span>
+<span class="nc" id="L483">      throw new TsurgeonParseException(&quot;No Tsurgeon operation provided.&quot;);</span>
+    }
+
+<span class="nc" id="L486">    return collectOperations(operations);</span>
+  }
+
+
+  private static String removeComments(String line) {
+<span class="nc" id="L491">    Matcher m = commentPattern.matcher(line);</span>
+<span class="nc" id="L492">    line = m.replaceFirst(&quot;&quot;);</span>
+<span class="nc" id="L493">    Matcher m1 = escapedCommentCharacterPattern.matcher(line);</span>
+<span class="nc" id="L494">    line = m1.replaceAll(commentIntroducingCharacter);</span>
+<span class="nc" id="L495">    return line;</span>
+  }
+
+
+  /**
+   * Assumes the given reader has only tsurgeon operations (not a tregex pattern), and returns
+   * them as a String, mirroring the way the strings appear in the file. This is helpful
+   * for lazy evaluation of the operations, as in a GUI,
+   * because you do not parse the operations on load.  Comments are still excised.
+   * @throws IOException
+   */
+  public static String getTsurgeonTextFromReader(BufferedReader reader) throws IOException {
+<span class="nc" id="L507">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">    for (String thisLine; (thisLine = reader.readLine()) != null; ) {</span>
+<span class="nc" id="L509">      thisLine = removeComments(thisLine);</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">      if (emptyLinePattern.matcher(thisLine).matches()) {</span>
+<span class="nc" id="L511">        continue;</span>
+      }
+<span class="nc" id="L513">      sb.append(thisLine);</span>
+<span class="nc" id="L514">      sb.append('\n');</span>
+    }
+<span class="nc" id="L516">    return sb.toString();</span>
+  }
+
+  /**
+   * Parses a tsurgeon script file and compiles all operations in the file into a list
+   * of pairs of tregex and tsurgeon patterns.
+   *
+   * @param filename A file, classpath resource or URL (perhaps gzipped) containing the tsurgeon script
+   * @return A pair of a tregex and tsurgeon pattern read from a file
+   * @throws IOException If there is any I/O problem
+   */
+  public static List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; getOperationsFromFile(String filename, String encoding, TregexPatternCompiler compiler) throws IOException {
+<span class="nc" id="L528">    BufferedReader reader = IOUtils.readerFromString(filename, encoding);</span>
+<span class="nc" id="L529">    List&lt;Pair&lt;TregexPattern,TsurgeonPattern&gt;&gt; operations = getOperationsFromReader(reader, compiler);</span>
+<span class="nc" id="L530">    reader.close();</span>
+<span class="nc" id="L531">    return operations;</span>
+  }
+
+
+  /**
+   * Parses and compiles all operations from a BufferedReader into a list
+   * of pairs of tregex and tsurgeon patterns.
+   *
+   * @param reader A BufferedReader to read the operations
+   * @return A pair of a tregex and tsurgeon pattern read from reader
+   * @throws IOException If there is any I/O problem
+   */
+  @SuppressWarnings(&quot;WeakerAccess&quot;)
+  public static List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; getOperationsFromReader(BufferedReader reader, TregexPatternCompiler compiler) throws IOException {
+<span class="nc" id="L545">    List&lt;Pair&lt;TregexPattern,TsurgeonPattern&gt;&gt; operations = new ArrayList&lt;&gt;();</span>
+    for ( ; ; ) {
+<span class="nc" id="L547">      Pair&lt;TregexPattern, TsurgeonPattern&gt; operation = getOperationFromReader(reader, compiler);</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      if (operation == null) {</span>
+<span class="nc" id="L549">        break;</span>
+      }
+<span class="nc" id="L551">      operations.add(operation);</span>
+<span class="nc" id="L552">    }</span>
+<span class="nc" id="L553">    return operations;</span>
+  }
+
+
+
+  /**
+   * Applies {#processPattern} to a collection of trees.
+   *
+   * @param matchPattern A {@link TregexPattern} to be matched against a {@link Tree}.
+   * @param p A {@link TsurgeonPattern} to apply.
+   * @param inputTrees The input trees to be processed
+   * @return A List of the transformed trees
+   */
+  public static List&lt;Tree&gt; processPatternOnTrees(TregexPattern matchPattern, TsurgeonPattern p, Collection&lt;Tree&gt; inputTrees) {
+<span class="nc" id="L567">    List&lt;Tree&gt; result = inputTrees.stream().map(tree -&gt; processPattern(matchPattern, p, tree)).collect(Collectors.toList());</span>
+<span class="nc" id="L568">    return result;</span>
+  }
+
+  /**
+   * Tries to match a pattern against a tree.  If it succeeds, apply the surgical operations contained in a {@link TsurgeonPattern}.
+   *
+   * @param matchPattern A {@link TregexPattern} to be matched against a {@link Tree}.
+   * @param p A {@link TsurgeonPattern} to apply.
+   * @param t the {@link Tree} to match against and perform surgery on.
+   * @return t, which has been surgically modified.
+   */
+  public static Tree processPattern(TregexPattern matchPattern, TsurgeonPattern p, Tree t) {
+<span class="fc" id="L580">    TregexMatcher m = matchPattern.matcher(t);</span>
+<span class="fc" id="L581">    TsurgeonMatcher tsm = p.matcher();</span>
+<span class="fc bfc" id="L582" title="All 2 branches covered.">    while (m.find()) {</span>
+<span class="fc" id="L583">      t = tsm.evaluate(t, m);</span>
+<span class="fc bfc" id="L584" title="All 2 branches covered.">      if (t==null) {</span>
+<span class="fc" id="L585">        break;</span>
+      }
+<span class="fc" id="L587">      m = matchPattern.matcher(t);</span>
+    }
+<span class="fc" id="L589">    return t;</span>
+  }
+
+  private static boolean matchedOnTree; // hack-in field for seeing whether there was a match.
+
+  @SuppressWarnings(&quot;StringContatenationInLoop&quot;)
+  public static Tree processPatternsOnTree(List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; ops, Tree t) {
+<span class="fc" id="L596">    matchedOnTree = false;</span>
+<span class="fc bfc" id="L597" title="All 2 branches covered.">    for (Pair&lt;TregexPattern,TsurgeonPattern&gt; op : ops) {</span>
+      try {
+        if (DEBUG) {
+          log.info(&quot;Running pattern &quot; + op.first());
+        }
+<span class="fc" id="L602">        TregexMatcher m = op.first().matcher(t);</span>
+<span class="fc" id="L603">        TsurgeonMatcher tsm = op.second().matcher();</span>
+<span class="fc bfc" id="L604" title="All 2 branches covered.">        while (m.find()) {</span>
+<span class="fc" id="L605">          matchedOnTree = true;</span>
+<span class="fc" id="L606">          t = tsm.evaluate(t,m);</span>
+<span class="fc bfc" id="L607" title="All 2 branches covered.">          if (t == null) {</span>
+<span class="fc" id="L608">            return null;</span>
+          }
+<span class="fc" id="L610">          m = op.first().matcher(t);</span>
+        }
+<span class="nc" id="L612">      } catch (NullPointerException npe) {</span>
+<span class="nc" id="L613">        throw new RuntimeException(&quot;Tsurgeon.processPatternsOnTree failed to match label for pattern: &quot; + op.first() + &quot;, &quot; + op.second(), npe);</span>
+<span class="fc" id="L614">      }</span>
+<span class="fc" id="L615">    }</span>
+<span class="fc" id="L616">    return t;</span>
+  }
+
+
+
+  /**
+   * Parses an operation string into a {@link TsurgeonPattern}.  Throws an {@link TsurgeonParseException} if
+   * the operation string is ill-formed.
+   * &lt;p&gt;
+   * Example of use:
+   * &lt;p&gt;
+   * &lt;tt&gt;
+   * TsurgeonPattern p = Tsurgeon.parseOperation(&quot;prune ed&quot;);
+   * &lt;/tt&gt;
+   * @param operationString The operation to perform, as a text string
+   * @return the operation pattern.
+   */
+  public static TsurgeonPattern parseOperation(String operationString) {
+    try {
+<span class="fc" id="L635">      TsurgeonParser parser =</span>
+        new TsurgeonParser(new StringReader(operationString + '\n'));
+<span class="fc" id="L637">      return parser.Root();</span>
+<span class="fc" id="L638">    } catch (ParseException | TokenMgrError e) {</span>
+<span class="fc" id="L639">      throw new TsurgeonParseException(&quot;Error parsing Tsurgeon expression: &quot; +</span>
+                                       operationString, e);
+    }
+  }
+
+  /**
+   * Collects a list of operation patterns into a sequence of operations to be applied.  Required to keep track of global properties
+   * across a sequence of operations.  For example, if you want to insert a named node and then coindex it with another node,
+   * you will need to collect the insertion and coindexation operations into a single TsurgeonPattern so that tsurgeon is aware
+   * of the name of the new node and coindexation becomes possible.
+   *
+   * @param patterns a list of {@link TsurgeonPattern} operations that you want to collect together into a single compound operation
+   * @return a new {@link TsurgeonPattern} that performs all the operations in the sequence of the {@code patterns} argument
+   */
+  public static TsurgeonPattern collectOperations(List&lt;TsurgeonPattern&gt; patterns) {
+<span class="nc" id="L654">    return new TsurgeonPatternRoot(patterns.toArray(new TsurgeonPattern[patterns.size()]));</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

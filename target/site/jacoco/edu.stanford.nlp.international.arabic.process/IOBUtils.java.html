@@ -1,0 +1,760 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IOBUtils.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.arabic.process</a> &gt; <span class="el_source">IOBUtils.java</span></div><h1>IOBUtils.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.arabic.process; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.international.arabic.ArabicMorphoFeatureSpecification;
+import edu.stanford.nlp.international.morph.MorphoFeatureSpecification;
+import edu.stanford.nlp.international.morph.MorphoFeatureSpecification.MorphoFeatureType;
+import edu.stanford.nlp.international.morph.MorphoFeatures;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.SentenceUtils;
+import edu.stanford.nlp.process.TokenizerFactory;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreAnnotations.CharacterOffsetBeginAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations.CharacterOffsetEndAnnotation;
+import edu.stanford.nlp.util.CollectionUtils;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.IntPair;
+import edu.stanford.nlp.util.Pair;
+
+/**
+ * A class for converting strings to input suitable for processing by
+ * an IOB sequence model.
+ *
+ * @author Spence Green
+ * @author Will Monroe
+ */
+<span class="nc bnc" id="L35" title="All 2 branches missed.">public class IOBUtils  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L38">  private static Redwood.RedwoodChannels log = Redwood.channels(IOBUtils.class);</span>
+
+  // Training token types.
+<span class="nc" id="L41">  private enum TokenType { BeginMarker, EndMarker, BothMarker, NoMarker }</span>
+
+  // Label inventory
+  public static final String BeginSymbol = &quot;BEGIN&quot;;
+  public static final String ContinuationSymbol = &quot;CONT&quot;;
+  public static final String NosegSymbol = &quot;NOSEG&quot;;
+  public static final String RewriteSymbol = &quot;REW&quot;;
+  
+  /** @deprecated use RewriteSymbol instead */
+  public static final String RewriteTahSymbol = &quot;REWTA&quot;;
+  /** @deprecated use RewriteSymbol instead */
+  public static final String RewriteTareefSymbol = &quot;REWAL&quot;;
+
+  private static final String BoundarySymbol = &quot;.##.&quot;;
+  private static final String BoundaryChar = &quot;.#.&quot;;
+
+  // Patterns for tokens that should not be segmented.
+<span class="nc" id="L58">  private static final Pattern isPunc = Pattern.compile(&quot;\\p{Punct}+&quot;);</span>
+<span class="nc" id="L59">  private static final Pattern isDigit = Pattern.compile(&quot;\\p{Digit}+&quot;);</span>
+<span class="nc" id="L60">  private static final Pattern notUnicodeArabic = Pattern.compile(&quot;\\P{InArabic}+&quot;);</span>
+
+  // Sets of known clitics for tagging when reconstructing the segmented sequences.
+  private static final Set&lt;String&gt; arPrefixSet;
+  private static final Set&lt;String&gt; arSuffixSet;
+  static {
+<span class="nc" id="L66">    String arabicPrefixString = &quot;ل ف و م ما ح حا ه ها ك ب س&quot;;</span>
+<span class="nc" id="L67">    arPrefixSet = Collections.unmodifiableSet(Generics.newHashSet(Arrays.asList(arabicPrefixString.split(&quot;\\s+&quot;))));</span>
+<span class="nc" id="L68">    String arabicSuffixString = &quot;ل و ما ه ها هم هن نا كم تن تم ى ي هما ك ب ش&quot;;</span>
+<span class="nc" id="L69">    arSuffixSet = Collections.unmodifiableSet(Generics.newHashSet(Arrays.asList(arabicSuffixString.split(&quot;\\s+&quot;))));</span>
+<span class="nc" id="L70">  }</span>
+
+  // Only static methods
+<span class="nc" id="L73">  private IOBUtils() {}</span>
+
+<span class="nc" id="L75">  public static String getBoundaryCharacter() { return BoundaryChar; }</span>
+
+  /**
+   * Convert a String to a list of characters suitable for labeling in an IOB
+   * segmentation model.
+   *
+   * @param tokenList
+   * @param segMarker
+   * @param applyRewriteRules add rewrite labels (for training data)
+   */
+  public static List&lt;CoreLabel&gt; StringToIOB(List&lt;CoreLabel&gt; tokenList,
+                                            Character segMarker,
+                                            boolean applyRewriteRules) {
+<span class="nc" id="L88">    return StringToIOB(tokenList, segMarker, applyRewriteRules, false, null, null);</span>
+  }
+
+  /**
+   * Convert a String to a list of characters suitable for labeling in an IOB
+   * segmentation model.
+   *
+   * @param tokenList
+   * @param segMarker
+   * @param applyRewriteRules add rewrite labels (for training data)
+   * @param tf a TokenizerFactory returning ArabicTokenizers (for determining original segment boundaries)
+   * @param origText the original string before tokenization (for determining original segment boundaries)
+   */
+  public static List&lt;CoreLabel&gt; StringToIOB(List&lt;CoreLabel&gt; tokenList,
+                                            Character segMarker,
+                                            boolean applyRewriteRules,
+                                            TokenizerFactory&lt;CoreLabel&gt; tf,
+                                            String origText) {
+<span class="nc" id="L106">    return StringToIOB(tokenList, segMarker, applyRewriteRules, false, tf, origText);</span>
+  }
+  
+  /**
+   * Convert a String to a list of characters suitable for labeling in an IOB
+   * segmentation model.
+   *
+   * @param tokenList
+   * @param segMarker
+   * @param applyRewriteRules add rewrite labels (for training data)
+   * @param stripRewrites revert training data to old Green &amp; DeNero model (remove
+   *    rewrite labels but still rewrite to try to preserve raw text)
+   */
+  public static List&lt;CoreLabel&gt; StringToIOB(List&lt;CoreLabel&gt; tokenList,
+                                            Character segMarker,
+                                            boolean applyRewriteRules,
+                                            boolean stripRewrites) {
+<span class="nc" id="L123">    return StringToIOB(tokenList, segMarker, applyRewriteRules, stripRewrites, null, null);</span>
+  }
+
+  /**
+   * Convert a String to a list of characters suitable for labeling in an IOB
+   * segmentation model.
+   *
+   * @param tokenList
+   * @param segMarker
+   * @param applyRewriteRules add rewrite labels (for training data)
+   * @param stripRewrites revert training data to old Green &amp; DeNero model (remove
+   *    rewrite labels but still rewrite to try to preserve raw text)
+   * @param tf a TokenizerFactory returning ArabicTokenizers (for determining original segment boundaries)
+   * @param origText the original string before tokenization (for determining original segment boundaries)
+   */
+  public static List&lt;CoreLabel&gt; StringToIOB(List&lt;CoreLabel&gt; tokenList,
+                                            Character segMarker,
+                                            boolean applyRewriteRules,
+                                            boolean stripRewrites,
+                                            TokenizerFactory&lt;CoreLabel&gt; tf,
+                                            String origText) {
+<span class="nc" id="L144">    List&lt;CoreLabel&gt; iobList = new ArrayList&lt;&gt;(tokenList.size() * 7 + tokenList.size());</span>
+<span class="nc" id="L145">    final String strSegMarker = String.valueOf(segMarker);</span>
+
+<span class="nc" id="L147">    boolean addWhitespace = false;</span>
+<span class="nc" id="L148">    final int numTokens = tokenList.size();</span>
+<span class="nc" id="L149">    String lastToken = &quot;&quot;;</span>
+<span class="nc" id="L150">    String currentWord = &quot;&quot;;</span>
+<span class="nc" id="L151">    int wordStartIndex = 0;</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">    for (CoreLabel cl : tokenList) {</span>
+      // What type of token is this
+<span class="nc bnc" id="L154" title="All 2 branches missed.">      if (addWhitespace) {</span>
+<span class="nc" id="L155">        fillInWordStatistics(iobList, currentWord, wordStartIndex);</span>
+<span class="nc" id="L156">        currentWord = &quot;&quot;;</span>
+<span class="nc" id="L157">        wordStartIndex = iobList.size() + 1;</span>
+
+<span class="nc" id="L159">        iobList.add(createDatum(cl, BoundaryChar, BoundarySymbol));</span>
+<span class="nc" id="L160">        final CoreLabel boundaryDatum = iobList.get(iobList.size() - 1);</span>
+<span class="nc" id="L161">        boundaryDatum.setIndex(0);</span>
+<span class="nc" id="L162">        boundaryDatum.setWord(&quot;&quot;);</span>
+<span class="nc" id="L163">        addWhitespace = false;</span>
+      }
+
+<span class="nc" id="L166">      String token = cl.word();</span>
+<span class="nc" id="L167">      TokenType tokType = getTokenType(token, strSegMarker);</span>
+<span class="nc" id="L168">      token = stripSegmentationMarkers(token, tokType);</span>
+<span class="nc bnc" id="L169" title="All 4 branches missed.">      assert token.length() != 0;</span>
+
+<span class="nc bnc" id="L171" title="All 2 branches missed.">      if (shouldNotSegment(token)) {</span>
+<span class="nc" id="L172">        iobList.add(createDatum(cl, token, NosegSymbol));</span>
+<span class="nc" id="L173">        addWhitespace = true;</span>
+
+      } else {
+        // Iterate over the characters in the token
+<span class="nc" id="L177">        tokenToDatums(iobList, cl, token, tokType, cl, lastToken, applyRewriteRules, stripRewrites, tf, origText);</span>
+<span class="nc bnc" id="L178" title="All 4 branches missed.">        addWhitespace = (tokType == TokenType.BeginMarker || tokType == TokenType.NoMarker);</span>
+      }
+<span class="nc" id="L180">      currentWord += token;</span>
+<span class="nc" id="L181">      lastToken = token;</span>
+<span class="nc" id="L182">    }</span>
+<span class="nc" id="L183">    fillInWordStatistics(iobList, currentWord, wordStartIndex);</span>
+<span class="nc" id="L184">    return iobList;</span>
+  }
+
+  /**
+   * Loops back through all the datums inserted for the most recent word
+   * and inserts statistics about the word they are a part of. This needs to
+   * be post hoc because the CoreLabel lists coming from testing data sets
+   * are pre-segmented (so treating each of those CoreLabels as a &quot;word&quot; lets
+   * us cheat and get 100% classification accuracy by just looking at whether
+   * we're at the beginning of a &quot;word&quot;). 
+   * 
+   * @param iobList
+   * @param currentWord
+   * @param wordStartIndex
+   */
+  private static void fillInWordStatistics(List&lt;CoreLabel&gt; iobList,
+      String currentWord, int wordStartIndex) {
+<span class="nc bnc" id="L201" title="All 2 branches missed.">    for (int j = wordStartIndex; j &lt; iobList.size(); j++) {</span>
+<span class="nc" id="L202">      CoreLabel tok = iobList.get(j);</span>
+<span class="nc" id="L203">      tok.setIndex(j - wordStartIndex);</span>
+<span class="nc" id="L204">      tok.setWord(currentWord);</span>
+    }
+<span class="nc" id="L206">  }</span>
+
+  /**
+   * Convert token to a sequence of datums and add to iobList.
+   *
+   * @param iobList
+   * @param token
+   * @param tokType
+   * @param tokenLabel
+   * @param lastToken
+   * @param applyRewriteRules
+   * @param tf a TokenizerFactory returning ArabicTokenizers (for determining original segment boundaries)
+   * @param origText the original string before tokenization (for determining original segment boundaries)
+   */
+  private static void tokenToDatums(List&lt;CoreLabel&gt; iobList,
+                                CoreLabel cl,
+                                String token,
+                                TokenType tokType, 
+                                CoreLabel tokenLabel,
+                                String lastToken,
+                                boolean applyRewriteRules,
+                                boolean stripRewrites,
+                                TokenizerFactory&lt;CoreLabel&gt; tf,
+                                String origText) {
+
+<span class="nc bnc" id="L231" title="All 2 branches missed.">    if (token.isEmpty()) return;</span>
+<span class="nc" id="L232">    String lastLabel = ContinuationSymbol;</span>
+<span class="nc" id="L233">    String firstLabel = BeginSymbol;</span>
+<span class="nc" id="L234">    String rewritten = cl.get(ArabicDocumentReaderAndWriter.RewrittenArabicAnnotation.class);</span>
+<span class="nc" id="L235">    boolean crossRefRewrites = true;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">    if (rewritten == null) {</span>
+<span class="nc" id="L237">      rewritten = token;</span>
+<span class="nc" id="L238">      crossRefRewrites = false;</span>
+    } else {
+<span class="nc" id="L240">      rewritten = stripSegmentationMarkers(rewritten, tokType);</span>
+    }
+
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    if (applyRewriteRules) {</span>
+      // Apply Arabic-specific re-write rules
+<span class="nc" id="L245">      String rawToken = tokenLabel.word();</span>
+<span class="nc" id="L246">      String tag = tokenLabel.tag();</span>
+<span class="nc" id="L247">      MorphoFeatureSpecification featureSpec = new ArabicMorphoFeatureSpecification();</span>
+<span class="nc" id="L248">      featureSpec.activate(MorphoFeatureType.NGEN);</span>
+<span class="nc" id="L249">      featureSpec.activate(MorphoFeatureType.NNUM);</span>
+<span class="nc" id="L250">      featureSpec.activate(MorphoFeatureType.DEF);</span>
+<span class="nc" id="L251">      featureSpec.activate(MorphoFeatureType.TENSE);</span>
+<span class="nc" id="L252">      MorphoFeatures features = featureSpec.strToFeatures(tag);</span>
+
+      // Rule #1 : ت --&gt; ة
+<span class="nc bnc" id="L255" title="All 2 branches missed.">      if (features.getValue(MorphoFeatureType.NGEN).equals(&quot;F&quot;) &amp;&amp;</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">          features.getValue(MorphoFeatureType.NNUM).equals(&quot;SG&quot;) &amp;&amp;</span>
+<span class="nc bnc" id="L257" title="All 4 branches missed.">          rawToken.endsWith(&quot;ت-&quot;) &amp;&amp;</span>
+          !stripRewrites) {
+<span class="nc" id="L259">        lastLabel = RewriteSymbol;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">      } else if (rawToken.endsWith(&quot;ة-&quot;)) {</span>
+<span class="nc bnc" id="L261" title="All 4 branches missed.">        assert token.endsWith(&quot;ة&quot;);</span>
+<span class="nc" id="L262">        token = token.substring(0, token.length() - 1) + &quot;ت&quot;;</span>
+<span class="nc" id="L263">        lastLabel = RewriteSymbol;</span>
+      }
+
+      // Rule #2 : لل --&gt; ل ال
+<span class="nc bnc" id="L267" title="All 2 branches missed.">      if (lastToken.equals(&quot;ل&quot;) &amp;&amp;</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">          features.getValue(MorphoFeatureType.DEF).equals(&quot;D&quot;)) {</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (rawToken.startsWith(&quot;-ال&quot;)) {</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">          if (!token.startsWith(&quot;ا&quot;))</span>
+<span class="nc" id="L271">            log.info(&quot;Bad REWAL: &quot; + rawToken + &quot; / &quot; + token);</span>
+<span class="nc" id="L272">          token = token.substring(1);</span>
+<span class="nc" id="L273">          rewritten = rewritten.substring(1);</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">          if (!stripRewrites)</span>
+<span class="nc" id="L275">            firstLabel = RewriteSymbol;</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        } else if (rawToken.startsWith(&quot;-ل&quot;)) {</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">          if (!token.startsWith(&quot;ل&quot;))</span>
+<span class="nc" id="L278">            log.info(&quot;Bad REWAL: &quot; + rawToken + &quot; / &quot; + token);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">          if (!stripRewrites)</span>
+<span class="nc" id="L280">            firstLabel = RewriteSymbol;</span>
+        } else {
+<span class="nc" id="L282">          log.info(&quot;Ignoring REWAL: &quot; + rawToken + &quot; / &quot; + token);</span>
+        }
+      }
+      
+      // Rule #3 : ي --&gt; ى
+      // Rule #4 : ا --&gt; ى
+<span class="nc bnc" id="L288" title="All 2 branches missed.">      if (rawToken.endsWith(&quot;ى-&quot;)) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (features.getValue(MorphoFeatureType.TENSE) != null) {</span>
+          // verb: ى becomes ا
+<span class="nc" id="L291">          token = token.substring(0, token.length() - 1) + &quot;ا&quot;;</span>
+        } else {
+          // assume preposition:
+<span class="nc" id="L294">          token = token.substring(0, token.length() - 1) + &quot;ي&quot;;</span>
+        }
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (!stripRewrites)</span>
+<span class="nc" id="L297">          lastLabel = RewriteSymbol;</span>
+<span class="nc bnc" id="L298" title="All 4 branches missed.">      } else if (rawToken.equals(&quot;علي-&quot;) || rawToken.equals(&quot;-علي-&quot;)) {</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (!stripRewrites)</span>
+<span class="nc" id="L300">          lastLabel = RewriteSymbol;</span>
+      }
+    }
+
+    String origWord;
+<span class="nc bnc" id="L305" title="All 2 branches missed.">    if (origText == null) {</span>
+<span class="nc" id="L306">      origWord = tokenLabel.word();</span>
+    } else {
+<span class="nc" id="L308">      origWord = origText.substring(cl.beginPosition(), cl.endPosition());</span>
+    }
+<span class="nc" id="L310">    int origIndex = 0;</span>
+<span class="nc bnc" id="L311" title="All 4 branches missed.">    while (origIndex &lt; origWord.length() &amp;&amp; isDeletedCharacter(origWord.charAt(origIndex), tf)) {</span>
+<span class="nc" id="L312">      ++origIndex;</span>
+    }
+
+    // Create datums and add to iobList
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    if (token.isEmpty())</span>
+<span class="nc" id="L317">      log.info(&quot;Rewriting resulted in empty token: &quot; + tokenLabel.word());</span>
+<span class="nc" id="L318">    String firstChar = String.valueOf(token.charAt(0));</span>
+    // Start at 0 to make sure we include the whole token according to the tokenizer
+<span class="nc" id="L320">    iobList.add(createDatum(cl, firstChar, firstLabel, 0, origIndex + 1));</span>
+<span class="nc" id="L321">    final int numChars = token.length();</span>
+<span class="nc bnc" id="L322" title="All 4 branches missed.">    if (crossRefRewrites &amp;&amp; rewritten.length() != numChars) {</span>
+<span class="nc" id="L323">      System.err.printf(&quot;Rewritten annotation doesn't have correct length: %s&gt;&gt;&gt;%s%n&quot;, token, rewritten);</span>
+<span class="nc" id="L324">      crossRefRewrites = false;</span>
+    }
+
+<span class="nc" id="L327">    ++origIndex;</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    for (int j = 1; j &lt; numChars; ++j, ++origIndex) {</span>
+<span class="nc bnc" id="L329" title="All 4 branches missed.">      while (origIndex &lt; origWord.length() &amp;&amp; isDeletedCharacter(origWord.charAt(origIndex), tf)) {</span>
+<span class="nc" id="L330">        ++origIndex;</span>
+      }
+<span class="nc bnc" id="L332" title="All 2 branches missed.">      if (origIndex &gt;= origWord.length()) {</span>
+<span class="nc" id="L333">        origIndex = origWord.length() - 1;</span>
+      }
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">      String charLabel = (j == numChars-1) ? lastLabel : ContinuationSymbol;</span>
+<span class="nc" id="L337">      String thisChar = String.valueOf(token.charAt(j));</span>
+<span class="nc bnc" id="L338" title="All 4 branches missed.">      if (crossRefRewrites &amp;&amp; !String.valueOf(rewritten.charAt(j)).equals(thisChar))</span>
+<span class="nc" id="L339">        charLabel = RewriteSymbol;</span>
+<span class="nc bnc" id="L340" title="All 6 branches missed.">      if (charLabel == ContinuationSymbol &amp;&amp; thisChar.equals(&quot;ى&quot;) &amp;&amp; j != numChars - 1)</span>
+<span class="nc" id="L341">        charLabel = RewriteSymbol; // Assume all mid-word alef maqsura are supposed to be yah</span>
+<span class="nc" id="L342">      iobList.add(createDatum(cl, thisChar, charLabel, origIndex, origIndex + 1));</span>
+    }
+
+    // End at endPosition to make sure we include the whole token according to the tokenizer
+<span class="nc bnc" id="L346" title="All 2 branches missed.">    if (!iobList.isEmpty()) {</span>
+<span class="nc" id="L347">      iobList.get(iobList.size() - 1).setEndPosition(cl.endPosition());</span>
+    }
+<span class="nc" id="L349">  }</span>
+
+  private static boolean isDeletedCharacter(char ch, TokenizerFactory&lt;CoreLabel&gt; tf) {
+<span class="nc" id="L352">    List&lt;CoreLabel&gt; tokens = tf.getTokenizer(new StringReader(Character.toString(ch))).tokenize();</span>
+<span class="nc" id="L353">    return tokens.isEmpty();</span>
+  }
+
+  /**
+   * Identify tokens that should not be segmented.
+   */
+  private static boolean shouldNotSegment(String token) {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">    return (isDigit.matcher(token).find() ||</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            isPunc.matcher(token).find() ||</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            notUnicodeArabic.matcher(token).find());</span>
+  }
+
+  /**
+   * Strip segmentation markers.
+   */
+  private static String stripSegmentationMarkers(String tok, TokenType tokType) {
+<span class="nc bnc" id="L369" title="All 4 branches missed.">    int beginOffset = (tokType == TokenType.BeginMarker || tokType == TokenType.BothMarker) ? 1 : 0;</span>
+<span class="nc bnc" id="L370" title="All 4 branches missed.">    int endOffset = (tokType == TokenType.EndMarker || tokType == TokenType.BothMarker) ? tok.length()-1 : tok.length();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    return tokType == TokenType.NoMarker ? tok : tok.substring(beginOffset, endOffset);</span>
+  }
+
+  private static CoreLabel createDatum(CoreLabel cl, String token, String label) {
+<span class="nc" id="L375">    int endOffset = cl.get(CharacterOffsetEndAnnotation.class) - cl.get(CharacterOffsetBeginAnnotation.class);</span>
+<span class="nc" id="L376">    return createDatum(cl, token, label, 0, endOffset);</span>
+  }
+
+  /**
+   * Create a datum from a string. The CoreAnnotations must correspond to those used by
+   * SequenceClassifier. The following annotations are copied from the provided
+   * CoreLabel cl, if present:
+   *    DomainAnnotation
+   * startOffset and endOffset will be added to the {@link CharacterOffsetBeginAnnotation} of
+   * the {@link CoreLabel} cl to give the {@link CharacterOffsetBeginAnnotation} and
+   * {@link CharacterOffsetEndAnnotation} of the resulting datum.
+   */
+  private static CoreLabel createDatum(CoreLabel cl, String token, String label, int startOffset, int endOffset) {
+<span class="nc" id="L389">    CoreLabel newTok = new CoreLabel();</span>
+<span class="nc" id="L390">    newTok.set(CoreAnnotations.TextAnnotation.class, token);</span>
+<span class="nc" id="L391">    newTok.set(CoreAnnotations.CharAnnotation.class, token);</span>
+<span class="nc" id="L392">    newTok.set(CoreAnnotations.AnswerAnnotation.class, label);</span>
+<span class="nc" id="L393">    newTok.set(CoreAnnotations.GoldAnswerAnnotation.class, label);</span>
+<span class="nc" id="L394">    newTok.set(CoreAnnotations.CharacterOffsetBeginAnnotation.class,</span>
+<span class="nc" id="L395">        cl.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class) + startOffset);</span>
+<span class="nc" id="L396">    newTok.set(CoreAnnotations.CharacterOffsetEndAnnotation.class,</span>
+<span class="nc" id="L397">        cl.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class) + endOffset);</span>
+<span class="nc bnc" id="L398" title="All 4 branches missed.">    if (cl != null &amp;&amp; cl.containsKey(CoreAnnotations.DomainAnnotation.class))</span>
+<span class="nc" id="L399">      newTok.set(CoreAnnotations.DomainAnnotation.class,</span>
+<span class="nc" id="L400">                 cl.get(CoreAnnotations.DomainAnnotation.class));</span>
+<span class="nc" id="L401">    return newTok;</span>
+  }
+
+  /**
+   * Deterministically classify a token.
+   */
+  private static TokenType getTokenType(String token, String segMarker) {
+<span class="nc bnc" id="L408" title="All 4 branches missed.">    if (segMarker == null || token.equals(segMarker)) {</span>
+<span class="nc" id="L409">      return TokenType.NoMarker;</span>
+    }
+
+<span class="nc" id="L412">    TokenType tokType = TokenType.NoMarker;</span>
+<span class="nc" id="L413">    boolean startsWithMarker = token.startsWith(segMarker);</span>
+<span class="nc" id="L414">    boolean endsWithMarker = token.endsWith(segMarker);</span>
+
+<span class="nc bnc" id="L416" title="All 4 branches missed.">    if (startsWithMarker &amp;&amp; endsWithMarker) {</span>
+<span class="nc" id="L417">      tokType = TokenType.BothMarker;</span>
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">    } else if (startsWithMarker) {</span>
+<span class="nc" id="L420">      tokType = TokenType.BeginMarker;</span>
+
+<span class="nc bnc" id="L422" title="All 2 branches missed.">    } else if (endsWithMarker) {</span>
+<span class="nc" id="L423">      tokType = TokenType.EndMarker;</span>
+    }
+<span class="nc" id="L425">    return tokType;</span>
+  }
+
+  /**
+   * This version is for turning an unsegmented string to an IOB input, i.e.,
+   * for processing raw text.
+   */
+  public static List&lt;CoreLabel&gt; StringToIOB(String string) {
+<span class="nc" id="L433">    return StringToIOB(string, null);</span>
+  }
+
+  public static List&lt;CoreLabel&gt; StringToIOB(String str, Character segMarker) {
+    // Whitespace tokenization
+<span class="nc" id="L438">    List&lt;CoreLabel&gt; toks = SentenceUtils.toCoreLabelList(str.trim().split(&quot;\\s+&quot;));</span>
+<span class="nc" id="L439">    return StringToIOB(toks, segMarker, false);</span>
+  }
+
+  /**
+   * Convert a list of labeled characters to a String. Include segmentation markers
+   * for prefixes and suffixes in the string, and add a space at segmentations.
+   */
+  public static String IOBToString(List&lt;CoreLabel&gt; labeledSequence, String prefixMarker, String suffixMarker) {
+<span class="nc" id="L447">    return IOBToString(labeledSequence, prefixMarker, suffixMarker, true, true, 0, labeledSequence.size());</span>
+  }
+
+  /**
+   * Convert a list of labeled characters to a String. Include segmentation markers
+   * for prefixes and suffixes in the string, and add a space at segmentations.
+   */
+  public static String IOBToString(List&lt;CoreLabel&gt; labeledSequence, String prefixMarker, String suffixMarker,
+      int startIndex, int endIndex) {
+<span class="nc" id="L456">    return IOBToString(labeledSequence, prefixMarker, suffixMarker, true, true, startIndex, endIndex);</span>
+  }
+
+  /**
+   * Convert a list of labeled characters to a String. Include segmentation markers
+   * (but no spaces) at segmentation boundaries.
+   */
+  public static String IOBToString(List&lt;CoreLabel&gt; labeledSequence, String segmentationMarker) {
+<span class="nc" id="L464">    return IOBToString(labeledSequence, segmentationMarker, null, false, true, 0, labeledSequence.size());</span>
+  }
+
+  /**
+   * Convert a list of labeled characters to a String. Preserve the original (unsegmented) text.
+   */
+  public static String IOBToString(List&lt;CoreLabel&gt; labeledSequence) {
+<span class="nc" id="L471">    return IOBToString(labeledSequence, null, null, false, false, 0, labeledSequence.size());</span>
+  }
+
+  private static String IOBToString(List&lt;CoreLabel&gt; labeledSequence,
+      String prefixMarker, String suffixMarker, boolean addSpace, boolean applyRewrites,
+      int startIndex, int endIndex) {
+<span class="nc" id="L477">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L478">    String lastLabel = &quot;&quot;;</span>
+<span class="nc bnc" id="L479" title="All 4 branches missed.">    final boolean addPrefixMarker = prefixMarker != null &amp;&amp; prefixMarker.length() &gt; 0;</span>
+<span class="nc bnc" id="L480" title="All 4 branches missed.">    final boolean addSuffixMarker = suffixMarker != null &amp;&amp; suffixMarker.length() &gt; 0;</span>
+<span class="nc bnc" id="L481" title="All 4 branches missed.">    if (addPrefixMarker || addSuffixMarker)</span>
+<span class="nc" id="L482">      annotateMarkers(labeledSequence);</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">    for (int i = startIndex; i &lt; endIndex; ++i) {</span>
+<span class="nc" id="L484">      CoreLabel labeledChar = labeledSequence.get(i);</span>
+<span class="nc" id="L485">      String token = labeledChar.get(CoreAnnotations.CharAnnotation.class);</span>
+<span class="nc bnc" id="L486" title="All 4 branches missed.">      if (addPrefixMarker &amp;&amp; token.equals(prefixMarker))</span>
+<span class="nc" id="L487">        token = &quot;#pm#&quot;;</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">      if (addSuffixMarker &amp;&amp; token.equals(suffixMarker))</span>
+<span class="nc" id="L489">        token = &quot;#sm#&quot;;</span>
+<span class="nc" id="L490">      String label = labeledChar.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">      if (token.equals(BoundaryChar)) {</span>
+<span class="nc" id="L492">        sb.append(&quot; &quot;);</span>
+
+<span class="nc bnc" id="L494" title="All 2 branches missed.">      } else if (label.equals(BeginSymbol)) {</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">        if (lastLabel.equals(ContinuationSymbol) || lastLabel.equals(BeginSymbol) ||</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            lastLabel.equals(RewriteSymbol)) {</span>
+<span class="nc bnc" id="L497" title="All 6 branches missed.">          if (addPrefixMarker &amp;&amp; (!addSpace || addPrefixMarker(i, labeledSequence))) {</span>
+<span class="nc" id="L498">            sb.append(prefixMarker);</span>
+          }
+<span class="nc bnc" id="L500" title="All 2 branches missed.">          if (addSpace) {</span>
+<span class="nc" id="L501">            sb.append(&quot; &quot;);</span>
+          }
+<span class="nc bnc" id="L503" title="All 6 branches missed.">          if (addSuffixMarker &amp;&amp; (!addSpace || addSuffixMarker(i, labeledSequence))) {</span>
+<span class="nc" id="L504">            sb.append(suffixMarker);</span>
+          }
+        }
+<span class="nc" id="L507">        sb.append(token);</span>
+
+<span class="nc bnc" id="L509" title="All 4 branches missed.">      } else if (label.equals(ContinuationSymbol) || label.equals(BoundarySymbol)) {</span>
+<span class="nc" id="L510">        sb.append(token);</span>
+
+<span class="nc bnc" id="L512" title="All 2 branches missed.">      } else if (label.equals(NosegSymbol)) {</span>
+<span class="nc bnc" id="L513" title="All 4 branches missed.">        if ( ! lastLabel.equals(BoundarySymbol) &amp;&amp; addSpace) {</span>
+<span class="nc" id="L514">          sb.append(&quot; &quot;);</span>
+        }
+<span class="nc" id="L516">        sb.append(token);</span>
+
+<span class="nc bnc" id="L518" title="All 6 branches missed.">      } else if (label.equals(RewriteSymbol) || label.equals(&quot;REWAL&quot;) || label.equals(&quot;REWTA&quot;)) {</span>
+<span class="nc bnc" id="L519" title="All 24 branches missed.">        switch (token) {</span>
+          case &quot;ت&quot;:
+          case &quot;ه&quot;:
+<span class="nc bnc" id="L522" title="All 2 branches missed.">            sb.append(applyRewrites ? &quot;ة&quot; : token);</span>
+<span class="nc" id="L523">            break;</span>
+          case &quot;ل&quot;:
+<span class="nc bnc" id="L525" title="All 6 branches missed.">            sb.append((addPrefixMarker ? prefixMarker : &quot;&quot;) +</span>
+                (addSpace ? &quot; &quot; : &quot;&quot;) +
+                (applyRewrites ? &quot;ال&quot; : &quot;ل&quot;));
+<span class="nc" id="L528">            break;</span>
+          case &quot;ي&quot;:
+          case &quot;ا&quot;:
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            sb.append(applyRewrites ? &quot;ى&quot; : token);</span>
+<span class="nc" id="L532">            break;</span>
+          case &quot;ى&quot;:
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            sb.append(applyRewrites ? &quot;ي&quot; : token);</span>
+<span class="nc" id="L535">            break;</span>
+          default:
+            // Nonsense rewrite predicted by the classifier--just assume CONT
+<span class="nc" id="L538">            sb.append(token);</span>
+<span class="nc" id="L539">            break;</span>
+        }
+      } else {
+<span class="nc" id="L542">        throw new RuntimeException(&quot;Unknown label: &quot; + label);</span>
+      }
+<span class="nc" id="L544">      lastLabel = label;</span>
+    }
+<span class="nc" id="L546">    return sb.toString().trim();</span>
+  }
+  
+<span class="nc" id="L549">  private static class PrefixMarkerAnnotation implements CoreAnnotation&lt;Boolean&gt; {</span>
+    @Override
+    public Class&lt;Boolean&gt; getType() {
+<span class="nc" id="L552">      return Boolean.class;</span>
+    }
+  }
+  
+<span class="nc" id="L556">  private static class SuffixMarkerAnnotation implements CoreAnnotation&lt;Boolean&gt; {</span>
+    @Override
+    public Class&lt;Boolean&gt; getType() {
+<span class="nc" id="L559">      return Boolean.class;</span>
+    }
+  }
+  
+  private static void annotateMarkers(List&lt;CoreLabel&gt; labeledSequence) {
+<span class="nc" id="L564">    StringBuilder segment = new StringBuilder();</span>
+<span class="nc" id="L565">    List&lt;String&gt; segments = CollectionUtils.makeList();</span>
+<span class="nc" id="L566">    int wordBegin = 0;</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">    for (int i = 0; i &lt; labeledSequence.size(); i++) {</span>
+<span class="nc" id="L568">      String token = labeledSequence.get(i).get(CoreAnnotations.CharAnnotation.class);</span>
+<span class="nc" id="L569">      String label = labeledSequence.get(i).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc bnc" id="L570" title="All 10 branches missed.">      switch (label) {</span>
+        case BeginSymbol:
+<span class="nc bnc" id="L572" title="All 2 branches missed.">          if (i != wordBegin) {</span>
+<span class="nc" id="L573">            segments.add(segment.toString());</span>
+<span class="nc" id="L574">            segment.setLength(0);</span>
+          }
+<span class="nc" id="L576">          segment.append(token);</span>
+<span class="nc" id="L577">          break;</span>
+        case BoundarySymbol:
+<span class="nc" id="L579">          segments.add(segment.toString());</span>
+<span class="nc" id="L580">          segment.setLength(0);</span>
+<span class="nc" id="L581">          annotateMarkersOnWord(labeledSequence, wordBegin, i, segments);</span>
+<span class="nc" id="L582">          segments.clear();</span>
+<span class="nc" id="L583">          wordBegin = i + 1;</span>
+<span class="nc" id="L584">          break;</span>
+        default:
+<span class="nc" id="L586">          segment.append(token);</span>
+          break;
+      }
+    }
+<span class="nc" id="L590">    segments.add(segment.toString());</span>
+<span class="nc" id="L591">    annotateMarkersOnWord(labeledSequence, wordBegin, labeledSequence.size(), segments);</span>
+<span class="nc" id="L592">  }</span>
+
+  private static void annotateMarkersOnWord(List&lt;CoreLabel&gt; labeledSequence,
+      int wordBegin, int wordEnd, List&lt;String&gt; segments) {
+<span class="nc" id="L596">    Pair&lt;Integer, Integer&gt; headBounds = getHeadBounds(segments);</span>
+<span class="nc" id="L597">    int currentIndex = 0;</span>
+    
+<span class="nc bnc" id="L599" title="All 2 branches missed.">    for (int i = wordBegin; i &lt; wordEnd; i++) {</span>
+<span class="nc" id="L600">      String label = labeledSequence.get(i).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L601">      labeledSequence.get(i).set(PrefixMarkerAnnotation.class, Boolean.FALSE);</span>
+<span class="nc" id="L602">      labeledSequence.get(i).set(SuffixMarkerAnnotation.class, Boolean.FALSE);</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">      if (label.equals(BeginSymbol)) {</span>
+        // Add prefix markers for BEGIN characters up to and including the start of the head
+        // (but don't add prefix markers if there aren't any prefixes)
+<span class="nc bnc" id="L606" title="All 4 branches missed.">        if (currentIndex &lt;= headBounds.first &amp;&amp; currentIndex != 0)</span>
+<span class="nc" id="L607">          labeledSequence.get(i).set(PrefixMarkerAnnotation.class, Boolean.TRUE);</span>
+        
+        // Add suffix markers for BEGIN characters starting one past the end of the head
+        // (headBounds.second is one past the end, no need to add one)
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        if (currentIndex &gt;= headBounds.second)</span>
+<span class="nc" id="L612">          labeledSequence.get(i).set(SuffixMarkerAnnotation.class, Boolean.TRUE);</span>
+        
+<span class="nc" id="L614">        currentIndex++;</span>
+      }
+    }
+<span class="nc" id="L617">  }</span>
+
+  private static Pair&lt;Integer, Integer&gt; getHeadBounds(List&lt;String&gt; segments) {
+<span class="nc" id="L620">    final int NOT_FOUND = -1;</span>
+<span class="nc" id="L621">    int potentialSuffix = segments.size() - 1;</span>
+<span class="nc" id="L622">    int nonSuffix = NOT_FOUND;</span>
+<span class="nc" id="L623">    int potentialPrefix = 0;</span>
+<span class="nc" id="L624">    int nonPrefix = NOT_FOUND;</span>
+    // Heuristic algorithm for finding the head of a segmented word:
+    while (true) {
+      /* Alternate considering suffixes and prefixes (starting with suffix).
+       * 
+       * If the current segment is a known Arabic {suffix|prefix}, mark it as
+       * such. Otherwise, stop considering tokens from that direction.
+       */ 
+<span class="nc bnc" id="L632" title="All 2 branches missed.">      if (nonSuffix == NOT_FOUND){</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">        if (arSuffixSet.contains(segments.get(potentialSuffix)))</span>
+<span class="nc" id="L634">          potentialSuffix--;</span>
+        else
+<span class="nc" id="L636">          nonSuffix = potentialSuffix;</span>
+      }
+<span class="nc bnc" id="L638" title="All 2 branches missed.">      if (potentialSuffix &lt; potentialPrefix)</span>
+<span class="nc" id="L639">        break;</span>
+      
+<span class="nc bnc" id="L641" title="All 2 branches missed.">      if (nonPrefix == NOT_FOUND) {</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (arPrefixSet.contains(segments.get(potentialPrefix)))</span>
+<span class="nc" id="L643">          potentialPrefix++;</span>
+        else
+<span class="nc" id="L645">          nonPrefix = potentialPrefix;</span>
+      }
+<span class="nc bnc" id="L647" title="All 6 branches missed.">      if (potentialSuffix &lt; potentialPrefix || (nonSuffix != NOT_FOUND &amp;&amp; nonPrefix != NOT_FOUND))</span>
+<span class="nc" id="L648">        break;</span>
+    }
+    
+    /* Once we have exhausted all known prefixes and suffixes, take the longest
+     * segment that remains to be the head. Break length ties by picking the first one.
+     * 
+     * Note that in some cases, no segments will remain (e.g. b# +y), so a
+     * segmented word may have zero or one heads, but never more than one.
+     */
+<span class="nc bnc" id="L657" title="All 2 branches missed.">    if (potentialSuffix &lt; potentialPrefix) {</span>
+      // no head--start and end are index of first suffix
+<span class="nc bnc" id="L659" title="All 2 branches missed.">      if (potentialSuffix + 1 != potentialPrefix)</span>
+<span class="nc" id="L660">        throw new RuntimeException(&quot;Suffix pointer moved too far!&quot;);</span>
+<span class="nc" id="L661">      return Pair.makePair(potentialSuffix + 1, potentialSuffix + 1);</span>
+    } else {
+<span class="nc" id="L663">      int headIndex = nonPrefix;</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">      for (int i = nonPrefix + 1; i &lt;= nonSuffix; i++) {</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        if (segments.get(i).length() &gt; segments.get(headIndex).length())</span>
+<span class="nc" id="L666">          headIndex = i;</span>
+      }
+<span class="nc" id="L668">      return Pair.makePair(headIndex, headIndex + 1);</span>
+    }
+  }
+
+  private static boolean addPrefixMarker(int focus, List&lt;CoreLabel&gt; labeledSequence) {
+<span class="nc" id="L673">    return labeledSequence.get(focus).get(PrefixMarkerAnnotation.class).booleanValue();</span>
+  }
+
+  private static boolean addSuffixMarker(int focus, List&lt;CoreLabel&gt; labeledSequence) {
+<span class="nc" id="L677">    return labeledSequence.get(focus).get(SuffixMarkerAnnotation.class).booleanValue();</span>
+  }
+
+  public static void labelDomain(List&lt;CoreLabel&gt; tokenList, String domain) {
+<span class="nc bnc" id="L681" title="All 2 branches missed.">    for (CoreLabel cl : tokenList) {</span>
+<span class="nc" id="L682">      cl.set(CoreAnnotations.DomainAnnotation.class, domain);</span>
+<span class="nc" id="L683">    }</span>
+<span class="nc" id="L684">  }</span>
+
+  public static List&lt;IntPair&gt; TokenSpansForIOB(List&lt;CoreLabel&gt; labeledSequence) {
+<span class="nc" id="L687">    List&lt;IntPair&gt; spans = CollectionUtils.makeList();</span>
+
+<span class="nc" id="L689">    String lastLabel = &quot;&quot;;</span>
+<span class="nc" id="L690">    boolean inToken = false;</span>
+<span class="nc" id="L691">    int tokenStart = 0;</span>
+<span class="nc" id="L692">    final int sequenceLength = labeledSequence.size();</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">    for (int i = 0; i &lt; sequenceLength; ++i) {</span>
+<span class="nc" id="L694">      CoreLabel labeledChar = labeledSequence.get(i);</span>
+<span class="nc" id="L695">      String token = labeledChar.get(CoreAnnotations.CharAnnotation.class);</span>
+<span class="nc" id="L696">      String label = labeledChar.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">      if (token.equals(BoundaryChar)) {</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        if (inToken) {</span>
+<span class="nc" id="L699">          spans.add(new IntPair(tokenStart, i));</span>
+        }
+<span class="nc" id="L701">        inToken = false;</span>
+      } else {
+<span class="nc bnc" id="L703" title="All 27 branches missed.">        switch(label) {</span>
+          case BeginSymbol:
+<span class="nc bnc" id="L705" title="All 4 branches missed.">            if (lastLabel.equals(ContinuationSymbol) || lastLabel.equals(BeginSymbol) ||</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">                lastLabel.equals(RewriteSymbol)) {</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">              if (inToken) {</span>
+<span class="nc" id="L708">                spans.add(new IntPair(tokenStart, i));</span>
+              }
+<span class="nc" id="L710">              inToken = true;</span>
+<span class="nc" id="L711">              tokenStart = i;</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">            } else if (!inToken) {</span>
+<span class="nc" id="L713">              inToken = true;</span>
+<span class="nc" id="L714">              tokenStart = i;</span>
+            }
+            break;
+
+          case ContinuationSymbol:
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (!inToken) {</span>
+<span class="nc" id="L720">              inToken = true;</span>
+<span class="nc" id="L721">              tokenStart = i;</span>
+            }
+            break;
+
+          case BoundarySymbol:
+          case NosegSymbol:
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            if (inToken) {</span>
+<span class="nc" id="L728">              spans.add(new IntPair(tokenStart, i));</span>
+            }
+<span class="nc" id="L730">            inToken = true;</span>
+<span class="nc" id="L731">            tokenStart = i;</span>
+<span class="nc" id="L732">            break;</span>
+
+          case RewriteSymbol:
+          case &quot;REWAL&quot;:
+          case &quot;REWTA&quot;:
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            if (token.equals(&quot;ل&quot;)) {</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">              if (inToken) {</span>
+<span class="nc" id="L739">                spans.add(new IntPair(tokenStart, i));</span>
+              }
+<span class="nc" id="L741">              inToken = true;</span>
+<span class="nc" id="L742">              tokenStart = i;</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">            } else if (!inToken) {</span>
+<span class="nc" id="L744">              inToken = true;</span>
+<span class="nc" id="L745">              tokenStart = i;</span>
+            }
+            break;
+        }
+      }
+<span class="nc" id="L750">      lastLabel = label;</span>
+    }
+
+<span class="nc bnc" id="L753" title="All 2 branches missed.">    if (inToken) {</span>
+<span class="nc" id="L754">      spans.add(new IntPair(tokenStart, sequenceLength));</span>
+    }
+
+<span class="nc" id="L757">    return spans;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,411 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SimpleSentiment.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.sentiment</a> &gt; <span class="el_source">SimpleSentiment.java</span></div><h1>SimpleSentiment.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.sentiment;
+
+
+import edu.stanford.nlp.classify.*;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.optimization.QNMinimizer;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.pipeline.StanfordCoreNLP;
+import edu.stanford.nlp.simple.Document;
+import edu.stanford.nlp.simple.SentimentClass;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Lazy;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.util.logging.RedwoodConfiguration;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
+import java.io.OutputStream;
+import java.text.DecimalFormat;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+/**
+ * A simple sentiment classifier, inspired by Sida's Naive Bayes SVM
+ * paper.
+ * The main goal of this class is to avoid the parse tree requirement of
+ * the RNN approach at: {@link SentimentPipeline}.
+ *
+ * @author &lt;a href=&quot;mailto:angeli@cs.stanford.edu&quot;&gt;Gabor Angeli&lt;/a&gt;
+ */
+public class SimpleSentiment {
+  /**
+   * A logger for this class.
+   */
+<span class="nc" id="L52">  private static final Redwood.RedwoodChannels log = Redwood.channels(SimpleSentiment.class);</span>
+
+  /** An appropriate pipeline object for featurizing training data */
+<span class="nc" id="L55">  private static Lazy&lt;StanfordCoreNLP&gt; pipeline = Lazy.of(() -&gt; {</span>
+<span class="nc" id="L56">    Properties props = new Properties();</span>
+<span class="nc" id="L57">    props.setProperty(&quot;annotators&quot;, &quot;tokenize,ssplit,pos,lemma&quot;);</span>
+<span class="nc" id="L58">    props.setProperty(&quot;language&quot;, &quot;english&quot;);</span>
+<span class="nc" id="L59">    props.setProperty(&quot;ssplit.isOneSentence&quot;, &quot;true&quot;);</span>
+<span class="nc" id="L60">    props.setProperty(&quot;tokenize.class&quot;, &quot;PTBTokenizer&quot;);</span>
+<span class="nc" id="L61">    props.setProperty(&quot;tokenize.language&quot;, &quot;en&quot;);</span>
+<span class="nc" id="L62">    return new StanfordCoreNLP(props);</span>
+  });
+
+
+  /**
+   * A single datum (presumably read from a training file) that encodes
+   * a sentence and an associated sentiment value.
+   */
+  private static class SentimentDatum {
+    /** The sentence to classify. */
+    public final String sentence;
+    /** The sentiment class of the sentence */
+    public final SentimentClass sentiment;
+
+    /** The trivial constructor */
+<span class="nc" id="L77">    private SentimentDatum(String sentence, SentimentClass sentiment) {</span>
+<span class="nc" id="L78">      this.sentence = sentence;</span>
+<span class="nc" id="L79">      this.sentiment = sentiment;</span>
+<span class="nc" id="L80">    }</span>
+
+    /** Annotate this datum, and return it as a CoreMap. */
+    CoreMap asCoreMap() {
+      Annotation ann;
+<span class="nc bnc" id="L85" title="All 2 branches missed.">      if (&quot;&quot;.equals(sentence.trim())) {</span>
+<span class="nc bnc" id="L86" title="All 6 branches missed.">        switch (sentiment) {</span>
+          case VERY_POSITIVE:
+<span class="nc" id="L88">            ann = new Annotation(&quot;cats are super awesome!&quot;);</span>
+<span class="nc" id="L89">            break;</span>
+          case POSITIVE:
+<span class="nc" id="L91">            ann = new Annotation(&quot;cats are great&quot;);</span>
+<span class="nc" id="L92">            break;</span>
+          case NEUTRAL:
+<span class="nc" id="L94">            ann = new Annotation(&quot;cats have tails&quot;);</span>
+<span class="nc" id="L95">            break;</span>
+          case NEGATIVE:
+<span class="nc" id="L97">            ann = new Annotation(&quot;cats suck&quot;);</span>
+<span class="nc" id="L98">            break;</span>
+          case VERY_NEGATIVE:
+<span class="nc" id="L100">            ann = new Annotation(&quot;cats are literally the worst, I can't even.&quot;);</span>
+<span class="nc" id="L101">            break;</span>
+          default:
+<span class="nc" id="L103">            throw new IllegalStateException();</span>
+        }
+      } else {
+<span class="nc" id="L106">        ann = new Annotation(sentence);</span>
+      }
+<span class="nc" id="L108">      pipeline.get().annotate(ann);</span>
+<span class="nc" id="L109">      return ann.get(CoreAnnotations.SentencesAnnotation.class).get(0);</span>
+    }
+  }
+
+  /** A simple regex for alpha words. That is, words matching [a-zA-Z] */
+<span class="nc" id="L114">  private static final Pattern alpha  = Pattern.compile(&quot;[a-zA-Z]+&quot;);</span>
+  /** A simple regex for number tokens. That is, words matching [0-9] */
+<span class="nc" id="L116">  private static final Pattern number = Pattern.compile(&quot;[0-9]+&quot;);</span>
+
+
+  /**
+   * The underlying classifier we have trained to detect sentiment.
+   */
+  private final Classifier&lt;SentimentClass, String&gt; impl;
+
+
+  /**
+   * Featurize a given sentence.
+   *
+   * @param sentence The sentence to featurize.
+   *
+   * @return A counter encoding the featurized sentence.
+   */
+  private static Counter&lt;String&gt; featurize(CoreMap sentence) {
+<span class="nc" id="L133">    ClassicCounter&lt;String&gt; features = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L134">    String lastLemma = &quot;^&quot;;</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">    for (CoreLabel token : sentence.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+<span class="nc" id="L136">      String lemma = token.lemma().toLowerCase();</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">      if (number.matcher(lemma).matches()) {</span>
+<span class="nc" id="L138">        features.incrementCount(&quot;**num**&quot;);</span>
+      } else {
+<span class="nc" id="L140">        features.incrementCount(lemma);</span>
+
+      }
+<span class="nc bnc" id="L143" title="All 2 branches missed.">      if (alpha.matcher(lemma).matches()) {</span>
+<span class="nc" id="L144">        features.incrementCount(lastLemma + &quot;__&quot; + lemma);</span>
+<span class="nc" id="L145">        lastLemma = lemma;</span>
+      }
+<span class="nc" id="L147">    }</span>
+<span class="nc" id="L148">    features.incrementCount(lastLemma + &quot;__$&quot;);</span>
+<span class="nc" id="L149">    return features;</span>
+  }
+
+
+  /**
+   * Create a new sentiment classifier object.
+   * This is really just a shallow wrapper around a classifier...
+   *
+   * @param impl The classifier doing the heavy lifting.
+   */
+<span class="nc" id="L159">  private SimpleSentiment(Classifier&lt;SentimentClass, String&gt; impl) {</span>
+<span class="nc" id="L160">    this.impl = impl;</span>
+<span class="nc" id="L161">  }</span>
+
+
+  /**
+   * Get the sentiment of a sentence.
+   *
+   * @param sentence The sentence as a core map.
+   *                 POS tags and Lemmas are a prerequisite.
+   *                 See {@link edu.stanford.nlp.ling.CoreAnnotations.PartOfSpeechAnnotation} and
+   *                 {@link edu.stanford.nlp.ling.CoreAnnotations.LemmaAnnotation}.
+   *
+   * @return The sentiment class of this sentence.
+   */
+  public SentimentClass classify(CoreMap sentence) {
+<span class="nc" id="L175">    Counter&lt;String&gt; features = featurize(sentence);</span>
+<span class="nc" id="L176">    RVFDatum&lt;SentimentClass, String&gt; datum = new RVFDatum&lt;&gt;(features);</span>
+<span class="nc" id="L177">    return impl.classOf(datum);</span>
+  }
+
+
+  /**
+   * @see SimpleSentiment#classify(CoreMap)
+   */
+  public SentimentClass classify(String text) {
+<span class="nc" id="L185">    Annotation ann = new Annotation(text);</span>
+<span class="nc" id="L186">    pipeline.get().annotate(ann);</span>
+<span class="nc" id="L187">    CoreMap sentence = ann.get(CoreAnnotations.SentencesAnnotation.class).get(0);</span>
+<span class="nc" id="L188">    Counter&lt;String&gt; features = featurize(sentence);</span>
+<span class="nc" id="L189">    RVFDatum&lt;SentimentClass, String&gt; datum = new RVFDatum&lt;&gt;(features);</span>
+<span class="nc" id="L190">    return impl.classOf(datum);</span>
+  }
+
+
+  /**
+   * Train a sentiment model from a set of data.
+   *
+   * @param data The data to train the model from.
+   * @param modelLocation An optional location to save the model.
+   *                      Note that this stream will be closed in this method,
+   *                      and should not be written to thereafter.
+   *
+   * @return A sentiment classifier, ready to use.
+   */
+  @SuppressWarnings({&quot;OptionalUsedAsFieldOrParameterType&quot;, &quot;ConstantConditions&quot;})
+  public static SimpleSentiment train(
+      Stream&lt;SentimentDatum&gt; data,
+      Optional&lt;OutputStream&gt; modelLocation) {
+
+    // Some useful variables configuring how we train
+<span class="nc" id="L210">    boolean useL1 = true;</span>
+<span class="nc" id="L211">    double sigma = 1.0;</span>
+<span class="nc" id="L212">    int featureCountThreshold = 5;</span>
+
+    // Featurize the data
+<span class="nc" id="L215">    forceTrack(&quot;Featurizing&quot;);</span>
+<span class="nc" id="L216">    RVFDataset&lt;SentimentClass, String&gt; dataset = new RVFDataset&lt;&gt;();</span>
+<span class="nc" id="L217">    AtomicInteger datasize = new AtomicInteger(0);</span>
+<span class="nc" id="L218">    Counter&lt;SentimentClass&gt; distribution = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L219">    data.unordered().parallel()</span>
+<span class="nc" id="L220">        .map(datum -&gt; {</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">          if (datasize.incrementAndGet() % 10000 == 0) {</span>
+<span class="nc" id="L222">            log(&quot;Added &quot; + datasize.get() + &quot; datums&quot;);</span>
+          }
+<span class="nc" id="L224">          return new RVFDatum&lt;&gt;(featurize(datum.asCoreMap()), datum.sentiment);</span>
+        })
+<span class="nc" id="L226">        .forEach(x -&gt; {</span>
+<span class="nc" id="L227">            synchronized (dataset) {</span>
+<span class="nc" id="L228">              distribution.incrementCount(x.label());</span>
+<span class="nc" id="L229">              dataset.add(x);</span>
+<span class="nc" id="L230">          }</span>
+<span class="nc" id="L231">        });</span>
+<span class="nc" id="L232">    endTrack(&quot;Featurizing&quot;);</span>
+
+    // Print label distribution
+<span class="nc" id="L235">    startTrack(&quot;Distribution&quot;);</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">    for (SentimentClass label : SentimentClass.values()) {</span>
+<span class="nc" id="L237">      log(String.format(&quot;%7d&quot;, (int) distribution.getCount(label)) + &quot;   &quot; + label);</span>
+    }
+<span class="nc" id="L239">    endTrack(&quot;Distribution&quot;);</span>
+
+    // Train the classifier
+<span class="nc" id="L242">    forceTrack(&quot;Training&quot;);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    if (featureCountThreshold &gt; 1) {</span>
+<span class="nc" id="L244">      dataset.applyFeatureCountThreshold(featureCountThreshold);</span>
+    }
+<span class="nc" id="L246">    dataset.randomize(42L);</span>
+<span class="nc" id="L247">    LinearClassifierFactory&lt;SentimentClass, String&gt; factory = new LinearClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L248">    factory.setVerbose(true);</span>
+    try {
+<span class="nc" id="L250">      factory.setMinimizerCreator(() -&gt; {</span>
+<span class="nc" id="L251">        QNMinimizer minimizer =  new QNMinimizer();</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (useL1) {</span>
+<span class="nc" id="L253">          minimizer.useOWLQN(true, 1 / (sigma * sigma));</span>
+        } else {
+<span class="nc" id="L255">          factory.setSigma(sigma);</span>
+        }
+<span class="nc" id="L257">        return minimizer;</span>
+      });
+<span class="nc" id="L259">    } catch (Exception ignored) {}</span>
+<span class="nc" id="L260">    factory.setSigma(sigma);</span>
+<span class="nc" id="L261">    LinearClassifier&lt;SentimentClass, String&gt; classifier = factory.trainClassifier(dataset);</span>
+
+    // Optionally save the model
+<span class="nc" id="L264">    modelLocation.ifPresent(stream -&gt; {</span>
+      try {
+<span class="nc" id="L266">        ObjectOutputStream oos = new ObjectOutputStream(stream);</span>
+<span class="nc" id="L267">        oos.writeObject(classifier);</span>
+<span class="nc" id="L268">        oos.close();</span>
+<span class="nc" id="L269">      } catch (IOException e) {</span>
+<span class="nc" id="L270">        log.err(&quot;Could not save model to stream!&quot;);</span>
+<span class="nc" id="L271">      }</span>
+<span class="nc" id="L272">    });</span>
+<span class="nc" id="L273">    endTrack(&quot;Training&quot;);</span>
+
+    // Evaluate the model
+<span class="nc" id="L276">    forceTrack(&quot;Evaluating&quot;);</span>
+<span class="nc" id="L277">    factory.setVerbose(false);</span>
+<span class="nc" id="L278">    double sumAccuracy = 0.0;</span>
+<span class="nc" id="L279">    Counter&lt;SentimentClass&gt; sumP = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L280">    Counter&lt;SentimentClass&gt; sumR = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L281">    int numFolds = 4;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">    for (int fold = 0; fold &lt; numFolds; ++fold) {</span>
+<span class="nc" id="L283">      Pair&lt;GeneralDataset&lt;SentimentClass, String&gt;, GeneralDataset&lt;SentimentClass, String&gt;&gt; trainTest = dataset.splitOutFold(fold, numFolds);</span>
+<span class="nc" id="L284">      LinearClassifier&lt;SentimentClass, String&gt; foldClassifier = factory.trainClassifierWithInitialWeights(trainTest.first, classifier);  // convex objective, so this should be OK</span>
+<span class="nc" id="L285">      sumAccuracy += foldClassifier.evaluateAccuracy(trainTest.second);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">      for (SentimentClass label : SentimentClass.values()) {</span>
+<span class="nc" id="L287">        Pair&lt;Double, Double&gt; pr = foldClassifier.evaluatePrecisionAndRecall(trainTest.second, label);</span>
+<span class="nc" id="L288">        sumP.incrementCount(label, pr.first);</span>
+<span class="nc" id="L289">        sumP.incrementCount(label, pr.second);</span>
+      }
+    }
+<span class="nc" id="L292">    DecimalFormat df = new DecimalFormat(&quot;0.000%&quot;);</span>
+<span class="nc" id="L293">    log.info(&quot;----------&quot;);</span>
+<span class="nc" id="L294">    double aveAccuracy = sumAccuracy / ((double) numFolds);</span>
+<span class="nc" id="L295">    log.info(&quot;&quot; + numFolds + &quot;-fold accuracy: &quot; + df.format(aveAccuracy));</span>
+<span class="nc" id="L296">    log.info(&quot;&quot;);</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">    for (SentimentClass label : SentimentClass.values()) {</span>
+<span class="nc" id="L298">      double p = sumP.getCount(label) / numFolds;</span>
+<span class="nc" id="L299">      double r = sumR.getCount(label) / numFolds;</span>
+<span class="nc" id="L300">      log.info(label + &quot; (P)  = &quot; + df.format(p));</span>
+<span class="nc" id="L301">      log.info(label + &quot; (R)  = &quot; + df.format(r));</span>
+<span class="nc" id="L302">      log.info(label + &quot; (F1) = &quot; + df.format(2 * p * r / (p + r)));</span>
+<span class="nc" id="L303">      log.info(&quot;&quot;);</span>
+    }
+<span class="nc" id="L305">    log.info(&quot;----------&quot;);</span>
+<span class="nc" id="L306">    endTrack(&quot;Evaluating&quot;);</span>
+
+    // Return
+<span class="nc" id="L309">    return new SimpleSentiment(classifier);</span>
+  }
+
+
+
+  private static Stream&lt;SentimentDatum&gt; imdb(String path, SentimentClass label) {
+<span class="nc" id="L315">    return StreamSupport.stream(</span>
+<span class="nc" id="L316">        IOUtils.iterFilesRecursive(new File(path)).spliterator(), true)</span>
+<span class="nc" id="L317">        .map(x -&gt; {</span>
+          try {
+<span class="nc" id="L319">            return new SentimentDatum(IOUtils.slurpFile(x), label);</span>
+<span class="nc" id="L320">          } catch (IOException e) {</span>
+<span class="nc" id="L321">            throw new RuntimeIOException(e);</span>
+          }
+        });
+  }
+
+
+  private static Stream&lt;SentimentDatum&gt; stanford(String path) {
+<span class="nc" id="L328">    return StreamSupport.stream(</span>
+<span class="nc" id="L329">        IOUtils.readLines(path).spliterator(), true</span>
+<span class="nc" id="L330">    ).map(line -&gt; {</span>
+<span class="nc" id="L331">      String[] fields = line.split(&quot;\t&quot;);</span>
+<span class="nc bnc" id="L332" title="All 4 branches missed.">      if (fields.length &lt; 4 || &quot;Sentiment&quot;.equalsIgnoreCase(fields[3]) ||</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">          fields[2].equals(&quot;&quot;)) {</span>
+<span class="nc" id="L334">        return new SentimentDatum(&quot;Cats have tails&quot;, SentimentClass.NEUTRAL);</span>
+      } else {
+<span class="nc" id="L336">        String text = fields[2];</span>
+<span class="nc" id="L337">        int sentiment = Integer.parseInt(fields[3]);</span>
+<span class="nc" id="L338">        return new SentimentDatum(text, SentimentClass.fromInt(sentiment));</span>
+      }
+    });
+  }
+
+  private static Stream&lt;SentimentDatum&gt; twitter(String path) {
+<span class="nc" id="L344">    return StreamSupport.stream(</span>
+<span class="nc" id="L345">        IOUtils.readLines(path).spliterator(), true</span>
+<span class="nc" id="L346">    ).map(line -&gt; {</span>
+<span class="nc" id="L347">      List&lt;String&gt; fields = Arrays.asList(line.split(&quot;,&quot;));</span>
+<span class="nc bnc" id="L348" title="All 4 branches missed.">      if (fields.size() &lt; 3 || &quot;Sentiment&quot;.equalsIgnoreCase(fields.get(1)) ||</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">          fields.get(3).equals(&quot;&quot;)) {</span>
+<span class="nc" id="L350">        return new SentimentDatum(&quot;Cats have tails&quot;, SentimentClass.NEUTRAL);</span>
+      } else {
+<span class="nc" id="L352">        int sentiment = Integer.parseInt(fields.get(1));</span>
+<span class="nc" id="L353">        String text = StringUtils.join(fields.subList(3, fields.size()), &quot;,&quot;);</span>
+<span class="nc" id="L354">        return new SentimentDatum(text, SentimentClass.fromInt(sentiment));</span>
+      }
+    });
+  }
+
+
+  private static Stream&lt;SentimentDatum&gt; unlabelled(String path) throws IOException {
+<span class="nc" id="L361">    return StreamSupport.stream(</span>
+<span class="nc" id="L362">        IOUtils.iterFilesRecursive(new File(path)).spliterator(), true)</span>
+<span class="nc" id="L363">        .flatMap(x -&gt; new Document(IOUtils.slurpReader(IOUtils.readerFromFile(x)))</span>
+<span class="nc" id="L364">            .sentences()</span>
+<span class="nc" id="L365">            .stream()</span>
+<span class="nc" id="L366">            .map(y -&gt; new SentimentDatum(y.text(), SentimentClass.NEUTRAL)));</span>
+  }
+
+
+  public static void main(String[] args) throws IOException {
+<span class="nc" id="L371">    RedwoodConfiguration.standard().apply();</span>
+<span class="nc" id="L372">    startTrack(&quot;main&quot;);</span>
+
+    // Read the data
+<span class="nc" id="L375">    Stream&lt;SentimentDatum&gt; data =</span>
+<span class="nc" id="L376">        Stream.concat(</span>
+<span class="nc" id="L377">            Stream.concat(</span>
+<span class="nc" id="L378">                Stream.concat(</span>
+<span class="nc" id="L379">                    imdb(&quot;/users/gabor/tmp/aclImdb/train/pos&quot;, SentimentClass.POSITIVE),</span>
+<span class="nc" id="L380">                    imdb(&quot;/users/gabor/tmp/aclImdb/train/neg&quot;, SentimentClass.NEGATIVE)),</span>
+<span class="nc" id="L381">                Stream.concat(</span>
+<span class="nc" id="L382">                    imdb(&quot;/users/gabor/tmp/aclImdb/test/pos&quot;, SentimentClass.POSITIVE),</span>
+<span class="nc" id="L383">                    imdb(&quot;/users/gabor/tmp/aclImdb/test/neg&quot;, SentimentClass.NEGATIVE)</span>
+                )
+            ),
+<span class="nc" id="L386">            Stream.concat(</span>
+<span class="nc" id="L387">                Stream.concat(</span>
+<span class="nc" id="L388">                    stanford(&quot;/users/gabor/tmp/train.tsv&quot;),</span>
+<span class="nc" id="L389">                    stanford(&quot;/users/gabor/tmp/test.tsv&quot;)</span>
+                ),
+<span class="nc" id="L391">                Stream.concat(</span>
+<span class="nc" id="L392">                    twitter(&quot;/users/gabor/tmp/twitter.csv&quot;),</span>
+<span class="nc" id="L393">                    unlabelled(&quot;/users/gabor/tmp/wikipedia&quot;)</span>
+                )
+            )
+        );
+
+
+    // Train the model
+<span class="nc" id="L400">    OutputStream stream = IOUtils.getFileOutputStream(&quot;/users/gabor/tmp/model.ser.gz&quot;);</span>
+<span class="nc" id="L401">    SimpleSentiment classifier = SimpleSentiment.train(data, Optional.of(stream));</span>
+<span class="nc" id="L402">    stream.close();</span>
+
+<span class="nc" id="L404">    log.info(classifier.classify(&quot;I think life is great&quot;));</span>
+<span class="nc" id="L405">    endTrack(&quot;main&quot;);</span>
+
+    // 85.8
+<span class="nc" id="L408">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

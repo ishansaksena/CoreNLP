@@ -1,0 +1,2561 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QNMinimizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">QNMinimizer.java</span></div><h1>QNMinimizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization;
+
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.CallbackFunction;
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+/**
+ *
+ * An implementation of L-BFGS for Quasi Newton unconstrained minimization.
+ * Also now has support for OWL-QN (Orthant-Wise Limited memory Quasi Newton)
+ * for L1 regularization.
+ *
+ * The general outline of the algorithm is taken from:
+ * &lt;blockquote&gt;
+ * &lt;i&gt;Numerical Optimization&lt;/i&gt; (second edition) 2006
+ * Jorge Nocedal and Stephen J. Wright
+ * &lt;/blockquote&gt;
+ * A variety of different options are available.
+ *
+ * &lt;h3&gt;LINESEARCHES&lt;/h3&gt;
+ *
+ * BACKTRACKING: This routine
+ * simply starts with a guess for step size of 1. If the step size doesn't
+ * supply a sufficient decrease in the function value the step is updated
+ * through step = 0.1*step. This method is certainly simpler, but doesn't allow
+ * for an increase in step size, and isn't well suited for Quasi Newton methods.
+ *
+ * MINPACK: This routine is based off of the implementation used in MINPACK.
+ * This routine finds a point satisfying the Wolfe conditions, which state that
+ * a point must have a sufficiently smaller function value, and a gradient of
+ * smaller magnitude. This provides enough to prove theoretically quadratic
+ * convergence. In order to find such a point the line search first finds an
+ * interval which must contain a satisfying point, and then progressively
+ * reduces that interval all using cubic or quadratic interpolation.
+ *
+ * SCALING: L-BFGS allows the initial guess at the hessian to be updated at each
+ * step. Standard BFGS does this by approximating the hessian as a scaled
+ * identity matrix. To use this method set the scaleOpt to SCALAR. A better way
+ * of approximate the hessian is by using a scaling diagonal matrix. The
+ * diagonal can then be updated as more information comes in. This method can be
+ * used by setting scaleOpt to DIAGONAL.
+ *
+ * CONVERGENCE: Previously convergence was gauged by looking at the average
+ * decrease per step dividing that by the current value and terminating when
+ * that value because smaller than TOL. This method fails when the function
+ * value approaches zero, so two other convergence criteria are used. The first
+ * stores the initial gradient norm |g0|, then terminates when the new gradient
+ * norm, |g| is sufficiently smaller: i.e., |g| &amp;lt; eps*|g0| the second checks if
+ * |g| &amp;lt; eps*max( 1 , |x| ) which is essentially checking to see if the gradient
+ * is numerically zero.
+ * Another convergence criteria is added where termination is triggered if no
+ * improvements are observed after X (set by terminateOnEvalImprovementNumOfEpoch)
+ * iterations over some validation test set as evaluated by Evaluator
+ *
+ * Each of these convergence criteria can be turned on or off by setting the
+ * flags:
+ * &lt;blockquote&gt;&lt;code&gt;
+ * private boolean useAveImprovement = true;
+ * private boolean useRelativeNorm = true;
+ * private boolean useNumericalZero = true;
+ * private boolean useEvalImprovement = false;
+ * &lt;/code&gt;&lt;/blockquote&gt;
+ *
+ * To use the QNMinimizer first construct it using
+ * &lt;blockquote&gt;&lt;code&gt;
+ * QNMinimizer qn = new QNMinimizer(mem, true)
+ * &lt;/code&gt;&lt;/blockquote&gt;
+ * mem - the number of previous estimate vector pairs to
+ * store, generally 15 is plenty. true - this tells the QN to use the MINPACK
+ * linesearch with DIAGONAL scaling. false would lead to the use of the criteria
+ * used in the old QNMinimizer class.
+ *
+ * Then call:
+ * &lt;blockquote&gt;&lt;code&gt;
+ * qn.minimize(dfunction,convergenceTolerance,initialGuess,maxFunctionEvaluations);
+ * &lt;/code&gt;&lt;/blockquote&gt;
+ *
+ * @author akleeman
+ */
+
+public class QNMinimizer implements Minimizer&lt;DiffFunction&gt;, HasEvaluators  {
+
+  /** A logger for this class */
+<span class="fc" id="L96">  private static final Redwood.RedwoodChannels log = Redwood.channels(QNMinimizer.class);</span>
+
+<span class="pc" id="L98">  private int fevals = 0; // the number of function evaluations</span>
+<span class="pc" id="L99">  private int maxFevals = -1;</span>
+<span class="pc" id="L100">  private int mem = 10; // the number of s,y pairs to retain for BFGS</span>
+  private int its; // = 0; // the number of iterations through the main do-while loop of L-BFGS's minimize()
+  private final Function monitor;
+  private boolean quiet; // = false
+<span class="fc" id="L104">  private static final NumberFormat nf = new DecimalFormat(&quot;0.000E0&quot;);</span>
+<span class="fc" id="L105">  private static final NumberFormat nfsec = new DecimalFormat(&quot;0.00&quot;); // for times</span>
+  private static final double ftol = 1e-4; // Linesearch parameters
+<span class="pc" id="L107">  private double gtol = 0.9;</span>
+  private static final double aMin = 1e-12; // Min step size
+  private static final double aMax = 1e12; // Max step size
+  private static final double p66 = 0.66; // used to check getting more than 2/3 of width improvement
+  private static final double p5 = 0.5; // Some other magic constant
+  private static final int a = 0;  // used as array index
+  private static final int f = 1;  // used as array index
+  private static final int g = 2;  // used as array index
+<span class="pc" id="L115">  public boolean outputToFile = false;</span>
+<span class="pc" id="L116">  private boolean success = false;</span>
+<span class="pc" id="L117">  private boolean bracketed = false; // used for linesearch</span>
+<span class="pc" id="L118">  private QNInfo presetInfo = null;</span>
+<span class="pc" id="L119">  private boolean noHistory = true;</span>
+
+  // parameters for OWL-QN (L-BFGS with L1-regularization)
+<span class="pc" id="L122">  private boolean useOWLQN = false;</span>
+<span class="pc" id="L123">  private double lambdaOWL = 0;</span>
+
+<span class="pc" id="L125">  private boolean useAveImprovement = true;</span>
+<span class="pc" id="L126">  private boolean useRelativeNorm = true;</span>
+<span class="pc" id="L127">  private boolean useNumericalZero = true;</span>
+<span class="pc" id="L128">  private boolean useEvalImprovement = false;</span>
+<span class="pc" id="L129">  private boolean useMaxItr = false;</span>
+<span class="pc" id="L130">  private int maxItr = 0;</span>
+
+<span class="pc" id="L132">  private boolean suppressTestPrompt = false;</span>
+<span class="pc" id="L133">  private int terminateOnEvalImprovementNumOfEpoch = 1;</span>
+
+<span class="pc" id="L135">  private int evaluateIters = 0;    // Evaluate every x iterations (0 = no evaluation)</span>
+<span class="pc" id="L136">  private int startEvaluateIters = 0; // starting evaluation after x iterations</span>
+  private Evaluator[] evaluators;  // separate set of evaluators to check how optimization is going
+
+<span class="pc" id="L139">  private transient CallbackFunction iterCallbackFunction = null;</span>
+
+<span class="pc" id="L141">  public enum eState {</span>
+<span class="fc" id="L142">    TERMINATE_MAXEVALS, TERMINATE_RELATIVENORM, TERMINATE_GRADNORM, TERMINATE_AVERAGEIMPROVE, CONTINUE, TERMINATE_EVALIMPROVE, TERMINATE_MAXITR</span>
+  }
+
+<span class="pc" id="L145">  public enum eLineSearch {</span>
+<span class="fc" id="L146">    BACKTRACK, MINPACK</span>
+  }
+
+<span class="pc" id="L149">  public enum eScaling {</span>
+<span class="fc" id="L150">    DIAGONAL, SCALAR</span>
+  }
+
+<span class="pc" id="L153">  private eLineSearch lsOpt = eLineSearch.MINPACK;</span>
+<span class="pc" id="L154">  private eScaling scaleOpt = eScaling.DIAGONAL;</span>
+
+
+  public QNMinimizer() {
+<span class="fc" id="L158">    this((Function) null);</span>
+<span class="fc" id="L159">  }</span>
+
+  public QNMinimizer(int m) {
+<span class="fc" id="L162">    this(null, m);</span>
+<span class="fc" id="L163">  }</span>
+
+  public QNMinimizer(int m, boolean useRobustOptions) {
+<span class="nc" id="L166">    this(null, m, useRobustOptions);</span>
+<span class="nc" id="L167">  }</span>
+
+<span class="fc" id="L169">  public QNMinimizer(Function monitor) {</span>
+<span class="fc" id="L170">    this.monitor = monitor;</span>
+<span class="fc" id="L171">  }</span>
+
+  public QNMinimizer(Function monitor, int m) {
+<span class="fc" id="L174">    this(monitor, m, false);</span>
+<span class="fc" id="L175">  }</span>
+
+<span class="fc" id="L177">  public QNMinimizer(Function monitor, int m, boolean useRobustOptions) {</span>
+<span class="fc" id="L178">    this.monitor = monitor;</span>
+<span class="fc" id="L179">    mem = m;</span>
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">    if (useRobustOptions) {</span>
+<span class="nc" id="L181">      this.setRobustOptions();</span>
+    }
+<span class="fc" id="L183">  }</span>
+
+<span class="nc" id="L185">  public QNMinimizer(FloatFunction monitor) {</span>
+<span class="nc" id="L186">    throw new UnsupportedOperationException(&quot;Doesn't support floats yet&quot;);</span>
+  }
+
+  public void setOldOptions() {
+<span class="nc" id="L190">    useAveImprovement = true;</span>
+<span class="nc" id="L191">    useRelativeNorm = false;</span>
+<span class="nc" id="L192">    useNumericalZero = false;</span>
+<span class="nc" id="L193">    lsOpt = eLineSearch.BACKTRACK;</span>
+<span class="nc" id="L194">    scaleOpt = eScaling.SCALAR;</span>
+<span class="nc" id="L195">  }</span>
+
+  public final void setRobustOptions() {
+<span class="nc" id="L198">    useAveImprovement = true;</span>
+<span class="nc" id="L199">    useRelativeNorm = true;</span>
+<span class="nc" id="L200">    useNumericalZero = true;</span>
+<span class="nc" id="L201">    lsOpt = eLineSearch.MINPACK;</span>
+<span class="nc" id="L202">    scaleOpt = eScaling.DIAGONAL;</span>
+<span class="nc" id="L203">  }</span>
+
+  @Override
+  public void setEvaluators(int iters, Evaluator[] evaluators) {
+<span class="fc" id="L207">    this.evaluateIters = iters;</span>
+<span class="fc" id="L208">    this.evaluators = evaluators;</span>
+<span class="fc" id="L209">  }</span>
+
+  public void setEvaluators(int iters, int startEvaluateIters, Evaluator[] evaluators) {
+<span class="nc" id="L212">    this.evaluateIters = iters;</span>
+<span class="nc" id="L213">    this.startEvaluateIters = startEvaluateIters;</span>
+<span class="nc" id="L214">    this.evaluators = evaluators;</span>
+<span class="nc" id="L215">  }</span>
+
+  public void setIterationCallbackFunction(CallbackFunction func){
+<span class="nc" id="L218">    iterCallbackFunction = func;</span>
+<span class="nc" id="L219">  }</span>
+
+  public void terminateOnRelativeNorm(boolean toTerminate) {
+<span class="nc" id="L222">    useRelativeNorm = toTerminate;</span>
+<span class="nc" id="L223">  }</span>
+
+  public void terminateOnNumericalZero(boolean toTerminate) {
+<span class="nc" id="L226">    useNumericalZero = toTerminate;</span>
+<span class="nc" id="L227">  }</span>
+
+  public void terminateOnAverageImprovement(boolean toTerminate) {
+<span class="nc" id="L230">    useAveImprovement = toTerminate;</span>
+<span class="nc" id="L231">  }</span>
+
+  public void terminateOnEvalImprovement(boolean toTerminate) {
+<span class="nc" id="L234">    useEvalImprovement = toTerminate;</span>
+<span class="nc" id="L235">  }</span>
+
+  public void terminateOnMaxItr(int maxItr) {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (maxItr &gt; 0) {</span>
+<span class="nc" id="L239">      useMaxItr = true;</span>
+<span class="nc" id="L240">      this.maxItr = maxItr;</span>
+    }
+<span class="nc" id="L242">  }</span>
+
+  public void suppressTestPrompt(boolean suppressTestPrompt) {
+<span class="nc" id="L245">    this.suppressTestPrompt = suppressTestPrompt;</span>
+<span class="nc" id="L246">  }</span>
+
+  public void setTerminateOnEvalImprovementNumOfEpoch(int terminateOnEvalImprovementNumOfEpoch) {
+<span class="nc" id="L249">    this.terminateOnEvalImprovementNumOfEpoch = terminateOnEvalImprovementNumOfEpoch;</span>
+<span class="nc" id="L250">  }</span>
+
+  public void useMinPackSearch() {
+<span class="nc" id="L253">    lsOpt = eLineSearch.MINPACK;</span>
+<span class="nc" id="L254">  }</span>
+
+  public void useBacktracking() {
+<span class="nc" id="L257">    lsOpt = eLineSearch.BACKTRACK;</span>
+<span class="nc" id="L258">  }</span>
+
+  public void useDiagonalScaling() {
+<span class="nc" id="L261">    scaleOpt = eScaling.DIAGONAL;</span>
+<span class="nc" id="L262">  }</span>
+
+  public void useScalarScaling() {
+<span class="nc" id="L265">    scaleOpt = eScaling.SCALAR;</span>
+<span class="nc" id="L266">  }</span>
+
+  public boolean wasSuccessful() {
+<span class="nc" id="L269">    return success;</span>
+  }
+
+  public void shutUp() {
+<span class="fc" id="L273">    this.quiet = true;</span>
+<span class="fc" id="L274">  }</span>
+  public void setM(int m) {
+<span class="nc" id="L276">    mem = m;</span>
+<span class="nc" id="L277">  }</span>
+
+  public static class SurpriseConvergence extends Exception {
+
+    private static final long serialVersionUID = 4290178321643529559L;
+
+    public SurpriseConvergence(String s) {
+<span class="nc" id="L284">      super(s);</span>
+<span class="nc" id="L285">    }</span>
+  }
+
+  private static class MaxEvaluationsExceeded extends Exception {
+
+    private static final long serialVersionUID = 8044806163343218660L;
+
+    public MaxEvaluationsExceeded(String s) {
+<span class="nc" id="L293">      super(s);</span>
+<span class="nc" id="L294">    }</span>
+  }
+
+  /**
+   * The Record class is used to collect information about the function value
+   * over a series of iterations. This information is used to determine
+   * convergence, and to (attempt to) ensure numerical errors are not an issue.
+   * It can also be used for plotting the results of the optimization routine.
+   *
+   * @author akleeman
+   */
+  class Record {
+    // convergence options.
+    // have average difference like before
+    // zero gradient.
+
+    // for convergence test
+<span class="pc" id="L311">    private final List&lt;Double&gt; evals = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L312">    private final List&lt;Double&gt; values = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L313">    private List&lt;Double&gt; gNorms = new ArrayList&lt;&gt;();</span>
+    // List&lt;Double&gt; xNorms = new ArrayList&lt;Double&gt;();
+<span class="pc" id="L315">    private final List&lt;Integer&gt; funcEvals = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L316">    private final List&lt;Double&gt; time = new ArrayList&lt;&gt;();</span>
+    // gNormInit: This makes it so that if for some reason
+    // you try and divide by the initial norm before it's been
+    // initialized you don't get a NAN but you will also never
+    // get false convergence.
+<span class="pc" id="L321">    private double gNormInit = Double.MIN_VALUE;</span>
+<span class="pc" id="L322">    private double relativeTOL = 1e-8;</span>
+<span class="pc" id="L323">    private double TOL = 1e-6;</span>
+<span class="pc" id="L324">    private double EPS = 1e-6;</span>
+    private long startTime;
+    private double gNormLast; // This is used for convergence.
+    private double[] xLast;
+<span class="pc" id="L328">    private int maxSize = 100; // This will control the number of func values /</span>
+    // gradients to retain.
+<span class="pc" id="L330">    private Function mon = null;</span>
+<span class="pc" id="L331">    private boolean quiet = false;</span>
+<span class="pc" id="L332">    private boolean memoryConscious = true;</span>
+<span class="pc" id="L333">    private PrintWriter outputFile = null;</span>
+
+    // private int noImproveItrCount = 0;
+    private double[] xBest;
+
+<span class="fc" id="L338">    Record(Function monitor, double tolerance, PrintWriter output) {</span>
+<span class="fc" id="L339">      this.mon = monitor;</span>
+<span class="fc" id="L340">      this.TOL = tolerance;</span>
+<span class="fc" id="L341">      this.outputFile = output;</span>
+<span class="fc" id="L342">    }</span>
+
+<span class="nc" id="L344">    Record(Function monitor, double tolerance, double eps) {</span>
+<span class="nc" id="L345">      this.mon = monitor;</span>
+<span class="nc" id="L346">      this.TOL = tolerance;</span>
+<span class="nc" id="L347">      this.EPS = eps;</span>
+<span class="nc" id="L348">    }</span>
+
+    void setEPS(double eps) {
+<span class="nc" id="L351">      EPS = eps;</span>
+<span class="nc" id="L352">    }</span>
+
+    void setTOL(double tolerance) {
+<span class="nc" id="L355">      TOL = tolerance;</span>
+<span class="nc" id="L356">    }</span>
+
+    void start(double val, double[] grad) {
+<span class="nc" id="L359">      start(val, grad, null);</span>
+<span class="nc" id="L360">    }</span>
+
+    /*
+     * Initialize the class, this starts the timer, and initiates the gradient
+     * norm for use with convergence.
+     */
+    void start(double val, double[] grad, double[] x) {
+<span class="fc" id="L367">      startTime = System.currentTimeMillis();</span>
+<span class="fc" id="L368">      gNormInit = ArrayMath.norm(grad);</span>
+<span class="fc" id="L369">      xLast = x;</span>
+<span class="fc" id="L370">      writeToFile(1, val, gNormInit, 0.0);</span>
+
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">      if (x != null) {</span>
+<span class="fc" id="L373">        monitorX(x);</span>
+      }
+<span class="fc" id="L375">    }</span>
+
+    private void writeToFile(double fevals, double val, double gNorm,
+                             double time) {
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">      if (outputFile != null) {</span>
+<span class="nc" id="L380">        outputFile.println(fevals + &quot;,&quot; + val + ',' + gNorm + ',' + time);</span>
+      }
+<span class="fc" id="L382">    }</span>
+
+    private void add(double val, double[] grad, double[] x, int fevals, double evalScore, StringBuilder sb) {
+
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">      if (!memoryConscious) {</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        if (gNorms.size() &gt; maxSize) {</span>
+<span class="nc" id="L388">          gNorms.remove(0);</span>
+        }
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (time.size() &gt; maxSize) {</span>
+<span class="nc" id="L391">          time.remove(0);</span>
+        }
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (funcEvals.size() &gt; maxSize) {</span>
+<span class="nc" id="L394">          funcEvals.remove(0);</span>
+        }
+<span class="nc" id="L396">        gNorms.add(gNormLast);</span>
+<span class="nc" id="L397">        time.add(howLong());</span>
+<span class="nc" id="L398">        funcEvals.add(fevals);</span>
+      } else {
+<span class="fc" id="L400">        maxSize = 10;</span>
+      }
+
+<span class="fc" id="L403">      gNormLast = ArrayMath.norm(grad);</span>
+<span class="fc bfc" id="L404" title="All 2 branches covered.">      if (values.size() &gt; maxSize) {</span>
+<span class="fc" id="L405">        values.remove(0);</span>
+      }
+
+<span class="fc" id="L408">      values.add(val);</span>
+
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">      if (evalScore != Double.NEGATIVE_INFINITY)</span>
+<span class="nc" id="L411">        evals.add(evalScore);</span>
+
+<span class="fc" id="L413">      writeToFile(fevals, val, gNormLast, howLong());</span>
+
+<span class="fc" id="L415">      sb.append(nf.format(val)).append(' ').append(nfsec.format(howLong())).append('s');</span>
+
+<span class="fc" id="L417">      xLast = x;</span>
+<span class="fc" id="L418">      monitorX(x);</span>
+<span class="fc" id="L419">    }</span>
+
+    void monitorX(double[] x) {
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">      if (this.mon != null) {</span>
+<span class="nc" id="L423">        this.mon.valueAt(x);</span>
+      }
+<span class="fc" id="L425">    }</span>
+
+    /**
+     * This function checks for convergence through first
+     * order optimality,  numerical convergence (i.e., zero numerical
+     * gradient), and also by checking the average improvement.
+     *
+     * @return A value of the enumeration type &lt;b&gt;eState&lt;/b&gt; which tells the
+     *   state of the optimization routine indicating whether the routine should
+     *   terminate, and if so why.
+     */
+    private eState toContinue(StringBuilder sb) {
+
+<span class="fc" id="L438">      double relNorm = gNormLast / gNormInit;</span>
+<span class="fc" id="L439">      int size = values.size();</span>
+<span class="fc" id="L440">      double newestVal = values.get(size - 1);</span>
+<span class="fc bfc" id="L441" title="All 2 branches covered.">      double previousVal = (size &gt;= 10 ? values.get(size - 10) : values.get(0));</span>
+<span class="fc bfc" id="L442" title="All 2 branches covered.">      double averageImprovement = (previousVal - newestVal) / (size &gt;= 10 ? 10 : size);</span>
+<span class="fc" id="L443">      int evalsSize = evals.size();</span>
+
+<span class="pc bpc" id="L445" title="3 of 4 branches missed.">      if (useMaxItr &amp;&amp; its &gt;= maxItr)</span>
+<span class="nc" id="L446">        return eState.TERMINATE_MAXITR;</span>
+
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">      if (useEvalImprovement) {</span>
+<span class="nc" id="L449">        int bestInd = -1;</span>
+<span class="nc" id="L450">        double bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">        for (int i = 0; i &lt; evalsSize; i++) {</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">          if (evals.get(i) &gt;= bestScore) {</span>
+<span class="nc" id="L453">            bestScore = evals.get(i);</span>
+<span class="nc" id="L454">            bestInd = i;</span>
+          }
+        }
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (bestInd == evalsSize-1) { // copy xBest</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">          if (xBest == null)</span>
+<span class="nc" id="L459">            xBest = Arrays.copyOf(xLast, xLast.length);</span>
+          else
+<span class="nc" id="L461">            System.arraycopy( xLast, 0, xBest, 0, xLast.length );</span>
+        }
+<span class="nc bnc" id="L463" title="All 2 branches missed.">        if ((evalsSize - bestInd) &gt;= terminateOnEvalImprovementNumOfEpoch)</span>
+<span class="nc" id="L464">          return eState.TERMINATE_EVALIMPROVE;</span>
+      }
+
+      // This is used to be able to reproduce results that were trained on the
+      // QNMinimizer before
+      // convergence criteria was updated.
+<span class="pc bpc" id="L470" title="1 of 4 branches missed.">      if (useAveImprovement</span>
+<span class="pc bpc" id="L471" title="1 of 2 branches missed.">          &amp;&amp; (size &gt; 5 &amp;&amp; Math.abs(averageImprovement / newestVal) &lt; TOL)) {</span>
+<span class="nc" id="L472">        return eState.TERMINATE_AVERAGEIMPROVE;</span>
+      }
+
+      // Check to see if the gradient is sufficiently small
+<span class="pc bpc" id="L476" title="2 of 4 branches missed.">      if (useRelativeNorm &amp;&amp; relNorm &lt;= relativeTOL) {</span>
+<span class="nc" id="L477">        return eState.TERMINATE_RELATIVENORM;</span>
+      }
+
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">      if (useNumericalZero) {</span>
+        // This checks if the gradient is sufficiently small compared to x that
+        // it is treated as zero.
+<span class="fc bfc" id="L483" title="All 2 branches covered.">        if (gNormLast &lt; EPS * Math.max(1.0, ArrayMath.norm_1(xLast))) {</span>
+          // |g| &lt; |x|_1
+          // First we do the one norm, because that's easiest, and always bigger.
+<span class="pc bpc" id="L486" title="1 of 2 branches missed.">          if (gNormLast &lt; EPS * Math.max(1.0, ArrayMath.norm(xLast))) {</span>
+            // |g| &lt; max(1,|x|)
+            // Now actually compare with the two norm if we have to.
+<span class="fc" id="L489">            log.warn(&quot;Gradient is numerically zero, stopped on machine epsilon.&quot;);</span>
+<span class="fc" id="L490">            return eState.TERMINATE_GRADNORM;</span>
+          }
+        }
+        // give user information about the norms.
+      }
+
+<span class="fc" id="L496">      sb.append(&quot; |&quot;).append(nf.format(gNormLast)).append(&quot;| {&quot;).append(nf.format(relNorm)).append(&quot;} &quot;);</span>
+<span class="fc" id="L497">      sb.append(nf.format(Math.abs(averageImprovement / newestVal))).append(' ');</span>
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">      sb.append(evalsSize &gt; 0 ? evals.get(evalsSize - 1).toString() : &quot;-&quot;).append(' ');</span>
+<span class="fc" id="L499">      return eState.CONTINUE;</span>
+    }
+
+    /**
+     *  Return the time in seconds since this class was created.
+     *  @return The time in seconds since this class was created.
+     */
+    double howLong() {
+<span class="fc" id="L507">      return (System.currentTimeMillis() - startTime) / 1000.0;</span>
+    }
+
+    double[] getBest() {
+<span class="nc" id="L511">      return xBest;</span>
+    }
+
+  } // end class Record
+
+  /**
+   * The QNInfo class is used to store information about the Quasi Newton
+   * update. it holds all the s,y pairs, updates the diagonal and scales
+   * everything as needed.
+   */
+  class QNInfo {
+    // Diagonal Options
+    // Line search Options
+    // Memory stuff
+<span class="pc" id="L525">    private List&lt;double[]&gt; s = null;</span>
+<span class="pc" id="L526">    private List&lt;double[]&gt; y = null;</span>
+<span class="pc" id="L527">    private List&lt;Double&gt; rho = null;</span>
+    private double gamma;
+<span class="pc" id="L529">    public double[] d = null;</span>
+    private int mem;
+<span class="pc" id="L531">    private int maxMem = 20;</span>
+<span class="pc" id="L532">    public eScaling scaleOpt = eScaling.SCALAR;</span>
+
+<span class="fc" id="L534">    QNInfo(int size) {</span>
+<span class="fc" id="L535">      s = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L536">      y = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L537">      rho = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L538">      gamma = 1;</span>
+<span class="fc" id="L539">      mem = size;</span>
+<span class="fc" id="L540">    }</span>
+
+<span class="nc" id="L542">    QNInfo(List&lt;double[]&gt; sList, List&lt;double[]&gt; yList) {</span>
+<span class="nc" id="L543">      s = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L544">      y = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L545">      rho = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L546">      gamma = 1;</span>
+<span class="nc" id="L547">      setHistory(sList, yList);</span>
+<span class="nc" id="L548">    }</span>
+
+    int size() {
+<span class="fc" id="L551">      return s.size();</span>
+    }
+
+    double getRho(int ind) {
+<span class="fc" id="L555">      return rho.get(ind);</span>
+    }
+
+    double[] getS(int ind) {
+<span class="fc" id="L559">      return s.get(ind);</span>
+    }
+
+    double[] getY(int ind) {
+<span class="fc" id="L563">      return y.get(ind);</span>
+    }
+
+    void useDiagonalScaling() {
+<span class="nc" id="L567">      this.scaleOpt = eScaling.DIAGONAL;</span>
+<span class="nc" id="L568">    }</span>
+
+    void useScalarScaling() {
+<span class="nc" id="L571">      this.scaleOpt = eScaling.SCALAR;</span>
+<span class="nc" id="L572">    }</span>
+
+    /*
+     * Free up that memory.
+     */
+    void free() {
+<span class="fc" id="L578">      s = null;</span>
+<span class="fc" id="L579">      y = null;</span>
+<span class="fc" id="L580">      rho = null;</span>
+<span class="fc" id="L581">      d = null;</span>
+<span class="fc" id="L582">    }</span>
+
+    void clear() {
+<span class="nc" id="L585">      s.clear();</span>
+<span class="nc" id="L586">      y.clear();</span>
+<span class="nc" id="L587">      rho.clear();</span>
+<span class="nc" id="L588">      d = null;</span>
+<span class="nc" id="L589">    }</span>
+
+    /**
+     * This function {@code applyInitialHessian(double[] x)}
+     * takes the vector {@code x}, and applies the best guess at the
+     * initial hessian to this vector, based off available information from
+     * previous updates.
+     */
+    void setHistory(List&lt;double[]&gt; sList, List&lt;double[]&gt; yList) {
+<span class="nc" id="L598">      int size = sList.size();</span>
+
+<span class="nc bnc" id="L600" title="All 2 branches missed.">      for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L601">        update(sList.get(i), yList.get(i), ArrayMath.innerProduct(yList.get(i),</span>
+<span class="nc" id="L602">            yList.get(i)), ArrayMath.innerProduct(sList.get(i), yList.get(i)),</span>
+            0, 1.0);
+      }
+<span class="nc" id="L605">    }</span>
+
+    double[] applyInitialHessian(double[] x, StringBuilder sb) {
+<span class="pc bpc" id="L608" title="2 of 3 branches missed.">      switch (scaleOpt) {</span>
+      case SCALAR:
+<span class="nc" id="L610">        sb.append('I');</span>
+<span class="nc" id="L611">        ArrayMath.multiplyInPlace(x, gamma);</span>
+<span class="nc" id="L612">        break;</span>
+      case DIAGONAL:
+<span class="fc" id="L614">        sb.append('D');</span>
+<span class="fc bfc" id="L615" title="All 2 branches covered.">        if (d != null) {</span>
+          // Check sizes
+<span class="pc bpc" id="L617" title="1 of 2 branches missed.">          if (x.length != d.length) {</span>
+<span class="nc" id="L618">            throw new IllegalArgumentException(&quot;Vector of incorrect size passed to applyInitialHessian in QNInfo class&quot;);</span>
+          }
+          // Scale element-wise
+<span class="fc bfc" id="L621" title="All 2 branches covered.">          for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="fc" id="L622">            x[i] = x[i] / (d[i]);</span>
+          }
+        }
+        break;
+      }
+
+<span class="fc" id="L628">      return x;</span>
+    }
+
+    /*
+     * The update function is used to update the hessian approximation used by
+     * the quasi newton optimization routine.
+     *
+     * If everything has behaved nicely, this involves deciding on a new initial
+     * hessian through scaling or diagonal update, and then storing of the
+     * secant pairs s = x - previousX and y = grad - previousGrad.
+     *
+     * Things can go wrong, if any non convex behavior is detected (s^T y &amp;lt; 0)
+     * or numerical errors are likely the update is skipped.
+     */
+    int update(double[] newX, double[] x, double[] newGrad,
+        double[] grad, double step) throws SurpriseConvergence {
+      // todo: add OutOfMemory error.
+      double[] newS, newY;
+      double sy, yy, sg;
+
+      // allocate arrays for new s,y pairs (or replace if the list is already
+      // full)
+<span class="pc bpc" id="L650" title="2 of 6 branches missed.">      if (mem &gt; 0 &amp;&amp; s.size() == mem || s.size() == maxMem) {</span>
+<span class="fc" id="L651">        newS = s.remove(0);</span>
+<span class="fc" id="L652">        newY = y.remove(0);</span>
+<span class="fc" id="L653">        rho.remove(0);</span>
+      } else {
+<span class="fc" id="L655">        newS = new double[x.length];</span>
+<span class="fc" id="L656">        newY = new double[x.length];</span>
+      }
+
+      // Here we construct the new pairs, and check for positive definiteness.
+<span class="fc" id="L660">      sy = 0;</span>
+<span class="fc" id="L661">      yy = 0;</span>
+<span class="fc" id="L662">      sg = 0;</span>
+<span class="fc bfc" id="L663" title="All 2 branches covered.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="fc" id="L664">        newS[i] = newX[i] - x[i];</span>
+<span class="fc" id="L665">        newY[i] = newGrad[i] - grad[i];</span>
+<span class="fc" id="L666">        sy += newS[i] * newY[i];</span>
+<span class="fc" id="L667">        yy += newY[i] * newY[i];</span>
+<span class="fc" id="L668">        sg += newS[i] * newGrad[i];</span>
+      }
+
+      // Apply the updates used for the initial hessian.
+
+<span class="fc" id="L673">      return update(newS, newY, yy, sy, sg, step);</span>
+    }
+
+    private class NegativeCurvature extends Exception {
+
+      private static final long serialVersionUID = 4676562552506850519L;
+
+<span class="nc" id="L680">      public NegativeCurvature() {</span>
+<span class="nc" id="L681">      }</span>
+    }
+
+    private class ZeroGradient extends Exception {
+
+      private static final long serialVersionUID = -4001834044987928521L;
+
+<span class="nc" id="L688">      public ZeroGradient() {</span>
+<span class="nc" id="L689">      }</span>
+    }
+
+    int update(double[] newS, double[] newY, double yy, double sy,
+        double sg, double step) {
+
+      // Initialize diagonal to the identity
+<span class="pc bpc" id="L696" title="1 of 4 branches missed.">      if (scaleOpt == eScaling.DIAGONAL &amp;&amp; d == null) {</span>
+<span class="fc" id="L697">        d = new double[newS.length];</span>
+<span class="fc bfc" id="L698" title="All 2 branches covered.">        for (int i = 0; i &lt; d.length; i++) {</span>
+<span class="fc" id="L699">          d[i] = 1.0;</span>
+        }
+      }
+
+      try {
+
+<span class="pc bpc" id="L705" title="1 of 2 branches missed.">        if (sy &lt; 0) {</span>
+<span class="nc" id="L706">          throw new NegativeCurvature();</span>
+        }
+
+<span class="pc bpc" id="L709" title="1 of 2 branches missed.">        if (yy == 0.0) {</span>
+<span class="nc" id="L710">          throw new ZeroGradient();</span>
+        }
+
+<span class="pc bpc" id="L713" title="2 of 3 branches missed.">        switch (scaleOpt) {</span>
+        /*
+         * SCALAR: The standard L-BFGS initial approximation which is just a
+         * scaled identity.
+         */
+        case SCALAR:
+<span class="nc" id="L719">          gamma = sy / yy;</span>
+<span class="nc" id="L720">          break;</span>
+        /*
+         * DIAGONAL: A diagonal scaling matrix is used as the initial
+         * approximation. The updating method used is used thanks to Andrew
+         * Bradley of the ICME dept.
+         */
+        case DIAGONAL:
+
+          double sDs;
+          // Gamma is designed to scale such that a step length of one is
+          // generally accepted.
+<span class="fc" id="L731">          gamma = sy / (step * (sy - sg));</span>
+<span class="fc" id="L732">          sDs = 0.0;</span>
+<span class="fc bfc" id="L733" title="All 2 branches covered.">          for (int i = 0; i &lt; d.length; i++) {</span>
+<span class="fc" id="L734">            d[i] = gamma * d[i];</span>
+<span class="fc" id="L735">            sDs += newS[i] * d[i] * newS[i];</span>
+          }
+          // This diagonal update was introduced by Andrew Bradley
+<span class="fc bfc" id="L738" title="All 2 branches covered.">          for (int i = 0; i &lt; d.length; i++) {</span>
+<span class="fc" id="L739">            d[i] = (1 - d[i] * newS[i] * newS[i] / sDs) * d[i] + newY[i]</span>
+                * newY[i] / sy;
+          }
+          // Here we make sure that the diagonal is alright
+<span class="fc" id="L743">          double minD = ArrayMath.min(d);</span>
+<span class="fc" id="L744">          double maxD = ArrayMath.max(d);</span>
+
+          // If things have gone bad, just fill with the SCALAR approx.
+<span class="pc bpc" id="L747" title="3 of 6 branches missed.">          if (minD &lt;= 0 || Double.isInfinite(maxD) || maxD / minD &gt; 1e12) {</span>
+<span class="nc" id="L748">            log.warn(&quot;QNInfo:update() : PROBLEM WITH DIAGONAL UPDATE&quot;);</span>
+<span class="nc" id="L749">            double fill = yy / sy;</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">            for (int i = 0; i &lt; d.length; i++) {</span>
+<span class="nc" id="L751">              d[i] = fill;</span>
+            }
+          }
+
+        }
+
+        // If s is already of size mem, remove the oldest vector and free it up.
+
+<span class="pc bpc" id="L759" title="3 of 6 branches missed.">        if (mem &gt; 0 &amp;&amp; s.size() == mem || s.size() == maxMem) {</span>
+<span class="nc" id="L760">          s.remove(0);</span>
+<span class="nc" id="L761">          y.remove(0);</span>
+<span class="nc" id="L762">          rho.remove(0);</span>
+        }
+
+        // Actually add the pair.
+<span class="fc" id="L766">        s.add(newS);</span>
+<span class="fc" id="L767">        y.add(newY);</span>
+<span class="fc" id="L768">        rho.add(1 / sy);</span>
+
+<span class="nc" id="L770">      } catch (NegativeCurvature nc) {</span>
+        // NOTE: if applying QNMinimizer to a non convex problem, we would still
+        // like to update the matrix
+        // or we could get stuck in a series of skipped updates.
+<span class="nc" id="L774">        sayln(&quot; Negative curvature detected, update skipped &quot;);</span>
+<span class="nc" id="L775">      } catch (ZeroGradient zg) {</span>
+<span class="nc" id="L776">        sayln(&quot; Either convergence, or floating point errors combined with extremely linear region &quot;);</span>
+<span class="pc" id="L777">      }</span>
+
+<span class="fc" id="L779">      return s.size();</span>
+    } // end update
+
+  } // end class QNInfo
+
+  public void setHistory(List&lt;double[]&gt; s, List&lt;double[]&gt; y) {
+<span class="nc" id="L785">    presetInfo = new QNInfo(s, y);</span>
+<span class="nc" id="L786">  }</span>
+
+  /**
+   * computeDir()
+   *
+   * This function will calculate an approximation of the inverse hessian based
+   * off the seen s,y vector pairs. This particular approximation uses the BFGS
+   * update.
+   */
+  private void computeDir(double[] dir, double[] fg, double[] x, QNInfo qn, Function func, StringBuilder sb)
+      throws SurpriseConvergence {
+<span class="fc" id="L797">    System.arraycopy(fg, 0, dir, 0, fg.length);</span>
+
+<span class="fc" id="L799">    int mmm = qn.size();</span>
+<span class="fc" id="L800">    double[] as = new double[mmm];</span>
+
+<span class="fc bfc" id="L802" title="All 2 branches covered.">    for (int i = mmm - 1; i &gt;= 0; i--) {</span>
+<span class="fc" id="L803">      as[i] = qn.getRho(i) * ArrayMath.innerProduct(qn.getS(i), dir);</span>
+<span class="fc" id="L804">      plusAndConstMult(dir, qn.getY(i), -as[i], dir);</span>
+    }
+
+    // multiply by hessian approximation
+<span class="fc" id="L808">    qn.applyInitialHessian(dir, sb);</span>
+
+<span class="fc bfc" id="L810" title="All 2 branches covered.">    for (int i = 0; i &lt; mmm; i++) {</span>
+<span class="fc" id="L811">      double b = qn.getRho(i) * ArrayMath.innerProduct(qn.getY(i), dir);</span>
+<span class="fc" id="L812">      plusAndConstMult(dir, qn.getS(i), as[i] - b, dir);</span>
+    }
+
+<span class="fc" id="L815">    ArrayMath.multiplyInPlace(dir, -1);</span>
+
+<span class="pc bpc" id="L817" title="1 of 2 branches missed.">    if (useOWLQN) { // step (2) in Galen &amp; Gao 2007</span>
+<span class="nc" id="L818">      constrainSearchDir(dir, fg, x, func);</span>
+    }
+<span class="fc" id="L820">  }</span>
+
+  // computes d = a + b * c
+  private static double[] plusAndConstMult(double[] a, double[] b, double c,
+      double[] d) {
+<span class="fc bfc" id="L825" title="All 2 branches covered.">    for (int i = 0; i &lt; a.length; i++) {</span>
+<span class="fc" id="L826">      d[i] = a[i] + c * b[i];</span>
+    }
+<span class="fc" id="L828">    return d;</span>
+  }
+
+  private double doEvaluation(double[] x) {
+    // Evaluate solution
+<span class="nc bnc" id="L833" title="All 2 branches missed.">    if (evaluators == null) return Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L834">    double score = 0;</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">    for (Evaluator eval:evaluators) {</span>
+<span class="nc bnc" id="L836" title="All 2 branches missed.">      if (!suppressTestPrompt)</span>
+<span class="nc" id="L837">        sayln(&quot;  Evaluating: &quot; + eval.toString());</span>
+<span class="nc" id="L838">      score = eval.evaluate(x);</span>
+    }
+<span class="nc" id="L840">    return score;</span>
+  }
+
+  public float[] minimize(DiffFloatFunction function, float functionTolerance,
+      float[] initial) {
+<span class="nc" id="L845">    throw new UnsupportedOperationException(&quot;Float not yet supported for QN&quot;);</span>
+  }
+
+  @Override
+  public double[] minimize(DiffFunction function, double functionTolerance,
+      double[] initial) {
+<span class="fc" id="L851">    return minimize(function, functionTolerance, initial, -1);</span>
+  }
+
+  @Override
+  public double[] minimize(DiffFunction dFunction, double functionTolerance,
+      double[] initial, int maxFunctionEvaluations) {
+<span class="fc" id="L857">    return minimize(dFunction, functionTolerance, initial,</span>
+        maxFunctionEvaluations, null);
+  }
+
+  public double[] minimize(DiffFunction dFunction, double functionTolerance,
+      double[] initial, int maxFunctionEvaluations, QNInfo qn) {
+
+<span class="pc bpc" id="L864" title="1 of 2 branches missed.">    if (mem &gt; 0) {</span>
+<span class="fc" id="L865">      sayln(&quot;QNMinimizer called on double function of &quot;</span>
+<span class="fc" id="L866">              + dFunction.domainDimension() + &quot; variables, using M = &quot; + mem + '.');</span>
+    } else {
+<span class="nc" id="L868">      sayln(&quot;QNMinimizer called on double function of &quot;</span>
+<span class="nc" id="L869">              + dFunction.domainDimension() + &quot; variables, using dynamic setting of M.&quot;);</span>
+    }
+
+<span class="pc bpc" id="L872" title="2 of 4 branches missed.">    if (qn == null &amp;&amp; presetInfo == null) {</span>
+<span class="fc" id="L873">      qn = new QNInfo(mem);</span>
+<span class="fc" id="L874">      noHistory = true;</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">    } else if (presetInfo != null) {</span>
+<span class="nc" id="L876">      qn = presetInfo;</span>
+<span class="nc" id="L877">      noHistory = false;</span>
+<span class="nc bnc" id="L878" title="All 2 branches missed.">    } else if (qn != null) {</span>
+<span class="nc" id="L879">      noHistory = false;</span>
+    }
+
+<span class="fc" id="L882">    its = 0;</span>
+<span class="fc" id="L883">    fevals = 0;</span>
+<span class="fc" id="L884">    success = false;</span>
+
+<span class="fc" id="L886">    qn.scaleOpt = scaleOpt;</span>
+
+    // initialize weights
+<span class="fc" id="L889">    double[] x = initial;</span>
+
+    // initialize gradient
+<span class="fc" id="L892">    double[] rawGrad = new double[x.length];</span>
+<span class="fc" id="L893">    double[] newGrad = new double[x.length];</span>
+<span class="fc" id="L894">    double[] newX = new double[x.length];</span>
+<span class="fc" id="L895">    double[] dir = new double[x.length];</span>
+
+    // initialize function value and gradient (gradient is stored in grad inside
+    // evaluateFunction)
+<span class="fc" id="L899">    double value = evaluateFunction(dFunction, x, rawGrad);</span>
+    double[] grad;
+<span class="pc bpc" id="L901" title="1 of 2 branches missed.">    if (useOWLQN) {</span>
+<span class="nc" id="L902">      double norm = l1NormOWL(x, dFunction);</span>
+<span class="nc" id="L903">      value += norm * lambdaOWL;</span>
+      // step (1) in Galen &amp; Gao except we are not computing v yet
+<span class="nc" id="L905">      grad = pseudoGradientOWL(x, rawGrad, dFunction);</span>
+<span class="nc" id="L906">    } else {</span>
+<span class="fc" id="L907">      grad = rawGrad;</span>
+    }
+
+<span class="fc" id="L910">    PrintWriter outFile = null;</span>
+<span class="fc" id="L911">    PrintWriter infoFile = null;</span>
+
+<span class="pc bpc" id="L913" title="1 of 2 branches missed.">    if (outputToFile) {</span>
+      try {
+<span class="nc" id="L915">        String baseName = &quot;QN_m&quot; + mem + '_' + lsOpt.toString() + '_'</span>
+<span class="nc" id="L916">            + scaleOpt.toString();</span>
+<span class="nc" id="L917">        outFile = new PrintWriter(new FileOutputStream(baseName + &quot;.output&quot;),</span>
+            true);
+<span class="nc" id="L919">        infoFile = new PrintWriter(new FileOutputStream(baseName + &quot;.info&quot;),</span>
+            true);
+<span class="nc" id="L921">        infoFile.println(dFunction.domainDimension() + &quot;; DomainDimension &quot;);</span>
+<span class="nc" id="L922">        infoFile.println(mem + &quot;; memory&quot;);</span>
+<span class="nc" id="L923">      } catch (IOException e) {</span>
+<span class="nc" id="L924">        throw new RuntimeIOException(&quot;Caught IOException outputting QN data to file&quot;, e);</span>
+<span class="nc" id="L925">      }</span>
+    }
+
+<span class="fc" id="L928">    Record rec = new Record(monitor, functionTolerance, outFile);</span>
+    // sets the original gradient and x. Also stores the monitor.
+<span class="fc" id="L930">    rec.start(value, rawGrad, x);</span>
+
+    // Check if max Evaluations and Iterations have been provided.
+<span class="pc bpc" id="L933" title="1 of 2 branches missed.">    maxFevals = (maxFunctionEvaluations &gt; 0) ? maxFunctionEvaluations</span>
+        : Integer.MAX_VALUE;
+    // maxIterations = (maxIterations &gt; 0) ? maxIterations : Integer.MAX_VALUE;
+
+<span class="fc" id="L937">    sayln(&quot;               An explanation of the output:&quot;);</span>
+<span class="fc" id="L938">    sayln(&quot;Iter           The number of iterations&quot;);</span>
+<span class="fc" id="L939">    sayln(&quot;evals          The number of function evaluations&quot;);</span>
+<span class="fc" id="L940">    sayln(&quot;SCALING        &lt;D&gt; Diagonal scaling was used; &lt;I&gt; Scaled Identity&quot;);</span>
+<span class="fc" id="L941">    sayln(&quot;LINESEARCH     [## M steplength]  Minpack linesearch&quot;);</span>
+<span class="fc" id="L942">    sayln(&quot;                   1-Function value was too high&quot;);</span>
+<span class="fc" id="L943">    sayln(&quot;                   2-Value ok, gradient positive, positive curvature&quot;);</span>
+<span class="fc" id="L944">    sayln(&quot;                   3-Value ok, gradient negative, positive curvature&quot;);</span>
+<span class="fc" id="L945">    sayln(&quot;                   4-Value ok, gradient negative, negative curvature&quot;);</span>
+<span class="fc" id="L946">    sayln(&quot;               [.. B]  Backtracking&quot;);</span>
+<span class="fc" id="L947">    sayln(&quot;VALUE          The current function value&quot;);</span>
+<span class="fc" id="L948">    sayln(&quot;TIME           Total elapsed time&quot;);</span>
+<span class="fc" id="L949">    sayln(&quot;|GNORM|        The current norm of the gradient&quot;);</span>
+<span class="fc" id="L950">    sayln(&quot;{RELNORM}      The ratio of the current to initial gradient norms&quot;);</span>
+<span class="fc" id="L951">    sayln(&quot;AVEIMPROVE     The average improvement / current value&quot;);</span>
+<span class="fc" id="L952">    sayln(&quot;EVALSCORE      The last available eval score&quot;);</span>
+<span class="fc" id="L953">    sayln();</span>
+<span class="fc" id="L954">    sayln(&quot;Iter ## evals ## &lt;SCALING&gt; [LINESEARCH] VALUE TIME |GNORM| {RELNORM} AVEIMPROVE EVALSCORE&quot;);</span>
+
+<span class="fc" id="L956">    StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L957">    eState state = eState.CONTINUE;</span>
+
+    // Beginning of the loop.
+    do {
+      try {
+<span class="fc bfc" id="L962" title="All 2 branches covered.">        if ( ! quiet) {</span>
+<span class="fc" id="L963">          sayln(sb.toString());</span>
+        }
+<span class="fc" id="L965">        sb = new StringBuilder();</span>
+<span class="pc bpc" id="L966" title="5 of 8 branches missed.">        boolean doEval = (its &gt;= 0 &amp;&amp; its &gt;= startEvaluateIters &amp;&amp; evaluateIters &gt; 0 &amp;&amp; its % evaluateIters == 0);</span>
+<span class="fc" id="L967">        its += 1;</span>
+        double newValue;
+<span class="fc" id="L969">        sb.append(&quot;Iter &quot;).append(its).append(&quot; evals &quot;).append(fevals).append(' ');</span>
+
+        // Compute the search direction
+<span class="fc" id="L972">        sb.append('&lt;');</span>
+<span class="fc" id="L973">        computeDir(dir, grad, x, qn, dFunction, sb);</span>
+<span class="fc" id="L974">        sb.append(&quot;&gt; &quot;);</span>
+
+        // sanity check dir
+<span class="fc" id="L977">        boolean hasNaNDir = false;</span>
+<span class="fc" id="L978">        boolean hasNaNGrad = false;</span>
+<span class="fc bfc" id="L979" title="All 2 branches covered.">        for (int i = 0; i &lt; dir.length; i++) {</span>
+<span class="pc bpc" id="L980" title="1 of 2 branches missed.">          if (dir[i] != dir[i]) hasNaNDir = true;</span>
+<span class="pc bpc" id="L981" title="1 of 2 branches missed.">          if (grad[i] != grad[i]) hasNaNGrad = true;</span>
+        }
+<span class="pc bpc" id="L983" title="3 of 4 branches missed.">        if (hasNaNDir &amp;&amp; !hasNaNGrad) {</span>
+<span class="nc" id="L984">          sayln(&quot;(NaN dir likely due to Hessian approx - resetting) &quot;);</span>
+<span class="nc" id="L985">          qn.clear();</span>
+          // re-compute the search direction
+<span class="nc" id="L987">          sb.append('&lt;');</span>
+<span class="nc" id="L988">          computeDir(dir, grad, x, qn, dFunction, sb);</span>
+<span class="nc" id="L989">          sb.append(&quot;&gt; &quot;);</span>
+        }
+
+        // perform line search
+<span class="fc" id="L993">        sb.append('[');</span>
+
+        double[] newPoint; // initialized in if/else/switch below
+<span class="pc bpc" id="L996" title="1 of 2 branches missed.">        if (useOWLQN) {</span>
+          // only linear search is allowed for OWL-QN
+<span class="nc" id="L998">          newPoint = lineSearchBacktrackOWL(dFunction, dir, x, newX, grad, value, sb);</span>
+<span class="nc" id="L999">          sb.append('B');</span>
+        } else {
+          // switch between line search options.
+<span class="pc bpc" id="L1002" title="2 of 3 branches missed.">          switch (lsOpt) {</span>
+          case BACKTRACK:
+<span class="nc" id="L1004">            newPoint = lineSearchBacktrack(dFunction, dir, x, newX, grad, value, sb);</span>
+<span class="nc" id="L1005">            sb.append('B');</span>
+<span class="nc" id="L1006">            break;</span>
+          case MINPACK:
+<span class="fc" id="L1008">            newPoint = lineSearchMinPack(dFunction, dir, x, newX, grad, value,</span>
+                functionTolerance, sb);
+<span class="fc" id="L1010">            sb.append('M');</span>
+<span class="fc" id="L1011">            break;</span>
+          default:
+<span class="nc" id="L1013">            throw new IllegalArgumentException(&quot;Invalid line search option for QNMinimizer.&quot;);</span>
+          }
+        }
+
+<span class="fc" id="L1017">        newValue = newPoint[f];</span>
+<span class="fc" id="L1018">        sb.append(' ');</span>
+<span class="fc" id="L1019">        sb.append(nf.format(newPoint[a]));</span>
+<span class="fc" id="L1020">        sb.append(&quot;] &quot;);</span>
+
+        // This shouldn't actually evaluate anything since that should have been
+        // done in the lineSearch.
+<span class="fc" id="L1024">        System.arraycopy(dFunction.derivativeAt(newX), 0, newGrad, 0, newGrad.length);</span>
+
+        // This is where all the s, y updates are applied.
+<span class="fc" id="L1027">        qn.update(newX, x, newGrad, rawGrad, newPoint[a]); // step (4) in Galen &amp; Gao 2007</span>
+
+<span class="pc bpc" id="L1029" title="1 of 2 branches missed.">        if (useOWLQN) {</span>
+<span class="nc" id="L1030">          System.arraycopy(newGrad, 0, rawGrad, 0, newGrad.length);</span>
+          // pseudo gradient
+<span class="nc" id="L1032">          newGrad = pseudoGradientOWL(newX, newGrad, dFunction);</span>
+        }
+
+<span class="fc" id="L1035">        double evalScore = Double.NEGATIVE_INFINITY;</span>
+<span class="pc bpc" id="L1036" title="1 of 2 branches missed.">        if (doEval) {</span>
+<span class="nc" id="L1037">          evalScore = doEvaluation(newX);</span>
+        }
+
+        // Add the current value and gradient to the records, this also monitors
+        // X and writes to output
+<span class="fc" id="L1042">        rec.add(newValue, newGrad, newX, fevals, evalScore, sb);</span>
+
+        // If you want to call a function and do whatever with the information ...
+<span class="pc bpc" id="L1045" title="1 of 2 branches missed.">        if (iterCallbackFunction != null) {</span>
+<span class="nc" id="L1046">          iterCallbackFunction.callback(newX, its, newValue, newGrad);</span>
+        }
+
+        // shift
+<span class="fc" id="L1050">        value = newValue;</span>
+        // double[] temp = x;
+        // x = newX;
+        // newX = temp;
+<span class="fc" id="L1054">        System.arraycopy(newX, 0, x, 0, x.length);</span>
+<span class="fc" id="L1055">        System.arraycopy(newGrad, 0, grad, 0, newGrad.length);</span>
+
+<span class="pc bpc" id="L1057" title="1 of 2 branches missed.">        if (fevals &gt; maxFevals) {</span>
+<span class="nc" id="L1058">          throw new MaxEvaluationsExceeded(&quot;Exceeded in minimize() loop.&quot;);</span>
+        }
+<span class="nc" id="L1060">      } catch (SurpriseConvergence s) {</span>
+<span class="nc" id="L1061">        sayln(&quot;QNMinimizer aborted due to surprise convergence&quot;);</span>
+<span class="nc" id="L1062">        break;</span>
+<span class="nc" id="L1063">      } catch (MaxEvaluationsExceeded m) {</span>
+<span class="nc" id="L1064">        sayln(&quot;QNMinimizer aborted due to maximum number of function evaluations&quot;);</span>
+<span class="nc" id="L1065">        sayln(m.toString());</span>
+<span class="nc" id="L1066">        sayln(&quot;** This is not an acceptable termination of QNMinimizer, consider&quot;);</span>
+<span class="nc" id="L1067">        sayln(&quot;** increasing the max number of evaluations, or safeguarding your&quot;);</span>
+<span class="nc" id="L1068">        sayln(&quot;** program by checking the QNMinimizer.wasSuccessful() method.&quot;);</span>
+<span class="nc" id="L1069">        break;</span>
+<span class="nc" id="L1070">      } catch (OutOfMemoryError oome) {</span>
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">        if ( ! qn.s.isEmpty()) {</span>
+<span class="nc" id="L1072">          qn.s.remove(0);</span>
+<span class="nc" id="L1073">          qn.y.remove(0);</span>
+<span class="nc" id="L1074">          qn.rho.remove(0);</span>
+<span class="nc" id="L1075">          sb.append(&quot;{Caught OutOfMemory, changing m from &quot;).append(qn.mem).append(&quot; to &quot;).append(qn.s.size()).append(&quot;}]&quot;);</span>
+<span class="nc" id="L1076">          qn.mem = qn.s.size();</span>
+        } else {
+<span class="nc" id="L1078">          throw oome;</span>
+        }
+<span class="fc" id="L1080">      }</span>
+<span class="fc bfc" id="L1081" title="All 2 branches covered.">    } while ((state = rec.toContinue(sb)) == eState.CONTINUE); // end do while</span>
+
+<span class="pc bpc" id="L1083" title="1 of 2 branches missed.">    if (evaluateIters &gt; 0) {</span>
+      // do final evaluation
+<span class="nc bnc" id="L1085" title="All 2 branches missed.">      double evalScore = (useEvalImprovement ? doEvaluation(rec.getBest()) : doEvaluation(x));</span>
+<span class="nc" id="L1086">      sayln(&quot;final evalScore is: &quot; + evalScore);</span>
+    }
+
+
+
+    //
+    // Announce the reason minimization has terminated.
+    //
+<span class="pc bpc" id="L1094" title="5 of 6 branches missed.">    switch (state) {</span>
+    case TERMINATE_GRADNORM:
+<span class="fc" id="L1096">      sayln(&quot;QNMinimizer terminated due to numerically zero gradient: |g| &lt; EPS  max(1,|x|) &quot;);</span>
+<span class="fc" id="L1097">      success = true;</span>
+<span class="fc" id="L1098">      break;</span>
+    case TERMINATE_RELATIVENORM:
+<span class="nc" id="L1100">      sayln(&quot;QNMinimizer terminated due to sufficient decrease in gradient norms: |g|/|g0| &lt; TOL &quot;);</span>
+<span class="nc" id="L1101">      success = true;</span>
+<span class="nc" id="L1102">      break;</span>
+    case TERMINATE_AVERAGEIMPROVE:
+<span class="nc" id="L1104">      sayln(&quot;QNMinimizer terminated due to average improvement: | newest_val - previous_val | / |newestVal| &lt; TOL &quot;);</span>
+<span class="nc" id="L1105">      success = true;</span>
+<span class="nc" id="L1106">      break;</span>
+    case TERMINATE_MAXITR:
+<span class="nc" id="L1108">      sayln(&quot;QNMinimizer terminated due to reached max iteration &quot; + maxItr );</span>
+<span class="nc" id="L1109">      success = true;</span>
+<span class="nc" id="L1110">      break;</span>
+    case TERMINATE_EVALIMPROVE:
+<span class="nc" id="L1112">      sayln(&quot;QNMinimizer terminated due to no improvement on eval &quot;);</span>
+<span class="nc" id="L1113">      success = true;</span>
+<span class="nc" id="L1114">      x = rec.getBest();</span>
+<span class="nc" id="L1115">      break;</span>
+    default:
+<span class="nc" id="L1117">      log.warn(&quot;QNMinimizer terminated without converging&quot;);</span>
+<span class="nc" id="L1118">      success = false;</span>
+      break;
+    }
+
+<span class="fc" id="L1122">    double completionTime = rec.howLong();</span>
+<span class="fc" id="L1123">    sayln(&quot;Total time spent in optimization: &quot; + nfsec.format(completionTime) + 's');</span>
+
+<span class="pc bpc" id="L1125" title="1 of 2 branches missed.">    if (outputToFile) {</span>
+<span class="nc" id="L1126">      infoFile.println(completionTime + &quot;; Total Time &quot;);</span>
+<span class="nc" id="L1127">      infoFile.println(fevals + &quot;; Total evaluations&quot;);</span>
+<span class="nc" id="L1128">      infoFile.close();</span>
+<span class="nc" id="L1129">      outFile.close();</span>
+    }
+
+<span class="fc" id="L1132">    qn.free();</span>
+<span class="fc" id="L1133">    return x;</span>
+
+  } // end minimize()
+
+
+
+  private void sayln() {
+<span class="fc bfc" id="L1140" title="All 2 branches covered.">    if (!quiet) {</span>
+<span class="fc" id="L1141">      log.info(&quot; &quot;);  // no argument seems to cause Redwoods to act weird (in 2016)</span>
+    }
+<span class="fc" id="L1143">  }</span>
+
+  private void sayln(String s) {
+<span class="fc bfc" id="L1146" title="All 2 branches covered.">    if (!quiet) {</span>
+<span class="fc" id="L1147">      log.info(s);</span>
+    }
+<span class="fc" id="L1149">  }</span>
+
+  // todo [cdm 2013]: Can this be sped up by returning a Pair rather than copying array?
+  private double evaluateFunction(DiffFunction dfunc, double[] x, double[] grad) {
+<span class="fc" id="L1153">    System.arraycopy(dfunc.derivativeAt(x), 0, grad, 0, grad.length);</span>
+<span class="fc" id="L1154">    fevals += 1;</span>
+<span class="fc" id="L1155">    return dfunc.valueAt(x);</span>
+  }
+
+  /** To set QNMinimizer to use L1 regularization, call this method before use,
+   *  with the boolean set true, and the appropriate lambda parameter.
+   *
+   *  @param use Whether to use Orthant-wise optimization
+   *  @param lambda The L1 regularization parameter.
+   */
+  public void useOWLQN(boolean use, double lambda) {
+<span class="nc" id="L1165">    this.useOWLQN = use;</span>
+<span class="nc" id="L1166">    this.lambdaOWL = lambda;</span>
+<span class="nc" id="L1167">  }</span>
+
+  private static double[] projectOWL(double[] x, double[] orthant, Function func) {
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">    if (func instanceof HasRegularizerParamRange) {</span>
+<span class="nc" id="L1171">      Set&lt;Integer&gt; paramRange = ((HasRegularizerParamRange)func).getRegularizerParamRange(x);</span>
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">      for (int i : paramRange) {</span>
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">        if (x[i] * orthant[i] &lt;= 0.0) {</span>
+<span class="nc" id="L1174">          x[i] = 0.0;</span>
+        }
+<span class="nc" id="L1176">      }</span>
+<span class="nc" id="L1177">    } else {</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc bnc" id="L1179" title="All 2 branches missed.">        if (x[i] * orthant[i] &lt;= 0.0) {</span>
+<span class="nc" id="L1180">          x[i] = 0.0;</span>
+        }
+      }
+    }
+<span class="nc" id="L1184">    return x;</span>
+  }
+
+  private static double l1NormOWL(double[] x, Function func) {
+<span class="nc" id="L1188">    double sum = 0.0;</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">    if (func instanceof HasRegularizerParamRange) {</span>
+<span class="nc" id="L1190">      Set&lt;Integer&gt; paramRange = ((HasRegularizerParamRange)func).getRegularizerParamRange(x);</span>
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">      for (int i : paramRange) {</span>
+<span class="nc" id="L1192">        sum += Math.abs(x[i]);</span>
+<span class="nc" id="L1193">      }</span>
+<span class="nc" id="L1194">    } else {</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">      for (double v : x) {</span>
+<span class="nc" id="L1196">        sum += Math.abs(v);</span>
+      }
+    }
+<span class="nc" id="L1199">    return sum;</span>
+  }
+
+  private static void constrainSearchDir(double[] dir, double[] fg, double[] x, Function func) {
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">    if (func instanceof HasRegularizerParamRange) {</span>
+<span class="nc" id="L1204">      Set&lt;Integer&gt; paramRange = ((HasRegularizerParamRange)func).getRegularizerParamRange(x);</span>
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">      for (int i : paramRange) {</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">        if (dir[i] * fg[i] &gt;= 0.0) {</span>
+<span class="nc" id="L1207">          dir[i] = 0.0;</span>
+        }
+<span class="nc" id="L1209">      }</span>
+<span class="nc" id="L1210">    } else {</span>
+<span class="nc bnc" id="L1211" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">        if (dir[i] * fg[i] &gt;= 0.0) {</span>
+<span class="nc" id="L1213">          dir[i] = 0.0;</span>
+        }
+      }
+    }
+<span class="nc" id="L1217">  }</span>
+
+  private double[] pseudoGradientOWL(double[] x, double[] grad, Function func) {
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">    Set&lt;Integer&gt; paramRange = func instanceof HasRegularizerParamRange ?</span>
+<span class="nc" id="L1221">        ((HasRegularizerParamRange)func).getRegularizerParamRange(x) : null ;</span>
+<span class="nc" id="L1222">    double[] newGrad = new double[grad.length];</span>
+
+    // compute pseudo gradient
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">    for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc bnc" id="L1226" title="All 4 branches missed.">      if (paramRange == null || paramRange.contains(i)) {</span>
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">        if (x[i] &lt; 0.0) {</span>
+          // Differentiable
+<span class="nc" id="L1229">          newGrad[i] = grad[i] - lambdaOWL;</span>
+<span class="nc bnc" id="L1230" title="All 2 branches missed.">        } else if (x[i] &gt; 0.0) {</span>
+          // Differentiable
+<span class="nc" id="L1232">          newGrad[i] = grad[i] + lambdaOWL;</span>
+        } else {
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">          if (grad[i] &lt; -lambdaOWL) {</span>
+            // Take the right partial derivative
+<span class="nc" id="L1236">            newGrad[i] = grad[i] + lambdaOWL;</span>
+<span class="nc bnc" id="L1237" title="All 2 branches missed.">          } else if (grad[i] &gt; lambdaOWL) {</span>
+            // Take the left partial derivative
+<span class="nc" id="L1239">            newGrad[i] = grad[i] - lambdaOWL;</span>
+          } else {
+<span class="nc" id="L1241">            newGrad[i] = 0.0;</span>
+          }
+        }
+      } else {
+<span class="nc" id="L1245">        newGrad[i] = grad[i];</span>
+      }
+    }
+
+<span class="nc" id="L1249">    return newGrad;</span>
+  }
+
+
+  /**
+   * lineSearchBacktrackOWL is the linesearch used for L1 regularization.
+   * it only satisfies sufficient descent not the Wolfe conditions.
+   */
+  private double[] lineSearchBacktrackOWL(Function func, double[] dir, double[] x,
+      double[] newX, double[] grad, double lastValue, StringBuilder sb)
+      throws MaxEvaluationsExceeded {
+
+    /* Choose the orthant for the new point. */
+<span class="nc" id="L1262">    double[] orthant = new double[x.length];</span>
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">    for (int i = 0; i &lt; orthant.length; i++) {</span>
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">      orthant[i] = (x[i] == 0.0) ? -grad[i] : x[i];</span>
+    }
+
+    // c1 can be anything between 0 and 1, exclusive (usu. 1/10 - 1/2)
+    double step, c1;
+
+    // for first few steps, we have less confidence in our initial step-size a
+    // so scale back quicker
+<span class="nc bnc" id="L1272" title="All 2 branches missed.">    if (its &lt;= 2) {</span>
+<span class="nc" id="L1273">      step = 0.1;</span>
+<span class="nc" id="L1274">      c1 = 0.1;</span>
+    } else {
+<span class="nc" id="L1276">      step = 1.0;</span>
+<span class="nc" id="L1277">      c1 = 0.1;</span>
+    }
+
+    // should be small e.g. 10^-5 ... 10^-1
+<span class="nc" id="L1281">    double c = 0.01;</span>
+
+    // c = c * normGradInDir;
+
+<span class="nc" id="L1285">    double[] newPoint = new double[3];</span>
+
+    while (true) {
+<span class="nc" id="L1288">      plusAndConstMult(x, dir, step, newX);</span>
+
+      // The current point is projected onto the orthant
+<span class="nc" id="L1291">      projectOWL(newX, orthant, func); // step (3) in Galen &amp; Gao 2007</span>
+
+      // Evaluate the function and gradient values
+<span class="nc" id="L1294">      double value  =  func.valueAt(newX);</span>
+
+      // Compute the L1 norm of the variables and add it to the object value
+<span class="nc" id="L1297">      double norm = l1NormOWL(newX, func);</span>
+<span class="nc" id="L1298">      value += norm * lambdaOWL;</span>
+
+<span class="nc" id="L1300">      newPoint[f] = value;</span>
+
+<span class="nc" id="L1302">      double dgtest = 0.0;</span>
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">      for (int i = 0;i &lt; x.length ;i++) {</span>
+<span class="nc" id="L1304">        dgtest += (newX[i] - x[i]) * grad[i];</span>
+      }
+
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">      if (newPoint[f] &lt;= lastValue + c * dgtest)</span>
+<span class="nc" id="L1308">        break;</span>
+      else {
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">        if (newPoint[f] &lt; lastValue) {</span>
+          // an improvement, but not good enough... suspicious!
+<span class="nc" id="L1312">          sb.append('!');</span>
+        } else {
+<span class="nc" id="L1314">          sb.append('.');</span>
+        }
+      }
+
+<span class="nc" id="L1318">      step = c1 * step;</span>
+<span class="nc" id="L1319">    }</span>
+
+<span class="nc" id="L1321">    newPoint[a] = step;</span>
+<span class="nc" id="L1322">    fevals += 1;</span>
+<span class="nc bnc" id="L1323" title="All 2 branches missed.">    if (fevals &gt; maxFevals) {</span>
+<span class="nc" id="L1324">      throw new MaxEvaluationsExceeded(&quot;Exceeded during linesearch() Function.&quot;);</span>
+    }
+
+<span class="nc" id="L1327">    return newPoint;</span>
+  }
+
+
+  /*
+   * lineSearchBacktrack is the original line search used for the first version
+   * of QNMinimizer. It only satisfies sufficient descent not the Wolfe
+   * conditions.
+   */
+  private double[] lineSearchBacktrack(Function func, double[] dir, double[] x,
+      double[] newX, double[] grad, double lastValue, StringBuilder sb)
+      throws MaxEvaluationsExceeded {
+
+<span class="nc" id="L1340">    double normGradInDir = ArrayMath.innerProduct(dir, grad);</span>
+<span class="nc" id="L1341">    sb.append('(').append(nf.format(normGradInDir)).append(')');</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">    if (normGradInDir &gt; 0) {</span>
+<span class="nc" id="L1343">      sayln(&quot;{WARNING--- direction of positive gradient chosen!}&quot;);</span>
+    }
+
+    // c1 can be anything between 0 and 1, exclusive (usu. 1/10 - 1/2)
+    double step, c1;
+
+    // for first few steps, we have less confidence in our initial step-size a
+    // so scale back quicker
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">    if (its &lt;= 2) {</span>
+<span class="nc" id="L1352">      step = 0.1;</span>
+<span class="nc" id="L1353">      c1 = 0.1;</span>
+    } else {
+<span class="nc" id="L1355">      step = 1.0;</span>
+<span class="nc" id="L1356">      c1 = 0.1;</span>
+    }
+
+    // should be small e.g. 10^-5 ... 10^-1
+<span class="nc" id="L1360">    double c = 0.01;</span>
+
+    // double v = func.valueAt(x);
+    // c = c * mult(grad, dir);
+<span class="nc" id="L1364">    c = c * normGradInDir;</span>
+
+<span class="nc" id="L1366">    double[] newPoint = new double[3];</span>
+
+<span class="nc bnc" id="L1368" title="All 2 branches missed.">    while ((newPoint[f] = func.valueAt((plusAndConstMult(x, dir, step, newX)))) &gt; lastValue</span>
+        + c * step) {
+<span class="nc" id="L1370">      fevals += 1;</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">      if (newPoint[f] &lt; lastValue) {</span>
+        // an improvement, but not good enough... suspicious!
+<span class="nc" id="L1373">        sb.append('!');</span>
+      } else {
+<span class="nc" id="L1375">        sb.append('.');</span>
+      }
+<span class="nc" id="L1377">      step = c1 * step;</span>
+    }
+
+<span class="nc" id="L1380">    newPoint[a] = step;</span>
+<span class="nc" id="L1381">    fevals += 1;</span>
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">    if (fevals &gt; maxFevals) {</span>
+<span class="nc" id="L1383">      throw new MaxEvaluationsExceeded(&quot;Exceeded during lineSearch() Function.&quot;);</span>
+    }
+
+<span class="nc" id="L1386">    return newPoint;</span>
+  }
+
+  private double[] lineSearchMinPack(DiffFunction dfunc, double[] dir,
+      double[] x, double[] newX, double[] grad, double f0, double tol, StringBuilder sb)
+      throws MaxEvaluationsExceeded {
+<span class="fc" id="L1392">    double xtrapf = 4.0;</span>
+<span class="fc" id="L1393">    int info = 0;</span>
+<span class="fc" id="L1394">    int infoc = 1;</span>
+<span class="fc" id="L1395">    bracketed = false;</span>
+<span class="fc" id="L1396">    boolean stage1 = true;</span>
+<span class="fc" id="L1397">    double width = aMax - aMin;</span>
+<span class="fc" id="L1398">    double width1 = 2 * width;</span>
+    // double[] wa = x;
+
+    // Should check input parameters
+
+<span class="fc" id="L1403">    double g0 = ArrayMath.innerProduct(grad, dir);</span>
+<span class="pc bpc" id="L1404" title="1 of 2 branches missed.">    if (g0 &gt;= 0) {</span>
+      // We're looking in a direction of positive gradient. This won't work.
+      // set dir = -grad
+<span class="nc bnc" id="L1407" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L1408">        dir[i] = -grad[i];</span>
+      }
+<span class="nc" id="L1410">      g0 = ArrayMath.innerProduct(grad, dir);</span>
+    }
+<span class="fc" id="L1412">    double gTest = ftol * g0;</span>
+
+<span class="fc" id="L1414">    double[] newPt = new double[3];</span>
+<span class="fc" id="L1415">    double[] bestPt = new double[3];</span>
+<span class="fc" id="L1416">    double[] endPt = new double[3];</span>
+
+<span class="fc" id="L1418">    newPt[a] = 1.0; // Always guess 1 first, this should be right if the</span>
+                    // function is &quot;nice&quot; and BFGS is working.
+
+<span class="pc bpc" id="L1421" title="1 of 4 branches missed.">    if (its == 1 &amp;&amp; noHistory) {</span>
+<span class="fc" id="L1422">      newPt[a] = 1e-1;</span>
+    }
+
+<span class="fc" id="L1425">    bestPt[a] = 0.0;</span>
+<span class="fc" id="L1426">    bestPt[f] = f0;</span>
+<span class="fc" id="L1427">    bestPt[g] = g0;</span>
+<span class="fc" id="L1428">    endPt[a] = 0.0;</span>
+<span class="fc" id="L1429">    endPt[f] = f0;</span>
+<span class="fc" id="L1430">    endPt[g] = g0;</span>
+
+    // int cnt = 0;
+
+    do {
+
+      double stpMin; // = aMin; [cdm: this initialization was always overridden below]
+      double stpMax; // = aMax; [cdm: this initialization was always overridden below]
+<span class="fc bfc" id="L1438" title="All 2 branches covered.">      if (bracketed) {</span>
+<span class="fc" id="L1439">        stpMin = Math.min(bestPt[a], endPt[a]);</span>
+<span class="fc" id="L1440">        stpMax = Math.max(bestPt[a], endPt[a]);</span>
+      } else {
+<span class="fc" id="L1442">        stpMin = bestPt[a];</span>
+<span class="fc" id="L1443">        stpMax = newPt[a] + xtrapf * (newPt[a] - bestPt[a]);</span>
+      }
+
+<span class="fc" id="L1446">      newPt[a] = Math.max(newPt[a], aMin);</span>
+<span class="fc" id="L1447">      newPt[a] = Math.min(newPt[a], aMax);</span>
+
+      // Use the best point if we have some sort of strange termination
+      // conditions.
+<span class="pc bpc" id="L1451" title="5 of 14 branches missed.">      if ((bracketed &amp;&amp; (newPt[a] &lt;= stpMin || newPt[a] &gt;= stpMax))</span>
+          || fevals &gt;= maxFevals || infoc == 0
+          || (bracketed &amp;&amp; stpMax - stpMin &lt;= tol * stpMax)) {
+        // todo: below..
+<span class="nc" id="L1455">        plusAndConstMult(x, dir, bestPt[a], newX);</span>
+<span class="nc" id="L1456">        newPt[f] = bestPt[f];</span>
+<span class="nc" id="L1457">        newPt[a] = bestPt[a];</span>
+      }
+
+<span class="fc" id="L1460">      newPt[f] = dfunc.valueAt((plusAndConstMult(x, dir, newPt[a], newX)));</span>
+<span class="fc" id="L1461">      newPt[g] = ArrayMath.innerProduct(dfunc.derivativeAt(newX), dir);</span>
+<span class="fc" id="L1462">      double fTest = f0 + newPt[a] * gTest;</span>
+<span class="fc" id="L1463">      fevals += 1;</span>
+
+      // Check and make sure everything is normal.
+<span class="pc bpc" id="L1466" title="3 of 8 branches missed.">      if ((bracketed &amp;&amp; (newPt[a] &lt;= stpMin || newPt[a] &gt;= stpMax))</span>
+          || infoc == 0) {
+<span class="nc" id="L1468">        info = 6;</span>
+<span class="nc" id="L1469">        sayln(&quot; line search failure: bracketed but no feasible found &quot;);</span>
+      }
+<span class="pc bpc" id="L1471" title="5 of 6 branches missed.">      if (newPt[a] == aMax &amp;&amp; newPt[f] &lt;= fTest &amp;&amp; newPt[g] &lt;= gTest) {</span>
+<span class="nc" id="L1472">        info = 5;</span>
+<span class="nc" id="L1473">        sayln(&quot; line search failure: sufficient decrease, but gradient is more negative &quot;);</span>
+      }
+<span class="pc bpc" id="L1475" title="5 of 6 branches missed.">      if (newPt[a] == aMin &amp;&amp; (newPt[f] &gt; fTest || newPt[g] &gt;= gTest)) {</span>
+<span class="nc" id="L1476">        info = 4;</span>
+<span class="nc" id="L1477">        sayln(&quot; line search failure: minimum step length reached &quot;);</span>
+      }
+<span class="pc bpc" id="L1479" title="1 of 2 branches missed.">      if (fevals &gt;= maxFevals) {</span>
+        // info = 3;
+<span class="nc" id="L1481">        throw new MaxEvaluationsExceeded(&quot;Exceeded during lineSearchMinPack() Function.&quot;);</span>
+      }
+<span class="pc bpc" id="L1483" title="1 of 4 branches missed.">      if (bracketed &amp;&amp; stpMax - stpMin &lt;= tol * stpMax) {</span>
+<span class="nc" id="L1484">        info = 2;</span>
+<span class="nc" id="L1485">        sayln(&quot; line search failure: interval is too small &quot;);</span>
+      }
+<span class="fc bfc" id="L1487" title="All 4 branches covered.">      if (newPt[f] &lt;= fTest &amp;&amp; Math.abs(newPt[g]) &lt;= -gtol * g0) {</span>
+<span class="fc" id="L1488">        info = 1;</span>
+      }
+
+<span class="fc bfc" id="L1491" title="All 2 branches covered.">      if (info != 0) {</span>
+<span class="fc" id="L1492">        return newPt;</span>
+      }
+
+      // this is the first stage where we look for a point that is lower and
+      // increasing
+
+<span class="pc bpc" id="L1498" title="2 of 6 branches missed.">      if (stage1 &amp;&amp; newPt[f] &lt;= fTest &amp;&amp; newPt[g] &gt;= Math.min(ftol, gtol) * g0) {</span>
+<span class="fc" id="L1499">        stage1 = false;</span>
+      }
+
+      // A modified function is used to predict the step only if
+      // we have not obtained a step for which the modified
+      // function has a non-positive function value and non-negative
+      // derivative, and if a lower function value has been
+      // obtained but the decrease is not sufficient.
+
+<span class="pc bpc" id="L1508" title="3 of 6 branches missed.">      if (stage1 &amp;&amp; newPt[f] &lt;= bestPt[f] &amp;&amp; newPt[f] &gt; fTest) {</span>
+<span class="nc" id="L1509">        newPt[f] = newPt[f] - newPt[a] * gTest;</span>
+<span class="nc" id="L1510">        bestPt[f] = bestPt[f] - bestPt[a] * gTest;</span>
+<span class="nc" id="L1511">        endPt[f] = endPt[f] - endPt[a] * gTest;</span>
+
+<span class="nc" id="L1513">        newPt[g] = newPt[g] - gTest;</span>
+<span class="nc" id="L1514">        bestPt[g] = bestPt[g] - gTest;</span>
+<span class="nc" id="L1515">        endPt[g] = endPt[g] - gTest;</span>
+
+<span class="nc" id="L1517">        infoc = getStep(/* x, dir, newX, f0, g0, */</span>
+                        newPt, bestPt, endPt, stpMin, stpMax, sb);
+
+<span class="nc" id="L1520">        bestPt[f] = bestPt[f] + bestPt[a] * gTest;</span>
+<span class="nc" id="L1521">        endPt[f] = endPt[f] + endPt[a] * gTest;</span>
+
+<span class="nc" id="L1523">        bestPt[g] = bestPt[g] + gTest;</span>
+<span class="nc" id="L1524">        endPt[g] = endPt[g] + gTest;</span>
+      } else {
+<span class="fc" id="L1526">        infoc = getStep(/* x, dir, newX, f0, g0, */</span>
+                        newPt, bestPt, endPt, stpMin, stpMax, sb);
+      }
+
+<span class="pc bpc" id="L1530" title="1 of 2 branches missed.">      if (bracketed) {</span>
+<span class="pc bpc" id="L1531" title="1 of 2 branches missed.">        if (Math.abs(endPt[a] - bestPt[a]) &gt;= p66 * width1) {</span>
+<span class="nc" id="L1532">          newPt[a] = bestPt[a] + p5 * (endPt[a] - bestPt[a]);</span>
+        }
+<span class="fc" id="L1534">        width1 = width;</span>
+<span class="fc" id="L1535">        width = Math.abs(endPt[a] - bestPt[a]);</span>
+      }
+
+<span class="fc" id="L1538">    } while (true);</span>
+  }
+
+
+  /**
+   * getStep()
+   *
+   * THIS FUNCTION IS A TRANSLATION OF A TRANSLATION OF THE MINPACK SUBROUTINE
+   * cstep(). Dianne O'Leary July 1991
+   *
+   * It was then interpreted from the implementation supplied by Andrew
+   * Bradley. Modifications have been made for this particular application.
+   *
+   * This function is used to find a new safe guarded step to be used for
+   * line search procedures.
+   *
+   */
+  private int getStep(
+        /* double[] x, double[] dir, double[] newX, double f0,
+        double g0, // None of these were used */
+        double[] newPt, double[] bestPt, double[] endPt,
+        double stpMin, double stpMax, StringBuilder sb) throws MaxEvaluationsExceeded {
+
+    // Should check for input errors.
+    int info; // = 0; always set in the if below
+    boolean bound; // = false; always set in the if below
+    double theta, gamma, p, q, r, s, stpc, stpq, stpf;
+<span class="fc" id="L1565">    double signG = newPt[g] * bestPt[g] / Math.abs(bestPt[g]);</span>
+
+    //
+    // First case. A higher function value.
+    // The minimum is bracketed. If the cubic step is closer
+    // to stx than the quadratic step, the cubic step is taken,
+    // else the average of the cubic and quadratic steps is taken.
+    //
+<span class="fc bfc" id="L1573" title="All 2 branches covered.">    if (newPt[f] &gt; bestPt[f]) {</span>
+<span class="fc" id="L1574">      info = 1;</span>
+<span class="fc" id="L1575">      bound = true;</span>
+<span class="fc" id="L1576">      theta = 3 * (bestPt[f] - newPt[f]) / (newPt[a] - bestPt[a]) + bestPt[g]</span>
+          + newPt[g];
+<span class="fc" id="L1578">      s = Math.max(Math.max(theta, newPt[g]), bestPt[g]);</span>
+<span class="fc" id="L1579">      gamma = s</span>
+<span class="fc" id="L1580">          * Math.sqrt((theta / s) * (theta / s) - (bestPt[g] / s)</span>
+              * (newPt[g] / s));
+<span class="pc bpc" id="L1582" title="1 of 2 branches missed.">      if (newPt[a] &lt; bestPt[a]) {</span>
+<span class="nc" id="L1583">        gamma = -gamma;</span>
+      }
+<span class="fc" id="L1585">      p = (gamma - bestPt[g]) + theta;</span>
+<span class="fc" id="L1586">      q = ((gamma - bestPt[g]) + gamma) + newPt[g];</span>
+<span class="fc" id="L1587">      r = p / q;</span>
+<span class="fc" id="L1588">      stpc = bestPt[a] + r * (newPt[a] - bestPt[a]);</span>
+<span class="fc" id="L1589">      stpq = bestPt[a]</span>
+          + ((bestPt[g] / ((bestPt[f] - newPt[f]) / (newPt[a] - bestPt[a]) + bestPt[g])) / 2)
+          * (newPt[a] - bestPt[a]);
+
+<span class="pc bpc" id="L1593" title="1 of 2 branches missed.">      if (Math.abs(stpc - bestPt[a]) &lt; Math.abs(stpq - bestPt[a])) {</span>
+<span class="nc" id="L1594">        stpf = stpc;</span>
+      } else {
+<span class="fc" id="L1596">        stpf = stpq;</span>
+        // stpf = stpc + (stpq - stpc)/2;
+      }
+<span class="fc" id="L1599">      bracketed = true;</span>
+<span class="pc bpc" id="L1600" title="1 of 2 branches missed.">      if (newPt[a] &lt; 0.1) {</span>
+<span class="nc" id="L1601">        stpf = 0.01 * stpf;</span>
+      }
+
+<span class="pc bpc" id="L1604" title="1 of 2 branches missed.">    } else if (signG &lt; 0.0) {</span>
+      //
+      // Second case. A lower function value and derivatives of
+      // opposite sign. The minimum is bracketed. If the cubic
+      // step is closer to stx than the quadratic (secant) step,
+      // the cubic step is taken, else the quadratic step is taken.
+      //
+<span class="fc" id="L1611">      info = 2;</span>
+<span class="fc" id="L1612">      bound = false;</span>
+<span class="fc" id="L1613">      theta = 3 * (bestPt[f] - newPt[f]) / (newPt[a] - bestPt[a]) + bestPt[g]</span>
+          + newPt[g];
+<span class="fc" id="L1615">      s = Math.max(Math.max(theta, bestPt[g]), newPt[g]);</span>
+<span class="fc" id="L1616">      gamma = s</span>
+<span class="fc" id="L1617">          * Math.sqrt((theta / s) * (theta / s) - (bestPt[g] / s)</span>
+              * (newPt[g] / s));
+<span class="pc bpc" id="L1619" title="1 of 2 branches missed.">      if (newPt[a] &gt; bestPt[a]) {</span>
+<span class="fc" id="L1620">        gamma = -gamma;</span>
+      }
+<span class="fc" id="L1622">      p = (gamma - newPt[g]) + theta;</span>
+<span class="fc" id="L1623">      q = ((gamma - newPt[g]) + gamma) + bestPt[g];</span>
+<span class="fc" id="L1624">      r = p / q;</span>
+<span class="fc" id="L1625">      stpc = newPt[a] + r * (bestPt[a] - newPt[a]);</span>
+<span class="fc" id="L1626">      stpq = newPt[a] + (newPt[g] / (newPt[g] - bestPt[g]))</span>
+          * (bestPt[a] - newPt[a]);
+<span class="pc bpc" id="L1628" title="1 of 2 branches missed.">      if (Math.abs(stpc - newPt[a]) &gt; Math.abs(stpq - newPt[a])) {</span>
+<span class="nc" id="L1629">        stpf = stpc;</span>
+      } else {
+<span class="fc" id="L1631">        stpf = stpq;</span>
+      }
+<span class="fc" id="L1633">      bracketed = true;</span>
+
+<span class="nc bnc" id="L1635" title="All 2 branches missed.">    } else if (Math.abs(newPt[g]) &lt; Math.abs(bestPt[g])) {</span>
+      //
+      // Third case. A lower function value, derivatives of the
+      // same sign, and the magnitude of the derivative decreases.
+      // The cubic step is only used if the cubic tends to infinity
+      // in the direction of the step or if the minimum of the cubic
+      // is beyond stp. Otherwise the cubic step is defined to be
+      // either stpmin or stpmax. The quadratic (secant) step is also
+      // computed and if the minimum is bracketed then the the step
+      // closest to stx is taken, else the step farthest away is taken.
+      //
+<span class="nc" id="L1646">      info = 3;</span>
+<span class="nc" id="L1647">      bound = true;</span>
+<span class="nc" id="L1648">      theta = 3 * (bestPt[f] - newPt[f]) / (newPt[a] - bestPt[a]) + bestPt[g]</span>
+          + newPt[g];
+<span class="nc" id="L1650">      s = Math.max(Math.max(theta, bestPt[g]), newPt[g]);</span>
+<span class="nc" id="L1651">      gamma = s</span>
+<span class="nc" id="L1652">          * Math.sqrt(Math.max(0.0, (theta / s) * (theta / s) - (bestPt[g] / s)</span>
+              * (newPt[g] / s)));
+<span class="nc bnc" id="L1654" title="All 2 branches missed.">      if (newPt[a] &lt; bestPt[a]) {</span>
+<span class="nc" id="L1655">        gamma = -gamma;</span>
+      }
+<span class="nc" id="L1657">      p = (gamma - bestPt[g]) + theta;</span>
+<span class="nc" id="L1658">      q = ((gamma - bestPt[g]) + gamma) + newPt[g];</span>
+<span class="nc" id="L1659">      r = p / q;</span>
+<span class="nc bnc" id="L1660" title="All 4 branches missed.">      if (r &lt; 0.0 &amp;&amp; gamma != 0.0) {</span>
+<span class="nc" id="L1661">        stpc = newPt[a] + r * (bestPt[a] - newPt[a]);</span>
+<span class="nc bnc" id="L1662" title="All 2 branches missed.">      } else if (newPt[a] &gt; bestPt[a]) {</span>
+<span class="nc" id="L1663">        stpc = stpMax;</span>
+      } else {
+<span class="nc" id="L1665">        stpc = stpMin;</span>
+      }
+<span class="nc" id="L1667">      stpq = newPt[a] + (newPt[g] / (newPt[g] - bestPt[g]))</span>
+          * (bestPt[a] - newPt[a]);
+
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">      if (bracketed) {</span>
+<span class="nc bnc" id="L1671" title="All 2 branches missed.">        if (Math.abs(newPt[a] - stpc) &lt; Math.abs(newPt[a] - stpq)) {</span>
+<span class="nc" id="L1672">          stpf = stpc;</span>
+        } else {
+<span class="nc" id="L1674">          stpf = stpq;</span>
+        }
+      } else {
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">        if (Math.abs(newPt[a] - stpc) &gt; Math.abs(newPt[a] - stpq)) {</span>
+<span class="nc" id="L1678">          stpf = stpc;</span>
+        } else {
+<span class="nc" id="L1680">          stpf = stpq;</span>
+        }
+      }
+
+    } else {
+      //
+      // Fourth case. A lower function value, derivatives of the
+      // same sign, and the magnitude of the derivative does
+      // not decrease. If the minimum is not bracketed, the step
+      // is either stpmin or stpmax, else the cubic step is taken.
+      //
+<span class="nc" id="L1691">      info = 4;</span>
+<span class="nc" id="L1692">      bound = false;</span>
+
+<span class="nc bnc" id="L1694" title="All 2 branches missed.">      if (bracketed) {</span>
+<span class="nc" id="L1695">        theta = 3 * (bestPt[f] - newPt[f]) / (newPt[a] - bestPt[a]) + bestPt[g]</span>
+            + newPt[g];
+<span class="nc" id="L1697">        s = Math.max(Math.max(theta, bestPt[g]), newPt[g]);</span>
+<span class="nc" id="L1698">        gamma = s</span>
+<span class="nc" id="L1699">            * Math.sqrt((theta / s) * (theta / s) - (bestPt[g] / s)</span>
+                * (newPt[g] / s));
+<span class="nc bnc" id="L1701" title="All 2 branches missed.">        if (newPt[a] &gt; bestPt[a]) {</span>
+<span class="nc" id="L1702">          gamma = -gamma;</span>
+        }
+<span class="nc" id="L1704">        p = (gamma - newPt[g]) + theta;</span>
+<span class="nc" id="L1705">        q = ((gamma - newPt[g]) + gamma) + bestPt[g];</span>
+<span class="nc" id="L1706">        r = p / q;</span>
+<span class="nc" id="L1707">        stpc = newPt[a] + r * (bestPt[a] - newPt[a]);</span>
+<span class="nc" id="L1708">        stpf = stpc;</span>
+<span class="nc bnc" id="L1709" title="All 2 branches missed.">      } else if (newPt[a] &gt; bestPt[a]) {</span>
+<span class="nc" id="L1710">        stpf = stpMax;</span>
+      } else {
+<span class="nc" id="L1712">        stpf = stpMin;</span>
+      }
+
+    }
+
+    //
+    // Update the interval of uncertainty. This update does not
+    // depend on the new step or the case analysis above.
+    //
+<span class="fc bfc" id="L1721" title="All 2 branches covered.">    if (newPt[f] &gt; bestPt[f]) {</span>
+<span class="fc" id="L1722">      copy(newPt, endPt);</span>
+    } else {
+<span class="pc bpc" id="L1724" title="1 of 2 branches missed.">      if (signG &lt; 0.0) {</span>
+<span class="fc" id="L1725">        copy(bestPt, endPt);</span>
+      }
+<span class="fc" id="L1727">      copy(newPt, bestPt);</span>
+    }
+
+<span class="fc" id="L1730">    sb.append(String.valueOf(info));</span>
+
+    //
+    // Compute the new step and safeguard it.
+    //
+<span class="fc" id="L1735">    stpf = Math.min(stpMax, stpf);</span>
+<span class="fc" id="L1736">    stpf = Math.max(stpMin, stpf);</span>
+<span class="fc" id="L1737">    newPt[a] = stpf;</span>
+
+<span class="pc bpc" id="L1739" title="1 of 4 branches missed.">    if (bracketed &amp;&amp; bound) {</span>
+<span class="pc bpc" id="L1740" title="1 of 2 branches missed.">      if (endPt[a] &gt; bestPt[a]) {</span>
+<span class="fc" id="L1741">        newPt[a] = Math.min(bestPt[a] + p66 * (endPt[a] - bestPt[a]), newPt[a]);</span>
+      } else {
+<span class="nc" id="L1743">        newPt[a] = Math.max(bestPt[a] + p66 * (endPt[a] - bestPt[a]), newPt[a]);</span>
+      }
+    }
+
+<span class="fc" id="L1747">    return info;</span>
+  }
+
+  private static void copy(double[] src, double[] dest) {
+<span class="fc" id="L1751">    System.arraycopy(src, 0, dest, 0, src.length);</span>
+<span class="fc" id="L1752">  }</span>
+
+  //
+  //
+  //
+  // private double[] lineSearchNocedal(DiffFunction dfunc, double[] dir,
+  // double[] x, double[] newX, double[] grad, double f0) throws
+  // MaxEvaluationsExceeded {
+  //
+  //
+  // double g0 = ArrayMath.innerProduct(grad,dir);
+  // if(g0 &gt; 0){
+  // //We're looking in a direction of positive gradient. This wont' work.
+  // //set dir = -grad
+  // plusAndConstMult(new double[x.length],grad,-1,dir);
+  // g0 = ArrayMath.innerProduct(grad,dir);
+  // }
+  // say(&quot;(&quot; + nf.format(g0) + &quot;)&quot;);
+  //
+  //
+  // double[] newPoint = new double[3];
+  // double[] prevPoint = new double[3];
+  // newPoint[a] = 1.0; //Always guess 1 first, this should be right if the
+  // function is &quot;nice&quot; and BFGS is working.
+  //
+  // //Special guess for the first iteration.
+  // if(its == 1){
+  // double aLin = - f0 / (ftol*g0);
+  // //Keep aLin within aMin and 1 for the first guess. But make a more
+  // intelligent guess based off the gradient
+  // aLin = Math.min(1.0, aLin);
+  // aLin = Math.max(aMin, aLin);
+  // newPoint[a] = aLin; // Guess low at first since we have no idea of scale at
+  // first.
+  // }
+  //
+  // prevPoint[a] = 0.0;
+  // prevPoint[f] = f0;
+  // prevPoint[g] = g0;
+  //
+  // int cnt = 0;
+  //
+  // do{
+  // newPoint[f] = dfunc.valueAt((plusAndConstMult(x, dir, newPoint[a], newX)));
+  // newPoint[g] = ArrayMath.innerProduct(dfunc.derivativeAt(newX),dir);
+  // fevals += 1;
+  //
+  // //If fNew &gt; f0 + small*aNew*g0 or fNew &gt; fPrev
+  // if( (newPoint[f] &gt; f0 + ftol*newPoint[a]*g0) || newPoint[f] &gt; prevPoint[f]
+  // ){
+  // //We know there must be a point that satisfies the strong wolfe conditions
+  // between
+  // //the previous and new point, so search between these points.
+  // say(&quot;-&gt;&quot;);
+  // return zoom(dfunc,x,dir,newX,f0,g0,prevPoint,newPoint);
+  // }
+  //
+
+  // //Here we check if the magnitude of the gradient has decreased, if
+  // //it is more negative we can expect to find a much better point
+  // //by stepping a little farther.
+  //
+  // //If |gNew| &lt; 0.9999 |g0|
+  // if( Math.abs(newPoint[g]) &lt;= -gtol*g0 ){
+  // //This is exactly what we wanted
+  // return newPoint;
+  // }
+  //
+  // if (newPoint[g] &gt; 0){
+  // //Hmm, our step is too big to be a satisfying point, lets look backwards.
+  // say(&quot;&lt;-&quot;);//say(&quot;^&quot;);
+  //
+  // return zoom(dfunc,x,dir,newX,f0,g0,newPoint,prevPoint);
+  // }
+  //
+  // //if we made it here, our function value has decreased enough, but the
+  // gradient is more negative.
+  // //we should increase our step size, since we have potential to decrease the
+  // function
+  // //value a lot more.
+  // newPoint[a] *= 10; // this is stupid, we should interpolate it. since we
+  // already have info for quadratic at least.
+  // newPoint[f] = Double.NaN;
+  // newPoint[g] = Double.NaN;
+  // cnt +=1;
+  // say(&quot;*&quot;);
+  //
+  // //if(cnt &gt; 10 || fevals &gt; maxFevals){
+  // if(fevals &gt; maxFevals){ throw new MaxEvaluationsExceeded(&quot; Exceeded during
+  // zoom() Function &quot;);}
+  //
+  // if(newPoint[a] &gt; aMax){
+  // log.info(&quot; max stepsize reached. This is unusual. &quot;);
+  // System.exit(1);
+  // }
+  //
+  // }while(true);
+  //
+  // }
+
+  // private double interpolate( double[] point0, double[] point1){
+  // double newAlpha;
+
+  // double intvl = Math.abs(point0[a] -point1[a]);
+
+  // //if(point2 == null){
+  // if( Double.isNaN(point0[g]) ){
+  // //We dont know the gradient at aLow so do bisection
+  // newAlpha = 0.5*(point0[a] + point1[a]);
+  // }else{
+  // //We know the gradient so do Quadratic 2pt
+  // newAlpha = interpolateQuadratic2pt(point0,point1);
+  // }
+
+  // //If the newAlpha is outside of the bounds just do bisection.
+
+  // if( ((newAlpha &gt; point0[a]) &amp;&amp; (newAlpha &gt; point1[a])) ||
+  // ((newAlpha &lt; point0[a]) &amp;&amp; (newAlpha &lt; point1[a])) ){
+
+  // //bisection.
+  // return 0.5*(point0[a] + point1[a]);
+  // }
+
+  // //If we aren't moving fast enough, revert to bisection.
+  // if( ((newAlpha/intvl) &lt; 1e-6) || ((newAlpha/intvl) &gt; (1- 1e-6)) ){
+  // //say(&quot;b&quot;);
+  // return 0.5*(point0[a] + point1[a]);
+  // }
+
+  // return newAlpha;
+  // }
+
+  /*
+   * private double interpolate( List&lt;double[]&gt; pointList ,) {
+   *
+   * int n = pointList.size(); double newAlpha = 0.0;
+   *
+   * if( n &gt; 2){ newAlpha =
+   * interpolateCubic(pointList.get(0),pointList.get(n-2),pointList.get(n-1));
+   * }else if(n == 2){
+   *
+   * //Only have two points
+   *
+   * if( Double.isNaN(pointList.get(0)[gInd]) ){ // We don't know the gradient at
+   * aLow so do bisection newAlpha = 0.5*(pointList.get(0)[aInd] +
+   * pointList.get(1)[aInd]); }else{ // We know the gradient so do Quadratic 2pt
+   * newAlpha = interpolateQuadratic2pt(pointList.get(0),pointList.get(1)); }
+   *
+   * }else { //not enough info to interpolate with!
+   * log.info(&quot;QNMinimizer:interpolate() attempt to interpolate with
+   * only one point.&quot;); System.exit(1); }
+   *
+   * return newAlpha;
+   *  }
+   */
+
+  // Returns the minimizer of a quadratic running through point (a0,f0) with
+  // derivative g0 and passing through (a1,f1).
+  // private double interpolateQuadratic2pt(double[] pt0, double[] pt1){
+  // if( Double.isNaN(pt0[g]) ){
+  // log.info(&quot;QNMinimizer:interpolateQuadratic - Gradient at point
+  // zero doesn't exist, interpolation failed&quot;);
+  // System.exit(1);
+  // }
+  // double aDif = pt1[a]-pt0[a];
+  // double fDif = pt1[f]-pt0[f];
+  // return (- pt0[g]*aDif*aDif)/(2*(fDif-pt0[g]*aDif)) + pt0[a];
+  // }
+  // private double interpolateCubic(double[] pt0, double[] pt1, double[] pt2){
+  // double a0 = pt1[a]-pt0[a];
+  // double a1 = pt2[a]-pt0[a];
+  // double f0 = pt1[f]-pt0[f];
+  // double f1 = pt2[f]-pt0[f];
+  // double g0 = pt0[g];
+  // double[][] mat = new double[2][2];
+  // double[] rhs = new double[2];
+  // double[] coefs = new double[2];
+  // double scale = 1/(a0*a0*a1*a1*(a1-a0));
+  // mat[0][0] = a0*a0;
+  // mat[0][1] = -a1*a1;
+  // mat[1][0] = -a0*a0*a0;
+  // mat[1][1] = a1*a1*a1;
+  // rhs[0] = f1 - g0*a1;
+  // rhs[1] = f0 - g0*a0;
+  // for(int i=0;i&lt;2;i++){
+  // for(int j=0;j&lt;2;j++){
+  // coefs[i] += mat[i][j]*rhs[j];
+  // }
+  // coefs[i] *= scale;
+  // }
+  // double a = coefs[0];
+  // double b = coefs[1];
+  // double root = b*b-3*a*g0;
+  // if( root &lt; 0 ){
+  // log.info(&quot;QNminimizer:interpolateCubic - interpolate failed&quot;);
+  // System.exit(1);
+  // }
+  // return (-b+Math.sqrt(root))/(3*a);
+  // }
+
+  // private double[] zoom(DiffFunction dfunc, double[] x, double[] dir,
+  // double[] newX, double f0, double g0, double[] bestPoint, double[] endPoint)
+  // throws MaxEvaluationsExceeded {
+  // return zoom(dfunc,x, dir, newX,f0,g0, bestPoint, endPoint,null);
+  // }
+
+  // private double[] zoom(DiffFunction dfunc, double[] x, double[] dir,
+  // double[] newX, double f0, double g0, double[] bestPt, double[] endPt,
+  // double[] newPt) throws MaxEvaluationsExceeded {
+  // double width = Math.abs(bestPt[a] - endPt[a]);
+  // double reduction = 1.0;
+  // double p66 = 0.66;
+  // int info = 0;
+  // double stpf;
+  // double theta,gamma,s,p,q,r,stpc,stpq;
+  // boolean bound = false;
+  // boolean bracketed = false;
+  // int cnt = 1;
+  // if(newPt == null){ newPt = new double[3]; newPt[a] =
+  // interpolate(bestPt,endPt);}// quadratic interp
+
+  // do{
+  // say(&quot;.&quot;);
+  // newPt[f] = dfunc.valueAt((plusAndConstMult(x, dir, newPt[a] , newX)));
+  // newPt[g] = ArrayMath.innerProduct(dfunc.derivativeAt(newX),dir);
+  // fevals += 1;
+  // //If we have satisfied Wolfe...
+  // //fNew &lt;= f0 + small*aNew*g0
+  // //|gNew| &lt;= 0.9999*|g0|
+  // //return the point.
+  // if( (newPt[f] &lt;= f0 + ftol*newPt[a]*g0) &amp;&amp; Math.abs(newPt[g]) &lt;= -gtol*g0
+  // ){
+  // //Sweet, we found a point that satisfies the strong wolfe conditions!!!
+  // lets return it.
+  // return newPt;
+  // }else{
+
+  // double signG = newPt[g]*bestPt[g]/Math.abs(bestPt[g]);
+  // //Our new point has a higher function value
+  // if( newPt[f] &gt; bestPt[f]){
+  // info = 1;
+  // bound = true;
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,newPt[g]), bestPt[g]);
+  // gamma = s*Math.sqrt( (theta/s)*(theta/s) - (bestPt[g]/s)*(newPt[g]/s) );
+  // if (newPt[a] &lt; bestPt[a]){
+  // gamma = -gamma;
+  // }
+  // p = (gamma - bestPt[g]) + theta;
+  // q = ((gamma-bestPt[g]) + gamma) + newPt[g];
+  // r = p/q;
+  // stpc = bestPt[a] + r*(newPt[a] - bestPt[a]);
+  // stpq = bestPt[a] +
+  // ((bestPt[g]/((bestPt[f]-newPt[f])/(newPt[a]-bestPt[a])+bestPt[g]))/2)*(newPt[a]
+  // - bestPt[a]);
+  // if ( Math.abs(stpc-bestPt[a]) &lt; Math.abs(stpq - bestPt[a] )){
+  // stpf = stpc;
+  // } else{
+  // stpf = stpq;
+  // //stpf = stpc + (stpq - stpc)/2;
+  // }
+  // bracketed = true;
+  // if (newPt[a] &lt; 0.1){
+  // stpf = 0.01*stpf;
+  // }
+
+  // } else if (signG &lt; 0.0){
+  // info = 2;
+  // bound = false;
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,bestPt[g]),newPt[g]);
+  // gamma = s*Math.sqrt((theta/s)*(theta/s) - (bestPt[g]/s)*(newPt[g]/s));
+  // if (newPt[a] &gt; bestPt[a]) {
+  // gamma = -gamma;
+  // }
+  // p = (gamma - newPt[g]) + theta;
+  // q = ((gamma - newPt[g]) + gamma) + bestPt[g];
+  // r = p/q;
+  // stpc = newPt[a] + r*(bestPt[a] - newPt[a]);
+  // stpq = newPt[a] + (newPt[g]/(newPt[g]-bestPt[g]))*(bestPt[a] - newPt[a]);
+  // if (Math.abs(stpc-newPt[a]) &gt; Math.abs(stpq-newPt[a])){
+  // stpf = stpc;
+  // } else {
+  // stpf = stpq;
+  // }
+  // bracketed = true;
+  // } else if ( Math.abs(newPt[g]) &lt; Math.abs(bestPt[g])){
+  // info = 3;
+  // bound = true;
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,bestPt[g]),newPt[g]);
+  // gamma = s*Math.sqrt(Math.max(0.0,(theta/s)*(theta/s) -
+  // (bestPt[g]/s)*(newPt[g]/s)));
+  // if (newPt[a] &lt; bestPt[a]){
+  // gamma = -gamma;
+  // }
+  // p = (gamma - bestPt[g]) + theta;
+  // q = ((gamma-bestPt[g]) + gamma) + newPt[g];
+  // r = p/q;
+  // if (r &lt; 0.0 &amp;&amp; gamma != 0.0){
+  // stpc = newPt[a] + r*(bestPt[a] - newPt[a]);
+  // } else if (newPt[a] &gt; bestPt[a]){
+  // stpc = aMax;
+  // } else{
+  // stpc = aMin;
+  // }
+  // stpq = newPt[a] + (newPt[g]/(newPt[g]-bestPt[g]))*(bestPt[a] - newPt[a]);
+  // if(bracketed){
+  // if (Math.abs(newPt[a]-stpc) &lt; Math.abs(newPt[a]-stpq)){
+  // stpf = stpc;
+  // } else {
+  // stpf = stpq;
+  // }
+  // } else{
+  // if (Math.abs(newPt[a]-stpc) &gt; Math.abs(newPt[a]-stpq)){
+  // stpf = stpc;
+  // } else {
+  // stpf = stpq;
+  // }
+  // }
+
+  // }else{
+  // info = 4;
+  // bound = false;
+  // if (bracketed){
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,bestPt[g]),newPt[g]);
+  // gamma = s*Math.sqrt((theta/s)*(theta/s) - (bestPt[g]/s)*(newPt[g]/s));
+  // if (newPt[a] &gt; bestPt[a]) {
+  // gamma = -gamma;
+  // }
+  // p = (gamma - newPt[g]) + theta;
+  // q = ((gamma - newPt[g]) + gamma) + bestPt[g];
+  // r = p/q;
+  // stpc = newPt[a] + r*(bestPt[a] - newPt[a]);
+  // stpf = stpc;
+  // }else if( newPt[a] &gt; bestPt[a]){
+  // stpf = aMax;
+  // } else {
+  // stpf = aMin;
+  // }
+  // }
+  // //Reduce the interval of uncertainty
+  // if (newPt[f] &gt; bestPt[f]) {
+  // copy(newPt,endPt);
+  // }else{
+  // if (signG &lt; 0.0){
+  // copy(bestPt,endPt);
+  // }
+  // copy(newPt,bestPt);
+  // }
+  // say(&quot;&quot; + info );
+  // newPt[a] = stpf;
+  // if(bracketed &amp;&amp; bound){
+  // if (endPt[a] &gt; bestPt[a]){
+  // newPt[a] = Math.min(bestPt[a]+p66*(endPt[a]-bestPt[a]),newPt[a]);
+  // }else{
+  // newPt[a] = Math.max(bestPt[a]+p66*(endPt[a]-bestPt[a]),newPt[a]);
+  // }
+  // }
+  // }
+  // //Check to see if the step has reached an extreme.
+  // newPt[a] = Math.max(aMin, newPt[a]);
+  // newPt[a] = Math.min(aMax,newPt[a]);
+  // if( newPt[a] == aMin || newPt[a] == aMax){
+  // return newPt;
+  // }
+  // cnt +=1;
+  // if(fevals &gt; maxFevals){
+  // throw new MaxEvaluationsExceeded(&quot; Exceeded during zoom() Function &quot;);}
+  // }while(true);
+  // }
+  // private double[] zoom2(DiffFunction dfunc, double[] x, double[] dir,
+  // double[] newX, double f0, double g0, double[] bestPoint, double[] endPoint)
+  // throws MaxEvaluationsExceeded {
+  //
+  // double[] newPoint = new double[3];
+  // double width = Math.abs(bestPoint[a] - endPoint[a]);
+  // double reduction = 0.0;
+  //
+  // int cnt = 1;
+  //
+  // //make sure the interval reduces enough.
+  // //if(reduction &gt;= 0.66){
+  // //say(&quot; |&quot; + nf.format(reduction)+&quot;| &quot;);
+  // //newPoint[a] = 0.5*(bestPoint[a]+endPoint[a]);
+  // //} else{
+  // newPoint[a] = interpolate(bestPoint,endPoint);// quadratic interp
+  // //}
+  //
+  // do{
+  // //Check to see if the step has reached an extreme.
+  // newPoint[a] = Math.max(aMin, newPoint[a]);
+  // newPoint[a] = Math.min(aMax,newPoint[a]);
+  //
+  // newPoint[f] = dfunc.valueAt((plusAndConstMult(x, dir, newPoint[a] ,
+  // newX)));
+  // newPoint[g] = ArrayMath.innerProduct(dfunc.derivativeAt(newX),dir);
+  // fevals += 1;
+  //
+  // //fNew &gt; f0 + small*aNew*g0 or fNew &gt; fLow
+  // if( (newPoint[f] &gt; f0 + ftol*newPoint[a]*g0) || newPoint[f] &gt; bestPoint[f]
+  // ){
+  // //Our new point didn't beat the best point, so just reduce the interval
+  // copy(newPoint,endPoint);
+  // say(&quot;.&quot;);//say(&quot;l&quot;);
+  // }else{
+  //
+  // //if |gNew| &lt;= 0.9999*|g0| If gNew is slightly smaller than g0
+  // if( Math.abs(newPoint[g]) &lt;= -gtol*g0 ){
+  // //Sweet, we found a point that satisfies the strong wolfe conditions!!!
+  // lets return it.
+  // return newPoint;
+  // }
+  //
+  // //If we made it this far, we've found a point that has satisfied descent,
+  // but hasn't satsified
+  // //the decrease in gradient. if the new gradient is telling us &gt;0 we need to
+  // look behind us
+  // //if the new gradient is negative still we can increase the step.
+  // if(newPoint[g]*(endPoint[a] - bestPoint[a] ) &gt;= 0){
+  // //Get going the right way.
+  // say(&quot;.&quot;);//say(&quot;f&quot;);
+  // copy(bestPoint,endPoint);
+  // }
+  //
+  // if( (Math.abs(newPoint[a]-bestPoint[a]) &lt; 1e-6) ||
+  // (Math.abs(newPoint[a]-endPoint[a]) &lt; 1e-6) ){
+  // //Not moving fast enough.
+  // sayln(&quot;had to improvise a bit&quot;);
+  // newPoint[a] = 0.5*(bestPoint[a] + endPoint[a]);
+  // }
+  //
+  // say(&quot;.&quot;);//say(&quot;r&quot;);
+  // copy(newPoint,bestPoint);
+  // }
+  //
+  //
+  // if( newPoint[a] == aMin || newPoint[a] == aMax){
+  // return newPoint;
+  // }
+  //
+  // reduction = Math.abs(bestPoint[a] - endPoint[a]) / width;
+  // width = Math.abs(bestPoint[a] - endPoint[a]);
+  //
+  // cnt +=1;
+  //
+  //
+  // //if(Math.abs(bestPoint[a] -endPoint[a]) &lt; 1e-12 ){
+  // //sayln();
+  // //sayln(&quot;!!!!!!!!!!!!!!!!!!&quot;);
+  // //sayln(&quot;points are too close&quot;);
+  // //sayln(&quot;!!!!!!!!!!!!!!!!!!&quot;);
+  // //sayln(&quot;f0 &quot; + nf.format(f0));
+  // //sayln(&quot;f0+crap &quot; + nf.format(f0 + cVal*bestPoint[a]*g0));
+  // //sayln(&quot;g0 &quot; + nf.format(g0));
+  // //sayln(&quot;ptLow&quot;);
+  // //printPt(bestPoint);
+  // //sayln();
+  // //sayln(&quot;ptHigh&quot;);
+  // //printPt(endPoint);
+  // //sayln();
+  //
+  // //DiffFunctionTester.test(dfunc, x,1e-4);
+  // //System.exit(1);
+  // ////return dfunc.valueAt((plusAndConstMult(x, dir, aMin , newX)));
+  // //}
+  //
+  // //if( (cnt &gt; 20) ){
+  //
+  // //sayln(&quot;!!!!!!!!!!!!!!!!!!&quot;);
+  // //sayln(&quot;! &quot; + cnt + &quot; iterations. I think we're out of luck&quot;);
+  // //sayln(&quot;!!!!!!!!!!!!!!!!!!&quot;);
+  // //sayln(&quot;f0&quot; + nf.format(f0));
+  // //sayln(&quot;f0+crap&quot; + nf.format(f0 + cVal*bestPoint[a]*g0));
+  // //sayln(&quot;g0 &quot; + nf.format(g0));
+  // //sayln(&quot;bestPoint&quot;);
+  // //printPt(bestPoint);
+  // //sayln();
+  // //sayln(&quot;ptHigh&quot;);
+  // //printPt(endPoint);
+  // //sayln();
+  //
+  //
+  //
+  // ////if( cnt &gt; 25 || fevals &gt; maxFevals){
+  // ////log.info(&quot;Max evaluations exceeded.&quot;);
+  // ////System.exit(1);
+  // ////return dfunc.valueAt((plusAndConstMult(x, dir, aMin , newX)));
+  // ////}
+  // //}
+  //
+  // if(fevals &gt; maxFevals){ throw new MaxEvaluationsExceeded(&quot; Exceeded during
+  // zoom() Function &quot;);}
+  //
+  // }while(true);
+  //
+  // }
+  //
+  // private double lineSearchNocedal(DiffFunction dfunc, double[] dir, double[]
+  // x, double[] newX, double[] grad, double f0, int maxEvals){
+  //
+  // boolean bracketed = false;
+  // boolean stage1 = false;
+  // double width = aMax - aMin;
+  // double width1 = 2*width;
+  // double stepMin = 0.0;
+  // double stepMax = 0.0;
+  // double xtrapf = 4.0;
+  // int nFevals = 0;
+  // double TOL = 1e-4;
+  // double X_TOL = 1e-8;
+  // int info = 0;
+  // int infoc = 1;
+  //
+  // double g0 = ArrayMath.innerProduct(grad,dir);
+  // if(g0 &gt; 0){
+  // //We're looking in a direction of positive gradient. This wont' work.
+  // //set dir = -grad
+  // plusAndConstMult(new double[x.length],grad,-1,dir);
+  // g0 = ArrayMath.innerProduct(grad,dir);
+  // log.info(&quot;Searching in direction of positive gradient.&quot;);
+  // }
+  // say(&quot;(&quot; + nf.format(g0) + &quot;)&quot;);
+  //
+  //
+  // double[] newPt = new double[3];
+  // double[] bestPt = new double[3];
+  // double[] endPt = new double[3];
+  //
+  // newPt[a] = 1.0; //Always guess 1 first, this should be right if the
+  // function is &quot;nice&quot; and BFGS is working.
+  //
+  // if(its == 1){
+  // newPt[a] = 1e-6; // Guess low at first since we have no idea of scale.
+  // }
+  //
+  // bestPt[a] = 0.0;
+  // bestPt[f] = f0;
+  // bestPt[g] = g0;
+  //
+  // endPt[a] = 0.0;
+  // endPt[f] = f0;
+  // endPt[g] = g0;
+  //
+  // int cnt = 0;
+  //
+  // do{
+  // //Determine the max and min step size given what we know already.
+  // if(bracketed){
+  // stepMin = Math.min(bestPt[a], endPt[a]);
+  // stepMax = Math.max(bestPt[a], endPt[a]);
+  // } else{
+  // stepMin = bestPt[a];
+  // stepMax = newPt[a] + xtrapf*(newPt[a] - bestPt[a]);
+  // }
+  //
+  // //Make sure our next guess is within the bounds
+  // newPt[a] = Math.max(newPt[a], stepMin);
+  // newPt[a] = Math.min(newPt[a], stepMax);
+  //
+  // if( (bracketed &amp;&amp; (newPt[a] &lt;= stepMin || newPt[a] &gt;= stepMax) )
+  // || nFevals &gt; maxEvals || (bracketed &amp; (stepMax-stepMin) &lt;= TOL*stepMax)){
+  // log.info(&quot;Linesearch for QN, Need to make srue that newX is set
+  // before returning bestPt. -akleeman&quot;);
+  // System.exit(1);
+  // return bestPt[f];
+  // }
+  //
+  //
+  // newPt[f] = dfunc.valueAt((plusAndConstMult(x, dir, newPt[a], newX)));
+  // newPt[g] = ArrayMath.innerProduct(dfunc.derivativeAt(newX),dir);
+  // nFevals += 1;
+  //
+  // double fTest = f0 + newPt[a]*g0;
+  //
+  // log.info(&quot;fTest &quot; + fTest + &quot; new&quot; + newPt[a] + &quot; newf&quot; +
+  // newPt[f] + &quot; newg&quot; + newPt[g] );
+  //
+  // if( ( bracketed &amp;&amp; (newPt[a] &lt;= stepMin | newPt[a] &gt;= stepMax )) || infoc
+  // == 0){
+  // info = 6;
+  // }
+  //
+  // if( newPt[a] == stepMax &amp;&amp; ( newPt[f] &lt;= fTest || newPt[g] &gt;= ftol*g0 )){
+  // info = 5;
+  // }
+  //
+  // if( (newPt[a] == stepMin &amp;&amp; ( newPt[f] &gt; fTest || newPt[g] &gt;= ftol*g0 ) )){
+  // info = 4;
+  // }
+  //
+  // if( (nFevals &gt;= maxEvals)){
+  // info = 3;
+  // }
+  //
+  // if( bracketed &amp;&amp; stepMax-stepMin &lt;= X_TOL*stepMax){
+  // info = 2;
+  // }
+  //
+  // if( (newPt[f] &lt;= fTest) &amp;&amp; (Math.abs(newPt[g]) &lt;= - gtol*g0) ){
+  // info = 1;
+  // }
+  //
+  // if(info != 0){
+  // return newPt[f];
+  // }
+  //
+  // if(stage1 &amp;&amp; newPt[f]&lt; fTest &amp;&amp; newPt[g] &gt;= ftol*g0){
+  // stage1 = false;
+  // }
+  //
+  //
+  // if( stage1 &amp;&amp; f&lt;= bestPt[f] &amp;&amp; f &gt; fTest){
+  //
+  // double[] newPtMod = new double[3];
+  // double[] bestPtMod = new double[3];
+  // double[] endPtMod = new double[3];
+  //
+  // newPtMod[f] = newPt[f] - newPt[a]*ftol*g0;
+  // newPtMod[g] = newPt[g] - ftol*g0;
+  // bestPtMod[f] = bestPt[f] - bestPt[a]*ftol*g0;
+  // bestPtMod[g] = bestPt[g] - ftol*g0;
+  // endPtMod[f] = endPt[f] - endPt[a]*ftol*g0;
+  // endPtMod[g] = endPt[g] - ftol*g0;
+  //
+  // //this.cstep(newPtMod, bestPtMod, endPtMod, bracketed);
+  //
+  // bestPt[f] = bestPtMod[f] + bestPt[a]*ftol*g0;
+  // bestPt[g] = bestPtMod[g] + ftol*g0;
+  // endPt[f] = endPtMod[f] + endPt[a]*ftol*g0;
+  // endPt[g] = endPtMod[g] + ftol*g0;
+  //
+  // }else{
+  // //this.cstep(newPt, bestPt, endPt, bracketed);
+  // }
+  //
+  // double p66 = 0.66;
+  // double p5 = 0.5;
+  //
+  // if(bracketed){
+  // if ( Math.abs(endPt[a] - bestPt[a]) &gt;= p66*width1){
+  // newPt[a] = bestPt[a] + p5*(endPt[a]-bestPt[a]);
+  // }
+  // width1 = width;
+  // width = Math.abs(endPt[a]-bestPt[a]);
+  // }
+  //
+  //
+  //
+  // }while(true);
+  //
+  // }
+  //
+  // private double cstepBackup( double[] newPt, double[] bestPt, double[]
+  // endPt, boolean bracketed ){
+  //
+  // double p66 = 0.66;
+  // int info = 0;
+  // double stpf;
+  // double theta,gamma,s,p,q,r,stpc,stpq;
+  // boolean bound = false;
+  //
+  // double signG = newPt[g]*bestPt[g]/Math.abs(bestPt[g]);
+  //
+  //
+  // //Our new point has a higher function value
+  // if( newPt[f] &gt; bestPt[f]){
+  // info = 1;
+  // bound = true;
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,newPt[g]), bestPt[g]);
+  // gamma = s*Math.sqrt( (theta/s)*(theta/s) - (bestPt[g]/s)*(newPt[g]/s) );
+  // if (newPt[a] &lt; bestPt[a]){
+  // gamma = -gamma;
+  // }
+  // p = (gamma - bestPt[g]) + theta;
+  // q = ((gamma-bestPt[g]) + gamma) + newPt[g];
+  // r = p/q;
+  // stpc = bestPt[a] + r*(newPt[a] - bestPt[a]);
+  // stpq = bestPt[a] +
+  // ((bestPt[g]/((bestPt[f]-newPt[f])/(newPt[a]-bestPt[a])+bestPt[g]))/2)*(newPt[a]
+  // - bestPt[a]);
+  //
+  // if ( Math.abs(stpc-bestPt[a]) &lt; Math.abs(stpq - bestPt[a] )){
+  // stpf = stpc;
+  // } else{
+  // stpf = stpc + (stpq - stpc)/2;
+  // }
+  // bracketed = true;
+  //
+  // } else if (signG &lt; 0.0){
+  //
+  // info = 2;
+  // bound = false;
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,bestPt[g]),newPt[g]);
+  // gamma = s*Math.sqrt((theta/s)*(theta/s) - (bestPt[g]/s)*(newPt[g]/s));
+  // if (newPt[a] &gt; bestPt[a]) {
+  // gamma = -gamma;
+  // }
+  // p = (gamma - newPt[g]) + theta;
+  // q = ((gamma - newPt[g]) + gamma) + bestPt[g];
+  // r = p/q;
+  // stpc = newPt[a] + r*(bestPt[a] - newPt[a]);
+  // stpq = newPt[a] + (newPt[g]/(newPt[g]-bestPt[g]))*(bestPt[a] - newPt[a]);
+  // if (Math.abs(stpc-newPt[a]) &gt; Math.abs(stpq-newPt[a])){
+  // stpf = stpc;
+  // } else {
+  // stpf = stpq;
+  // }
+  // bracketed = true;
+  // } else if ( Math.abs(newPt[g]) &lt; Math.abs(bestPt[g])){
+  // info = 3;
+  // bound = true;
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,bestPt[g]),newPt[g]);
+  // gamma = s*Math.sqrt(Math.max(0.0,(theta/s)*(theta/s) -
+  // (bestPt[g]/s)*(newPt[g]/s)));
+  // if (newPt[a] &lt; bestPt[a]){
+  // gamma = -gamma;
+  // }
+  // p = (gamma - bestPt[g]) + theta;
+  // q = ((gamma-bestPt[g]) + gamma) + newPt[g];
+  // r = p/q;
+  // if (r &lt; 0.0 &amp;&amp; gamma != 0.0){
+  // stpc = newPt[a] + r*(bestPt[a] - newPt[a]);
+  // } else if (newPt[a] &gt; bestPt[a]){
+  // stpc = aMax;
+  // } else{
+  // stpc = aMin;
+  // }
+  // stpq = newPt[a] + (newPt[g]/(newPt[g]-bestPt[g]))*(bestPt[a] - newPt[a]);
+  // if (bracketed){
+  // if (Math.abs(newPt[a]-stpc) &lt; Math.abs(newPt[a]-stpq)){
+  // stpf = stpc;
+  // } else {
+  // stpf = stpq;
+  // }
+  // } else {
+  // if (Math.abs(newPt[a]-stpc) &gt; Math.abs(newPt[a]-stpq)){
+  // log.info(&quot;modified to take only quad&quot;);
+  // stpf = stpq;
+  // }else{
+  // stpf = stpq;
+  // }
+  // }
+  //
+  //
+  // }else{
+  // info = 4;
+  // bound = false;
+  //
+  // if(bracketed){
+  // theta = 3*(bestPt[f] - newPt[f])/(newPt[a] - bestPt[a]) + bestPt[g] +
+  // newPt[g];
+  // s = Math.max(Math.max(theta,bestPt[g]),newPt[g]);
+  // gamma = s*Math.sqrt((theta/s)*(theta/s) - (bestPt[g]/s)*(newPt[g]/s));
+  // if (newPt[a] &gt; bestPt[a]) {
+  // gamma = -gamma;
+  // }
+  // p = (gamma - newPt[g]) + theta;
+  // q = ((gamma - newPt[g]) + gamma) + bestPt[g];
+  // r = p/q;
+  // stpc = newPt[a] + r*(bestPt[a] - newPt[a]);
+  // stpf = stpc;
+  // }else if (newPt[a] &gt; bestPt[a]){
+  // stpf = aMax;
+  // }else{
+  // stpf = aMin;
+  // }
+  //
+  // }
+  //
+  //
+  // if (newPt[f] &gt; bestPt[f]) {
+  // copy(newPt,endPt);
+  // }else{
+  // if (signG &lt; 0.0){
+  // copy(bestPt,endPt);
+  // }
+  // copy(newPt,bestPt);
+  // }
+  //
+  // stpf = Math.min(aMax,stpf);
+  // stpf = Math.max(aMin,stpf);
+  // newPt[a] = stpf;
+  // if (bracketed &amp; bound){
+  // if (endPt[a] &gt; bestPt[a]){
+  // newPt[a] = Math.min(bestPt[a]+p66*(endPt[a]-bestPt[a]),newPt[a]);
+  // }else{
+  // newPt[a] = Math.max(bestPt[a]+p66*(endPt[a]-bestPt[a]),newPt[a]);
+  // }
+  // }
+  //
+  // //newPt[f] =
+  // log.info(&quot;cstep &quot; + nf.format(newPt[a]) + &quot; info &quot; + info);
+  // return newPt[a];
+  //
+  // }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,2320 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NERFeatureFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">NERFeatureFactory.java</span></div><h1>NERFeatureFactory.java</h1><pre class="source lang-java linenums">// NERFeatureFactory -- features for a probabilistic Named Entity Recognizer
+// Copyright (c) 2002-2008 Leland Stanford Junior University
+// Additional features (c) 2003 The University of Edinburgh
+//
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    Support/Questions: java-nlp-user@lists.stanford.edu
+//    Licensing: java-nlp-support@lists.stanford.edu
+//    http://nlp.stanford.edu/downloads/crf-classifier.shtml
+
+package edu.stanford.nlp.ie;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.CoreLabel.GenericAnnotation;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.process.WordShapeClassifier;
+import edu.stanford.nlp.sequences.Clique;
+import edu.stanford.nlp.sequences.CoNLLDocumentReaderAndWriter;
+import edu.stanford.nlp.sequences.FeatureFactory;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.trees.international.pennchinese.RadicalMap;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.PaddedList;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+/**
+ * Features for Named Entity Recognition.  The code here creates the features
+ * by processing Lists of CoreLabels.
+ * Look at {@link SeqClassifierFlags} to see where the flags are set for
+ * what options to use for what flags.
+ * &lt;p&gt;
+ * To add a new feature extractor, you should do the following:
+ * &lt;ol&gt;
+ * &lt;li&gt;Add a variable (boolean, int, String, etc. as appropriate) to
+ *     SeqClassifierFlags to mark if the new extractor is turned on or
+ *     its value, etc. Add it at the &lt;i&gt;bottom&lt;/i&gt; of the list of variables
+ *     currently in the class (this avoids problems with older serialized
+ *     files breaking). Make the default value of the variable false/null/0
+ *     (this is again for backwards compatibility).&lt;/li&gt;
+ * &lt;li&gt;Add a clause to the big if/then/else of setProperties(Properties) in
+ *     SeqClassifierFlags.  Unless it is a macro option, make the option name
+ *     the same as the variable name used in step 1.&lt;/li&gt;
+ * &lt;li&gt;Add code to NERFeatureFactory for this feature. First decide which
+ *     classes (hidden states) are involved in the feature.  If only the
+ *     current class, you add the feature extractor to the
+ *     {@code featuresC} code, if both the current and previous class,
+ *     then {@code featuresCpC}, etc.&lt;/li&gt;
+ * &lt;/ol&gt;
+ * &lt;p&gt; Parameters can be defined using a Properties file
+ * (specified on the command-line with {@code -prop} &lt;i&gt;propFile&lt;/i&gt;),
+ * or directly on the command line. The following properties are recognized:
+ * &lt;/p&gt;
+ * &lt;table border=&quot;1&quot;&gt;
+ * &lt;tr&gt;&lt;td&gt;&lt;b&gt;Property Name&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Type&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Default Value&lt;/b&gt;&lt;/td&gt;&lt;td&gt;&lt;b&gt;Description&lt;/b&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; loadClassifier &lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path to serialized classifier to load&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; loadAuxClassifier &lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path to auxiliary classifier to load.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; serializeTo&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path to serialize classifier to&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; trainFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path of file to use as training data&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; testFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path of file to use as training data&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; map&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;see below&lt;/td&gt;&lt;td&gt;This applies at training time or if testing on tab-separated column data.  It says what is in each column.  It doesn't apply when running on plain text data.  The simplest scenario for training is having words and classes in two column.  word=0,answer=1 is the default if conllNoTags is specified; otherwise word=0,tag=1,answer=2 is the default.  But you can add other columns, such as for a part-of-speech tag, presences in a lexicon, etc.  That would only be useful at runtime if you have part-of-speech information or whatever available and are passing it in with the tokens (that is, you can pass to classify CoreLabel tokens with additional fields stored in them).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useWord&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;true&lt;/td&gt;&lt;td&gt;Gives you feature for w&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useBinnedLength&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, treat as a sequence of comma separated integer bounds, where items above the previous bound up to the next bound are binned Len-&lt;i&gt;range&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from letter n-grams, i.e., substrings of the word&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; lowercaseNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from letter n-grams only lowercase&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; dehyphenateNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Remove hyphens before making features from letter n-grams&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; conjoinShapeNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Conjoin word shape and n-gram features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNeighborNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use letter n-grams for the previous and current words in the CpC clique.  This feature helps languages such as Chinese, but not so much for English&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useMoreNeighborNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use letter n-grams for the previous and next words in the C clique.  This feature helps languages such as Chinese, but not so much for English&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; usePrev&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you feature for (pw,c), and together with other options enables other previous features, such as (pt,c) [with useTags)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNext&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you feature for (nw,c), and together with other options enables other next features, such as (nt,c) [with useTags)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTags&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you features for (t,c), (pt,c) [if usePrev], (nt,c) [if useNext]&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useWordPairs&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you
+ * features for (pw, w, c) and (w, nw, c)&lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; useGazettes&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, use gazette features (defined by other flags)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; gazette&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;The value can be one or more filenames (names separated by a comma, semicolon or space).
+ * If provided gazettes are loaded from these files.  Each line should be an entity class name, followed by whitespace followed by an entity (which might be a phrase of several tokens with a single space between words).
+ * Giving this property turns on useGazettes, so you normally don't need to specify it (but can use it to turn off gazettes specified in a properties file).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; sloppyGazette&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, a gazette feature fires when any token of a gazette entry matches&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; cleanGazette&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, a gazette feature fires when all tokens of a gazette entry match&lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; wordShape&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;none&lt;/td&gt;&lt;td&gt;Either &quot;none&quot; for no wordShape use, or the name of a word shape function recognized by {@link WordShapeClassifier#lookupShaper(String)}&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;true&lt;/td&gt;&lt;td&gt;Does not use any class combination features if this is false&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; usePrevSequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Does not use any class combination features using previous classes if this is false&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNextSequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Does not use any class combination features using next classes if this is false&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLongSequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use plain higher-order state sequences out to minimum of length or maxLeft&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useBoundarySequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use extra second order class sequence features when previous is CoNLL boundary, so entity knows it can span boundary.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTaggySequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use first, second, and third order class and tag sequence interaction features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useExtraTaggySequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Add in sequences of tags with just current class features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTaggySequencesShapeInteraction&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Add in terms that join sequences of 2 or 3 tags with the current shape&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; strictlyFirstOrder&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;As an override to whatever other options are in effect, deletes all features other than C and CpC clique features when building the classifier&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; entitySubclassification&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&quot;IO&quot;&lt;/td&gt;&lt;td&gt;If
+ * set, convert the labeling of classes (but not  the background) into
+ * one of several alternate encodings (IO, IOB1, IOB2, IOE1, IOE2, SBIEO, with
+ * a S(ingle), B(eginning),
+ * E(nding), I(nside) 4-way classification for each class.  By default, we
+ * either do no re-encoding, or the CoNLLDocumentIteratorFactory does a
+ * lossy encoding as IO.  Note that this is all CoNLL-specific, and depends on
+ * their way of prefix encoding classes, and is only implemented by
+ * the CoNLLDocumentIteratorFactory. &lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; useSum&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; tolerance&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;1e-4&lt;/td&gt;&lt;td&gt;Convergence tolerance in optimization&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printFeatures&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;print out all the features generated by the classifier for a dataset to a file based on this name (starting with &quot;features-&quot;, suffixed &quot;-1&quot; and &quot;-2&quot; for train and test). This simply prints the feature names, one per line.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printFeaturesUpto&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;Print out features for only the first this many datums, if the value is positive. &lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; useSymTags&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you
+ * features (pt, t, nt, c), (t, nt, c), (pt, t, c)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSymWordPairs&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you
+ * features (pw, nw, c)&lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; printClassifier&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;Style in which to print the classifier. One of: HighWeight, HighMagnitude, Collection, AllWeights, WeightHistogram&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printClassifierParam&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;100&lt;/td&gt;&lt;td&gt;A parameter
+ * to the printing style, which may give, for example the number of parameters
+ * to print&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; intern&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true,
+ * (String) intern read in data and classes and feature (pre-)names such
+ * as substring features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; intern2&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, intern all (final) feature names (if only current word and ngram features are used, these will already have been interned by intern, and this is an unnecessary no-op)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; cacheNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true,
+ * record the NGram features that correspond to a String (under the current
+ * option settings) and reuse rather than recalculating if the String is seen
+ * again.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; selfTest&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; noMidNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Do not include character n-gram features for n-grams that contain neither the beginning or end of the word&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; maxNGramLeng&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;If this number is
+ * positive, n-grams above this size will not be used in the model&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useReverse&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; retainEntitySubclassification&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, rather than undoing a recoding of entity tag subtypes (such as BIO variants), just leave them in the output.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLemmas&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include the lemma of a word as a feature.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; usePrevNextLemmas&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include the previous/next lemma of a word as a feature.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLemmaAsWord&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include the lemma of a word as a feature.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; normalizeTerms&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If this is true, some words are normalized: day and month names are lowercased (as for normalizeTimex) and some British spellings are mapped to American English spellings (e.g., -our/-or, etc.).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; normalizeTimex&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If this is true, capitalization of day and month names is normalized to lowercase&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNB&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTypeSeqs&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use basic zeroeth order word shape features.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTypeSeqs2&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Add additional first and second order word shape features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTypeSeqs3&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Adds one more first order shape sequence&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useDisjunctive&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include in features giving disjunctions of words anywhere in the left or right disjunctionWidth words (preserving direction but not position)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; disjunctionWidth&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;4&lt;/td&gt;&lt;td&gt;The number of words on each side of the current word that are included in the disjunction features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useDisjunctiveShapeInteraction&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include in features giving disjunctions of words anywhere in the left or right disjunctionWidth words (preserving direction but not position) interacting with the word shape of the current word&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useWideDisjunctive&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include in features giving disjunctions of words anywhere in the left or right wideDisjunctionWidth words (preserving direction but not position)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; wideDisjunctionWidth&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;4&lt;/td&gt;&lt;td&gt;The number of words on each side of the current word that are included in the disjunction features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; usePosition&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use combination of position in sentence and class as a feature&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useBeginSent&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use combination of initial position in sentence and class (and word shape) as a feature.  (Doesn't seem to help.)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useDisjShape&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include features giving disjunctions of word shapes anywhere in the left or right disjunctionWidth words (preserving direction but not position)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useClassFeature&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include a feature for the class (as a class marginal).  Puts a prior on the classes which is equivalent to how often the feature appeared in the training data. This is the same thing as having a bias vector or having an always-on feature in a model.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useShapeConjunctions&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Conjoin shape with tag or position&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useWordTag&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include word and tag pair features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLastRealWord&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Iff the prev word is of length 3 or less, add an extra feature that combines the word two back and the current word's shape. &lt;i&gt;Weird!&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNextRealWord&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Iff the next word is of length 3 or less, add an extra feature that combines the word after next and the current word's shape. &lt;i&gt;Weird!&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTitle&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Match a word against a list of name titles (Mr, Mrs, etc.). Doesn't really seem to help.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTitle2&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Match a word against a better list of English name titles (Mr, Mrs, etc.). Still doesn't really seem to help.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useDistSim&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Load a file of distributional similarity classes (specified by {@code distSimLexicon}) and use it for features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; distSimLexicon&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;The file to be loaded for distsim classes.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; distSimFileFormat&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;alexclark&lt;/td&gt;&lt;td&gt;Files should be formatted as tab separated rows where each row is a word/class pair.  alexclark=word first, terrykoo=class first&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useOccurrencePatterns&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;This is a very engineered feature designed to capture multiple references to names.  If the current word isn't capitalized, followed by a non-capitalized word, and preceded by a word with alphabetic characters, it returns NO-OCCURRENCE-PATTERN.  Otherwise, if the previous word is a capitalized NNP, then if in the next 150 words you find this PW-W sequence, you get XY-NEXT-OCCURRENCE-XY, else if you find W you get XY-NEXT-OCCURRENCE-Y.  Similarly for backwards and XY-PREV-OCCURRENCE-XY and XY-PREV-OCCURRENCE-Y.  Else (if the previous word isn't a capitalized NNP), under analogous rules you get one or more of X-NEXT-OCCURRENCE-YX, X-NEXT-OCCURRENCE-XY, X-NEXT-OCCURRENCE-X, X-PREV-OCCURRENCE-YX, X-PREV-OCCURRENCE-XY, X-PREV-OCCURRENCE-X.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useTypeySequences&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Some first order word shape patterns.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useGenericFeatures&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, any features you include in the map will be incorporated into the model with values equal to those given in the file; values are treated as strings unless you use the &quot;realValued&quot; option (described below)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; justify&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Print out all
+ * feature/class pairs and their weight, and then for each input data
+ * point, print justification (weights) for active features. Only implemented for CMMClassifier.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; normalize&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;For the CMMClassifier (only) if this is true then the Scorer normalizes scores as probabilities.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useHuber&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use a Huber loss prior rather than the default quadratic loss.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useQuartic&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use a Quartic prior rather than the default quadratic loss.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; sigma&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;1.0&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; epsilon&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;0.01&lt;/td&gt;&lt;td&gt;Used only as a parameter in the Huber loss: this is the distance from 0 at which the loss changes from quadratic to linear&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; beamSize&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;30&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; maxLeft&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;The number of things to the left that have to be cached to run the Viterbi algorithm: the maximum context of class features used.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; maxRight&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;The number of things to the right that have to be cached to run the Viterbi algorithm: the maximum context of class features used.  The maximum possible clique size to use is (maxLeft + maxRight + 1)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; dontExtendTaggy&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Don't extend the range of useTaggySequences when maxLeft is increased.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; numFolds &lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;The number of folds to use for cross-validation. CURRENTLY NOT IMPLEMENTED.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; startFold &lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;The starting fold to run. CURRENTLY NOT IMPLEMENTED.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; endFold &lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;The last fold to run. CURRENTLY NOT IMPLEMENTED.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; mergeTags &lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Whether to merge B- and I- tags.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; splitDocuments&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;true&lt;/td&gt;&lt;td&gt;Whether or not to split the data into separate documents for training/testing&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; maxDocSize&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;10000&lt;/td&gt;&lt;td&gt;If this number is greater than 0, attempt to split documents bigger than this value into multiple documents at sentence boundaries during testing; otherwise do nothing.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;/table&gt;
+ * &lt;p&gt;
+ * Note: flags/properties overwrite left to right.  That is, the parameter
+ * setting specified &lt;i&gt;last&lt;/i&gt; is the one used.
+ * &lt;/p&gt;&lt;p&gt;
+ * &lt;pre&gt;
+ * DOCUMENTATION ON FEATURE TEMPLATES
+ * &lt;br&gt;
+ * w = word
+ * t = tag
+ * p = position (word index in sentence)
+ * c = class
+ * p = paren
+ * g = gazette
+ * a = abbrev
+ * s = shape
+ * r = regent (dependency governor)
+ * h = head word of phrase
+ * n(w) = ngrams from w
+ * g(w) = gazette entries containing w
+ * l(w) = length of w
+ * o(...) = occurrence patterns of words
+ * &lt;br&gt;
+ * useReverse reverses meaning of prev, next everywhere below (on in macro)
+ * &lt;br&gt;
+ * &quot;Prolog&quot; booleans: , = AND and ; = OR
+ * &lt;br&gt;
+ * Mac: Y = turned on in -macro,
+ *      + = additional positive things relative to -macro for CoNLL NERFeatureFactory
+ *          (perhaps none...)
+ *      - = Known negative for CoNLL NERFeatureFactory relative to -macro
+ * &lt;br&gt;
+ * Bio: + = additional things that are positive for BioCreative
+ *      - = things negative relative to -macro
+ * &lt;br&gt;
+ * HighMagnitude: There are no (0) to a few (+) to many (+++) high weight
+ * features of this template. (? = not used in goodCoNLL, but usually = 0)
+ * &lt;br&gt;
+ * Feature              Mac Bio CRFFlags                   HighMagnitude
+ * ---------------------------------------------------------------------
+ * w,c                    Y     useWord                    0 (useWord is almost useless with unlimited ngram features, but helps a fraction in goodCoNLL, if only because of prior fiddling
+ * p,c                          usePosition                ?
+ * p=0,c                        useBeginSent               ?
+ * p=0,s,c                      useBeginSent               ?
+ * t,c                    Y     useTags                    ++
+ * pw,c                   Y     usePrev                    +
+ * pt,c                   Y     usePrev,useTags            0
+ * nw,c                   Y     useNext                    ++
+ * nt,c                   Y     useNext,useTags            0
+ * pw,w,c                 Y     useWordPairs               +
+ * w,nw,c                 Y     useWordPairs               +
+ * pt,t,nt,c                    useSymTags                 ?
+ * t,nt,c                       useSymTags                 ?
+ * pt,t,c                       useSymTags                 ?
+ * pw,nw,c                      useSymWordPairs            ?
+ * &lt;br&gt;
+ * pc,c                   Y     usePrev,useSequences,usePrevSequences   +++
+ * pc,w,c                 Y     usePrev,useSequences,usePrevSequences   0
+ * nc,c                         useNext,useSequences,useNextSequences   ?
+ * w,nc,c                       useNext,useSequences,useNextSequences   ?
+ * pc,nc,c                      useNext,usePrev,useSequences,usePrevSequences,useNextSequences  ?
+ * w,pc,nc,c                    useNext,usePrev,useSequences,usePrevSequences,useNextSequences   ?
+ * &lt;br&gt;
+ * (pw;p2w;p3w;p4w),c        +  useDisjunctive  (out to disjunctionWidth now)   +++
+ * (nw;n2w;n3w;n4w),c        +  useDisjunctive  (out to disjunctionWidth now)   ++++
+ * (pw;p2w;p3w;p4w),s,c      +  useDisjunctiveShapeInteraction          ?
+ * (nw;n2w;n3w;n4w),s,c      +  useDisjunctiveShapeInteraction          ?
+ * (pw;p2w;p3w;p4w),c        +  useWideDisjunctive (to wideDisjunctionWidth)   ?
+ * (nw;n2w;n3w;n4w),c        +  useWideDisjunctive (to wideDisjunctionWidth)   ?
+ * (ps;p2s;p3s;p4s),c           useDisjShape  (out to disjunctionWidth now)   ?
+ * (ns;n2s;n3s;n4s),c           useDisjShape  (out to disjunctionWidth now)   ?
+ * &lt;br&gt;
+ * pt,pc,t,c              Y     useTaggySequences                        +
+ * p2t,p2c,pt,pc,t,c      Y     useTaggySequences,maxLeft&amp;gt;=2          +
+ * p3t,p3c,p2t,p2c,pt,pc,t,c Y  useTaggySequences,maxLeft&amp;gt;=3,!dontExtendTaggy   ?
+ * p2c,pc,c               Y     useLongSequences                         ++
+ * p3c,p2c,pc,c           Y     useLongSequences,maxLeft&amp;gt;=3           ?
+ * p4c,p3c,p2c,pc,c       Y     useLongSequences,maxLeft&amp;gt;=4           ?
+ * p2c,pc,c,pw=BOUNDARY         useBoundarySequences                     0 (OK, but!)
+ * &lt;br&gt;
+ * p2t,pt,t,c             -     useExtraTaggySequences                   ?
+ * p3t,p2t,pt,t,c         -     useExtraTaggySequences                   ?
+ * &lt;br&gt;
+ * p2t,pt,t,s,p2c,pc,c    -     useTaggySequencesShapeInteraction        ?
+ * p3t,p2t,pt,t,s,p3c,p2c,pc,c  useTaggySequencesShapeInteraction        ?
+ * &lt;br&gt;
+ * s,pc,c                 Y     useTypeySequences                        ++
+ * ns,pc,c                Y     useTypeySequences  // error for ps? not? 0
+ * ps,pc,s,c              Y     useTypeySequences                        0
+ * // p2s,p2c,ps,pc,s,c      Y     useTypeySequences,maxLeft&amp;gt;=2 // duplicated a useTypeSeqs2 feature
+ * &lt;br&gt;
+ * n(w),c                 Y     useNGrams (noMidNGrams, MaxNGramLeng, lowercaseNGrams, dehyphenateNGrams)   +++
+ * n(w),s,c                     useNGrams,conjoinShapeNGrams             ?
+ * &lt;br&gt;
+ * g,c                        + useGazFeatures   // test refining this?   ?
+ * pg,pc,c                    + useGazFeatures                           ?
+ * ng,c                       + useGazFeatures                           ?
+ * // pg,g,c                    useGazFeatures                           ?
+ * // pg,g,ng,c                 useGazFeatures                           ?
+ * // p2g,p2c,pg,pc,g,c         useGazFeatures                           ?
+ * g,w,c                        useMoreGazFeatures                       ?
+ * pg,pc,g,c                    useMoreGazFeatures                       ?
+ * g,ng,c                       useMoreGazFeatures                       ?
+ * &lt;br&gt;
+ * g(w),c                       useGazette,sloppyGazette (contains same word)   ?
+ * g(w),[pw,nw,...],c           useGazette,cleanGazette (entire entry matches)   ?
+ * &lt;br&gt;
+ * s,c                    Y     wordShape &amp;gt;= 0                       +++
+ * ps,c                   Y     wordShape &amp;gt;= 0,useTypeSeqs           +
+ * ns,c                   Y     wordShape &amp;gt;= 0,useTypeSeqs           +
+ * pw,s,c                 Y     wordShape &amp;gt;= 0,useTypeSeqs           +
+ * s,nw,c                 Y     wordShape &amp;gt;= 0,useTypeSeqs           +
+ * ps,s,c                 Y     wordShape &amp;gt;= 0,useTypeSeqs           0
+ * s,ns,c                 Y     wordShape &amp;gt;= 0,useTypeSeqs           ++
+ * ps,s,ns,c              Y     wordShape &amp;gt;= 0,useTypeSeqs           ++
+ * pc,ps,s,c              Y     wordShape &amp;gt;= 0,useTypeSeqs,useTypeSeqs2   0
+ * p2c,p2s,pc,ps,s,c      Y     wordShape &amp;gt;= 0,useTypeSeqs,useTypeSeqs2,maxLeft&amp;gt;=2   +++
+ * pc,ps,s,ns,c                 wordShape &amp;gt;= 0,useTypeSeqs,useTypeSeqs3   ?
+ * &lt;br&gt;
+ * p2w,s,c if l(pw) &amp;lt;= 3 Y     useLastRealWord // weird features, but work   0
+ * n2w,s,c if l(nw) &amp;lt;= 3 Y     useNextRealWord                        ++
+ * o(pw,w,nw),c           Y     useOccurrencePatterns // don't fully grok but has to do with capitalized name patterns   ++
+ * &lt;br&gt;
+ * a,c                          useAbbr;useMinimalAbbr
+ * pa,a,c                       useAbbr
+ * a,na,c                       useAbbr
+ * pa,a,na,c                    useAbbr
+ * pa,pc,a,c                    useAbbr;useMinimalAbbr
+ * p2a,p2c,pa,pc,a              useAbbr
+ * w,a,c                        useMinimalAbbr
+ * p2a,p2c,a,c                  useMinimalAbbr
+ * &lt;br&gt;
+ * RESTR. w,(pw,pc;p2w,p2c;p3w,p3c;p4w,p4c)   + useParenMatching,maxLeft&amp;gt;=n
+ * &lt;br&gt;
+ * c                          - useClassFeature
+ * &lt;br&gt;
+  * p,s,c                      - useShapeConjunctions
+ * t,s,c                      - useShapeConjunctions
+ * &lt;br&gt;
+ * w,t,c                      + useWordTag                      ?
+ * w,pt,c                     + useWordTag                      ?
+ * w,nt,c                     + useWordTag                      ?
+ * &lt;br&gt;
+ * r,c                          useNPGovernor (only for baseNP words)
+ * r,t,c                        useNPGovernor (only for baseNP words)
+ * h,c                          useNPHead (only for baseNP words)
+ * h,t,c                        useNPHead (only for baseNP words)
+ * &lt;br&gt;
+ * &lt;/pre&gt;
+ *
+ * @author Dan Klein
+ * @author Jenny Finkel
+ * @author Christopher Manning
+ * @author Shipra Dingare
+ * @author Huy Nguyen
+ * @author Mengqiu Wang
+ */
+public class NERFeatureFactory&lt;IN extends CoreLabel&gt; extends FeatureFactory&lt;IN&gt;  {
+
+  /** A logger for this class */
+<span class="fc" id="L375">  private static final Redwood.RedwoodChannels log = Redwood.channels(NERFeatureFactory.class);</span>
+
+  private static final long serialVersionUID = -2329726064739185544L;
+
+  public NERFeatureFactory() {
+<span class="fc" id="L380">    super();</span>
+<span class="fc" id="L381">  }</span>
+
+  @Override
+  public void init(SeqClassifierFlags flags) {
+<span class="fc" id="L385">    super.init(flags);</span>
+<span class="fc" id="L386">    initGazette();</span>
+<span class="pc bpc" id="L387" title="1 of 2 branches missed.">    if (flags.useDistSim) {</span>
+<span class="nc" id="L388">      initLexicon(flags);</span>
+    }
+<span class="fc" id="L390">  }</span>
+
+  /**
+   * Extracts all the features from the input data at a certain index.
+   *
+   * @param cInfo The complete data set as a List of WordInfo
+   * @param loc  The index at which to extract features.
+   */
+  @Override
+  public Collection&lt;String&gt; getCliqueFeatures(PaddedList&lt;IN&gt; cInfo, int loc, Clique clique) {
+<span class="nc" id="L400">    Collection&lt;String&gt; features = Generics.newHashSet();</span>
+<span class="nc" id="L401">    String domain = cInfo.get(0).get(CoreAnnotations.DomainAnnotation.class);</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">    final boolean doFE = domain != null;</span>
+
+//    log.info(doFE+&quot;\t&quot;+domain);
+
+    // there are two special cases below, because 2 cliques have 2 names
+    Collection&lt;String&gt; c;
+    String suffix;
+<span class="nc bnc" id="L409" title="All 2 branches missed.">    if (clique == cliqueC) {</span>
+      //200710: tried making this clique null; didn't improve performance (rafferty)
+<span class="nc" id="L411">      c = featuresC(cInfo, loc);</span>
+<span class="nc" id="L412">      suffix = &quot;C&quot;;</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">    } else if (clique == cliqueCpC) {</span>
+<span class="nc" id="L414">      c = featuresCpC(cInfo, loc);</span>
+<span class="nc" id="L415">      suffix = &quot;CpC&quot;;</span>
+<span class="nc" id="L416">      addAllInterningAndSuffixing(features, c, suffix);</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">      if (doFE) {</span>
+<span class="nc" id="L418">        addAllInterningAndSuffixing(features, c, domain + '-' + suffix);</span>
+      }
+<span class="nc" id="L420">      c = featuresCnC(cInfo, loc-1);</span>
+<span class="nc" id="L421">      suffix = &quot;CnC&quot;;</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">    } else if (clique == cliqueCp2C) {</span>
+<span class="nc" id="L423">      c = featuresCp2C(cInfo, loc);</span>
+<span class="nc" id="L424">      suffix = &quot;Cp2C&quot;;</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">    } else if (clique == cliqueCp3C) {</span>
+<span class="nc" id="L426">      c = featuresCp3C(cInfo, loc);</span>
+<span class="nc" id="L427">      suffix = &quot;Cp3C&quot;;</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">    } else if (clique == cliqueCp4C) {</span>
+<span class="nc" id="L429">      c = featuresCp4C(cInfo, loc);</span>
+<span class="nc" id="L430">      suffix = &quot;Cp4C&quot;;</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">    } else if (clique == cliqueCp5C) {</span>
+<span class="nc" id="L432">      c = featuresCp5C(cInfo, loc);</span>
+<span class="nc" id="L433">      suffix = &quot;Cp5C&quot;;</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">    } else if (clique == cliqueCpCp2C) {</span>
+<span class="nc" id="L435">      c = featuresCpCp2C(cInfo, loc);</span>
+<span class="nc" id="L436">      suffix = &quot;CpCp2C&quot;;</span>
+<span class="nc" id="L437">      addAllInterningAndSuffixing(features, c, suffix);</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      if (doFE) {</span>
+<span class="nc" id="L439">        addAllInterningAndSuffixing(features, c, domain+ '-' + suffix);</span>
+      }
+<span class="nc" id="L441">      c = featuresCpCnC(cInfo, loc-1);</span>
+<span class="nc" id="L442">      suffix = &quot;CpCnC&quot;;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">    } else if (clique == cliqueCpCp2Cp3C) {</span>
+<span class="nc" id="L444">      c = featuresCpCp2Cp3C(cInfo, loc);</span>
+<span class="nc" id="L445">      suffix = &quot;CpCp2Cp3C&quot;;</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">    } else if (clique == cliqueCpCp2Cp3Cp4C) {</span>
+<span class="nc" id="L447">      c = featuresCpCp2Cp3Cp4C(cInfo, loc);</span>
+<span class="nc" id="L448">      suffix = &quot;CpCp2Cp3Cp4C&quot;;</span>
+    } else {
+<span class="nc" id="L450">      throw new IllegalArgumentException(&quot;Unknown clique: &quot; + clique);</span>
+    }
+
+<span class="nc" id="L453">    addAllInterningAndSuffixing(features, c, suffix);</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">    if (doFE) {</span>
+<span class="nc" id="L455">      addAllInterningAndSuffixing(features, c, domain + '-' + suffix);</span>
+    }
+
+    // log.info(StringUtils.join(features,&quot;\n&quot;)+&quot;\n&quot;);
+<span class="nc" id="L459">    return features;</span>
+  }
+
+
+  // TODO: when breaking serialization, it seems like it would be better to
+  // move the lexicon into (Abstract)SequenceClassifier and to do this
+  // annotation as part of the ObjectBankWrapper.  But note that it is
+  // serialized in this object currently and it would then need to be
+  // serialized elsewhere or loaded each time
+  private Map&lt;String,String&gt; lexicon;
+
+  private void initLexicon(SeqClassifierFlags flags) {
+<span class="nc bnc" id="L471" title="All 2 branches missed.">    if (flags.distSimLexicon == null) {</span>
+<span class="nc" id="L472">      return;</span>
+    }
+<span class="nc bnc" id="L474" title="All 2 branches missed.">    if (lexicon != null) {</span>
+<span class="nc" id="L475">      return;</span>
+    }
+<span class="nc" id="L477">    Timing timing = new Timing();</span>
+<span class="nc" id="L478">    lexicon = Generics.newHashMap();</span>
+<span class="nc" id="L479">    boolean terryKoo = &quot;terryKoo&quot;.equals(flags.distSimFileFormat);</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">    for (String line : ObjectBank.getLineIterator(flags.distSimLexicon,</span>
+                                                  flags.inputEncoding)) {
+      String word;
+      String wordClass;
+<span class="nc bnc" id="L484" title="All 2 branches missed.">      if (terryKoo) {</span>
+<span class="nc" id="L485">        String[] bits = line.split(&quot;\\t&quot;);</span>
+<span class="nc" id="L486">        word = bits[1];</span>
+<span class="nc" id="L487">        wordClass = bits[0];</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">        if (flags.distSimMaxBits &gt; 0 &amp;&amp; wordClass.length() &gt; flags.distSimMaxBits) {</span>
+<span class="nc" id="L489">          wordClass = wordClass.substring(0, flags.distSimMaxBits);</span>
+        }
+<span class="nc" id="L491">      } else {</span>
+        // &quot;alexClark&quot;
+<span class="nc" id="L493">        String[] bits = line.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L494">        word = bits[0];</span>
+<span class="nc" id="L495">        wordClass = bits[1];</span>
+      }
+<span class="nc bnc" id="L497" title="All 2 branches missed.">      if ( ! flags.casedDistSim) {</span>
+<span class="nc" id="L498">        word = word.toLowerCase();</span>
+      }
+<span class="nc bnc" id="L500" title="All 2 branches missed.">      if (flags.numberEquivalenceDistSim) {</span>
+<span class="nc" id="L501">        word = WordShapeClassifier.wordShape(word, WordShapeClassifier.WORDSHAPEDIGITS);</span>
+      }
+<span class="nc" id="L503">      lexicon.put(word, wordClass);</span>
+<span class="nc" id="L504">    }</span>
+<span class="nc" id="L505">    timing.done(log, &quot;Loading distsim lexicon from &quot; + flags.distSimLexicon);</span>
+<span class="nc" id="L506">  }</span>
+
+  public String describeDistsimLexicon() {
+<span class="nc bnc" id="L509" title="All 2 branches missed.">    if (lexicon == null) {</span>
+<span class="nc" id="L510">      return &quot;No distsim lexicon&quot;;</span>
+    } else {
+<span class="nc" id="L512">      return &quot;Distsim lexicon of size &quot; + lexicon.size();</span>
+    }
+  }
+
+  private void distSimAnnotate(PaddedList&lt;IN&gt; info) {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">    for (CoreLabel fl : info) {</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">      if (fl.containsKey(CoreAnnotations.DistSimAnnotation.class)) { return; }</span>
+<span class="nc" id="L519">      String word = getWord(fl);</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">      if ( ! flags.casedDistSim) {</span>
+<span class="nc" id="L521">        word = word.toLowerCase();</span>
+      }
+<span class="nc bnc" id="L523" title="All 2 branches missed.">      if (flags.numberEquivalenceDistSim) {</span>
+<span class="nc" id="L524">        word = WordShapeClassifier.wordShape(word, WordShapeClassifier.WORDSHAPEDIGITS);</span>
+      }
+<span class="nc" id="L526">      String distSim = lexicon.get(word);</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">      if (distSim == null) {</span>
+<span class="nc" id="L528">        distSim = flags.unknownWordDistSimClass;</span>
+      }
+<span class="nc" id="L530">      fl.set(CoreAnnotations.DistSimAnnotation.class, distSim);</span>
+<span class="nc" id="L531">    }</span>
+<span class="nc" id="L532">  }</span>
+
+
+<span class="fc" id="L535">  private Map&lt;String,Collection&lt;String&gt;&gt; wordToSubstrings = Generics.newHashMap();</span>
+
+  public void clearMemory() {
+<span class="nc" id="L538">    wordToSubstrings = Generics.newHashMap();</span>
+<span class="nc" id="L539">    lexicon = null;</span>
+<span class="nc" id="L540">  }</span>
+
+  private static String dehyphenate(String str) {
+    // don't take out leading or ending ones, just internal
+    // and remember padded with &lt; &gt; characters
+<span class="nc" id="L545">    String retStr = str;</span>
+<span class="nc" id="L546">    int leng = str.length();</span>
+<span class="nc" id="L547">    int hyphen = 2;</span>
+    do {
+<span class="nc" id="L549">      hyphen = retStr.indexOf('-', hyphen);</span>
+<span class="nc bnc" id="L550" title="All 4 branches missed.">      if (hyphen &gt;= 0 &amp;&amp; hyphen &lt; leng - 2) {</span>
+<span class="nc" id="L551">        retStr = retStr.substring(0, hyphen) + retStr.substring(hyphen + 1);</span>
+      } else {
+<span class="nc" id="L553">        hyphen = -1;</span>
+      }
+<span class="nc bnc" id="L555" title="All 2 branches missed.">    } while (hyphen &gt;= 0);</span>
+<span class="nc" id="L556">    return retStr;</span>
+  }
+
+  private static String greekify(String str) {
+    // don't take out leading or ending ones, just internal
+    // and remember padded with &lt; &gt; characters
+
+<span class="nc" id="L563">    String pattern = &quot;(alpha)|(beta)|(gamma)|(delta)|(epsilon)|(zeta)|(kappa)|(lambda)|(rho)|(sigma)|(tau)|(upsilon)|(omega)&quot;;</span>
+
+<span class="nc" id="L565">    Pattern p = Pattern.compile(pattern);</span>
+<span class="nc" id="L566">    Matcher m = p.matcher(str);</span>
+<span class="nc" id="L567">    return m.replaceAll(&quot;~&quot;);</span>
+  }
+
+  /* end methods that do transformations */
+
+  /*
+   * static booleans that check strings for certain qualities *
+   */
+
+  // cdm: this could be improved to handle more name types, such as
+  // O'Reilly, DeGuzman, etc. (need a little classifier?!?)
+  private static boolean isNameCase(String str) {
+<span class="nc bnc" id="L579" title="All 2 branches missed.">    if (str.length() &lt; 2) {</span>
+<span class="nc" id="L580">      return false;</span>
+    }
+<span class="nc bnc" id="L582" title="All 4 branches missed.">    if (!(Character.isUpperCase(str.charAt(0)) || Character.isTitleCase(str.charAt(0)))) {</span>
+<span class="nc" id="L583">      return false;</span>
+    }
+<span class="nc bnc" id="L585" title="All 2 branches missed.">    for (int i = 1; i &lt; str.length(); i++) {</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">      if (Character.isUpperCase(str.charAt(i))) {</span>
+<span class="nc" id="L587">        return false;</span>
+      }
+    }
+<span class="nc" id="L590">    return true;</span>
+  }
+
+  private static boolean noUpperCase(String str) {
+<span class="nc bnc" id="L594" title="All 2 branches missed.">    if (str.length() &lt; 1) {</span>
+<span class="nc" id="L595">      return false;</span>
+    }
+<span class="nc bnc" id="L597" title="All 2 branches missed.">    for (int i = 0; i &lt; str.length(); i++) {</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">      if (Character.isUpperCase(str.charAt(i))) {</span>
+<span class="nc" id="L599">        return false;</span>
+      }
+    }
+<span class="nc" id="L602">    return true;</span>
+  }
+
+  private static boolean hasLetter(String str) {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">    if (str.length() &lt; 1) {</span>
+<span class="nc" id="L607">      return false;</span>
+    }
+<span class="nc bnc" id="L609" title="All 2 branches missed.">    for (int i = 0; i &lt; str.length(); i++) {</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">      if (Character.isLetter(str.charAt(i))) {</span>
+<span class="nc" id="L611">        return true;</span>
+      }
+    }
+<span class="nc" id="L614">    return false;</span>
+  }
+
+<span class="fc" id="L617">  private static final Pattern ordinalPattern = Pattern.compile(&quot;(?:(?:first|second|third|fourth|fifth|&quot;+</span>
+                                                          &quot;sixth|seventh|eighth|ninth|tenth|&quot;+
+                                                          &quot;eleventh|twelfth|thirteenth|&quot;+
+                                                          &quot;fourteenth|fifteenth|sixteenth|&quot;+
+                                                          &quot;seventeenth|eighteenth|nineteenth|&quot;+
+                                                          &quot;twenty|twentieth|thirty|thirtieth|&quot;+
+                                                          &quot;forty|fortieth|fifty|fiftieth|&quot;+
+                                                          &quot;sixty|sixtieth|seventy|seventieth|&quot;+
+                                                          &quot;eighty|eightieth|ninety|ninetieth|&quot;+
+                                                          &quot;one|two|three|four|five|six|seven|&quot;+
+                                                          &quot;eight|nine|hundred|hundredth)-?)+|[0-9]+(?:st|nd|rd|th)&quot;, Pattern.CASE_INSENSITIVE);
+
+
+<span class="fc" id="L630">  private static final Pattern numberPattern = Pattern.compile(&quot;[0-9]+&quot;);</span>
+<span class="fc" id="L631">  private static final Pattern ordinalEndPattern = Pattern.compile(&quot;(?:st|nd|rd|th)&quot;, Pattern.CASE_INSENSITIVE);</span>
+
+  private boolean isOrdinal(List&lt;? extends CoreLabel&gt; wordInfos, int pos) {
+<span class="nc" id="L634">    CoreLabel c = wordInfos.get(pos);</span>
+<span class="nc" id="L635">    String cWord = getWord(c);</span>
+<span class="nc" id="L636">    Matcher m = ordinalPattern.matcher(cWord);</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">    if (m.matches()) { return true; }</span>
+<span class="nc" id="L638">    m = numberPattern.matcher(cWord);</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">    if (m.matches()) {</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">      if (pos+1 &lt; wordInfos.size()) {</span>
+<span class="nc" id="L641">        CoreLabel n = wordInfos.get(pos+1);</span>
+<span class="nc" id="L642">        m = ordinalEndPattern.matcher(getWord(n));</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        if (m.matches()) { return true; }</span>
+      }
+<span class="nc" id="L645">      return false;</span>
+    }
+
+<span class="nc" id="L648">    m = ordinalEndPattern.matcher(cWord);</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">    if (m.matches()) {</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">      if (pos &gt; 0) {</span>
+<span class="nc" id="L651">        CoreLabel p = wordInfos.get(pos-1);</span>
+<span class="nc" id="L652">        m = numberPattern.matcher(getWord(p));</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        if (m.matches()) { return true; }</span>
+      }
+    }
+<span class="nc bnc" id="L656" title="All 2 branches missed.">    if (cWord.equals(&quot;-&quot;)) {</span>
+<span class="nc bnc" id="L657" title="All 4 branches missed.">      if (pos+1 &lt; wordInfos.size() &amp;&amp; pos &gt; 0) {</span>
+<span class="nc" id="L658">        CoreLabel p = wordInfos.get(pos-1);</span>
+<span class="nc" id="L659">        CoreLabel n = wordInfos.get(pos+1);</span>
+<span class="nc" id="L660">        m = ordinalPattern.matcher(getWord(p));</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">        if (m.matches()) {</span>
+<span class="nc" id="L662">          m = ordinalPattern.matcher(getWord(n));</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">          if (m.matches()) {</span>
+<span class="nc" id="L664">            return true;</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L669">    return false;</span>
+  }
+
+  /* end static booleans that check strings for certain qualities */
+
+  /**
+   * Gazette Stuff.
+   */
+  private static class GazetteInfo implements Serializable {
+    final String feature;
+    final int loc;
+    final String[] words;
+    private static final long serialVersionUID = -5903728481621584810L;
+<span class="nc" id="L682">    public GazetteInfo(String feature, int loc, String[] words) {</span>
+<span class="nc" id="L683">      this.feature = feature;</span>
+<span class="nc" id="L684">      this.loc = loc;</span>
+<span class="nc" id="L685">      this.words = words;</span>
+<span class="nc" id="L686">    }</span>
+  } // end class GazetteInfo
+
+<span class="fc" id="L689">  private Map&lt;String,Collection&lt;String&gt;&gt; wordToGazetteEntries = Generics.newHashMap();</span>
+<span class="fc" id="L690">  private Map&lt;String,Collection&lt;GazetteInfo&gt;&gt; wordToGazetteInfos = Generics.newHashMap();</span>
+
+  /** Reads a gazette file.  Each line of it consists of a class name
+   *  (a String not containing whitespace characters), followed by whitespace
+   *  characters followed by a phrase, which is one or more tokens separated
+   *  by a single space.
+   *
+   *  @param in Where to read the gazette from
+   *  @throws IOException If IO errors
+   */
+  private void readGazette(BufferedReader in) throws IOException {
+<span class="nc" id="L701">    Pattern p = Pattern.compile(&quot;^(\\S+)\\s+(.+)$&quot;);</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">    for (String line; (line = in.readLine()) != null; ) {</span>
+<span class="nc" id="L703">      Matcher m = p.matcher(line);</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">      if (m.matches()) {</span>
+<span class="nc" id="L705">        String type = intern(m.group(1));</span>
+<span class="nc" id="L706">        String phrase = m.group(2);</span>
+<span class="nc" id="L707">        String[] words = phrase.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">        for (int i = 0; i &lt; words.length; i++) {</span>
+<span class="nc" id="L709">          String word = intern(words[i]);</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">          if (flags.sloppyGazette) {</span>
+<span class="nc" id="L711">            Collection&lt;String&gt; entries = wordToGazetteEntries.get(word);</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">            if (entries == null) {</span>
+<span class="nc" id="L713">              entries = Generics.newHashSet();</span>
+<span class="nc" id="L714">              wordToGazetteEntries.put(word, entries);</span>
+            }
+<span class="nc" id="L716">            String feature = intern(type + &quot;-GAZ&quot; + words.length);</span>
+<span class="nc" id="L717">            entries.add(feature);</span>
+<span class="nc" id="L718">            feature = intern(type + &quot;-GAZ&quot;);</span>
+<span class="nc" id="L719">            entries.add(feature);</span>
+          }
+<span class="nc bnc" id="L721" title="All 2 branches missed.">          if (flags.cleanGazette) {</span>
+<span class="nc" id="L722">            Collection&lt;GazetteInfo&gt; infos = wordToGazetteInfos.get(word);</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (infos == null) {</span>
+<span class="nc" id="L724">              infos = Generics.newHashSet();</span>
+<span class="nc" id="L725">              wordToGazetteInfos.put(word, infos);</span>
+            }
+<span class="nc" id="L727">            GazetteInfo info = new GazetteInfo(intern(type + &quot;-GAZ&quot; + words.length), i, words);</span>
+<span class="nc" id="L728">            infos.add(info);</span>
+<span class="nc" id="L729">            info = new GazetteInfo(intern(type + &quot;-GAZ&quot;), i, words);</span>
+<span class="nc" id="L730">            infos.add(info);</span>
+          }
+        }
+      }
+<span class="nc" id="L734">    }</span>
+<span class="nc" id="L735">  }</span>
+
+  private Set&lt;Class&lt;? extends GenericAnnotation&lt;?&gt;&gt;&gt; genericAnnotationKeys; // = null; //cache which keys are generic annotations so we don't have to do too many instanceof checks
+
+  @SuppressWarnings({&quot;unchecked&quot;, &quot;SuspiciousMethodCalls&quot;})
+  private void makeGenericKeyCache(CoreLabel c) {
+<span class="nc" id="L741">    genericAnnotationKeys = Generics.newHashSet();</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">    for (Class&lt;?&gt; key : c.keySet()) {</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">      if (CoreLabel.genericValues.containsKey(key)) {</span>
+<span class="nc" id="L744">        Class&lt;? extends GenericAnnotation&lt;?&gt;&gt; genKey = (Class&lt;? extends GenericAnnotation&lt;?&gt;&gt;) key;</span>
+<span class="nc" id="L745">        genericAnnotationKeys.add(genKey);</span>
+      }
+<span class="nc" id="L747">    }</span>
+<span class="nc" id="L748">  }</span>
+
+  private Set&lt;String&gt; lastNames; // = null;
+  private Set&lt;String&gt; maleNames; // = null;
+  private Set&lt;String&gt; femaleNames; // = null;
+
+<span class="fc" id="L754">  private final Pattern titlePattern = Pattern.compile(&quot;(?:Mr|Ms|Mrs|Dr|Miss|Sen|Judge|Sir)\\.?&quot;); // todo: should make static final and add more titles</span>
+<span class="fc" id="L755">  private static final Pattern titlePattern2 = Pattern.compile(&quot;(?i:Mr|Mrs|Ms|Miss|Drs?|Profs?|Sens?|Reps?|Attys?|Lt|Col|Gen|Messrs|Govs?|Adm|Rev|Maj|Sgt|Cpl|Pvt|Capt|Ste?|Ave|Pres|Lieut|Hon|Brig|Co?mdr|Pfc|Spc|Supts?|Det|Mt|Ft|Adj|Adv|Asst|Assoc|Ens|Insp|Mlle|Mme|Msgr|Sfc)\\.?&quot;);</span>
+
+<span class="fc" id="L757">  private static final Pattern splitSlashHyphenWordsPattern = Pattern.compile(&quot;[-/]&quot;);</span>
+
+  private void generateSlashHyphenFeatures(String word, Collection&lt;String&gt; featuresC, String fragSuffix, String wordSuffix) {
+<span class="nc" id="L760">    String[] bits = splitSlashHyphenWordsPattern.split(word);</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">    for (String bit : bits) {</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">      if (flags.slashHyphenTreatment == SeqClassifierFlags.SlashHyphenEnum.WFRAG) {</span>
+<span class="nc" id="L763">        featuresC.add(bit + fragSuffix);</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">      } else if (flags.slashHyphenTreatment == SeqClassifierFlags.SlashHyphenEnum.BOTH) {</span>
+<span class="nc" id="L765">        featuresC.add(bit + fragSuffix);</span>
+<span class="nc" id="L766">        featuresC.add(bit + wordSuffix);</span>
+      } else {
+        // option WORD
+<span class="nc" id="L769">        featuresC.add(bit + wordSuffix);</span>
+      }
+    }
+<span class="nc" id="L772">  }</span>
+
+
+  protected Collection&lt;String&gt; featuresC(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L776">    CoreLabel p3 = cInfo.get(loc - 3);</span>
+<span class="nc" id="L777">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+<span class="nc" id="L778">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L779">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L780">    CoreLabel n = cInfo.get(loc + 1);</span>
+<span class="nc" id="L781">    CoreLabel n2 = cInfo.get(loc + 2);</span>
+
+<span class="nc" id="L783">    String cWord = getWord(c);</span>
+<span class="nc" id="L784">    String pWord = getWord(p);</span>
+<span class="nc" id="L785">    String nWord = getWord(n);</span>
+<span class="nc" id="L786">    String cShape = c.getString(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L787">    String pShape = p.getString(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L788">    String nShape = n.getString(CoreAnnotations.ShapeAnnotation.class);</span>
+
+<span class="nc" id="L790">    Collection&lt;String&gt; featuresC = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L792" title="All 2 branches missed.">    if (flags.useDistSim) {</span>
+<span class="nc" id="L793">      distSimAnnotate(cInfo);</span>
+    }
+
+<span class="nc bnc" id="L796" title="All 2 branches missed.">    if (flags.useBagOfWords) {</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">      for (IN word : cInfo) {</span>
+<span class="nc" id="L798">        featuresC.add(getWord(word) + &quot;-BAGOFWORDS&quot;);</span>
+<span class="nc" id="L799">      }</span>
+    }
+
+<span class="nc bnc" id="L802" title="All 4 branches missed.">    if (flags.useDistSim &amp;&amp; flags.useMoreTags) {</span>
+<span class="nc" id="L803">      featuresC.add(p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + cWord + &quot;-PDISTSIM-CWORD&quot;);</span>
+    }
+
+
+<span class="nc bnc" id="L807" title="All 2 branches missed.">    if (flags.useDistSim) {</span>
+<span class="nc" id="L808">      featuresC.add(c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM&quot;);</span>
+    }
+
+
+<span class="nc bnc" id="L812" title="All 2 branches missed.">    if (flags.useTitle) {</span>
+<span class="nc" id="L813">      Matcher m = titlePattern.matcher(cWord);</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">      if (m.matches()) {</span>
+<span class="nc" id="L815">        featuresC.add(&quot;IS_TITLE&quot;);</span>
+      }
+<span class="nc" id="L817">    }</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">    else if (flags.useTitle2) {</span>
+<span class="nc" id="L819">      Matcher m = titlePattern2.matcher(cWord);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">      if (m.matches()) {</span>
+<span class="nc" id="L821">        featuresC.add(&quot;IS_TITLE&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L825" title="All 2 branches missed.">    if (flags.slashHyphenTreatment != SeqClassifierFlags.SlashHyphenEnum.NONE) {</span>
+<span class="nc bnc" id="L826" title="All 2 branches missed.">      if (flags.useWord) {</span>
+<span class="nc" id="L827">        generateSlashHyphenFeatures(cWord, featuresC, &quot;-WFRAG&quot;, &quot;-WORD&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L831" title="All 4 branches missed.">    if (flags.useInternal &amp;&amp; flags.useExternal ) {</span>
+
+<span class="nc bnc" id="L833" title="All 2 branches missed.">      if (flags.useWord) {</span>
+<span class="nc" id="L834">        featuresC.add(cWord + &quot;-WORD&quot;);</span>
+      }
+
+<span class="nc bnc" id="L837" title="All 2 branches missed.">      if (flags.use2W) {</span>
+<span class="nc" id="L838">        featuresC.add(getWord(p2) + &quot;-P2W&quot;);</span>
+<span class="nc" id="L839">        featuresC.add(getWord(n2) + &quot;-N2W&quot;);</span>
+      }
+
+<span class="nc bnc" id="L842" title="All 2 branches missed.">      if (flags.useLC) {</span>
+<span class="nc" id="L843">        featuresC.add(cWord.toLowerCase() + &quot;-CL&quot;);</span>
+<span class="nc" id="L844">        featuresC.add(pWord.toLowerCase() + &quot;-PL&quot;);</span>
+<span class="nc" id="L845">        featuresC.add(nWord.toLowerCase() + &quot;-NL&quot;);</span>
+      }
+
+<span class="nc bnc" id="L848" title="All 2 branches missed.">      if (flags.useUnknown) { // for true casing</span>
+<span class="nc" id="L849">        featuresC.add(c.get(CoreAnnotations.UnknownAnnotation.class)+&quot;-UNKNOWN&quot;);</span>
+<span class="nc" id="L850">        featuresC.add(p.get(CoreAnnotations.UnknownAnnotation.class)+&quot;-PUNKNOWN&quot;);</span>
+<span class="nc" id="L851">        featuresC.add(n.get(CoreAnnotations.UnknownAnnotation.class)+&quot;-NUNKNOWN&quot;);</span>
+      }
+
+<span class="nc bnc" id="L854" title="All 2 branches missed.">      if (flags.useLemmas) {</span>
+<span class="nc" id="L855">        String lem = c.getString(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L856" title="All 2 branches missed.">        if (! &quot;&quot;.equals(lem)) {</span>
+<span class="nc" id="L857">          featuresC.add(lem + &quot;-LEM&quot;);</span>
+        }
+      }
+<span class="nc bnc" id="L860" title="All 2 branches missed.">      if (flags.usePrevNextLemmas) {</span>
+<span class="nc" id="L861">        String plem = p.getString(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc" id="L862">        String nlem = n.getString(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L863" title="All 2 branches missed.">        if (! &quot;&quot;.equals(plem)) {</span>
+<span class="nc" id="L864">          featuresC.add(plem + &quot;-PLEM&quot;);</span>
+        }
+<span class="nc bnc" id="L866" title="All 2 branches missed.">        if (! &quot;&quot;.equals(nlem)) {</span>
+<span class="nc" id="L867">          featuresC.add(nlem + &quot;-NLEM&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L871" title="All 2 branches missed.">      if (flags.checkNameList) {</span>
+        try {
+<span class="nc bnc" id="L873" title="All 2 branches missed.">          if (lastNames == null) {</span>
+<span class="nc" id="L874">            lastNames = Generics.newHashSet();</span>
+
+<span class="nc bnc" id="L876" title="All 2 branches missed.">            for (String line : ObjectBank.getLineIterator(flags.lastNameList)) {</span>
+<span class="nc" id="L877">              String[] cols = line.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L878">              lastNames.add(cols[0]);</span>
+<span class="nc" id="L879">            }</span>
+          }
+<span class="nc bnc" id="L881" title="All 2 branches missed.">          if (maleNames == null) {</span>
+<span class="nc" id="L882">            maleNames = Generics.newHashSet();</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">            for (String line : ObjectBank.getLineIterator(flags.maleNameList)) {</span>
+<span class="nc" id="L884">              String[] cols = line.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L885">              maleNames.add(cols[0]);</span>
+<span class="nc" id="L886">            }</span>
+          }
+<span class="nc bnc" id="L888" title="All 2 branches missed.">          if (femaleNames == null) {</span>
+<span class="nc" id="L889">            femaleNames = Generics.newHashSet();</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">            for (String line : ObjectBank.getLineIterator(flags.femaleNameList)) {</span>
+<span class="nc" id="L891">              String[] cols = line.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L892">              femaleNames.add(cols[0]);</span>
+<span class="nc" id="L893">            }</span>
+          }
+
+<span class="nc" id="L896">          String name = cWord.toUpperCase();</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">          if (lastNames.contains(name)) {</span>
+<span class="nc" id="L898">            featuresC.add(&quot;LAST_NAME&quot;);</span>
+          }
+
+<span class="nc bnc" id="L901" title="All 2 branches missed.">          if (maleNames.contains(name)) {</span>
+<span class="nc" id="L902">            featuresC.add(&quot;MALE_NAME&quot;);</span>
+          }
+
+<span class="nc bnc" id="L905" title="All 2 branches missed.">          if (femaleNames.contains(name)) {</span>
+<span class="nc" id="L906">            featuresC.add(&quot;FEMALE_NAME&quot;);</span>
+          }
+
+<span class="nc" id="L909">        } catch (Exception e) {</span>
+<span class="nc" id="L910">          throw new RuntimeException(e);</span>
+<span class="nc" id="L911">        }</span>
+      }
+
+<span class="nc bnc" id="L914" title="All 2 branches missed.">      if (flags.binnedLengths != null) {</span>
+<span class="nc" id="L915">        int len = cWord.length();</span>
+<span class="nc" id="L916">        String featureName = null;</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">        for (int i = 0; i &lt;= flags.binnedLengths.length; i++) {</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">          if (i == flags.binnedLengths.length) {</span>
+<span class="nc" id="L919">            featureName = &quot;Len-&quot; + flags.binnedLengths[flags.binnedLengths.length - 1] + &quot;-Inf&quot;;</span>
+<span class="nc bnc" id="L920" title="All 2 branches missed.">          } else if (len &lt;= flags.binnedLengths[i]) {</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">            featureName = &quot;Len-&quot; + ((i == 0) ? 1 : flags.binnedLengths[i - 1]) + '-' + flags.binnedLengths[i];</span>
+<span class="nc" id="L922">            break;</span>
+          }
+        }
+<span class="nc" id="L925">        featuresC.add(featureName);</span>
+      }
+
+<span class="nc bnc" id="L928" title="All 2 branches missed.">      if (flags.useABGENE) {</span>
+<span class="nc" id="L929">        featuresC.add(c.get(CoreAnnotations.AbgeneAnnotation.class) + &quot;-ABGENE&quot;);</span>
+<span class="nc" id="L930">        featuresC.add(p.get(CoreAnnotations.AbgeneAnnotation.class) + &quot;-PABGENE&quot;);</span>
+<span class="nc" id="L931">        featuresC.add(n.get(CoreAnnotations.AbgeneAnnotation.class) + &quot;-NABGENE&quot;);</span>
+      }
+
+<span class="nc bnc" id="L934" title="All 2 branches missed.">      if (flags.useABSTRFreqDict) {</span>
+<span class="nc" id="L935">        featuresC.add(c.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-ABSTRACT&quot; + c.get(CoreAnnotations.FreqAnnotation.class) + &quot;-FREQ&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+<span class="nc" id="L936">        featuresC.add(c.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-ABSTRACT&quot; + c.get(CoreAnnotations.DictAnnotation.class) + &quot;-DICT&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+<span class="nc" id="L937">        featuresC.add(c.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-ABSTRACT&quot; + c.get(CoreAnnotations.DictAnnotation.class) + &quot;-DICT&quot; + c.get(CoreAnnotations.FreqAnnotation.class) + &quot;-FREQ&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+      }
+
+<span class="nc bnc" id="L940" title="All 2 branches missed.">      if (flags.useABSTR) {</span>
+<span class="nc" id="L941">        featuresC.add(c.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-ABSTRACT&quot;);</span>
+<span class="nc" id="L942">        featuresC.add(p.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-PABSTRACT&quot;);</span>
+<span class="nc" id="L943">        featuresC.add(n.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-NABSTRACT&quot;);</span>
+      }
+
+<span class="nc bnc" id="L946" title="All 2 branches missed.">      if (flags.useGENIA) {</span>
+<span class="nc" id="L947">        featuresC.add(c.get(CoreAnnotations.GeniaAnnotation.class) + &quot;-GENIA&quot;);</span>
+<span class="nc" id="L948">        featuresC.add(p.get(CoreAnnotations.GeniaAnnotation.class) + &quot;-PGENIA&quot;);</span>
+<span class="nc" id="L949">        featuresC.add(n.get(CoreAnnotations.GeniaAnnotation.class) + &quot;-NGENIA&quot;);</span>
+      }
+<span class="nc bnc" id="L951" title="All 2 branches missed.">      if (flags.useWEBFreqDict) {</span>
+<span class="nc" id="L952">        featuresC.add(c.get(CoreAnnotations.WebAnnotation.class) + &quot;-WEB&quot; + c.get(CoreAnnotations.FreqAnnotation.class) + &quot;-FREQ&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+<span class="nc" id="L953">        featuresC.add(c.get(CoreAnnotations.WebAnnotation.class) + &quot;-WEB&quot; + c.get(CoreAnnotations.DictAnnotation.class) + &quot;-DICT&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+<span class="nc" id="L954">        featuresC.add(c.get(CoreAnnotations.WebAnnotation.class) + &quot;-WEB&quot; + c.get(CoreAnnotations.DictAnnotation.class) + &quot;-DICT&quot; + c.get(CoreAnnotations.FreqAnnotation.class) + &quot;-FREQ&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+      }
+
+<span class="nc bnc" id="L957" title="All 2 branches missed.">      if (flags.useWEB) {</span>
+<span class="nc" id="L958">        featuresC.add(c.get(CoreAnnotations.WebAnnotation.class) + &quot;-WEB&quot;);</span>
+<span class="nc" id="L959">        featuresC.add(p.get(CoreAnnotations.WebAnnotation.class) + &quot;-PWEB&quot;);</span>
+<span class="nc" id="L960">        featuresC.add(n.get(CoreAnnotations.WebAnnotation.class) + &quot;-NWEB&quot;);</span>
+      }
+
+<span class="nc bnc" id="L963" title="All 2 branches missed.">      if (flags.useIsURL) {</span>
+<span class="nc" id="L964">        featuresC.add(c.get(CoreAnnotations.IsURLAnnotation.class) + &quot;-ISURL&quot;);</span>
+      }
+<span class="nc bnc" id="L966" title="All 2 branches missed.">      if (flags.useEntityRule) {</span>
+<span class="nc" id="L967">        featuresC.add(c.get(CoreAnnotations.EntityRuleAnnotation.class)+&quot;-ENTITYRULE&quot;);</span>
+      }
+<span class="nc bnc" id="L969" title="All 2 branches missed.">      if (flags.useEntityTypes) {</span>
+<span class="nc" id="L970">        featuresC.add(c.get(CoreAnnotations.EntityTypeAnnotation.class) + &quot;-ENTITYTYPE&quot;);</span>
+      }
+<span class="nc bnc" id="L972" title="All 2 branches missed.">      if (flags.useIsDateRange) {</span>
+<span class="nc" id="L973">        featuresC.add(c.get(CoreAnnotations.IsDateRangeAnnotation.class) + &quot;-ISDATERANGE&quot;);</span>
+      }
+
+<span class="nc bnc" id="L976" title="All 2 branches missed.">      if (flags.useABSTRFreq) {</span>
+<span class="nc" id="L977">        featuresC.add(c.get(CoreAnnotations.AbstrAnnotation.class) + &quot;-ABSTRACT&quot; + c.get(CoreAnnotations.FreqAnnotation.class) + &quot;-FREQ&quot;);</span>
+      }
+
+<span class="nc bnc" id="L980" title="All 2 branches missed.">      if (flags.useFREQ) {</span>
+<span class="nc" id="L981">        featuresC.add(c.get(CoreAnnotations.FreqAnnotation.class) + &quot;-FREQ&quot;);</span>
+      }
+
+<span class="nc bnc" id="L984" title="All 2 branches missed.">      if (flags.useMoreTags) {</span>
+<span class="nc" id="L985">        featuresC.add(p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + cWord + &quot;-PTAG-CWORD&quot;);</span>
+      }
+
+<span class="nc bnc" id="L988" title="All 2 branches missed.">      if (flags.usePosition) {</span>
+<span class="nc" id="L989">        featuresC.add(c.get(CoreAnnotations.PositionAnnotation.class) + &quot;-POSITION&quot;);</span>
+      }
+<span class="nc bnc" id="L991" title="All 2 branches missed.">      if (flags.useBeginSent) {</span>
+<span class="nc" id="L992">        String pos = c.get(CoreAnnotations.PositionAnnotation.class);</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        if (&quot;0&quot;.equals(pos)) {</span>
+<span class="nc" id="L994">          featuresC.add(&quot;BEGIN-SENT&quot;);</span>
+<span class="nc" id="L995">          featuresC.add(cShape + &quot;-BEGIN-SENT&quot;);</span>
+<span class="nc bnc" id="L996" title="All 2 branches missed.">        } else if (Integer.toString(cInfo.size() - 1).equals(pos)) {</span>
+<span class="nc" id="L997">          featuresC.add(&quot;END-SENT&quot;);</span>
+<span class="nc" id="L998">          featuresC.add(cShape + &quot;-END-SENT&quot;);</span>
+        } else {
+<span class="nc" id="L1000">          featuresC.add(&quot;IN-SENT&quot;);</span>
+<span class="nc" id="L1001">          featuresC.add(cShape + &quot;-IN-SENT&quot;);</span>
+        }
+      }
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">      if (flags.useTags) {</span>
+<span class="nc" id="L1005">        featuresC.add(c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TAG&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">      if (flags.useOrdinal) {</span>
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">        if (isOrdinal(cInfo, loc)) {</span>
+<span class="nc" id="L1010">          featuresC.add(&quot;C_ORDINAL&quot;);</span>
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">          if (isOrdinal(cInfo, loc-1)) {</span>
+            //log.info(getWord(p) + &quot; &quot;);
+<span class="nc" id="L1013">            featuresC.add(&quot;PC_ORDINAL&quot;);</span>
+          }
+          //log.info(cWord);
+        }
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">        if (isOrdinal(cInfo, loc-1)) {</span>
+<span class="nc" id="L1018">          featuresC.add(&quot;P_ORDINAL&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">      if (flags.usePrev) {</span>
+<span class="nc" id="L1023">        featuresC.add(pWord + &quot;-PW&quot;);</span>
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1025">          featuresC.add(p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-PTAG&quot;);</span>
+        }
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1028">          featuresC.add(p.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-PDISTSIM&quot;);</span>
+        }
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">        if (flags.useIsURL) {</span>
+<span class="nc" id="L1031">          featuresC.add(p.get(CoreAnnotations.IsURLAnnotation.class) + &quot;-PISURL&quot;);</span>
+        }
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        if (flags.useEntityTypes) {</span>
+<span class="nc" id="L1034">          featuresC.add(p.get(CoreAnnotations.EntityTypeAnnotation.class) + &quot;-PENTITYTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">      if (flags.useNext) {</span>
+<span class="nc" id="L1039">        featuresC.add(nWord + &quot;-NW&quot;);</span>
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1041">          featuresC.add(n.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-NTAG&quot;);</span>
+        }
+<span class="nc bnc" id="L1043" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1044">          featuresC.add(n.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-NDISTSIM&quot;);</span>
+        }
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">        if (flags.useIsURL) {</span>
+<span class="nc" id="L1047">          featuresC.add(n.get(CoreAnnotations.IsURLAnnotation.class) + &quot;-NISURL&quot;);</span>
+        }
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (flags.useEntityTypes) {</span>
+<span class="nc" id="L1050">          featuresC.add(n.get(CoreAnnotations.EntityTypeAnnotation.class) + &quot;-NENTITYTYPE&quot;);</span>
+        }
+      }
+      /*here, entityTypes refers to the type in the PASCAL IE challenge:
+       * i.e. certain words are tagged &quot;Date&quot; or &quot;Location&quot; */
+
+
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">      if (flags.useEitherSideWord) {</span>
+<span class="nc" id="L1058">        featuresC.add(pWord + &quot;-EW&quot;);</span>
+<span class="nc" id="L1059">        featuresC.add(nWord + &quot;-EW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">      if (flags.useWordPairs) {</span>
+<span class="nc" id="L1063">        featuresC.add(cWord + '-' + pWord + &quot;-W-PW&quot;);</span>
+<span class="nc" id="L1064">        featuresC.add(cWord + '-' + nWord + &quot;-W-NW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">      if (flags.useSymTags) {</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1069">          featuresC.add(p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + n.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-PCNTAGS&quot;);</span>
+<span class="nc" id="L1070">          featuresC.add(c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + n.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-CNTAGS&quot;);</span>
+<span class="nc" id="L1071">          featuresC.add(p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-PCTAGS&quot;);</span>
+        }
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1074">          featuresC.add(p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + '-' + n.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-PCNDISTSIM&quot;);</span>
+<span class="nc" id="L1075">          featuresC.add(c.get(CoreAnnotations.DistSimAnnotation.class) + '-' + n.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-CNDISTSIM&quot;);</span>
+<span class="nc" id="L1076">          featuresC.add(p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-PCDISTSIM&quot;);</span>
+        }
+
+      }
+
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">      if (flags.useSymWordPairs) {</span>
+<span class="nc" id="L1082">        featuresC.add(pWord + '-' + nWord + &quot;-SWORDS&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1085" title="All 4 branches missed.">      String pGazAnnotation = (flags.useGazFeatures || flags.useMoreGazFeatures) ? p.get(CoreAnnotations.GazAnnotation.class) : null;</span>
+<span class="nc bnc" id="L1086" title="All 4 branches missed.">      String nGazAnnotation = (flags.useGazFeatures || flags.useMoreGazFeatures) ? n.get(CoreAnnotations.GazAnnotation.class) : null;</span>
+<span class="nc bnc" id="L1087" title="All 4 branches missed.">      String cGazAnnotation = (flags.useGazFeatures || flags.useMoreGazFeatures) ? c.get(CoreAnnotations.GazAnnotation.class) : null;</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">      if (flags.useGazFeatures) {</span>
+
+<span class="nc bnc" id="L1090" title="All 4 branches missed.">        if (cGazAnnotation != null &amp;&amp; !cGazAnnotation.equals(flags.dropGaz)) {</span>
+<span class="nc" id="L1091">          featuresC.add(cGazAnnotation + &quot;-GAZ&quot;);</span>
+        }
+        // n
+<span class="nc bnc" id="L1094" title="All 4 branches missed.">        if (nGazAnnotation != null &amp;&amp; !nGazAnnotation.equals(flags.dropGaz)) {</span>
+<span class="nc" id="L1095">          featuresC.add(nGazAnnotation + &quot;-NGAZ&quot;);</span>
+        }
+        // p
+<span class="nc bnc" id="L1098" title="All 4 branches missed.">        if (pGazAnnotation != null &amp;&amp; !pGazAnnotation.equals(flags.dropGaz)) {</span>
+<span class="nc" id="L1099">          featuresC.add(pGazAnnotation + &quot;-PGAZ&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">      if (flags.useMoreGazFeatures) {</span>
+<span class="nc bnc" id="L1104" title="All 4 branches missed.">        if (cGazAnnotation != null &amp;&amp; !cGazAnnotation.equals(flags.dropGaz)) {</span>
+<span class="nc" id="L1105">          featuresC.add(cGazAnnotation + '-' + cWord + &quot;-CG-CW-GAZ&quot;);</span>
+
+          // c-n
+<span class="nc bnc" id="L1108" title="All 4 branches missed.">          if (nGazAnnotation != null &amp;&amp; !nGazAnnotation.equals(flags.dropGaz)) {</span>
+<span class="nc" id="L1109">            featuresC.add(cGazAnnotation + '-' + nGazAnnotation + &quot;-CNGAZ&quot;);</span>
+          }
+
+          // p-c
+<span class="nc bnc" id="L1113" title="All 4 branches missed.">          if (pGazAnnotation != null &amp;&amp; !pGazAnnotation.equals(flags.dropGaz)) {</span>
+<span class="nc" id="L1114">            featuresC.add(pGazAnnotation + '-' + cGazAnnotation + &quot;-PCGAZ&quot;);</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1119" title="All 4 branches missed.">      if (flags.useAbbr || flags.useMinimalAbbr) {</span>
+<span class="nc" id="L1120">        featuresC.add(c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-ABBR&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1123" title="All 4 branches missed.">      if (flags.useAbbr1 || flags.useMinimalAbbr1) {</span>
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">        if (!c.get(CoreAnnotations.AbbrAnnotation.class).equals(&quot;XX&quot;)) {</span>
+<span class="nc" id="L1125">          featuresC.add(c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-ABBR&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">      if (flags.useAbbr) {</span>
+<span class="nc" id="L1130">        featuresC.add(p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-PCABBR&quot;);</span>
+<span class="nc" id="L1131">        featuresC.add(c.get(CoreAnnotations.AbbrAnnotation.class) + '-' + n.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-CNABBR&quot;);</span>
+<span class="nc" id="L1132">        featuresC.add(p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + '-' + n.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-PCNABBR&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">      if (flags.useAbbr1) {</span>
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        if (!c.get(CoreAnnotations.AbbrAnnotation.class).equals(&quot;XX&quot;)) {</span>
+<span class="nc" id="L1137">          featuresC.add(p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-PCABBR&quot;);</span>
+<span class="nc" id="L1138">          featuresC.add(c.get(CoreAnnotations.AbbrAnnotation.class) + '-' + n.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-CNABBR&quot;);</span>
+<span class="nc" id="L1139">          featuresC.add(p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + '-' + n.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-PCNABBR&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">      if (flags.useChunks) {</span>
+<span class="nc" id="L1144">        featuresC.add(p.get(CoreAnnotations.ChunkAnnotation.class) + '-' + c.get(CoreAnnotations.ChunkAnnotation.class) + &quot;-PCCHUNK&quot;);</span>
+<span class="nc" id="L1145">        featuresC.add(c.get(CoreAnnotations.ChunkAnnotation.class) + '-' + n.get(CoreAnnotations.ChunkAnnotation.class) + &quot;-CNCHUNK&quot;);</span>
+<span class="nc" id="L1146">        featuresC.add(p.get(CoreAnnotations.ChunkAnnotation.class) + '-' + c.get(CoreAnnotations.ChunkAnnotation.class) + '-' + n.get(CoreAnnotations.ChunkAnnotation.class) + &quot;-PCNCHUNK&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">      if (flags.useMinimalAbbr) {</span>
+<span class="nc" id="L1150">        featuresC.add(cWord + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-CWABB&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">      if (flags.useMinimalAbbr1) {</span>
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">        if (!c.get(CoreAnnotations.AbbrAnnotation.class).equals(&quot;XX&quot;)) {</span>
+<span class="nc" id="L1155">          featuresC.add(cWord + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-CWABB&quot;);</span>
+        }
+      }
+
+<span class="nc" id="L1159">      String prevVB = &quot;&quot;, nextVB = &quot;&quot;;</span>
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">      if (flags.usePrevVB) {</span>
+<span class="nc" id="L1161">        for (int j = loc - 1; ; j--) {</span>
+<span class="nc" id="L1162">          CoreLabel wi = cInfo.get(j);</span>
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">          if (wi == cInfo.getPad()) {</span>
+<span class="nc" id="L1164">            prevVB = &quot;X&quot;;</span>
+<span class="nc" id="L1165">            featuresC.add(&quot;X-PVB&quot;);</span>
+<span class="nc" id="L1166">            break;</span>
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">          } else if (wi.getString(CoreAnnotations.PartOfSpeechAnnotation.class).startsWith(&quot;VB&quot;)) {</span>
+<span class="nc" id="L1168">            featuresC.add(getWord(wi) + &quot;-PVB&quot;);</span>
+<span class="nc" id="L1169">            prevVB = getWord(wi);</span>
+<span class="nc" id="L1170">            break;</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">      if (flags.useNextVB) {</span>
+<span class="nc" id="L1176">        for (int j = loc + 1; ; j++) {</span>
+<span class="nc" id="L1177">          CoreLabel wi = cInfo.get(j);</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">          if (wi == cInfo.getPad()) {</span>
+<span class="nc" id="L1179">            featuresC.add(&quot;X-NVB&quot;);</span>
+<span class="nc" id="L1180">            nextVB = &quot;X&quot;;</span>
+<span class="nc" id="L1181">            break;</span>
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">          } else if (wi.getString(CoreAnnotations.PartOfSpeechAnnotation.class).startsWith(&quot;VB&quot;)) {</span>
+<span class="nc" id="L1183">            featuresC.add(getWord(wi) + &quot;-NVB&quot;);</span>
+<span class="nc" id="L1184">            nextVB = getWord(wi);</span>
+<span class="nc" id="L1185">            break;</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">      if (flags.useVB) {</span>
+<span class="nc" id="L1191">        featuresC.add(prevVB + '-' + nextVB + &quot;-PNVB&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1194" title="All 2 branches missed.">      if (flags.useShapeConjunctions) {</span>
+<span class="nc" id="L1195">        featuresC.add(c.get(CoreAnnotations.PositionAnnotation.class) + cShape + &quot;-POS-SH&quot;);</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1197">          featuresC.add(c.tag() + cShape + &quot;-TAG-SH&quot;);</span>
+        }
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1200">          featuresC.add(c.get(CoreAnnotations.DistSimAnnotation.class) + cShape + &quot;-DISTSIM-SH&quot;);</span>
+        }
+
+      }
+
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">      if (flags.useWordTag) {</span>
+<span class="nc" id="L1206">        featuresC.add(cWord + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-W-T&quot;);</span>
+<span class="nc" id="L1207">        featuresC.add(cWord + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-W-PT&quot;);</span>
+<span class="nc" id="L1208">        featuresC.add(cWord + '-' + n.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-W-NT&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1211" title="All 2 branches missed.">      if (flags.useNPHead) {</span>
+        // TODO: neat idea, but this would need to be set somewhere.
+        // Probably should have its own annotation as this one would
+        // be more narrow and would clobber other potential uses
+<span class="nc" id="L1215">        featuresC.add(c.get(CoreAnnotations.HeadWordStringAnnotation.class) + &quot;-HW&quot;);</span>
+<span class="nc bnc" id="L1216" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1217">          featuresC.add(c.get(CoreAnnotations.HeadWordStringAnnotation.class) + &quot;-&quot; + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-HW-T&quot;);</span>
+        }
+<span class="nc bnc" id="L1219" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1220">          featuresC.add(c.get(CoreAnnotations.HeadWordStringAnnotation.class) + &quot;-&quot; + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-HW-DISTSIM&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1224" title="All 2 branches missed.">      if (flags.useNPGovernor) {</span>
+<span class="nc" id="L1225">        featuresC.add(c.get(CoreAnnotations.GovernorAnnotation.class) + &quot;-GW&quot;);</span>
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1227">          featuresC.add(c.get(CoreAnnotations.GovernorAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-GW-T&quot;);</span>
+        }
+<span class="nc bnc" id="L1229" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1230">          featuresC.add(c.get(CoreAnnotations.GovernorAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM-T1&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">      if (flags.useHeadGov) {</span>
+        // TODO: neat idea, but this would need to be set somewhere.
+        // Probably should have its own annotation as this one would
+        // be more narrow and would clobber other potential uses
+<span class="nc" id="L1238">        featuresC.add(c.get(CoreAnnotations.HeadWordStringAnnotation.class) + &quot;-&quot; + c.get(CoreAnnotations.GovernorAnnotation.class) + &quot;-HW_GW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">      if (flags.useClassFeature) {</span>
+<span class="nc" id="L1242">        featuresC.add(&quot;###&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1245" title="All 2 branches missed.">      if (flags.useFirstWord) {</span>
+<span class="nc" id="L1246">        String firstWord = getWord(cInfo.get(0));</span>
+<span class="nc" id="L1247">        featuresC.add(firstWord);</span>
+      }
+
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">      if (flags.useNGrams) {</span>
+<span class="nc" id="L1251">        Collection&lt;String&gt; subs = null;</span>
+<span class="nc bnc" id="L1252" title="All 2 branches missed.">        if (flags.cacheNGrams) {</span>
+<span class="nc" id="L1253">          subs = wordToSubstrings.get(cWord);</span>
+        }
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">        if (subs == null) {</span>
+<span class="nc" id="L1256">          subs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1257">          String word = '&lt;' + cWord + '&gt;';</span>
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">          if (flags.lowercaseNGrams) {</span>
+<span class="nc" id="L1259">            word = word.toLowerCase();</span>
+          }
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">          if (flags.dehyphenateNGrams) {</span>
+<span class="nc" id="L1262">            word = dehyphenate(word);</span>
+          }
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">          if (flags.greekifyNGrams) {</span>
+<span class="nc" id="L1265">            word = greekify(word);</span>
+          }
+          // minimum length substring is 2 letters (hardwired)
+          // hoist flags.noMidNGrams so only linear in word length for that case
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">          if (flags.noMidNGrams) {</span>
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">            int max = flags.maxNGramLeng &gt;= 0 ? Math.min(flags.maxNGramLeng, word.length()) :</span>
+<span class="nc" id="L1271">                                                word.length();</span>
+<span class="nc bnc" id="L1272" title="All 2 branches missed.">            for (int j = 2; j &lt;= max; j++) {</span>
+<span class="nc" id="L1273">              subs.add(intern('#' + word.substring(0, j) + '#'));</span>
+            }
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">            int start = flags.maxNGramLeng &gt;= 0 ? Math.max(0, word.length() - flags.maxNGramLeng) :</span>
+                                                0;
+<span class="nc" id="L1277">            int lenM1 = word.length() - 1;</span>
+<span class="nc bnc" id="L1278" title="All 2 branches missed.">            for (int i = start; i &lt; lenM1; i++) {</span>
+<span class="nc" id="L1279">              subs.add(intern('#' + word.substring(i) + '#'));</span>
+            }
+<span class="nc" id="L1281">          } else {</span>
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">            for (int i = 0; i &lt; word.length(); i++) {</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">              for (int j = i + 2, max = Math.min(word.length(), i + flags.maxNGramLeng); j &lt;= max; j++) {</span>
+<span class="nc bnc" id="L1284" title="All 4 branches missed.">                if (flags.maxNGramLeng &gt;= 0 &amp;&amp; j - i &gt; flags.maxNGramLeng) {</span>
+<span class="nc" id="L1285">                  continue;</span>
+                }
+<span class="nc" id="L1287">                subs.add(intern('#' + word.substring(i, j) + '#'));</span>
+              }
+            }
+          }
+<span class="nc bnc" id="L1291" title="All 2 branches missed.">          if (flags.cacheNGrams) {</span>
+<span class="nc" id="L1292">            wordToSubstrings.put(cWord, subs);</span>
+          }
+        }
+<span class="nc" id="L1295">        featuresC.addAll(subs);</span>
+<span class="nc bnc" id="L1296" title="All 2 branches missed.">        if (flags.conjoinShapeNGrams) {</span>
+<span class="nc bnc" id="L1297" title="All 2 branches missed.">          for (String str : subs) {</span>
+<span class="nc" id="L1298">            String feat = str + '-' + cShape + &quot;-CNGram-CS&quot;;</span>
+<span class="nc" id="L1299">            featuresC.add(feat);</span>
+<span class="nc" id="L1300">          }</span>
+        }
+      }
+
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">      if (flags.useGazettes) {</span>
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">        if (flags.sloppyGazette) {</span>
+<span class="nc" id="L1306">          Collection&lt;String&gt; entries = wordToGazetteEntries.get(cWord);</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">          if (entries != null) {</span>
+<span class="nc" id="L1308">            featuresC.addAll(entries);</span>
+          }
+        }
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">        if (flags.cleanGazette) {</span>
+<span class="nc" id="L1312">          Collection&lt;GazetteInfo&gt; infos = wordToGazetteInfos.get(cWord);</span>
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">          if (infos != null) {</span>
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">            for (GazetteInfo gInfo : infos) {</span>
+<span class="nc" id="L1315">              boolean ok = true;</span>
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">              for (int gLoc = 0; gLoc &lt; gInfo.words.length; gLoc++) {</span>
+<span class="nc" id="L1317">                ok &amp;= gInfo.words[gLoc].equals(getWord(cInfo.get(loc + gLoc - gInfo.loc)));</span>
+              }
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">              if (ok) {</span>
+<span class="nc" id="L1320">                featuresC.add(gInfo.feature);</span>
+              }
+<span class="nc" id="L1322">            }</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1327" title="All 4 branches missed.">      if ((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) || (flags.useShapeStrings)) {</span>
+<span class="nc" id="L1328">        featuresC.add(cShape + &quot;-TYPE&quot;);</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">        if (flags.useTypeSeqs) {</span>
+<span class="nc" id="L1330">          featuresC.add(pShape + &quot;-PTYPE&quot;);</span>
+<span class="nc" id="L1331">          featuresC.add(nShape + &quot;-NTYPE&quot;);</span>
+<span class="nc" id="L1332">          featuresC.add(pWord + &quot;...&quot; + cShape + &quot;-PW_CTYPE&quot;);</span>
+<span class="nc" id="L1333">          featuresC.add(cShape + &quot;...&quot; + nWord + &quot;-NW_CTYPE&quot;);</span>
+<span class="nc" id="L1334">          featuresC.add(pShape + &quot;...&quot; + cShape + &quot;-PCTYPE&quot;);</span>
+<span class="nc" id="L1335">          featuresC.add(cShape + &quot;...&quot; + nShape + &quot;-CNTYPE&quot;);</span>
+<span class="nc" id="L1336">          featuresC.add(pShape + &quot;...&quot; + cShape + &quot;...&quot; + nShape + &quot;-PCNTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">      if (flags.useLastRealWord) {</span>
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">        if (pWord.length() &lt;= 3) {</span>
+          // extending this to check for 2 short words doesn't seem to help....
+<span class="nc" id="L1343">          featuresC.add(getWord(p2) + &quot;...&quot; + cShape + &quot;-PPW_CTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">      if (flags.useNextRealWord) {</span>
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">        if (nWord.length() &lt;= 3) {</span>
+          // extending this to check for 2 short words doesn't seem to help....
+<span class="nc" id="L1350">          featuresC.add(getWord(n2) + &quot;...&quot; + cShape + &quot;-NNW_CTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">      if (flags.useOccurrencePatterns) {</span>
+<span class="nc" id="L1355">        featuresC.addAll(occurrencePatterns(cInfo, loc));</span>
+      }
+
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">      if (flags.useDisjunctive) {</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.disjunctionWidth; i++) {</span>
+<span class="nc" id="L1360">          CoreLabel dn = cInfo.get(loc + i);</span>
+<span class="nc" id="L1361">          CoreLabel dp = cInfo.get(loc - i);</span>
+<span class="nc" id="L1362">          featuresC.add(getWord(dn) + &quot;-DISJN&quot;);</span>
+<span class="nc bnc" id="L1363" title="All 2 branches missed.">          if (flags.useDisjunctiveShapeInteraction) {</span>
+<span class="nc" id="L1364">            featuresC.add(getWord(dn) + '-' + cShape + &quot;-DISJN-CS&quot;);</span>
+          }
+<span class="nc" id="L1366">          featuresC.add(getWord(dp) + &quot;-DISJP&quot;);</span>
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">          if (flags.useDisjunctiveShapeInteraction) {</span>
+<span class="nc" id="L1368">            featuresC.add(getWord(dp) + '-' + cShape + &quot;-DISJP-CS&quot;);</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1373" title="All 2 branches missed.">      if (flags.useUndirectedDisjunctive) {</span>
+<span class="nc bnc" id="L1374" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.disjunctionWidth; i++) {</span>
+<span class="nc" id="L1375">          CoreLabel dn = cInfo.get(loc + i);</span>
+<span class="nc" id="L1376">          CoreLabel dp = cInfo.get(loc - i);</span>
+<span class="nc" id="L1377">          featuresC.add(getWord(dn) + &quot;-DISJ&quot;);</span>
+<span class="nc" id="L1378">          featuresC.add(getWord(dp) + &quot;-DISJ&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">      if (flags.useWideDisjunctive) {</span>
+<span class="nc bnc" id="L1383" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.wideDisjunctionWidth; i++) {</span>
+<span class="nc" id="L1384">          featuresC.add(getWord(cInfo.get(loc + i)) + &quot;-DISJWN&quot;);</span>
+<span class="nc" id="L1385">          featuresC.add(getWord(cInfo.get(loc - i)) + &quot;-DISJWP&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1389" title="All 2 branches missed.">      if (flags.useEitherSideDisjunctive) {</span>
+<span class="nc bnc" id="L1390" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.disjunctionWidth; i++) {</span>
+<span class="nc" id="L1391">          featuresC.add(getWord(cInfo.get(loc + i)) + &quot;-DISJWE&quot;);</span>
+<span class="nc" id="L1392">          featuresC.add(getWord(cInfo.get(loc - i)) + &quot;-DISJWE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">      if (flags.useDisjShape) {</span>
+<span class="nc bnc" id="L1397" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.disjunctionWidth; i++) {</span>
+<span class="nc" id="L1398">          featuresC.add(cInfo.get(loc + i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-NDISJSHAPE&quot;);</span>
+          // featuresC.add(cInfo.get(loc - i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-PDISJSHAPE&quot;);
+<span class="nc" id="L1400">          featuresC.add(cShape + '-' + cInfo.get(loc + i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-CNDISJSHAPE&quot;);</span>
+          // featuresC.add(c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-&quot; + cInfo.get(loc - i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-CPDISJSHAPE&quot;);
+        }
+      }
+
+<span class="nc bnc" id="L1405" title="All 2 branches missed.">      if (flags.useExtraTaggySequences) {</span>
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1407">          featuresC.add(p2.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TTS&quot;);</span>
+<span class="nc" id="L1408">          featuresC.add(p3.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p2.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TTTS&quot;);</span>
+        }
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1411">          featuresC.add(p2.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM_TTS1&quot;);</span>
+<span class="nc" id="L1412">          featuresC.add(p3.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p2.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM_TTTS1&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1416" title="All 2 branches missed.">      if (flags.useMUCFeatures) {</span>
+<span class="nc" id="L1417">        featuresC.add(c.get(CoreAnnotations.SectionAnnotation.class)+&quot;-SECTION&quot;);</span>
+<span class="nc" id="L1418">        featuresC.add(c.get(CoreAnnotations.WordPositionAnnotation.class)+&quot;-WORD_POSITION&quot;);</span>
+<span class="nc" id="L1419">        featuresC.add(c.get(CoreAnnotations.SentencePositionAnnotation.class)+&quot;-SENT_POSITION&quot;);</span>
+<span class="nc" id="L1420">        featuresC.add(c.get(CoreAnnotations.ParaPositionAnnotation.class)+&quot;-PARA_POSITION&quot;);</span>
+<span class="nc" id="L1421">        featuresC.add(c.get(CoreAnnotations.WordPositionAnnotation.class)+ '-' +c.get(CoreAnnotations.ShapeAnnotation.class)+&quot;-WORD_POSITION_SHAPE&quot;);</span>
+      }
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">    } else if (flags.useInternal) {</span>
+
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">      if (flags.useWord) {</span>
+<span class="nc" id="L1426">        featuresC.add(cWord + &quot;-WORD&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1429" title="All 2 branches missed.">      if (flags.useNGrams) {</span>
+<span class="nc" id="L1430">        Collection&lt;String&gt; subs = wordToSubstrings.get(cWord);</span>
+<span class="nc bnc" id="L1431" title="All 2 branches missed.">        if (subs == null) {</span>
+<span class="nc" id="L1432">          subs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1433">          String word = '&lt;' + cWord + '&gt;';</span>
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">          if (flags.lowercaseNGrams) {</span>
+<span class="nc" id="L1435">            word = word.toLowerCase();</span>
+          }
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">          if (flags.dehyphenateNGrams) {</span>
+<span class="nc" id="L1438">            word = dehyphenate(word);</span>
+          }
+<span class="nc bnc" id="L1440" title="All 2 branches missed.">          if (flags.greekifyNGrams) {</span>
+<span class="nc" id="L1441">            word = greekify(word);</span>
+          }
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">          for (int i = 0; i &lt; word.length(); i++) {</span>
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">            for (int j = i + 2; j &lt;= word.length(); j++) {</span>
+<span class="nc bnc" id="L1445" title="All 6 branches missed.">              if (flags.noMidNGrams &amp;&amp; i != 0 &amp;&amp; j != word.length()) {</span>
+<span class="nc" id="L1446">                continue;</span>
+              }
+<span class="nc bnc" id="L1448" title="All 4 branches missed.">              if (flags.maxNGramLeng &gt;= 0 &amp;&amp; j - i &gt; flags.maxNGramLeng) {</span>
+<span class="nc" id="L1449">                continue;</span>
+              }
+              //subs.add(intern(&quot;#&quot; + word.substring(i, j) + &quot;#&quot;));
+<span class="nc" id="L1452">              subs.add(intern('#' + word.substring(i, j) + '#'));</span>
+            }
+          }
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">          if (flags.cacheNGrams) {</span>
+<span class="nc" id="L1456">            wordToSubstrings.put(cWord, subs);</span>
+          }
+        }
+<span class="nc" id="L1459">        featuresC.addAll(subs);</span>
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">        if (flags.conjoinShapeNGrams) {</span>
+<span class="nc" id="L1461">          String shape = c.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc bnc" id="L1462" title="All 2 branches missed.">          for (String str : subs) {</span>
+<span class="nc" id="L1463">            String feat = str + '-' + shape + &quot;-CNGram-CS&quot;;</span>
+<span class="nc" id="L1464">            featuresC.add(feat);</span>
+<span class="nc" id="L1465">          }</span>
+        }
+      }
+
+<span class="nc bnc" id="L1469" title="All 4 branches missed.">      if ((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) || (flags.useShapeStrings)) {</span>
+<span class="nc" id="L1470">        featuresC.add(cShape + &quot;-TYPE&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1473" title="All 2 branches missed.">      if (flags.useOccurrencePatterns) {</span>
+<span class="nc" id="L1474">        featuresC.addAll(occurrencePatterns(cInfo, loc));</span>
+      }
+
+<span class="nc bnc" id="L1477" title="All 2 branches missed.">    } else if (flags.useExternal) {</span>
+
+<span class="nc bnc" id="L1479" title="All 2 branches missed.">      if (flags.usePrev) {</span>
+<span class="nc" id="L1480">        featuresC.add(pWord + &quot;-PW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1483" title="All 2 branches missed.">      if (flags.useNext) {</span>
+<span class="nc" id="L1484">        featuresC.add(nWord + &quot;-NW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1487" title="All 2 branches missed.">      if (flags.useWordPairs) {</span>
+<span class="nc" id="L1488">        featuresC.add(cWord + '-' + pWord + &quot;-W-PW&quot;);</span>
+<span class="nc" id="L1489">        featuresC.add(cWord + '-' + nWord + &quot;-W-NW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">      if (flags.useSymWordPairs) {</span>
+<span class="nc" id="L1493">        featuresC.add(pWord + '-' + nWord + &quot;-SWORDS&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1496" title="All 4 branches missed.">      if ((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) || (flags.useShapeStrings)) {</span>
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">        if (flags.useTypeSeqs) {</span>
+<span class="nc" id="L1498">          featuresC.add(pShape + &quot;-PTYPE&quot;);</span>
+<span class="nc" id="L1499">          featuresC.add(nShape + &quot;-NTYPE&quot;);</span>
+<span class="nc" id="L1500">          featuresC.add(pWord + &quot;...&quot; + cShape + &quot;-PW_CTYPE&quot;);</span>
+<span class="nc" id="L1501">          featuresC.add(cShape + &quot;...&quot; + nWord + &quot;-NW_CTYPE&quot;);</span>
+<span class="nc bnc" id="L1502" title="All 2 branches missed.">          if (flags.maxLeft &gt; 0) featuresC.add(pShape + &quot;...&quot; + cShape + &quot;-PCTYPE&quot;); // this one just isn't useful, at least given c,pc,s,ps.  Might be useful 0th-order</span>
+<span class="nc" id="L1503">          featuresC.add(cShape + &quot;...&quot; + nShape + &quot;-CNTYPE&quot;);</span>
+<span class="nc" id="L1504">          featuresC.add(pShape + &quot;...&quot; + cShape + &quot;...&quot; + nShape + &quot;-PCNTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1508" title="All 2 branches missed.">      if (flags.useLastRealWord) {</span>
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">        if (pWord.length() &lt;= 3) {</span>
+<span class="nc" id="L1510">          featuresC.add(getWord(p2) + &quot;...&quot; + cShape + &quot;-PPW_CTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1514" title="All 2 branches missed.">      if (flags.useNextRealWord) {</span>
+<span class="nc bnc" id="L1515" title="All 2 branches missed.">        if (nWord.length() &lt;= 3) {</span>
+<span class="nc" id="L1516">          featuresC.add(getWord(n2) + &quot;...&quot; + cShape + &quot;-NNW_CTYPE&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1520" title="All 2 branches missed.">      if (flags.useDisjunctive) {</span>
+<span class="nc bnc" id="L1521" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.disjunctionWidth; i++) {</span>
+<span class="nc" id="L1522">          CoreLabel dn = cInfo.get(loc + i);</span>
+<span class="nc" id="L1523">          CoreLabel dp = cInfo.get(loc - i);</span>
+<span class="nc" id="L1524">          featuresC.add(getWord(dn) + &quot;-DISJN&quot;);</span>
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">          if (flags.useDisjunctiveShapeInteraction) {</span>
+<span class="nc" id="L1526">            featuresC.add(getWord(dn) + '-' + cShape + &quot;-DISJN-CS&quot;);</span>
+          }
+<span class="nc" id="L1528">          featuresC.add(getWord(dp) + &quot;-DISJP&quot;);</span>
+<span class="nc bnc" id="L1529" title="All 2 branches missed.">          if (flags.useDisjunctiveShapeInteraction) {</span>
+<span class="nc" id="L1530">            featuresC.add(getWord(dp) + '-' + cShape + &quot;-DISJP-CS&quot;);</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">      if (flags.useWideDisjunctive) {</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.wideDisjunctionWidth; i++) {</span>
+<span class="nc" id="L1537">          featuresC.add(getWord(cInfo.get(loc + i)) + &quot;-DISJWN&quot;);</span>
+<span class="nc" id="L1538">          featuresC.add(getWord(cInfo.get(loc - i)) + &quot;-DISJWP&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1542" title="All 2 branches missed.">      if (flags.useDisjShape) {</span>
+<span class="nc bnc" id="L1543" title="All 2 branches missed.">        for (int i = 1; i &lt;= flags.disjunctionWidth; i++) {</span>
+<span class="nc" id="L1544">          featuresC.add(cInfo.get(loc + i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-NDISJSHAPE&quot;);</span>
+          // featuresC.add(cInfo.get(loc - i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-PDISJSHAPE&quot;);
+<span class="nc" id="L1546">          featuresC.add(c.get(CoreAnnotations.ShapeAnnotation.class) + '-' + cInfo.get(loc + i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-CNDISJSHAPE&quot;);</span>
+          // featuresC.add(c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-&quot; + cInfo.get(loc - i).get(CoreAnnotations.ShapeAnnotation.class) + &quot;-CPDISJSHAPE&quot;);
+        }
+      }
+
+    }
+
+    // Stuff to add binary features from the additional columns
+<span class="nc bnc" id="L1554" title="All 2 branches missed.">    if (flags.twoStage) {</span>
+<span class="nc" id="L1555">      featuresC.add(c.get(Bin1Annotation.class) + &quot;-BIN1&quot;);</span>
+<span class="nc" id="L1556">      featuresC.add(c.get(Bin2Annotation.class) + &quot;-BIN2&quot;);</span>
+<span class="nc" id="L1557">      featuresC.add(c.get(Bin3Annotation.class) + &quot;-BIN3&quot;);</span>
+<span class="nc" id="L1558">      featuresC.add(c.get(Bin4Annotation.class) + &quot;-BIN4&quot;);</span>
+<span class="nc" id="L1559">      featuresC.add(c.get(Bin5Annotation.class) + &quot;-BIN5&quot;);</span>
+<span class="nc" id="L1560">      featuresC.add(c.get(Bin6Annotation.class) + &quot;-BIN6&quot;);</span>
+    }
+
+<span class="nc bnc" id="L1563" title="All 2 branches missed.">    if(flags.useIfInteger){</span>
+      try {
+<span class="nc" id="L1565">        int val = Integer.parseInt(cWord);</span>
+<span class="nc bnc" id="L1566" title="All 2 branches missed.">        if(val &gt; 0) featuresC.add(&quot;POSITIVE_INTEGER&quot;);</span>
+<span class="nc bnc" id="L1567" title="All 2 branches missed.">        else if(val &lt; 0) featuresC.add(&quot;NEGATIVE_INTEGER&quot;);</span>
+        // log.info(&quot;FOUND INTEGER&quot;);
+<span class="nc" id="L1569">      } catch(NumberFormatException e){</span>
+        // not an integer value, nothing to do
+<span class="nc" id="L1571">      }</span>
+    }
+
+    //Stuff to add arbitrary features
+<span class="nc bnc" id="L1575" title="All 2 branches missed.">    if (flags.useGenericFeatures) {</span>
+      //see if we need to cache the keys
+<span class="nc bnc" id="L1577" title="All 2 branches missed.">      if (genericAnnotationKeys == null) {</span>
+<span class="nc" id="L1578">        makeGenericKeyCache(c);</span>
+      }
+      //now look through the cached keys
+<span class="nc bnc" id="L1581" title="All 2 branches missed.">      for (Class key : genericAnnotationKeys) {</span>
+        //log.info(&quot;Adding feature: &quot; + CoreLabel.genericValues.get(key) + &quot; with value &quot; + c.get(key));
+<span class="nc bnc" id="L1583" title="All 4 branches missed.">        if (c.get(key) != null &amp;&amp; c.get(key) instanceof Collection) {</span>
+<span class="nc bnc" id="L1584" title="All 2 branches missed.">          for (Object ob: (Collection)c.get(key)) {</span>
+<span class="nc" id="L1585">            featuresC.add(ob + &quot;-&quot; + CoreLabel.genericValues.get(key));</span>
+<span class="nc" id="L1586">          }</span>
+        } else {
+<span class="nc" id="L1588">          featuresC.add(c.get(key) + &quot;-&quot; + CoreLabel.genericValues.get(key));</span>
+        }
+<span class="nc" id="L1590">      }</span>
+    }
+
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">    if(flags.useTopics){</span>
+      //featuresC.add(p.get(CoreAnnotations.TopicAnnotation.class) + '-' + cWord + &quot;--CWORD&quot;);
+<span class="nc" id="L1595">      featuresC.add(c.get(CoreAnnotations.TopicAnnotation.class)+ &quot;-TopicID&quot;);</span>
+<span class="nc" id="L1596">      featuresC.add(p.get(CoreAnnotations.TopicAnnotation.class) + &quot;-PTopicID&quot;);</span>
+<span class="nc" id="L1597">      featuresC.add(n.get(CoreAnnotations.TopicAnnotation.class) + &quot;-NTopicID&quot;);</span>
+      //featuresC.add(p.get(CoreAnnotations.TopicAnnotation.class) + '-' + c.get(CoreAnnotations.TopicAnnotation.class) + '-' + n.get(CoreAnnotations.TopicAnnotation.class) + &quot;-PCNTopicID&quot;);
+      //featuresC.add(c.get(CoreAnnotations.TopicAnnotation.class) + '-' + n.get(CoreAnnotations.TopicAnnotation.class) + &quot;-CNTopicID&quot;);
+      //featuresC.add(p.get(CoreAnnotations.TopicAnnotation.class) + '-' + c.get(CoreAnnotations.TopicAnnotation.class) + &quot;-PCTopicID&quot;);
+      //featuresC.add(c.get(CoreAnnotations.TopicAnnotation.class) + cShape + &quot;-TopicID-SH&quot;);
+      //asdasd
+    }
+
+    // todo [cdm 2014]: Have this guarded by a flag and things would be a little faster. Set flag in current uses of this annotation.
+    // NER tag annotations from a previous NER system
+<span class="nc bnc" id="L1607" title="All 2 branches missed.">    if (c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) != null) {</span>
+<span class="nc" id="L1608">      featuresC.add(c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class)+ &quot;-CStackedNERTag&quot;);</span>
+<span class="nc" id="L1609">      featuresC.add(cWord + &quot;-&quot; + c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class)+ &quot;-WCStackedNERTag&quot;);</span>
+
+<span class="nc bnc" id="L1611" title="All 2 branches missed.">      if (flags.useNext) {</span>
+<span class="nc" id="L1612">        featuresC.add(c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + '-' + n.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + &quot;-CNStackedNERTag&quot;);</span>
+<span class="nc" id="L1613">        featuresC.add(cWord + &quot;-&quot; + c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + '-' + n.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + &quot;-WCNStackedNERTag&quot;);</span>
+
+<span class="nc bnc" id="L1615" title="All 2 branches missed.">        if (flags.usePrev) {</span>
+<span class="nc" id="L1616">          featuresC.add(p.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + '-' + c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + '-' + n.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + &quot;-PCNStackedNERTag&quot;);</span>
+<span class="nc" id="L1617">          featuresC.add(p.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + '-' + cWord + &quot; -&quot; + c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class)</span>
+<span class="nc" id="L1618">              + '-' + n.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + &quot;-PWCNStackedNERTag&quot;);</span>
+        }
+      }
+<span class="nc bnc" id="L1621" title="All 2 branches missed.">      if (flags.usePrev) {</span>
+<span class="nc" id="L1622">        featuresC.add(p.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + '-' + c.get(CoreAnnotations.StackedNamedEntityTagAnnotation.class) + &quot;-PCStackedNERTag&quot;);</span>
+      }
+    }
+<span class="nc bnc" id="L1625" title="All 2 branches missed.">    if(flags.useWordnetFeatures)</span>
+<span class="nc" id="L1626">      featuresC.add(c.get(CoreAnnotations.WordnetSynAnnotation.class)+&quot;-WordnetSyn&quot;);</span>
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">    if(flags.useProtoFeatures)</span>
+<span class="nc" id="L1628">      featuresC.add(c.get(CoreAnnotations.ProtoAnnotation.class)+&quot;-Proto&quot;);</span>
+<span class="nc bnc" id="L1629" title="All 2 branches missed.">    if(flags.usePhraseWordTags)</span>
+<span class="nc" id="L1630">      featuresC.add(c.get(CoreAnnotations.PhraseWordsTagAnnotation.class)+&quot;-PhraseTag&quot;);</span>
+<span class="nc bnc" id="L1631" title="All 2 branches missed.">    if(flags.usePhraseWords)</span>
+    {
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">      for(String w: c.get(CoreAnnotations.PhraseWordsAnnotation.class))</span>
+<span class="nc" id="L1634">      featuresC.add(w+&quot;-PhraseWord&quot;);</span>
+    }
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">    if(flags.useCommonWordsFeature)</span>
+<span class="nc" id="L1637">      featuresC.add(c.get(CoreAnnotations.CommonWordsAnnotation.class));</span>
+
+<span class="nc bnc" id="L1639" title="All 4 branches missed.">    if (flags.useRadical &amp;&amp; cWord.length() &gt; 0) {</span>
+      // todo [cdm 2016]: Really all stuff in this file should be fixed to work with codepoints outside BMP
+<span class="nc bnc" id="L1641" title="All 2 branches missed.">      if (cWord.length() == 1) {</span>
+<span class="nc" id="L1642">        featuresC.add(RadicalMap.getRadical(cWord.charAt(0)) +</span>
+                      &quot;-SINGLE-CHAR-RADICAL&quot;);
+      } else {
+<span class="nc" id="L1645">        featuresC.add(RadicalMap.getRadical(cWord.charAt(0)) +</span>
+                      &quot;-START-RADICAL&quot;);
+<span class="nc" id="L1647">        featuresC.add(RadicalMap.getRadical(cWord.charAt(cWord.length() - 1)) +</span>
+                      &quot;-END-RADICAL&quot;);
+      }
+<span class="nc bnc" id="L1650" title="All 2 branches missed.">      for (int i = 0; i &lt; cWord.length(); ++i) {</span>
+<span class="nc" id="L1651">        featuresC.add(RadicalMap.getRadical(cWord.charAt(i)) +</span>
+                      &quot;-RADICAL&quot;);
+      }
+    }
+
+<span class="nc bnc" id="L1656" title="All 4 branches missed.">    if(flags.splitWordRegex != null &amp;&amp; !flags.splitWordRegex.isEmpty()){</span>
+<span class="nc" id="L1657">      String[] ws = c.word().split(flags.splitWordRegex);</span>
+<span class="nc bnc" id="L1658" title="All 2 branches missed.">      for(String s: ws){</span>
+<span class="nc" id="L1659">       featuresC.add(s+&quot;-SPLITWORD&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L1663" title="All 2 branches missed.">    if (flags.useMoreNeighborNGrams) {</span>
+<span class="nc" id="L1664">      int maxLen = pWord.length();</span>
+<span class="nc bnc" id="L1665" title="All 4 branches missed.">      if (flags.maxNGramLeng &gt;= 0 &amp;&amp; flags.maxNGramLeng &lt; maxLen) {</span>
+<span class="nc" id="L1666">        maxLen = flags.maxNGramLeng;</span>
+      }
+<span class="nc bnc" id="L1668" title="All 2 branches missed.">      for (int len = 1; len &lt;= maxLen; ++len) {</span>
+<span class="nc" id="L1669">        featuresC.add(pWord.substring(0, len) + &quot;-PREV-PREFIX&quot;);</span>
+      }
+<span class="nc bnc" id="L1671" title="All 2 branches missed.">      for (int pos = pWord.length() - maxLen; pos &lt; pWord.length(); ++pos) {</span>
+<span class="nc" id="L1672">        featuresC.add(pWord.substring(pos, pWord.length()) +</span>
+                        &quot;-PREV-SUFFIX&quot;);
+      }
+
+<span class="nc" id="L1676">      maxLen = nWord.length();</span>
+<span class="nc bnc" id="L1677" title="All 4 branches missed.">      if (flags.maxNGramLeng &gt;= 0 &amp;&amp; flags.maxNGramLeng &lt; maxLen) {</span>
+<span class="nc" id="L1678">        maxLen = flags.maxNGramLeng;</span>
+      }
+<span class="nc bnc" id="L1680" title="All 2 branches missed.">      for (int len = 1; len &lt;= maxLen; ++len) {</span>
+<span class="nc" id="L1681">        featuresC.add(nWord.substring(0, len) + &quot;-NEXT-PREFIX&quot;);</span>
+      }
+<span class="nc bnc" id="L1683" title="All 2 branches missed.">      for (int pos = nWord.length() - maxLen; pos &lt; nWord.length(); ++pos) {</span>
+<span class="nc" id="L1684">        featuresC.add(nWord.substring(pos, nWord.length()) +</span>
+                        &quot;-NEXT-SUFFIX&quot;);
+      }
+    }
+
+<span class="nc" id="L1689">    return featuresC;</span>
+  } // end featuresC()
+
+
+  /**
+   * Binary feature annotations
+   */
+<span class="nc" id="L1696">  private static class Bin1Annotation implements CoreAnnotation&lt;String&gt; {</span>
+<span class="nc" id="L1697">    public Class&lt;String&gt; getType() {  return String.class; } }</span>
+
+<span class="nc" id="L1699">  private static class Bin2Annotation implements CoreAnnotation&lt;String&gt; {</span>
+<span class="nc" id="L1700">    public Class&lt;String&gt; getType() {  return String.class; } }</span>
+
+<span class="nc" id="L1702">  private static class Bin3Annotation implements CoreAnnotation&lt;String&gt; {</span>
+<span class="nc" id="L1703">    public Class&lt;String&gt; getType() {  return String.class; } }</span>
+
+<span class="nc" id="L1705">  private static class Bin4Annotation implements CoreAnnotation&lt;String&gt; {</span>
+<span class="nc" id="L1706">    public Class&lt;String&gt; getType() {  return String.class; } }</span>
+
+<span class="nc" id="L1708">  private static class Bin5Annotation implements CoreAnnotation&lt;String&gt; {</span>
+<span class="nc" id="L1709">    public Class&lt;String&gt; getType() {  return String.class; } }</span>
+
+<span class="nc" id="L1711">  private static class Bin6Annotation implements CoreAnnotation&lt;String&gt; {</span>
+<span class="nc" id="L1712">    public Class&lt;String&gt; getType() {  return String.class; } }</span>
+
+
+
+  protected Collection&lt;String&gt; featuresCpC(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L1717">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L1718">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L1719">    CoreLabel n = cInfo.get(loc + 1);</span>
+
+<span class="nc" id="L1721">    String cWord = getWord(c);</span>
+<span class="nc" id="L1722">    String pWord = getWord(p);</span>
+<span class="nc" id="L1723">    String cDS = c.getString(CoreAnnotations.DistSimAnnotation.class);</span>
+<span class="nc" id="L1724">    String pDS = p.getString(CoreAnnotations.DistSimAnnotation.class);</span>
+<span class="nc" id="L1725">    String cShape = c.getString(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L1726">    String pShape = p.getString(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L1727">    Collection&lt;String&gt; featuresCpC = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1729" title="All 2 branches missed.">    if (flags.noEdgeFeature)</span>
+<span class="nc" id="L1730">      return featuresCpC;</span>
+
+<span class="nc bnc" id="L1732" title="All 2 branches missed.">    if (flags.transitionEdgeOnly) {</span>
+<span class="nc" id="L1733">      featuresCpC.add(&quot;PSEQ&quot;);</span>
+<span class="nc" id="L1734">      return featuresCpC;</span>
+    }
+
+<span class="nc bnc" id="L1737" title="All 2 branches missed.">    if (flags.useNeighborNGrams) {</span>
+<span class="nc" id="L1738">      int maxLen = pWord.length();</span>
+<span class="nc bnc" id="L1739" title="All 4 branches missed.">      if (flags.maxNGramLeng &gt;= 0 &amp;&amp; flags.maxNGramLeng &lt; maxLen) {</span>
+<span class="nc" id="L1740">        maxLen = flags.maxNGramLeng;</span>
+      }
+<span class="nc bnc" id="L1742" title="All 2 branches missed.">      for (int len = 1; len &lt;= maxLen; ++len) {</span>
+<span class="nc" id="L1743">        featuresCpC.add(pWord.substring(0, len) + &quot;-PREVIOUS-PREFIX&quot;);</span>
+      }
+<span class="nc bnc" id="L1745" title="All 2 branches missed.">      for (int pos = pWord.length() - maxLen; pos &lt; pWord.length(); ++pos) {</span>
+<span class="nc" id="L1746">        featuresCpC.add(pWord.substring(pos, pWord.length()) +</span>
+                        &quot;-PREVIOUS-SUFFIX&quot;);
+      }
+
+<span class="nc" id="L1750">      maxLen = cWord.length();</span>
+<span class="nc bnc" id="L1751" title="All 4 branches missed.">      if (flags.maxNGramLeng &gt;= 0 &amp;&amp; flags.maxNGramLeng &lt; maxLen) {</span>
+<span class="nc" id="L1752">        maxLen = flags.maxNGramLeng;</span>
+      }
+<span class="nc bnc" id="L1754" title="All 2 branches missed.">      for (int len = 1; len &lt;= maxLen; ++len) {</span>
+<span class="nc" id="L1755">        featuresCpC.add(cWord.substring(0, len) + &quot;-CURRENT-PREFIX&quot;);</span>
+      }
+<span class="nc bnc" id="L1757" title="All 2 branches missed.">      for (int pos = cWord.length() - maxLen; pos &lt; cWord.length(); ++pos) {</span>
+<span class="nc" id="L1758">        featuresCpC.add(cWord.substring(pos, cWord.length()) +</span>
+                        &quot;-CURRENT-SUFFIX&quot;);
+      }
+    }
+
+<span class="nc bnc" id="L1763" title="All 4 branches missed.">    if (flags.useInternal &amp;&amp; flags.useExternal ) {</span>
+
+<span class="nc bnc" id="L1765" title="All 2 branches missed.">      if (flags.useOrdinal) {</span>
+<span class="nc bnc" id="L1766" title="All 2 branches missed.">        if (isOrdinal(cInfo, loc)) {</span>
+<span class="nc" id="L1767">          featuresCpC.add(&quot;C_ORDINAL&quot;);</span>
+<span class="nc bnc" id="L1768" title="All 2 branches missed.">          if (isOrdinal(cInfo, loc-1)) {</span>
+<span class="nc" id="L1769">            featuresCpC.add(&quot;PC_ORDINAL&quot;);</span>
+          }
+        }
+<span class="nc bnc" id="L1772" title="All 2 branches missed.">        if (isOrdinal(cInfo, loc-1)) {</span>
+<span class="nc" id="L1773">          featuresCpC.add(&quot;P_ORDINAL&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1777" title="All 4 branches missed.">      if (flags.useAbbr || flags.useMinimalAbbr) {</span>
+<span class="nc" id="L1778">        featuresCpC.add(p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-PABBRANS&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1781" title="All 4 branches missed.">      if (flags.useAbbr1 || flags.useMinimalAbbr1) {</span>
+<span class="nc bnc" id="L1782" title="All 2 branches missed.">        if (!c.get(CoreAnnotations.AbbrAnnotation.class).equals(&quot;XX&quot;)) {</span>
+<span class="nc" id="L1783">          featuresCpC.add(p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-PABBRANS&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1787" title="All 2 branches missed.">      if (flags.useChunkySequences) {</span>
+<span class="nc" id="L1788">        featuresCpC.add(p.get(CoreAnnotations.ChunkAnnotation.class) + '-' + c.get(CoreAnnotations.ChunkAnnotation.class) + '-' + n.get(CoreAnnotations.ChunkAnnotation.class) + &quot;-PCNCHUNK&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1791" title="All 2 branches missed.">      if (flags.usePrev) {</span>
+<span class="nc bnc" id="L1792" title="All 4 branches missed.">        if (flags.useSequences &amp;&amp; flags.usePrevSequences) {</span>
+<span class="nc" id="L1793">          featuresCpC.add(&quot;PSEQ&quot;);</span>
+<span class="nc" id="L1794">          featuresCpC.add(cWord + &quot;-PSEQW&quot;);</span>
+
+<span class="nc bnc" id="L1796" title="All 2 branches missed.">          if ( ! flags.strictGoodCoNLL) {</span>
+<span class="nc" id="L1797">            featuresCpC.add(pWord+ '-' +cWord + &quot;-PSEQW2&quot;);  // added later after goodCoNLL</span>
+<span class="nc" id="L1798">            featuresCpC.add(pWord + &quot;-PSEQpW&quot;); // added later after goodCoNLL</span>
+          }
+
+<span class="nc bnc" id="L1801" title="All 2 branches missed.">          if (flags.useDistSim) {</span>
+<span class="nc" id="L1802">            featuresCpC.add(pDS + &quot;-PSEQpDS&quot;);</span>
+<span class="nc" id="L1803">            featuresCpC.add(cDS + &quot;-PSEQcDS&quot;);</span>
+<span class="nc" id="L1804">            featuresCpC.add(pDS+ '-' +cDS + &quot;-PSEQpcDS&quot;);</span>
+          }
+
+<span class="nc bnc" id="L1807" title="All 4 branches missed.">          if (((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) || flags.useShapeStrings)) {</span>
+<span class="nc bnc" id="L1808" title="All 2 branches missed.">            if ( ! flags.strictGoodCoNLL) {     // These ones were added later after goodCoNLL</span>
+<span class="nc" id="L1809">              featuresCpC.add(pShape + &quot;-PSEQpS&quot;);</span>
+<span class="nc" id="L1810">              featuresCpC.add(cShape + &quot;-PSEQcS&quot;);</span>
+            }
+<span class="nc bnc" id="L1812" title="All 4 branches missed.">            if (flags.strictGoodCoNLL &amp;&amp; ! flags.removeStrictGoodCoNLLDuplicates) {</span>
+<span class="nc" id="L1813">              featuresCpC.add(pShape + '-' + cShape + &quot;-PSEQpcS&quot;); // Duplicate (in goodCoNLL orig, see -TYPES below)</span>
+            }
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1819" title="All 10 branches missed.">      if (((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) ||</span>
+           flags.useShapeStrings)
+          &amp;&amp; flags.useTypeSeqs &amp;&amp; (flags.useTypeSeqs2 || flags.useTypeSeqs3)) {
+<span class="nc bnc" id="L1822" title="All 2 branches missed.">        if (flags.useTypeSeqs3) {</span>
+<span class="nc" id="L1823">          featuresCpC.add(pShape + '-' + cShape + '-' + n.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-PCNSHAPES&quot;);</span>
+        }
+<span class="nc bnc" id="L1825" title="All 2 branches missed.">        if (flags.useTypeSeqs2) {</span>
+<span class="nc" id="L1826">          featuresCpC.add(pShape + '-' + cShape + &quot;-TYPES&quot;);  // this duplicates PSEQpcS above</span>
+        }
+
+<span class="nc bnc" id="L1829" title="All 2 branches missed.">        if (flags.useYetMoreCpCShapes) {</span>
+<span class="nc" id="L1830">          String p2Shape = cInfo.get(loc - 2).getString(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L1831">          featuresCpC.add(p2Shape + '-' + pShape + '-' + cShape + &quot;-YMS&quot;);</span>
+<span class="nc" id="L1832">          featuresCpC.add(pShape + '-' + cShape + &quot;-&quot; + n.getString(CoreAnnotations.ShapeAnnotation.class) + &quot;-YMSPCN&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1836" title="All 2 branches missed.">      if (flags.useTypeySequences) {</span>
+<span class="nc" id="L1837">        featuresCpC.add(cShape + &quot;-TPS2&quot;);</span>
+<span class="nc" id="L1838">        featuresCpC.add(n.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-TNS1&quot;);</span>
+        // featuresCpC.add(pShape) + &quot;-&quot; + cShape) + &quot;-TPS&quot;); // duplicates -TYPES, so now omitted; you may need to slightly increase sigma to duplicate previous results, however.
+      }
+
+<span class="nc bnc" id="L1842" title="All 2 branches missed.">      if (flags.useTaggySequences) {</span>
+<span class="nc bnc" id="L1843" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L1844">          featuresCpC.add(p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TS&quot;);</span>
+        }
+<span class="nc bnc" id="L1846" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L1847">          featuresCpC.add(p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM_TS1&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1851" title="All 2 branches missed.">      if (flags.useParenMatching) {</span>
+<span class="nc bnc" id="L1852" title="All 2 branches missed.">        if (flags.useReverse) {</span>
+<span class="nc bnc" id="L1853" title="All 6 branches missed.">          if (cWord.equals(&quot;(&quot;) || cWord.equals(&quot;[&quot;) || cWord.equals(&quot;-LRB-&quot;)) {</span>
+<span class="nc bnc" id="L1854" title="All 6 branches missed.">            if (pWord.equals(&quot;)&quot;) || pWord.equals(&quot;]&quot;) || pWord.equals(&quot;-RRB-&quot;)) {</span>
+<span class="nc" id="L1855">              featuresCpC.add(&quot;PAREN-MATCH&quot;);</span>
+            }
+          }
+        } else {
+<span class="nc bnc" id="L1859" title="All 6 branches missed.">          if (cWord.equals(&quot;)&quot;) || cWord.equals(&quot;]&quot;) || cWord.equals(&quot;-RRB-&quot;)) {</span>
+<span class="nc bnc" id="L1860" title="All 6 branches missed.">            if (pWord.equals(&quot;(&quot;) || pWord.equals(&quot;[&quot;) || pWord.equals(&quot;-LRB-&quot;)) {</span>
+<span class="nc" id="L1861">              featuresCpC.add(&quot;PAREN-MATCH&quot;);</span>
+            }
+          }
+        }
+      }
+<span class="nc bnc" id="L1866" title="All 2 branches missed.">      if (flags.useEntityTypeSequences) {</span>
+<span class="nc" id="L1867">        featuresCpC.add(p.get(CoreAnnotations.EntityTypeAnnotation.class) + '-' + c.get(CoreAnnotations.EntityTypeAnnotation.class) + &quot;-ETSEQ&quot;);</span>
+      }
+<span class="nc bnc" id="L1869" title="All 2 branches missed.">      if (flags.useURLSequences) {</span>
+<span class="nc" id="L1870">        featuresCpC.add(p.get(CoreAnnotations.IsURLAnnotation.class) + '-' + c.get(CoreAnnotations.IsURLAnnotation.class) + &quot;-URLSEQ&quot;);</span>
+      }
+<span class="nc bnc" id="L1872" title="All 2 branches missed.">    } else if (flags.useInternal) {</span>
+
+<span class="nc bnc" id="L1874" title="All 4 branches missed.">      if (flags.useSequences &amp;&amp; flags.usePrevSequences) {</span>
+<span class="nc" id="L1875">        featuresCpC.add(&quot;PSEQ&quot;);</span>
+<span class="nc" id="L1876">        featuresCpC.add(cWord + &quot;-PSEQW&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1879" title="All 2 branches missed.">      if (flags.useTypeySequences) {</span>
+<span class="nc" id="L1880">        featuresCpC.add(cShape + &quot;-TPS2&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1883" title="All 2 branches missed.">    } else if (flags.useExternal) {</span>
+
+<span class="nc bnc" id="L1885" title="All 10 branches missed.">      if( ((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) ||</span>
+           flags.useShapeStrings)
+          &amp;&amp; flags.useTypeSeqs &amp;&amp; (flags.useTypeSeqs2 || flags.useTypeSeqs3)) {
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">        if (flags.useTypeSeqs3) {</span>
+<span class="nc" id="L1889">          featuresCpC.add(pShape + '-' + cShape + '-' + n.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-PCNSHAPES&quot;);</span>
+        }
+<span class="nc bnc" id="L1891" title="All 2 branches missed.">        if (flags.useTypeSeqs2) {</span>
+<span class="nc" id="L1892">          featuresCpC.add(pShape + '-' + cShape + &quot;-TYPES&quot;);</span>
+        }
+      }
+
+<span class="nc bnc" id="L1896" title="All 2 branches missed.">      if (flags.useTypeySequences) {</span>
+<span class="nc" id="L1897">        featuresCpC.add(n.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-TNS1&quot;);</span>
+<span class="nc" id="L1898">        featuresCpC.add(pShape + '-' + c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-TPS&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L1902">    return featuresCpC;</span>
+  }
+
+  protected Collection&lt;String&gt; featuresCp2C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L1906">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L1907">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L1908">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+
+<span class="nc" id="L1910">    String cWord = getWord(c);</span>
+<span class="nc" id="L1911">    String pWord = getWord(p);</span>
+<span class="nc" id="L1912">    String p2Word = getWord(p2);</span>
+<span class="nc" id="L1913">    Collection&lt;String&gt; featuresCp2C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1915" title="All 2 branches missed.">    if (flags.useMoreAbbr) {</span>
+<span class="nc" id="L1916">      featuresCp2C.add(p2.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-P2ABBRANS&quot;);</span>
+    }
+
+<span class="nc bnc" id="L1919" title="All 2 branches missed.">    if (flags.useMinimalAbbr) {</span>
+<span class="nc" id="L1920">      featuresCp2C.add(p2.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-P2AP2CABB&quot;);</span>
+    }
+
+<span class="nc bnc" id="L1923" title="All 2 branches missed.">    if (flags.useMinimalAbbr1) {</span>
+<span class="nc bnc" id="L1924" title="All 2 branches missed.">      if (!c.get(CoreAnnotations.AbbrAnnotation.class).equals(&quot;XX&quot;)) {</span>
+<span class="nc" id="L1925">        featuresCp2C.add(p2.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-P2AP2CABB&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L1929" title="All 2 branches missed.">    if (flags.useParenMatching) {</span>
+<span class="nc bnc" id="L1930" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc bnc" id="L1931" title="All 6 branches missed.">        if (cWord.equals(&quot;(&quot;) || cWord.equals(&quot;[&quot;) || cWord.equals(&quot;-LRB-&quot;)) {</span>
+<span class="nc bnc" id="L1932" title="All 12 branches missed.">          if ((p2Word.equals(&quot;)&quot;) || p2Word.equals(&quot;]&quot;) || p2Word.equals(&quot;-RRB-&quot;)) &amp;&amp; ! (pWord.equals(&quot;)&quot;) || pWord.equals(&quot;]&quot;) || pWord.equals(&quot;-RRB-&quot;))) {</span>
+<span class="nc" id="L1933">            featuresCp2C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      } else {
+<span class="nc bnc" id="L1937" title="All 6 branches missed.">        if (cWord.equals(&quot;)&quot;) || cWord.equals(&quot;]&quot;) || cWord.equals(&quot;-RRB-&quot;)) {</span>
+<span class="nc bnc" id="L1938" title="All 12 branches missed.">          if ((p2Word.equals(&quot;(&quot;) || p2Word.equals(&quot;[&quot;) || p2Word.equals(&quot;-LRB-&quot;)) &amp;&amp; ! (pWord.equals(&quot;(&quot;) || pWord.equals(&quot;[&quot;) || pWord.equals(&quot;-LRB-&quot;))) {</span>
+<span class="nc" id="L1939">            featuresCp2C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L1945">    return featuresCp2C;</span>
+  }
+
+  protected Collection&lt;String&gt; featuresCp3C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L1949">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L1950">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L1951">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+<span class="nc" id="L1952">    CoreLabel p3 = cInfo.get(loc - 3);</span>
+
+<span class="nc" id="L1954">    String cWord = getWord(c);</span>
+<span class="nc" id="L1955">    String pWord = getWord(p);</span>
+<span class="nc" id="L1956">    String p2Word = getWord(p2);</span>
+<span class="nc" id="L1957">    String p3Word = getWord(p3);</span>
+<span class="nc" id="L1958">    Collection&lt;String&gt; featuresCp3C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1960" title="All 2 branches missed.">    if (flags.useParenMatching) {</span>
+<span class="nc bnc" id="L1961" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc bnc" id="L1962" title="All 4 branches missed.">        if (cWord.equals(&quot;(&quot;) || cWord.equals(&quot;[&quot;)) {</span>
+<span class="nc bnc" id="L1963" title="All 14 branches missed.">          if ((flags.maxLeft &gt;= 3) &amp;&amp; (p3Word.equals(&quot;)&quot;) || p3Word.equals(&quot;]&quot;)) &amp;&amp; !(p2Word.equals(&quot;)&quot;) || p2Word.equals(&quot;]&quot;) || pWord.equals(&quot;)&quot;) || pWord.equals(&quot;]&quot;))) {</span>
+<span class="nc" id="L1964">            featuresCp3C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      } else {
+<span class="nc bnc" id="L1968" title="All 4 branches missed.">        if (cWord.equals(&quot;)&quot;) || cWord.equals(&quot;]&quot;)) {</span>
+<span class="nc bnc" id="L1969" title="All 14 branches missed.">          if ((flags.maxLeft &gt;= 3) &amp;&amp; (p3Word.equals(&quot;(&quot;) || p3Word.equals(&quot;[&quot;)) &amp;&amp; !(p2Word.equals(&quot;(&quot;) || p2Word.equals(&quot;[&quot;) || pWord.equals(&quot;(&quot;) || pWord.equals(&quot;[&quot;))) {</span>
+<span class="nc" id="L1970">            featuresCp3C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L1976">    return featuresCp3C;</span>
+  }
+
+  protected Collection&lt;String&gt; featuresCp4C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L1980">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L1981">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L1982">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+<span class="nc" id="L1983">    CoreLabel p3 = cInfo.get(loc - 3);</span>
+<span class="nc" id="L1984">    CoreLabel p4 = cInfo.get(loc - 4);</span>
+
+<span class="nc" id="L1986">    String cWord = getWord(c);</span>
+<span class="nc" id="L1987">    String pWord = getWord(p);</span>
+<span class="nc" id="L1988">    String p2Word = getWord(p2);</span>
+<span class="nc" id="L1989">    String p3Word = getWord(p3);</span>
+<span class="nc" id="L1990">    String p4Word = getWord(p4);</span>
+
+<span class="nc" id="L1992">    Collection&lt;String&gt; featuresCp4C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1994" title="All 2 branches missed.">    if (flags.useParenMatching) {</span>
+<span class="nc bnc" id="L1995" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc bnc" id="L1996" title="All 4 branches missed.">        if (cWord.equals(&quot;(&quot;) || cWord.equals(&quot;[&quot;)) {</span>
+<span class="nc bnc" id="L1997" title="All 18 branches missed.">          if ((flags.maxLeft &gt;= 4) &amp;&amp; (p4Word.equals(&quot;)&quot;) || p4Word.equals(&quot;]&quot;)) &amp;&amp; !(p3Word.equals(&quot;)&quot;) || p3Word.equals(&quot;]&quot;) || p2Word.equals(&quot;)&quot;) || p2Word.equals(&quot;]&quot;) || pWord.equals(&quot;)&quot;) || pWord.equals(&quot;]&quot;))) {</span>
+<span class="nc" id="L1998">            featuresCp4C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      } else {
+<span class="nc bnc" id="L2002" title="All 4 branches missed.">        if (cWord.equals(&quot;)&quot;) || cWord.equals(&quot;]&quot;)) {</span>
+<span class="nc bnc" id="L2003" title="All 18 branches missed.">          if ((flags.maxLeft &gt;= 4) &amp;&amp; (p4Word.equals(&quot;(&quot;) || p4Word.equals(&quot;[&quot;)) &amp;&amp; !(p3Word.equals(&quot;(&quot;) || p3Word.equals(&quot;[&quot;) || p2Word.equals(&quot;(&quot;) || p2Word.equals(&quot;[&quot;) || pWord.equals(&quot;(&quot;) || pWord.equals(&quot;[&quot;))) {</span>
+<span class="nc" id="L2004">            featuresCp4C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L2010">    return featuresCp4C;</span>
+  }
+
+  protected Collection&lt;String&gt; featuresCp5C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L2014">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L2015">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L2016">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+<span class="nc" id="L2017">    CoreLabel p3 = cInfo.get(loc - 3);</span>
+<span class="nc" id="L2018">    CoreLabel p4 = cInfo.get(loc - 4);</span>
+<span class="nc" id="L2019">    CoreLabel p5 = cInfo.get(loc - 5);</span>
+
+<span class="nc" id="L2021">    String cWord = getWord(c);</span>
+<span class="nc" id="L2022">    String pWord = getWord(p);</span>
+<span class="nc" id="L2023">    String p2Word = getWord(p2);</span>
+<span class="nc" id="L2024">    String p3Word = getWord(p3);</span>
+<span class="nc" id="L2025">    String p4Word = getWord(p4);</span>
+<span class="nc" id="L2026">    String p5Word = getWord(p5);</span>
+<span class="nc" id="L2027">    Collection&lt;String&gt; featuresCp5C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L2029" title="All 2 branches missed.">    if (flags.useParenMatching) {</span>
+<span class="nc bnc" id="L2030" title="All 2 branches missed.">      if (flags.useReverse) {</span>
+<span class="nc bnc" id="L2031" title="All 4 branches missed.">        if (cWord.equals(&quot;(&quot;) || cWord.equals(&quot;[&quot;)) {</span>
+<span class="nc bnc" id="L2032" title="All 22 branches missed.">          if ((flags.maxLeft &gt;= 5) &amp;&amp; (p5Word.equals(&quot;)&quot;) || p5Word.equals(&quot;]&quot;)) &amp;&amp; !(p4Word.equals(&quot;)&quot;) || p4Word.equals(&quot;]&quot;) || p3Word.equals(&quot;)&quot;) || p3Word.equals(&quot;]&quot;) || p2Word.equals(&quot;)&quot;) || p2Word.equals(&quot;]&quot;) || pWord.equals(&quot;)&quot;) || pWord.equals(&quot;]&quot;))) {</span>
+<span class="nc" id="L2033">            featuresCp5C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      } else {
+<span class="nc bnc" id="L2037" title="All 4 branches missed.">        if (cWord.equals(&quot;)&quot;) || cWord.equals(&quot;]&quot;)) {</span>
+<span class="nc bnc" id="L2038" title="All 22 branches missed.">          if ((flags.maxLeft &gt;= 5) &amp;&amp; (p5Word.equals(&quot;(&quot;) || p5Word.equals(&quot;[&quot;)) &amp;&amp; !(p4Word.equals(&quot;(&quot;) || p4Word.equals(&quot;[&quot;) || p3Word.equals(&quot;(&quot;) || p3Word.equals(&quot;[&quot;) || p2Word.equals(&quot;(&quot;) || p2Word.equals(&quot;[&quot;) || pWord.equals(&quot;(&quot;) || pWord.equals(&quot;[&quot;))) {</span>
+<span class="nc" id="L2039">            featuresCp5C.add(&quot;PAREN-MATCH&quot;);</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L2044">    return featuresCp5C;</span>
+  }
+
+
+  protected Collection&lt;String&gt; featuresCpCp2C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L2049">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L2050">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L2051">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+
+<span class="nc" id="L2053">    String pWord = getWord(p);</span>
+    // String p2Word = getWord(p2);
+
+<span class="nc" id="L2056">    Collection&lt;String&gt; featuresCpCp2C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L2058" title="All 4 branches missed.">    if (flags.useInternal &amp;&amp; flags.useExternal) {</span>
+
+<span class="nc bnc" id="L2060" title="All 8 branches missed.">      if (flags.strictGoodCoNLL &amp;&amp; ! flags.removeStrictGoodCoNLLDuplicates &amp;&amp; flags.useTypeySequences &amp;&amp; flags.maxLeft &gt;= 2) {</span>
+        // this feature duplicates -TYPETYPES below, so probably don't include it, but it was in original tests of CMM goodCoNLL
+<span class="nc" id="L2062">        featuresCpCp2C.add(p2.get(CoreAnnotations.ShapeAnnotation.class) + '-' + p.get(CoreAnnotations.ShapeAnnotation.class) + '-' + c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-TTPS&quot;);</span>
+      }
+
+<span class="nc bnc" id="L2065" title="All 2 branches missed.">      if (flags.useAbbr) {</span>
+<span class="nc" id="L2066">        featuresCpCp2C.add(p2.get(CoreAnnotations.AbbrAnnotation.class) + '-' + p.get(CoreAnnotations.AbbrAnnotation.class) + '-' + c.get(CoreAnnotations.AbbrAnnotation.class) + &quot;-2PABBRANS&quot;);</span>
+      }
+
+<span class="nc bnc" id="L2069" title="All 2 branches missed.">      if (flags.useChunks) {</span>
+<span class="nc" id="L2070">        featuresCpCp2C.add(p2.get(CoreAnnotations.ChunkAnnotation.class) + '-' + p.get(CoreAnnotations.ChunkAnnotation.class) + '-' + c.get(CoreAnnotations.ChunkAnnotation.class) + &quot;-2PCHUNKS&quot;);</span>
+      }
+
+<span class="nc bnc" id="L2073" title="All 2 branches missed.">      if (flags.useLongSequences) {</span>
+<span class="nc" id="L2074">        featuresCpCp2C.add(&quot;PPSEQ&quot;);</span>
+      }
+<span class="nc bnc" id="L2076" title="All 4 branches missed.">      if (flags.useBoundarySequences &amp;&amp; pWord.equals(CoNLLDocumentReaderAndWriter.BOUNDARY)) {</span>
+<span class="nc" id="L2077">        featuresCpCp2C.add(&quot;BNDRY-SPAN-PPSEQ&quot;);</span>
+      }
+      // This more complex consistency checker didn't help!
+      // if (flags.useBoundarySequences) {
+      //   // try enforce consistency over &quot;and&quot; and &quot;,&quot; as well as boundary
+      //   if (pWord.equals(CoNLLDocumentIteratorFactory.BOUNDARY) ||
+      //       pWord.equalsIgnoreCase(&quot;and&quot;) || pWord.equalsIgnoreCase(&quot;or&quot;) ||
+      //       pWord.equals(&quot;,&quot;)) {
+      //   }
+      // }
+
+<span class="nc bnc" id="L2088" title="All 2 branches missed.">      if (flags.useTaggySequences) {</span>
+<span class="nc bnc" id="L2089" title="All 2 branches missed.">        if (flags.useTags) {</span>
+<span class="nc" id="L2090">          featuresCpCp2C.add(p2.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TTS&quot;);</span>
+<span class="nc bnc" id="L2091" title="All 2 branches missed.">          if (flags.useTaggySequencesShapeInteraction) {</span>
+<span class="nc" id="L2092">            featuresCpCp2C.add(p2.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-TTS-CS&quot;);</span>
+          }
+        }
+<span class="nc bnc" id="L2095" title="All 2 branches missed.">        if (flags.useDistSim) {</span>
+<span class="nc" id="L2096">          featuresCpCp2C.add(p2.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM_TTS1&quot;);</span>
+<span class="nc bnc" id="L2097" title="All 2 branches missed.">          if (flags.useTaggySequencesShapeInteraction) {</span>
+<span class="nc" id="L2098">            featuresCpCp2C.add(p2.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-DISTSIM_TTS1-CS&quot;);</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L2103" title="All 10 branches missed.">      if (((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) ||</span>
+           flags.useShapeStrings)
+          &amp;&amp; flags.useTypeSeqs &amp;&amp; flags.useTypeSeqs2 &amp;&amp; flags.maxLeft &gt;= 2) {
+<span class="nc" id="L2106">        String cShape = c.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L2107">        String pShape = p.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L2108">        String p2Shape = p2.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L2109">        featuresCpCp2C.add(p2Shape + '-' + pShape + '-' + cShape + &quot;-TYPETYPES&quot;);</span>
+<span class="nc" id="L2110">      }</span>
+<span class="nc bnc" id="L2111" title="All 2 branches missed.">    } else if (flags.useInternal) {</span>
+
+<span class="nc bnc" id="L2113" title="All 2 branches missed.">      if (flags.useLongSequences) {</span>
+<span class="nc" id="L2114">        featuresCpCp2C.add(&quot;PPSEQ&quot;);</span>
+      }
+<span class="nc bnc" id="L2116" title="All 2 branches missed.">    } else if (flags.useExternal) {</span>
+
+<span class="nc bnc" id="L2118" title="All 2 branches missed.">      if (flags.useLongSequences) {</span>
+<span class="nc" id="L2119">        featuresCpCp2C.add(&quot;PPSEQ&quot;);</span>
+      }
+
+<span class="nc bnc" id="L2122" title="All 10 branches missed.">      if (((flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) ||</span>
+           flags.useShapeStrings)
+          &amp;&amp; flags.useTypeSeqs &amp;&amp; flags.useTypeSeqs2 &amp;&amp; flags.maxLeft &gt;= 2) {
+<span class="nc" id="L2125">        String cShape = c.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L2126">        String pShape = p.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L2127">        String p2Shape = p2.get(CoreAnnotations.ShapeAnnotation.class);</span>
+<span class="nc" id="L2128">        featuresCpCp2C.add(p2Shape + '-' + pShape + '-' + cShape + &quot;-TYPETYPES&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L2132">    return featuresCpCp2C;</span>
+  }
+
+
+  protected Collection&lt;String&gt; featuresCpCp2Cp3C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L2137">    CoreLabel c = cInfo.get(loc);</span>
+<span class="nc" id="L2138">    CoreLabel p = cInfo.get(loc - 1);</span>
+<span class="nc" id="L2139">    CoreLabel p2 = cInfo.get(loc - 2);</span>
+<span class="nc" id="L2140">    CoreLabel p3 = cInfo.get(loc - 3);</span>
+
+<span class="nc" id="L2142">    Collection&lt;String&gt; featuresCpCp2Cp3C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L2144" title="All 2 branches missed.">    if (flags.useTaggySequences) {</span>
+<span class="nc bnc" id="L2145" title="All 2 branches missed.">      if (flags.useTags) {</span>
+<span class="nc bnc" id="L2146" title="All 4 branches missed.">        if (flags.maxLeft &gt;= 3 &amp;&amp; !flags.dontExtendTaggy) {</span>
+<span class="nc" id="L2147">          featuresCpCp2Cp3C.add(p3.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p2.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + &quot;-TTTS&quot;);</span>
+<span class="nc bnc" id="L2148" title="All 2 branches missed.">          if (flags.useTaggySequencesShapeInteraction) {</span>
+<span class="nc" id="L2149">            featuresCpCp2Cp3C.add(p3.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p2.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + p.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.getString(CoreAnnotations.PartOfSpeechAnnotation.class) + '-' + c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-TTTS-CS&quot;);</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L2153" title="All 2 branches missed.">      if (flags.useDistSim) {</span>
+<span class="nc bnc" id="L2154" title="All 4 branches missed.">        if (flags.maxLeft &gt;= 3 &amp;&amp; !flags.dontExtendTaggy) {</span>
+<span class="nc" id="L2155">          featuresCpCp2Cp3C.add(p3.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p2.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + &quot;-DISTSIM_TTTS1&quot;);</span>
+<span class="nc bnc" id="L2156" title="All 2 branches missed.">          if (flags.useTaggySequencesShapeInteraction) {</span>
+<span class="nc" id="L2157">            featuresCpCp2Cp3C.add(p3.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p2.get(CoreAnnotations.DistSimAnnotation.class) + '-' + p.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.DistSimAnnotation.class) + '-' + c.get(CoreAnnotations.ShapeAnnotation.class) + &quot;-DISTSIM_TTTS1-CS&quot;);</span>
+          }
+        }
+      }
+    }
+
+<span class="nc bnc" id="L2163" title="All 2 branches missed.">    if (flags.maxLeft &gt;= 3) {</span>
+<span class="nc bnc" id="L2164" title="All 2 branches missed.">      if (flags.useLongSequences) {</span>
+<span class="nc" id="L2165">        featuresCpCp2Cp3C.add(&quot;PPPSEQ&quot;);</span>
+      }
+<span class="nc bnc" id="L2167" title="All 4 branches missed.">      if (flags.useBoundarySequences &amp;&amp; getWord(p).equals(CoNLLDocumentReaderAndWriter.BOUNDARY)) {</span>
+<span class="nc" id="L2168">        featuresCpCp2Cp3C.add(&quot;BNDRY-SPAN-PPPSEQ&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L2172">    return featuresCpCp2Cp3C;</span>
+  }
+
+  protected Collection&lt;String&gt; featuresCpCp2Cp3Cp4C(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L2176">    Collection&lt;String&gt; featuresCpCp2Cp3Cp4C = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L2178">    CoreLabel p = cInfo.get(loc - 1);</span>
+
+<span class="nc bnc" id="L2180" title="All 2 branches missed.">    if (flags.maxLeft &gt;= 4) {</span>
+<span class="nc bnc" id="L2181" title="All 2 branches missed.">      if (flags.useLongSequences) {</span>
+<span class="nc" id="L2182">        featuresCpCp2Cp3Cp4C.add(&quot;PPPPSEQ&quot;);</span>
+      }
+<span class="nc bnc" id="L2184" title="All 4 branches missed.">      if (flags.useBoundarySequences &amp;&amp; getWord(p).equals(CoNLLDocumentReaderAndWriter.BOUNDARY)) {</span>
+<span class="nc" id="L2185">        featuresCpCp2Cp3Cp4C.add(&quot;BNDRY-SPAN-PPPPSEQ&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L2189">    return featuresCpCp2Cp3Cp4C;</span>
+  }
+
+
+  protected Collection&lt;String&gt; featuresCnC(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L2194">    CoreLabel c = cInfo.get(loc);</span>
+
+<span class="nc" id="L2196">    Collection&lt;String&gt; featuresCnC = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L2198" title="All 2 branches missed.">    if (flags.useNext) {</span>
+<span class="nc bnc" id="L2199" title="All 4 branches missed.">      if (flags.useSequences &amp;&amp; flags.useNextSequences) {</span>
+<span class="nc" id="L2200">        featuresCnC.add(&quot;NSEQ&quot;);</span>
+<span class="nc" id="L2201">        featuresCnC.add(getWord(c) + &quot;-NSEQW&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L2205">    return featuresCnC;</span>
+  }
+
+
+  protected Collection&lt;String&gt; featuresCpCnC(PaddedList&lt;IN&gt; cInfo, int loc) {
+<span class="nc" id="L2210">    CoreLabel c = cInfo.get(loc);</span>
+
+<span class="nc" id="L2212">    Collection&lt;String&gt; featuresCpCnC = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L2214" title="All 4 branches missed.">    if (flags.useNext &amp;&amp; flags.usePrev) {</span>
+<span class="nc bnc" id="L2215" title="All 6 branches missed.">      if (flags.useSequences &amp;&amp; flags.usePrevSequences &amp;&amp; flags.useNextSequences) {</span>
+<span class="nc" id="L2216">        featuresCpCnC.add(&quot;PNSEQ&quot;);</span>
+<span class="nc" id="L2217">        featuresCpCnC.add(getWord(c) + &quot;-PNSEQW&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L2221">    return featuresCpCnC;</span>
+  }
+
+
+  private int reverse(int i) {
+<span class="nc bnc" id="L2226" title="All 2 branches missed.">    return (flags.useReverse ? -1 * i : i);</span>
+  }
+
+  private Collection&lt;String&gt; occurrencePatterns(PaddedList&lt;IN&gt; cInfo, int loc) {
+    // features on last Cap
+<span class="nc" id="L2231">    String word = getWord(cInfo.get(loc));</span>
+<span class="nc" id="L2232">    String nWord = getWord(cInfo.get(loc + reverse(1)));</span>
+<span class="nc" id="L2233">    CoreLabel p = cInfo.get(loc - reverse(1));</span>
+<span class="nc" id="L2234">    String pWord = getWord(p);</span>
+    // log.info(word+&quot; &quot;+nWord);
+<span class="nc bnc" id="L2236" title="All 10 branches missed.">    if (!(isNameCase(word) &amp;&amp; noUpperCase(nWord) &amp;&amp; hasLetter(nWord) &amp;&amp; hasLetter(pWord) &amp;&amp; p != cInfo.getPad())) {</span>
+<span class="nc" id="L2237">      return Collections.singletonList(&quot;NO-OCCURRENCE-PATTERN&quot;);</span>
+    }
+    // log.info(&quot;LOOKING&quot;);
+<span class="nc" id="L2240">    Set&lt;String&gt; l = Generics.newHashSet();</span>
+<span class="nc bnc" id="L2241" title="All 6 branches missed.">    if (cInfo.get(loc - reverse(1)).getString(CoreAnnotations.PartOfSpeechAnnotation.class) != null &amp;&amp; isNameCase(pWord) &amp;&amp; cInfo.get(loc - reverse(1)).getString(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;NNP&quot;)) {</span>
+<span class="nc bnc" id="L2242" title="All 2 branches missed.">      for (int jump = 3; jump &lt; 150; jump++) {</span>
+<span class="nc bnc" id="L2243" title="All 2 branches missed.">        if (getWord(cInfo.get(loc + reverse(jump))).equals(word)) {</span>
+<span class="nc bnc" id="L2244" title="All 2 branches missed.">          if (getWord(cInfo.get(loc + reverse(jump - 1))).equals(pWord)) {</span>
+<span class="nc" id="L2245">            l.add(&quot;XY-NEXT-OCCURRENCE-XY&quot;);</span>
+          } else {
+<span class="nc" id="L2247">            l.add(&quot;XY-NEXT-OCCURRENCE-Y&quot;);</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L2251" title="All 2 branches missed.">      for (int jump = -3; jump &gt; -150; jump--) {</span>
+<span class="nc bnc" id="L2252" title="All 2 branches missed.">        if (getWord(cInfo.get(loc + reverse(jump))).equals(word)) {</span>
+<span class="nc bnc" id="L2253" title="All 2 branches missed.">          if (getWord(cInfo.get(loc + reverse(jump - 1))).equals(pWord)) {</span>
+<span class="nc" id="L2254">            l.add(&quot;XY-PREV-OCCURRENCE-XY&quot;);</span>
+          } else {
+<span class="nc" id="L2256">            l.add(&quot;XY-PREV-OCCURRENCE-Y&quot;);</span>
+          }
+        }
+      }
+    } else {
+<span class="nc bnc" id="L2261" title="All 2 branches missed.">      for (int jump = 3; jump &lt; 150; jump++) {</span>
+<span class="nc bnc" id="L2262" title="All 2 branches missed.">        if (getWord(cInfo.get(loc + reverse(jump))).equals(word)) {</span>
+<span class="nc bnc" id="L2263" title="All 4 branches missed.">          if (isNameCase(getWord(cInfo.get(loc + reverse(jump - 1)))) &amp;&amp; (cInfo.get(loc + reverse(jump - 1))).getString(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;NNP&quot;)) {</span>
+<span class="nc" id="L2264">            l.add(&quot;X-NEXT-OCCURRENCE-YX&quot;);</span>
+            // log.info(getWord(cInfo.get(loc+reverse(jump-1))));
+<span class="nc bnc" id="L2266" title="All 4 branches missed.">          } else if (isNameCase(getWord(cInfo.get(loc + reverse(jump + 1)))) &amp;&amp; (cInfo.get(loc + reverse(jump + 1))).getString(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;NNP&quot;)) {</span>
+            // log.info(getWord(cInfo.get(loc+reverse(jump+1))));
+<span class="nc" id="L2268">            l.add(&quot;X-NEXT-OCCURRENCE-XY&quot;);</span>
+          } else {
+<span class="nc" id="L2270">            l.add(&quot;X-NEXT-OCCURRENCE-X&quot;);</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L2274" title="All 2 branches missed.">      for (int jump = -3; jump &gt; -150; jump--) {</span>
+<span class="nc bnc" id="L2275" title="All 4 branches missed.">        if (getWord(cInfo.get(loc + jump)) != null &amp;&amp; getWord(cInfo.get(loc + jump)).equals(word)) {</span>
+<span class="nc bnc" id="L2276" title="All 4 branches missed.">          if (isNameCase(getWord(cInfo.get(loc + reverse(jump + 1)))) &amp;&amp; (cInfo.get(loc + reverse(jump + 1))).getString(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;NNP&quot;)) {</span>
+<span class="nc" id="L2277">            l.add(&quot;X-PREV-OCCURRENCE-YX&quot;);</span>
+            // log.info(getWord(cInfo.get(loc+reverse(jump+1))));
+<span class="nc bnc" id="L2279" title="All 4 branches missed.">          } else if (isNameCase(getWord(cInfo.get(loc + reverse(jump - 1)))) &amp;&amp; cInfo.get(loc + reverse(jump - 1)).getString(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;NNP&quot;)) {</span>
+<span class="nc" id="L2280">            l.add(&quot;X-PREV-OCCURRENCE-XY&quot;);</span>
+            // log.info(getWord(cInfo.get(loc+reverse(jump-1))));
+          } else {
+<span class="nc" id="L2283">            l.add(&quot;X-PREV-OCCURRENCE-X&quot;);</span>
+          }
+        }
+      }
+    }
+    /*
+    if (!l.isEmpty()) {
+      log.info(pWord+&quot; &quot;+word+&quot; &quot;+nWord+&quot; &quot;+l);
+    }
+    */
+<span class="nc" id="L2293">    return l;</span>
+  }
+
+  String intern(String s) {
+<span class="nc bnc" id="L2297" title="All 2 branches missed.">    if (flags.intern) {</span>
+<span class="nc" id="L2298">      return s.intern();</span>
+    } else {
+<span class="nc" id="L2300">      return s;</span>
+    }
+  }
+
+  public void initGazette() {
+    try {
+      // read in gazettes
+<span class="pc bpc" id="L2307" title="1 of 2 branches missed.">      if (flags.gazettes == null) { flags.gazettes = new ArrayList&lt;&gt;(); }</span>
+<span class="fc" id="L2308">      List&lt;String&gt; gazettes = flags.gazettes;</span>
+<span class="pc bpc" id="L2309" title="1 of 2 branches missed.">      for (String gazetteFile : gazettes) {</span>
+<span class="nc" id="L2310">        BufferedReader r = IOUtils.readerFromString(gazetteFile, flags.inputEncoding);</span>
+<span class="nc" id="L2311">        readGazette(r);</span>
+<span class="nc" id="L2312">        r.close();</span>
+<span class="nc" id="L2313">      }</span>
+<span class="nc" id="L2314">    } catch (IOException e) {</span>
+<span class="nc" id="L2315">      throw new RuntimeIOException(e);</span>
+<span class="fc" id="L2316">    }</span>
+<span class="fc" id="L2317">  }</span>
+
+} // end class NERFeatureFactory
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

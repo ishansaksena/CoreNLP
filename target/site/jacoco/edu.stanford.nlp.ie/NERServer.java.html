@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NERServer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">NERServer.java</span></div><h1>NERServer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ie.crf.CRFClassifier;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.io.EncodingPrintWriter;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.io.OutputStreamWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.UnknownHostException;
+import java.util.Properties;
+
+
+/*****************************************************************************
+ * A named-entity recognizer server for Stanford's NER.
+ * Runs on a socket and waits for text to annotate and returns the
+ * annotated text.  (Internally, it uses the &lt;code&gt;classifyString()&lt;/code&gt;
+ * method on a classifier, which can be either the default CRFClassifier
+ * which is serialized inside the jar file from which it is called, or another
+ * classifier which is passed as an argument to the main method.
+ *
+ * @version $Id$
+ * @author
+ *      Bjorn Aldag&lt;BR&gt;
+ *      Copyright &amp;copy; 2000 - 2004 Cycorp, Inc.  All rights reserved.
+ *      Permission granted for Stanford to distribute with their NER code
+ *      by Bjorn Aldag
+ * @author Christopher Manning 2006 (considerably rewritten)
+ *
+*****************************************************************************/
+
+public class NERServer  {
+
+  /** A logger for this class */
+<span class="nc" id="L41">  private static Redwood.RedwoodChannels log = Redwood.channels(NERServer.class);</span>
+
+  //// Variables
+
+  /**
+   * Debugging toggle.
+   */
+<span class="nc bnc" id="L48" title="All 2 branches missed.">  private static final boolean ENV_DEBUG = ((System.getenv(&quot;NERSERVER_DEBUG&quot;) != null) ?</span>
+<span class="nc" id="L49">                                            Boolean.parseBoolean(System.getenv(&quot;NERSERVER_DEBUG&quot;)) :</span>
+                                            false);
+
+<span class="nc" id="L52">  private boolean DEBUG = ENV_DEBUG;</span>
+
+  private final String charset;
+
+  /**
+   * The listener socket of this server.
+   */
+  private final ServerSocket listener;
+
+  /**
+   * The classifier that does the actual tagging.
+   */
+  private final AbstractSequenceClassifier ner;
+
+
+  //// Constructors
+
+  /**
+   * Creates a new named entity recognizer server on the specified port.
+   *
+   * @param port the port this NERServer listens on.
+   * @param asc The classifier which will do the tagging
+   * @param charset The character set for encoding Strings over the socket stream, e.g., &quot;utf-8&quot;
+   * @throws IOException If there is a problem creating a ServerSocket
+   */
+<span class="nc" id="L77">  public NERServer(int port, AbstractSequenceClassifier asc, String charset) throws IOException {</span>
+<span class="nc" id="L78">    ner = asc;</span>
+<span class="nc" id="L79">    listener = new ServerSocket(port);</span>
+<span class="nc" id="L80">    this.charset = charset;</span>
+<span class="nc" id="L81">  }</span>
+
+  //// Public Methods
+
+  /**
+   * Runs this named entity recognizer server.
+   */
+  @SuppressWarnings({&quot;InfiniteLoopStatement&quot;, &quot;ConstantConditions&quot;, &quot;null&quot;})
+  public void run() {
+<span class="nc" id="L90">    Socket client = null;</span>
+    while (true) {
+      try {
+<span class="nc" id="L93">        client = listener.accept();</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L95">          log.info(&quot;Accepted request from &quot;);</span>
+<span class="nc" id="L96">          log.info(client.getInetAddress().getHostName());</span>
+        }
+<span class="nc" id="L98">        new Session(client);</span>
+<span class="nc" id="L99">      } catch (Exception e1) {</span>
+<span class="nc" id="L100">        log.info(&quot;NERServer: couldn't accept&quot;);</span>
+<span class="nc" id="L101">        e1.printStackTrace(System.err);</span>
+        try {
+<span class="nc" id="L103">          client.close();</span>
+<span class="nc" id="L104">        } catch (Exception e2) {</span>
+<span class="nc" id="L105">          log.info(&quot;NERServer: couldn't close client&quot;);</span>
+<span class="nc" id="L106">          e2.printStackTrace(System.err);</span>
+<span class="nc" id="L107">        }</span>
+<span class="nc" id="L108">      }</span>
+    }
+  }
+
+
+  //// Inner Classes
+
+  /**
+   * A single user session, accepting one request, processing it, and
+   * sending back the results.
+   */
+  private class Session extends Thread {
+
+  //// Instance Fields
+
+    /**
+     * The socket to the client.
+     */
+    private final Socket client;
+
+    /**
+     * The input stream from the client.
+     */
+    private final BufferedReader in;
+
+    /**
+     * The output stream to the client.
+     */
+    private PrintWriter out;
+
+
+    //// Constructors
+
+<span class="nc" id="L141">    private Session(Socket socket) throws IOException {</span>
+<span class="nc" id="L142">      client = socket;</span>
+<span class="nc" id="L143">      in = new BufferedReader(new InputStreamReader(client.getInputStream(), charset));</span>
+<span class="nc" id="L144">      out = new PrintWriter(new OutputStreamWriter(client.getOutputStream(), charset));</span>
+<span class="nc" id="L145">      start();</span>
+<span class="nc" id="L146">    }</span>
+
+
+    //// Public Methods
+
+    /**
+     * Runs this session by reading a string, tagging it, and writing
+     * back the result.  The input should be a single line (no embedded
+     * newlines), which represents a whole sentence or document.
+     */
+    @Override
+    public void run() {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">      if (DEBUG) {log.info(&quot;Created new session&quot;);}</span>
+<span class="nc" id="L159">      String input = null;</span>
+      try {
+        // TODO: why not allow for multiple lines of input?
+<span class="nc" id="L162">        input = in.readLine();</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L164">          EncodingPrintWriter.err.println(&quot;Receiving: \&quot;&quot; + input + '\&quot;', charset);</span>
+        }
+<span class="nc" id="L166">      } catch (IOException e) {</span>
+<span class="nc" id="L167">        log.info(&quot;NERServer:Session: couldn't read input&quot;);</span>
+<span class="nc" id="L168">        e.printStackTrace(System.err);</span>
+<span class="nc" id="L169">      } catch (NullPointerException npe) {</span>
+<span class="nc" id="L170">        log.info(&quot;NERServer:Session: connection closed by peer&quot;);</span>
+<span class="nc" id="L171">        npe.printStackTrace(System.err);</span>
+<span class="nc" id="L172">      }</span>
+      try {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (! (input == null)) {</span>
+<span class="nc" id="L175">          String output = </span>
+<span class="nc" id="L176">            ner.classifyToString(input, ner.flags.outputFormat, </span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                                 !&quot;slashTags&quot;.equals(ner.flags.outputFormat));</span>
+          
+<span class="nc bnc" id="L179" title="All 2 branches missed.">          if (DEBUG) {</span>
+<span class="nc" id="L180">            EncodingPrintWriter.err.println(&quot;Sending: \&quot;&quot; + output + '\&quot;', charset);</span>
+          }
+<span class="nc" id="L182">          out.print(output);</span>
+<span class="nc" id="L183">          out.flush();</span>
+        }
+<span class="nc" id="L185">      } catch (RuntimeException | OutOfMemoryError e) {</span>
+        // ah well, guess they won't be hearing back from us after all
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L188">          log.error(&quot;NERServer.Session: error classifying string.&quot;);</span>
+<span class="nc" id="L189">          log.error(e);</span>
+        }
+      } finally {
+<span class="nc" id="L192">        close();</span>
+<span class="nc" id="L193">      }</span>
+<span class="nc" id="L194">    }</span>
+
+    /**
+     * Terminates this session gracefully.
+     */
+    private void close() {
+      try {
+<span class="nc" id="L201">        in.close();</span>
+<span class="nc" id="L202">        out.close();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L204">          log.info(&quot;Closing connection to client&quot;);</span>
+<span class="nc" id="L205">          log.info(client.getInetAddress().getHostName());</span>
+        }
+<span class="nc" id="L207">        client.close();</span>
+<span class="nc" id="L208">      } catch (Exception e) {</span>
+<span class="nc" id="L209">        log.info(&quot;NERServer:Session: can't close session&quot;);</span>
+<span class="nc" id="L210">        e.printStackTrace(System.err);</span>
+<span class="nc" id="L211">      }</span>
+<span class="nc" id="L212">    }</span>
+
+  } // end class Session
+
+  /** This example sends material to the NER server one line at a time.
+   *  Each line should be at least a whole sentence, or can be a whole
+   *  document.
+   */
+  public static class NERClient {
+
+<span class="nc" id="L222">    private NERClient() {}</span>
+
+    public static void communicateWithNERServer(String host, int port,
+                                                String charset) 
+      throws IOException
+    {
+<span class="nc" id="L228">      System.out.println(&quot;Input some text and press RETURN to NER tag it, &quot; +</span>
+                         &quot; or just RETURN to finish.&quot;);
+
+<span class="nc" id="L231">      BufferedReader stdIn = </span>
+        new BufferedReader(new InputStreamReader(System.in, charset));
+<span class="nc" id="L233">      communicateWithNERServer(host, port, charset, stdIn, null, true);</span>
+<span class="nc" id="L234">      stdIn.close();</span>
+<span class="nc" id="L235">    }</span>
+
+    public static void communicateWithNERServer(String host, int port, 
+                                                String charset, 
+                                                BufferedReader input,
+                                                BufferedWriter output,
+                                                boolean closeOnBlank)
+      throws IOException 
+    {
+<span class="nc bnc" id="L244" title="All 2 branches missed.">      if (host == null) {</span>
+<span class="nc" id="L245">        host = &quot;localhost&quot;;</span>
+      }
+
+<span class="nc bnc" id="L248" title="All 2 branches missed.">      for (String userInput; (userInput = input.readLine()) != null; ) {</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (userInput.matches(&quot;\\n?&quot;)) {</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">          if (closeOnBlank) {</span>
+<span class="nc" id="L251">            break;</span>
+          } else {
+            continue;
+          }
+        }
+        try {
+          // TODO: why not keep the same socket for multiple lines?
+<span class="nc" id="L258">          Socket socket = new Socket(host, port);</span>
+<span class="nc" id="L259">          PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), charset), true);</span>
+<span class="nc" id="L260">          BufferedReader in = new BufferedReader(new InputStreamReader(</span>
+<span class="nc" id="L261">                  socket.getInputStream(), charset));</span>
+          // send material to NER to socket
+<span class="nc" id="L263">          out.println(userInput);</span>
+          // Print the results of NER
+          String result;
+<span class="nc bnc" id="L266" title="All 2 branches missed.">          while ((result = in.readLine()) != null) {</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (output == null) {</span>
+<span class="nc" id="L268">              EncodingPrintWriter.out.println(result, charset);</span>
+            } else {
+<span class="nc" id="L270">              output.write(result);</span>
+<span class="nc" id="L271">              output.newLine();</span>
+            }
+          }
+<span class="nc" id="L274">          in.close();</span>
+<span class="nc" id="L275">          socket.close();</span>
+<span class="nc" id="L276">        } catch (UnknownHostException e) {</span>
+<span class="nc" id="L277">          log.info(&quot;Cannot find host: &quot;);</span>
+<span class="nc" id="L278">          log.info(host);</span>
+<span class="nc" id="L279">          return;</span>
+<span class="nc" id="L280">        } catch (IOException e) {</span>
+<span class="nc" id="L281">          log.info(&quot;I/O error in the connection to: &quot;);</span>
+<span class="nc" id="L282">          log.info(host);</span>
+<span class="nc" id="L283">          return;</span>
+<span class="nc" id="L284">        }</span>
+      }
+<span class="nc" id="L286">    }</span>
+  } // end static class NERClient
+
+
+  private static final String USAGE = &quot;Usage: NERServer [-loadClassifier file|-loadJarClassifier resource|-client] -port portNumber&quot;;
+
+  /**
+   * Starts this server on the specified port.  The classifier used can be
+   * either a default one stored in the jar file from which this code is
+   * invoked or you can specify it as a filename or as another classifier
+   * resource name, which must correspond to the name of a resource in the
+   * /classifiers/ directory of the jar file.
+   * &lt;p&gt;
+   * Default port is 4465.
+   * &lt;/p&gt;&lt;p&gt;
+   * When run in server mode, additional properties can be specified
+   * on the command line and will be passed to the model loaded.
+   * &lt;/p&gt;&lt;p&gt;
+   * Usage: &lt;code&gt;java edu.stanford.nlp.ie.NERServer [-loadClassifier file|-loadJarClassifier resource|-client] -port portNumber&lt;/code&gt;
+   *
+   * @param args Command-line arguments (described above)
+   * @throws Exception If file or Java class problems with serialized classifier
+   */
+  @SuppressWarnings({&quot;StringEqualsEmptyString&quot;})
+  public static void main (String[] args) throws Exception {
+<span class="nc" id="L311">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L312">    String loadFile = props.getProperty(&quot;loadClassifier&quot;);</span>
+<span class="nc" id="L313">    String loadJarFile = props.getProperty(&quot;loadJarClassifier&quot;);</span>
+<span class="nc" id="L314">    String client = props.getProperty(&quot;client&quot;);</span>
+<span class="nc" id="L315">    String portStr = props.getProperty(&quot;port&quot;, &quot;4465&quot;);</span>
+<span class="nc" id="L316">    props.remove(&quot;port&quot;); // so later code doesn't complain</span>
+<span class="nc bnc" id="L317" title="All 4 branches missed.">    if (portStr == null || portStr.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L318">      log.info(USAGE);</span>
+<span class="nc" id="L319">      return;</span>
+    }
+<span class="nc" id="L321">    String charset = &quot;utf-8&quot;;</span>
+<span class="nc" id="L322">    String encoding = props.getProperty(&quot;encoding&quot;);</span>
+<span class="nc bnc" id="L323" title="All 4 branches missed.">    if (encoding != null &amp;&amp; ! &quot;&quot;.equals(encoding)) {</span>
+<span class="nc" id="L324">      charset = encoding;</span>
+    }
+    int port;
+    try {
+<span class="nc" id="L328">      port = Integer.parseInt(portStr);</span>
+<span class="nc" id="L329">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L330">      log.info(&quot;Non-numerical port&quot;);</span>
+<span class="nc" id="L331">      log.info(USAGE);</span>
+<span class="nc" id="L332">      return;</span>
+<span class="nc" id="L333">    }</span>
+    // default output format for if no output format is specified
+<span class="nc bnc" id="L335" title="All 2 branches missed.">    if (props.getProperty(&quot;outputFormat&quot;) == null) {</span>
+<span class="nc" id="L336">      props.setProperty(&quot;outputFormat&quot;, &quot;slashTags&quot;);</span>
+    }
+
+<span class="nc bnc" id="L339" title="All 4 branches missed.">    if (client != null &amp;&amp; ! client.equals(&quot;&quot;)) {</span>
+      // run a test client for illustration/testing
+<span class="nc" id="L341">      String host = props.getProperty(&quot;host&quot;);</span>
+<span class="nc" id="L342">      NERClient.communicateWithNERServer(host, port, charset);</span>
+<span class="nc" id="L343">    } else {</span>
+      AbstractSequenceClassifier asc;
+<span class="nc bnc" id="L345" title="All 4 branches missed.">      if (loadFile != null &amp;&amp; ! loadFile.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L346">        asc = CRFClassifier.getClassifier(loadFile, props);</span>
+<span class="nc bnc" id="L347" title="All 4 branches missed.">      } else if (loadJarFile != null &amp;&amp; ! loadJarFile.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L348">        asc = CRFClassifier.getJarClassifier(loadJarFile, props);</span>
+      } else {
+<span class="nc" id="L350">        asc = CRFClassifier.getDefaultClassifier(props);</span>
+      }
+
+<span class="nc" id="L353">      new NERServer(port, asc, charset).run();</span>
+    }
+<span class="nc" id="L355">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

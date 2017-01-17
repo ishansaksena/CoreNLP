@@ -1,0 +1,453 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ChineseMaxentLexicon.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">ChineseMaxentLexicon.java</span></div><h1>ChineseMaxentLexicon.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.classify.LinearClassifier;
+import edu.stanford.nlp.classify.LinearClassifierFactory;
+import edu.stanford.nlp.classify.WeightedDataset;
+import edu.stanford.nlp.io.NumberRangesFileFilter;
+import edu.stanford.nlp.ling.BasicDatum;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.optimization.QNMinimizer;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.Treebank;
+import edu.stanford.nlp.trees.TreebankLanguagePack;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.stats.*;
+
+import java.io.*;
+import java.util.*;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+
+/**
+ * A Lexicon class that computes the score of word|tag according to a maxent model
+ * of tag|word (divided by MLE estimate of P(tag)).
+ * &lt;p/&gt;
+ * It would be nice to factor out a superclass MaxentLexicon that takes a WordFeatureExtractor
+ *
+ * @author Galen Andrew
+ */
+public class ChineseMaxentLexicon implements Lexicon  {
+
+  /** A logger for this class */
+<span class="nc" id="L34">  private static Redwood.RedwoodChannels log = Redwood.channels(ChineseMaxentLexicon.class);</span>
+
+  private static final long serialVersionUID = 238834703409896852L;
+  private static final boolean verbose = true;
+  public static final boolean seenTagsOnly = false;
+  private ChineseWordFeatureExtractor featExtractor;
+  public static final boolean fixUnkFunctionWords = false;
+
+<span class="nc" id="L42">  private static final Pattern wordPattern = Pattern.compile(&quot;.*-W&quot;);</span>
+<span class="nc" id="L43">  private static final Pattern charPattern = Pattern.compile(&quot;.*-.C&quot;);</span>
+<span class="nc" id="L44">  private static final Pattern bigramPattern = Pattern.compile(&quot;.*-.B&quot;);</span>
+<span class="nc" id="L45">  private static final Pattern conjPattern = Pattern.compile(&quot;.*&amp;&amp;.*&quot;);</span>
+
+<span class="nc" id="L47">  private final Pair&lt;Pattern, Integer&gt; wordThreshold = new Pair&lt;&gt;(wordPattern, 0);</span>
+<span class="nc" id="L48">  private final Pair&lt;Pattern, Integer&gt; charThreshold = new Pair&lt;&gt;(charPattern, 2);</span>
+<span class="nc" id="L49">  private final Pair&lt;Pattern, Integer&gt; bigramThreshold = new Pair&lt;&gt;(bigramPattern, 3);</span>
+<span class="nc" id="L50">  private final Pair&lt;Pattern, Integer&gt; conjThreshold = new Pair&lt;&gt;(conjPattern, 3);</span>
+
+<span class="nc" id="L52">  private final List&lt;Pair&lt;Pattern, Integer&gt;&gt; featureThresholds = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L53">  private final int universalThreshold = 0;</span>
+
+  private LinearClassifier scorer;
+<span class="nc" id="L56">  private Map&lt;String, String&gt; functionWordTags = Generics.newHashMap();</span>
+  private Distribution&lt;String&gt; tagDist;
+  private final Index&lt;String&gt; wordIndex;
+  private final Index&lt;String&gt; tagIndex;
+  private transient Counter&lt;String&gt; logProbs;
+<span class="nc" id="L61">  private double iteratorCutoffFactor = 4;</span>
+<span class="nc" id="L62">  private transient int lastWord = -1;</span>
+<span class="nc" id="L63">  String initialWeightFile = null;</span>
+<span class="nc" id="L64">  boolean trainFloat = false;</span>
+  private static final String featureDir = &quot;gbfeatures&quot;;
+
+<span class="nc" id="L67">  private double tol = 1e-4;</span>
+<span class="nc" id="L68">  private double sigma = 0.4;</span>
+
+  static final boolean tuneSigma = false;
+  static final int trainCountThreshold = 5;
+  final int featureLevel;
+  static final int DEFAULT_FEATURE_LEVEL = 2;
+<span class="nc" id="L74">  private boolean trainOnLowCount = false;</span>
+<span class="nc" id="L75">  private boolean trainByType = false;</span>
+  private final TreebankLangParserParams tlpParams;
+  private final TreebankLanguagePack ctlp;
+  private final Options op;
+
+  public boolean isKnown(int word) {
+<span class="nc" id="L81">    return isKnown(wordIndex.get(word));</span>
+  }
+
+  public boolean isKnown(String word) {
+<span class="nc" id="L85">    return tagsForWord.containsKey(word);</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;String&gt; tagSet(Function&lt;String,String&gt; basicCategoryFunction) {
+<span class="nc" id="L91">    Set&lt;String&gt; tagSet = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">    for (String tag : tagIndex.objectsList()) {</span>
+<span class="nc" id="L93">      tagSet.add(basicCategoryFunction.apply(tag));</span>
+<span class="nc" id="L94">    }</span>
+<span class="nc" id="L95">    return tagSet;</span>
+  }
+
+
+  private void ensureProbs(int word) {
+<span class="nc" id="L100">    ensureProbs(word, true);</span>
+<span class="nc" id="L101">  }</span>
+
+  private void ensureProbs(int word, boolean subtractTagScore) {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    if (word == lastWord) {</span>
+<span class="nc" id="L105">      return;</span>
+    }
+<span class="nc" id="L107">    lastWord = word;</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">    if (functionWordTags.containsKey(wordIndex.get(word))) {</span>
+<span class="nc" id="L109">      logProbs = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L110">      String trueTag = functionWordTags.get(wordIndex.get(word));</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">      for (String tag : tagIndex.objectsList()) {</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        if (ctlp.basicCategory(tag).equals(trueTag)) {</span>
+<span class="nc" id="L113">          logProbs.setCount(tag, 0);</span>
+        } else {
+<span class="nc" id="L115">          logProbs.setCount(tag, Double.NEGATIVE_INFINITY);</span>
+        }
+<span class="nc" id="L117">      }</span>
+<span class="nc" id="L118">      return;</span>
+    }
+<span class="nc" id="L120">    Datum datum = new BasicDatum(featExtractor.makeFeatures(wordIndex.get(word)));</span>
+<span class="nc" id="L121">    logProbs = scorer.logProbabilityOf(datum);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">    if (subtractTagScore) {</span>
+<span class="nc" id="L123">      Set&lt;String&gt; tagSet = logProbs.keySet();</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">      for (String tag : tagSet) {</span>
+<span class="nc" id="L125">        logProbs.incrementCount(tag, -Math.log(tagDist.probabilityOf(tag)));</span>
+<span class="nc" id="L126">      }</span>
+    }
+<span class="nc" id="L128">  }</span>
+
+<span class="nc" id="L130">  public CollectionValuedMap&lt;String, String&gt; tagsForWord = new CollectionValuedMap&lt;&gt;();</span>
+
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(int word, int loc, String featureSpec) {
+<span class="nc" id="L133">    ensureProbs(word);</span>
+<span class="nc" id="L134">    List&lt;IntTaggedWord&gt; rules = new ArrayList&lt;&gt;();</span>
+    if (seenTagsOnly) {
+      String wordString = wordIndex.get(word);
+      Collection&lt;String&gt; tags = tagsForWord.get(wordString);
+      for (String tag : tags) {
+        rules.add(new IntTaggedWord(wordString, tag, wordIndex, tagIndex));
+      }
+    } else {
+<span class="nc" id="L142">      double max = Counters.max(logProbs);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">      for (int tag = 0; tag &lt; tagIndex.size(); tag++) {</span>
+<span class="nc" id="L144">        IntTaggedWord iTW = new IntTaggedWord(word, tag);</span>
+<span class="nc" id="L145">        double score = logProbs.getCount(tagIndex.get(tag));</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (score &gt; max - iteratorCutoffFactor) {</span>
+<span class="nc" id="L147">          rules.add(iTW);</span>
+        }
+      }
+    }
+<span class="nc" id="L151">    return rules.iterator();</span>
+  }
+
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(String word, int loc, String featureSpec) {
+<span class="nc" id="L155">    return ruleIteratorByWord(wordIndex.indexOf(word), loc, featureSpec);</span>
+  }
+
+  /** Returns the number of rules (tag rewrites as word) in the Lexicon.
+   *  This method isn't yet implemented in this class.
+   *  It currently just returns 0, which may or may not be helpful.
+   */
+  public int numRules() {
+<span class="nc" id="L163">    int accumulated = 0;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">    for (int w = 0, tot = wordIndex.size(); w &lt; tot; w++) {</span>
+<span class="nc" id="L165">      Iterator&lt;IntTaggedWord&gt; iter = ruleIteratorByWord(w, 0, null);</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">      while (iter.hasNext()) {</span>
+<span class="nc" id="L167">        iter.next();</span>
+<span class="nc" id="L168">        accumulated++;</span>
+      }
+    }
+<span class="nc" id="L171">    return accumulated;</span>
+  }
+
+  private String getTag(String word) {
+<span class="nc" id="L175">    int iW = wordIndex.addToIndex(word);</span>
+<span class="nc" id="L176">    ensureProbs(iW, false);</span>
+<span class="nc" id="L177">    return Counters.argmax(logProbs);</span>
+  }
+
+
+  private void verbose(String s) {
+    if (verbose) {
+<span class="nc" id="L183">      log.info(s);</span>
+    }
+<span class="nc" id="L185">  }</span>
+
+<span class="nc" id="L187">  public ChineseMaxentLexicon(Options op, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex, int featureLevel) {</span>
+<span class="nc" id="L188">    this.op = op;</span>
+<span class="nc" id="L189">    this.tlpParams = op.tlpParams;</span>
+<span class="nc" id="L190">    this.ctlp = op.tlpParams.treebankLanguagePack();;</span>
+<span class="nc" id="L191">    this.wordIndex = wordIndex;</span>
+<span class="nc" id="L192">    this.tagIndex = tagIndex;</span>
+<span class="nc" id="L193">    this.featureLevel = featureLevel;</span>
+    if (fixUnkFunctionWords) {
+      String filename = &quot;unknown_function_word-simple.gb&quot;;
+      try {
+        BufferedReader in = new BufferedReader(new InputStreamReader(new FileInputStream(filename), &quot;GB18030&quot;));
+        for (String line = in.readLine(); line != null; line = in.readLine()) {
+          String[] parts = line.split(&quot;\\s+&quot;, 2);
+          functionWordTags.put(parts[0], parts[1]);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException(&quot;Couldn't read function word file &quot; + filename);
+      }
+    }
+<span class="nc" id="L206">  }</span>
+
+  // only used at training time
+  transient IntCounter&lt;TaggedWord&gt; datumCounter;
+
+  @Override
+  public void initializeTraining(double numTrees) {
+<span class="nc" id="L213">    verbose(&quot;Training ChineseMaxentLexicon.&quot;);</span>
+<span class="nc" id="L214">    verbose(&quot;trainOnLowCount = &quot; + trainOnLowCount + &quot;, trainByType = &quot; + trainByType + &quot;, featureLevel = &quot; + featureLevel + &quot;, tuneSigma = &quot; + tuneSigma);</span>
+<span class="nc" id="L215">    verbose(&quot;Making dataset...&quot;);</span>
+
+<span class="nc bnc" id="L217" title="All 2 branches missed.">    if (featExtractor == null) {</span>
+<span class="nc" id="L218">      featExtractor = new ChineseWordFeatureExtractor(featureLevel);</span>
+    }
+
+<span class="nc" id="L221">    this.datumCounter = new IntCounter&lt;&gt;();</span>
+<span class="nc" id="L222">  }</span>
+
+  /**
+   * Add the given collection of trees to the statistics counted.  Can
+   * be called multiple times with different trees.
+   */
+  public final void train(Collection&lt;Tree&gt; trees) {
+<span class="nc" id="L229">    train(trees, 1.0);</span>
+<span class="nc" id="L230">  }</span>
+
+  /**
+   * Add the given collection of trees to the statistics counted.  Can
+   * be called multiple times with different trees.
+   */
+  @Override
+  public void train(Collection&lt;Tree&gt; trees, double weight) {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    for (Tree tree : trees) {</span>
+<span class="nc" id="L239">      train(tree, weight);</span>
+<span class="nc" id="L240">    }</span>
+<span class="nc" id="L241">  }</span>
+
+  /**
+   * Add the given tree to the statistics counted.  Can
+   * be called multiple times with different trees.
+   */
+  @Override
+  public void train(Tree tree, double weight) {
+<span class="nc" id="L249">    train(tree.taggedYield(), weight);</span>
+<span class="nc" id="L250">  }</span>
+
+  /**
+   * Add the given sentence to the statistics counted.  Can
+   * be called multiple times with different sentences.
+   */
+  @Override
+  public void train(List&lt;TaggedWord&gt; sentence, double weight) {
+<span class="nc" id="L258">    featExtractor.train(sentence, weight);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">    for (TaggedWord word : sentence) {</span>
+<span class="nc" id="L260">      datumCounter.incrementCount(word, weight);</span>
+<span class="nc" id="L261">      tagsForWord.add(word.word(), word.tag());</span>
+<span class="nc" id="L262">    }</span>
+<span class="nc" id="L263">  }</span>
+
+  @Override
+  public void trainUnannotated(List&lt;TaggedWord&gt; sentence, double weight) {
+    // TODO: for now we just punt on these
+<span class="nc" id="L268">    throw new UnsupportedOperationException(&quot;This version of the parser does not support non-tree training data&quot;);</span>
+  }
+
+  @Override
+  public void incrementTreesRead(double weight) {
+<span class="nc" id="L273">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public void train(TaggedWord tw, int loc, double weight) {
+<span class="nc" id="L278">    throw new UnsupportedOperationException();</span>
+  }
+
+  @Override
+  public void finishTraining() {
+<span class="nc" id="L283">    IntCounter&lt;String&gt; tagCounter = new IntCounter&lt;&gt;();</span>
+
+<span class="nc" id="L285">    WeightedDataset data = new WeightedDataset(datumCounter.size());</span>
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">    for (TaggedWord word : datumCounter.keySet()) {</span>
+<span class="nc" id="L288">      int count = datumCounter.getIntCount(word);</span>
+<span class="nc bnc" id="L289" title="All 4 branches missed.">      if (trainOnLowCount &amp;&amp; count &gt; trainCountThreshold) {</span>
+<span class="nc" id="L290">        continue;</span>
+      }
+<span class="nc bnc" id="L292" title="All 2 branches missed.">      if (functionWordTags.containsKey(word.word())) {</span>
+<span class="nc" id="L293">        continue;</span>
+      }
+<span class="nc" id="L295">      tagCounter.incrementCount(word.tag());</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">      if (trainByType) {</span>
+<span class="nc" id="L297">        count = 1;</span>
+      }
+<span class="nc" id="L299">      data.add(new BasicDatum(featExtractor.makeFeatures(word.word()), word.tag()), count);</span>
+<span class="nc" id="L300">    }</span>
+<span class="nc" id="L301">    datumCounter = null;</span>
+
+<span class="nc" id="L303">    tagDist = Distribution.laplaceSmoothedDistribution(tagCounter, tagCounter.size(), 0.5);</span>
+<span class="nc" id="L304">    tagCounter = null;</span>
+<span class="nc" id="L305">    applyThresholds(data);</span>
+
+<span class="nc" id="L307">    verbose(&quot;Making classifier...&quot;);</span>
+<span class="nc" id="L308">    QNMinimizer minim = new QNMinimizer();//new ResultStoringMonitor(5, &quot;weights&quot;));</span>
+//    minim.shutUp();
+
+<span class="nc" id="L311">    LinearClassifierFactory factory = new LinearClassifierFactory(minim);</span>
+<span class="nc" id="L312">    factory.setTol(tol);</span>
+<span class="nc" id="L313">    factory.setSigma(sigma);</span>
+    if (tuneSigma) {
+      factory.setTuneSigmaHeldOut();
+    }
+<span class="nc" id="L317">    scorer = factory.trainClassifier(data);</span>
+
+<span class="nc" id="L319">    verbose(&quot;Done training.&quot;);</span>
+<span class="nc" id="L320">  }</span>
+
+  private void applyThresholds(WeightedDataset data) {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">    if (wordThreshold.second &gt; 0) {</span>
+<span class="nc" id="L324">      featureThresholds.add(wordThreshold);</span>
+    }
+<span class="nc bnc" id="L326" title="All 4 branches missed.">    if (featExtractor.chars &amp;&amp; charThreshold.second &gt; 0) {</span>
+<span class="nc" id="L327">      featureThresholds.add(charThreshold);</span>
+    }
+<span class="nc bnc" id="L329" title="All 4 branches missed.">    if (featExtractor.bigrams &amp;&amp; bigramThreshold.second &gt; 0) {</span>
+<span class="nc" id="L330">      featureThresholds.add(bigramThreshold);</span>
+    }
+<span class="nc bnc" id="L332" title="All 6 branches missed.">    if ((featExtractor.conjunctions || featExtractor.mildConjunctions) &amp;&amp; conjThreshold.second &gt; 0) {</span>
+<span class="nc" id="L333">      featureThresholds.add(conjThreshold);</span>
+    }
+
+<span class="nc" id="L336">    int types = data.numFeatureTypes();</span>
+    if (universalThreshold &gt; 0) {
+      data.applyFeatureCountThreshold(universalThreshold);
+    }
+<span class="nc bnc" id="L340" title="All 2 branches missed.">    if (featureThresholds.size() &gt; 0) {</span>
+<span class="nc" id="L341">      data.applyFeatureCountThreshold(featureThresholds);</span>
+    }
+<span class="nc" id="L343">    int numRemoved = types - data.numFeatureTypes();</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    if (numRemoved &gt; 0) {</span>
+<span class="nc" id="L345">      verbose(&quot;Thresholding removed &quot; + numRemoved + &quot; features.&quot;);</span>
+    }
+<span class="nc" id="L347">  }</span>
+
+  public static void main(String[] args) {
+<span class="nc" id="L350">    TreebankLangParserParams tlpParams = new ChineseTreebankParserParams();</span>
+<span class="nc" id="L351">    TreebankLanguagePack ctlp = tlpParams.treebankLanguagePack();</span>
+<span class="nc" id="L352">    Options op = new Options(tlpParams);</span>
+<span class="nc" id="L353">    TreeAnnotator ta = new TreeAnnotator(tlpParams.headFinder(), tlpParams, op);</span>
+
+<span class="nc" id="L355">    log.info(&quot;Reading Trees...&quot;);</span>
+<span class="nc" id="L356">    FileFilter trainFilter = new NumberRangesFileFilter(args[1], true);</span>
+<span class="nc" id="L357">    Treebank trainTreebank = tlpParams.memoryTreebank();</span>
+<span class="nc" id="L358">    trainTreebank.loadPath(args[0], trainFilter);</span>
+
+<span class="nc" id="L360">    log.info(&quot;Annotating trees...&quot;);</span>
+<span class="nc" id="L361">    Collection&lt;Tree&gt; trainTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    for (Tree tree : trainTreebank) {</span>
+<span class="nc" id="L363">      trainTrees.add(ta.transformTree(tree));</span>
+<span class="nc" id="L364">    }</span>
+<span class="nc" id="L365">    trainTreebank = null; // saves memory</span>
+
+<span class="nc" id="L367">    log.info(&quot;Training lexicon...&quot;);</span>
+
+<span class="nc" id="L369">    Index&lt;String&gt; wordIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L370">    Index&lt;String&gt; tagIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L371">    int featureLevel = DEFAULT_FEATURE_LEVEL;</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">    if (args.length &gt; 3) {</span>
+<span class="nc" id="L373">      featureLevel = Integer.parseInt(args[3]);</span>
+    }
+<span class="nc" id="L375">    ChineseMaxentLexicon lex = new ChineseMaxentLexicon(op, wordIndex, tagIndex, featureLevel);</span>
+<span class="nc" id="L376">    lex.initializeTraining(trainTrees.size());</span>
+<span class="nc" id="L377">    lex.train(trainTrees);</span>
+<span class="nc" id="L378">    lex.finishTraining();</span>
+
+<span class="nc" id="L380">    log.info(&quot;Testing&quot;);</span>
+
+<span class="nc" id="L382">    FileFilter testFilter = new NumberRangesFileFilter(args[2], true);</span>
+<span class="nc" id="L383">    Treebank testTreebank = tlpParams.memoryTreebank();</span>
+<span class="nc" id="L384">    testTreebank.loadPath(args[0], testFilter);</span>
+<span class="nc" id="L385">    List&lt;TaggedWord&gt; testWords = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">    for (Tree t : testTreebank) {</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">      for (TaggedWord tw : t.taggedYield()) {</span>
+<span class="nc" id="L388">        testWords.add(tw);</span>
+<span class="nc" id="L389">      }</span>
+      //testWords.addAll(t.taggedYield());
+<span class="nc" id="L391">    }</span>
+<span class="nc" id="L392">    int[] totalAndCorrect = lex.testOnTreebank(testWords);</span>
+
+<span class="nc" id="L394">    log.info(&quot;done.&quot;);</span>
+<span class="nc" id="L395">    System.out.println(totalAndCorrect[1] + &quot; correct out of &quot; + totalAndCorrect[0] + &quot; -- ACC: &quot; + ((double) totalAndCorrect[1]) / totalAndCorrect[0]);</span>
+<span class="nc" id="L396">  }</span>
+
+  private int[] testOnTreebank(Collection&lt;TaggedWord&gt; testWords) {
+<span class="nc" id="L399">    int[] totalAndCorrect = new int[2];</span>
+<span class="nc" id="L400">    totalAndCorrect[0] = 0;</span>
+<span class="nc" id="L401">    totalAndCorrect[1] = 0;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">    for (TaggedWord word : testWords) {</span>
+<span class="nc" id="L403">      String goldTag = word.tag();</span>
+<span class="nc" id="L404">      String guessTag = ctlp.basicCategory(getTag(word.word()));</span>
+<span class="nc" id="L405">      totalAndCorrect[0]++;</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">      if (goldTag.equals(guessTag)) {</span>
+<span class="nc" id="L407">        totalAndCorrect[1]++;</span>
+      }
+<span class="nc" id="L409">    }</span>
+<span class="nc" id="L410">    return totalAndCorrect;</span>
+  }
+
+  public float score(IntTaggedWord iTW, int loc, String word, String featureSpec) {
+<span class="nc" id="L414">    ensureProbs(iTW.word());</span>
+<span class="nc" id="L415">    double max = Counters.max(logProbs);</span>
+<span class="nc" id="L416">    double score = logProbs.getCount(iTW.tagString(tagIndex));</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">    if (score &gt; max - iteratorCutoffFactor) {</span>
+<span class="nc" id="L418">      return (float) score;</span>
+    } else {
+<span class="nc" id="L420">      return Float.NEGATIVE_INFINITY;</span>
+    }
+  }
+
+
+  public void writeData(Writer w) throws IOException {
+<span class="nc" id="L426">    throw new UnsupportedOperationException();</span>
+  }
+
+  public void readData(BufferedReader in) throws IOException {
+<span class="nc" id="L430">    throw new UnsupportedOperationException();</span>
+  }
+
+  public UnknownWordModel getUnknownWordModel() {
+    // TODO Auto-generated method stub
+<span class="nc" id="L435">    return null;</span>
+  }
+
+  public void setUnknownWordModel(UnknownWordModel uwm) {
+    // TODO Auto-generated method stub
+
+<span class="nc" id="L441">  }</span>
+
+  @Override
+  public void train(Collection&lt;Tree&gt; trees, Collection&lt;Tree&gt; rawTrees) {
+<span class="nc" id="L445">    train(trees);</span>
+
+<span class="nc" id="L447">  }</span>
+
+
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

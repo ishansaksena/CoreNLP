@@ -1,0 +1,1289 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LambdaSolve.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.maxent.iis</a> &gt; <span class="el_source">LambdaSolve.java</span></div><h1>LambdaSolve.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.maxent.iis; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.io.*;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.maxent.*;
+import edu.stanford.nlp.util.MutableDouble;
+
+import java.text.NumberFormat;
+import java.io.IOException;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+
+
+/**
+ * This is the main class that does the core computation in IIS.
+ * (Parts of it still get invoked in the POS tagger, even when not using IIS.)
+ *
+ * @author Kristina Toutanova
+ * @version 1.0
+ */
+public class LambdaSolve  {
+
+  /** A logger for this class */
+<span class="nc" id="L27">  private static Redwood.RedwoodChannels log = Redwood.channels(LambdaSolve.class);</span>
+
+  /**
+   * These are the model parameters that have to be learned.
+   * This field is used at runtime in all tagger and other IIS/Kristina code.
+   */
+  public double[] lambda;
+
+  /** Only allocated and used in the IIS optimization routines. */
+  protected boolean[] lambda_converged;
+
+  /** Only used in the IIS optimization routines. Convergence threshold / allowed &quot;newtonErr&quot; */
+  protected double eps;
+  // protected double newtonerr;
+
+  /**
+   * This flag is true if all (x,y) have the same f# in which case the newton equation solving is avoided.
+   */
+  private boolean fixedFnumXY;
+
+  protected Problem p;
+
+  /**
+   * Conditional probabilities.
+   */
+  protected double[][] probConds;
+
+  /**
+   * Normalization factors, one for each x.  (CDM questions 2008: Are these
+   * only at training time?  Can we not allocate it at test time (unlike
+   * what LambdaSolveTagger now does)?  Is the place where it is set from
+   * ySize wrong?
+   */
+  protected double[] zlambda;
+
+  /**
+   * This contains the number of features active for each pair (x,y)
+   */
+
+  protected byte[][] fnumArr;
+
+  /**
+   * This is an array of empirical expectations for the features
+   */
+  protected double[] ftildeArr;
+
+  private static final boolean smooth = false;
+  private static final boolean VERBOSE = false;
+
+  /**
+   * If this is true, assume that active features are binary, and one
+   * does not have to multiply in a feature value.
+   */
+<span class="nc" id="L80">  private boolean ASSUME_BINARY = false;</span>
+
+  private double[] aux;  // auxiliary array used by some procedures for computing objective functions and their derivatives
+  private double[][] sum;// auxiliary array
+  private double[][] sub;// auxiliary array
+<span class="nc" id="L85">  public boolean weightRanks = false;</span>
+<span class="nc" id="L86">  private boolean convertValues = false;</span>
+
+
+<span class="nc" id="L89">  public LambdaSolve(Problem p1, double eps1, double nerr1) {</span>
+<span class="nc" id="L90">    p = p1;</span>
+<span class="nc" id="L91">    eps = eps1;</span>
+    // newtonerr = nerr1;
+    // lambda = new double[p.fSize];
+<span class="nc" id="L94">    probConds = new double[p.data.xSize][];</span>
+<span class="nc" id="L95">    log.info(&quot;xSize is &quot; + p.data.xSize);</span>
+
+<span class="nc bnc" id="L97" title="All 2 branches missed.">    for (int i = 0; i &lt; p.data.xSize; i++) {</span>
+<span class="nc" id="L98">      probConds[i] = new double[p.data.numY(i)];</span>
+    }
+<span class="nc" id="L100">    fnumArr = new byte[p.data.xSize][];</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">    for (int i = 0; i &lt; p.data.xSize; i++) {</span>
+<span class="nc" id="L102">      fnumArr[i] = new byte[p.data.numY(i)];</span>
+    }
+
+<span class="nc" id="L105">    zlambda = new double[p.data.xSize];</span>
+<span class="nc" id="L106">    ftildeArr = new double[p.fSize];</span>
+<span class="nc" id="L107">    initCondsZlambdaEtc();</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">    if (convertValues) {</span>
+<span class="nc" id="L109">      transformValues();</span>
+    }
+<span class="nc" id="L111">  }</span>
+
+  /**
+   * Reads the lambda parameters from a file.
+   *
+   * @param filename File to read from
+   */
+<span class="nc" id="L118">  public LambdaSolve(String filename) {</span>
+<span class="nc" id="L119">    this.readL(filename);</span>
+<span class="nc" id="L120">  }</span>
+
+<span class="nc" id="L122">  public LambdaSolve() {</span>
+<span class="nc" id="L123">  }</span>
+
+  public void setNonBinary() {
+<span class="nc" id="L126">    ASSUME_BINARY = false;</span>
+<span class="nc" id="L127">  }</span>
+
+  public void setBinary() {
+<span class="nc" id="L130">    ASSUME_BINARY = true;</span>
+<span class="nc" id="L131">  }</span>
+
+
+  /**
+   * This is a specialized procedure to change the values
+   * of parses for semantic ranking.
+   * The highest value is changed to 2/3
+   * and values of 1 are changed to 1/(3*numones). 0 is unchanged
+   * this is used to rank higher the ordering for the best parse
+   * values are in p.data.values
+   */
+  public void transformValues() {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.values.length; x++) {</span>
+<span class="nc" id="L144">      double highest = p.data.values[x][0];</span>
+<span class="nc" id="L145">      double sumhighest = 0;</span>
+<span class="nc" id="L146">      double sumrest = 0;</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">      for (int y = 0; y &lt; p.data.values[x].length; y++) {</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (p.data.values[x][y] &gt; highest) {</span>
+<span class="nc" id="L149">          highest = p.data.values[x][y];</span>
+        }
+      }
+
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      for (int y = 0; y &lt; p.data.values[x].length; y++) {</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (p.data.values[x][y] == highest) {</span>
+<span class="nc" id="L155">          sumhighest += highest;</span>
+        } else {
+<span class="nc" id="L157">          sumrest += p.data.values[x][y];</span>
+        }
+      }
+
+<span class="nc bnc" id="L161" title="All 2 branches missed.">      if (sumrest == 0) {</span>
+<span class="nc" id="L162">        continue;</span>
+      } // do not change , makes no difference
+
+      //now change them
+<span class="nc bnc" id="L166" title="All 2 branches missed.">      for (int y = 0; y &lt; p.data.values[x].length; y++) {</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (p.data.values[x][y] == highest) {</span>
+<span class="nc" id="L168">          p.data.values[x][y] = .7 * highest / sumhighest;</span>
+        } else {
+<span class="nc" id="L170">          p.data.values[x][y] = .3 * p.data.values[x][y] / sumrest;</span>
+        }
+      }
+    }
+<span class="nc" id="L174">  }</span>
+
+
+  /**
+   * Initializes the model parameters, empirical expectations of the
+   * features, and f#(x,y).
+   */
+  void initCondsZlambdaEtc() {
+    // init pcond
+<span class="nc bnc" id="L183" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">      for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L185">        probConds[x][y] = 1.0 / probConds[x].length;</span>
+      }
+    }
+
+    // init zlambda
+<span class="nc bnc" id="L190" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+<span class="nc" id="L191">      zlambda[x] = probConds[x].length;</span>
+    }
+
+    // init ftildeArr
+<span class="nc bnc" id="L195" title="All 2 branches missed.">    for (int i = 0; i &lt; p.fSize; i++) {</span>
+<span class="nc" id="L196">      ftildeArr[i] = p.functions.get(i).ftilde();</span>
+<span class="nc" id="L197">      p.functions.get(i).setSum();</span>
+
+      // if the expectation of a feature is zero make sure we are not
+      // trying to find a lambda for it
+      // if (ftildeArr[i] == 0) {
+      //   lambda_converged[i]=true;
+      //   lambda[i]=0;
+      // }
+
+      //dumb smoothing that is not sound and doesn't seem to work
+      if (smooth) {
+        double alfa = .015;
+        for (int j = 0; j &lt; p.fSize; j++) {
+          ftildeArr[j] = (ftildeArr[j] * p.data.xSize + alfa) / p.data.xSize;
+        }
+      }
+
+<span class="nc" id="L214">      Feature f = p.functions.get(i);</span>
+      //collecting f#(x,y)
+<span class="nc bnc" id="L216" title="All 2 branches missed.">      for (int j = 0; j &lt; f.len(); j++) {</span>
+<span class="nc" id="L217">        int x = f.getX(j);</span>
+<span class="nc" id="L218">        int y = f.getY(j);</span>
+<span class="nc" id="L219">        fnumArr[x][y] += f.getVal(j);</span>
+      }//j
+    }//i
+<span class="nc" id="L222">    int constAll = fnumArr[0][0];</span>
+<span class="nc" id="L223">    fixedFnumXY = true;</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">      for (int y = 0; y &lt; fnumArr[x].length; y++) {</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        if (fnumArr[x][y] != constAll) {</span>
+<span class="nc" id="L227">          fixedFnumXY = false;</span>
+<span class="nc" id="L228">          break;</span>
+        }
+      }
+    }//x
+    if (VERBOSE) {
+      log.info(&quot; pcond, zlamda, ftildeArr &quot; + (fixedFnumXY ? &quot;(fixed sum) &quot; : &quot;&quot;) + &quot;initialized &quot;);
+    }
+<span class="nc" id="L235">  }</span>
+
+
+  /**
+   * Iterate until convergence.  I usually use the other method that
+   * does a fixed number of iterations.
+   */
+  public void improvedIterative() {
+    boolean flag;
+<span class="nc" id="L244">    int iterations = 0;</span>
+<span class="nc" id="L245">    lambda_converged = new boolean[p.fSize];</span>
+<span class="nc" id="L246">    int numNConverged = p.fSize;</span>
+    do {
+      if (VERBOSE) {
+        log.info(iterations);
+      }
+<span class="nc" id="L251">      flag = false;</span>
+<span class="nc" id="L252">      iterations++;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">      for (int i = 0; i &lt; lambda.length; i++) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        if (lambda_converged[i]) {</span>
+<span class="nc" id="L255">          continue;</span>
+        }
+<span class="nc" id="L257">        MutableDouble deltaI = new MutableDouble();</span>
+<span class="nc" id="L258">        boolean fl = iterate(i, eps, deltaI);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (fl) {</span>
+<span class="nc" id="L260">          flag = true;</span>
+<span class="nc" id="L261">          updateConds(i, deltaI.doubleValue());</span>
+          // checkCorrectness();
+        } else {
+          //lambda_converged[i]=true;
+<span class="nc" id="L265">          numNConverged--;</span>
+        }
+      }
+<span class="nc bnc" id="L268" title="All 4 branches missed.">    } while ((flag) &amp;&amp; (iterations &lt; 1000));</span>
+<span class="nc" id="L269">  }</span>
+
+
+  /**
+   * Does a fixed number of IIS iterations.
+   *
+   * @param iters Number of iterations to run
+   */
+  public void improvedIterative(int iters) {
+<span class="nc" id="L278">    int iterations = 0;</span>
+<span class="nc" id="L279">    lambda_converged = new boolean[p.fSize];</span>
+<span class="nc" id="L280">    int numNConverged = p.fSize;</span>
+    //double lOld=logLikelihood();
+    do {
+<span class="nc" id="L283">      iterations++;</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">      for (int i = 0; i &lt; lambda.length; i++) {</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (lambda_converged[i]) {</span>
+<span class="nc" id="L286">          continue;</span>
+        }
+<span class="nc" id="L288">        MutableDouble deltaI = new MutableDouble();</span>
+<span class="nc" id="L289">        boolean fl = iterate(i, eps, deltaI);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if (fl) {</span>
+<span class="nc" id="L291">          updateConds(i, deltaI.doubleValue());</span>
+          // checkCorrectness();
+        } else {
+          //lambda_converged[i]=true;
+<span class="nc" id="L295">          numNConverged--;</span>
+        }
+      }
+
+      /*
+        double lNew=logLikelihood();
+        double gain=(lNew-lOld);
+        if(gain&lt;0) {
+        log.info(&quot; Likelihood decreased by &quot;+ (-gain));
+        System.exit(1);
+        }
+        if(Math.abs(gain)&lt;eps){
+        log.info(&quot;Converged&quot;);
+        break;
+        }
+
+        if(VERBOSE)
+        log.info(&quot;Likelihood &quot;+lNew+&quot; &quot;+&quot; gain &quot;+gain);
+        lOld=lNew;
+      */
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">      if (iterations % 100 == 0) {</span>
+<span class="nc" id="L317">        save_lambdas(iterations + &quot;.lam&quot;);</span>
+      }
+<span class="nc" id="L319">      log.info(iterations);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    } while (iterations &lt; iters);</span>
+<span class="nc" id="L321">  }</span>
+
+
+  /**
+   * Iteration for lambda[index].
+   * Returns true if this lambda hasn't converged. A lambda is deemed
+   * converged if the change found for it is smaller then the parameter eps.
+   */
+  boolean iterate(int index, double err, MutableDouble ret) {
+<span class="nc" id="L330">    double deltaL = 0.0;</span>
+<span class="nc" id="L331">    deltaL = newton(deltaL, index, err);</span>
+    //log.info(&quot;delta is &quot;+deltaL+&quot; feature &quot;+index+&quot; expectation &quot;+ftildeArr[index]);
+
+<span class="nc bnc" id="L334" title="All 2 branches missed.">    if (Math.abs(deltaL + lambda[index]) &gt; 200) {</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">      if ((deltaL + lambda[index]) &gt; 200) {</span>
+<span class="nc" id="L336">        deltaL = 200 - lambda[index];</span>
+      } else {
+<span class="nc" id="L338">        deltaL = -lambda[index] - 200;</span>
+      }
+
+<span class="nc" id="L341">      log.info(&quot;set delta to smth &quot; + deltaL);</span>
+    }
+<span class="nc" id="L343">    lambda[index] = lambda[index] + deltaL;</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    if (Double.isNaN(deltaL)) {</span>
+<span class="nc" id="L345">      log.info(&quot; NaN &quot; + index + ' ' + deltaL);</span>
+    }
+<span class="nc" id="L347">    ret.set(deltaL);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    return (Math.abs(deltaL) &gt;= eps);</span>
+  }
+
+
+  /*
+   * Finds the root of an equation by Newton's method.
+   * This is my implementation. It might be improved
+   * if we looked at some official library for numerical methods.
+   */
+  double newton(double lambda0, int index, double err) {
+<span class="nc" id="L358">    double lambdaN = lambda0;</span>
+<span class="nc" id="L359">    int i = 0;</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">    if (fixedFnumXY) {</span>
+<span class="nc" id="L361">      double plambda = fExpected(p.functions.get(index));</span>
+<span class="nc" id="L362">      return (1 / (double) fnumArr[0][0]) * (Math.log(this.ftildeArr[index]) - Math.log(plambda));</span>
+    }
+    do {
+<span class="nc" id="L365">      i++;</span>
+<span class="nc" id="L366">      double lambdaP = lambdaN;</span>
+<span class="nc" id="L367">      double gPrimeVal = gprime(lambdaP, index);</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">      if (Double.isNaN(gPrimeVal)) {</span>
+<span class="nc" id="L369">        log.info(&quot;gPrime of &quot; + lambdaP + &quot; &quot; + index + &quot; is NaN &quot; + gPrimeVal);</span>
+        //lambda_converged[index]=true;
+        //   System.exit(1);
+      }
+<span class="nc" id="L373">      double gVal = g(lambdaP, index);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      if (gPrimeVal == 0.0) {</span>
+<span class="nc" id="L375">        return 0.0;</span>
+      }
+<span class="nc" id="L377">      lambdaN = lambdaP - gVal / gPrimeVal;</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      if (Double.isNaN(lambdaN)) {</span>
+<span class="nc" id="L379">        log.info(&quot;the division of &quot; + gVal + &quot; &quot; + gPrimeVal + &quot; &quot; + index + &quot; is NaN &quot; + lambdaN);</span>
+        //lambda_converged[index]=true;
+<span class="nc" id="L381">        return 0;</span>
+      }
+<span class="nc bnc" id="L383" title="All 2 branches missed.">      if (Math.abs(lambdaN - lambdaP) &lt; err) {</span>
+<span class="nc" id="L384">        return lambdaN;</span>
+      }
+<span class="nc bnc" id="L386" title="All 2 branches missed.">      if (i &gt; 100) {</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        if (Math.abs(gVal) &gt; 0.01) {</span>
+<span class="nc" id="L388">          return 0;</span>
+        }
+<span class="nc" id="L390">        return lambdaN;</span>
+      }
+<span class="nc" id="L392">    } while (true);</span>
+  }
+
+
+  /**
+   * This method updates the conditional probabilities in the model, resulting from the
+   * update of lambda[index] to lambda[index]+deltaL .
+   */
+  void updateConds(int index, double deltaL) {
+    //  for each x that (x,y)=true / exists y
+    //  recalculate pcond(y,x) for all y
+<span class="nc bnc" id="L403" title="All 2 branches missed.">    for (int i = 0; i &lt; p.functions.get(index).len(); i++) {</span>
+      // update for this x
+<span class="nc" id="L405">      double s = 0;</span>
+<span class="nc" id="L406">      int x = p.functions.get(index).getX(i);</span>
+<span class="nc" id="L407">      int y = p.functions.get(index).getY(i);</span>
+<span class="nc" id="L408">      double val = p.functions.get(index).getVal(i);</span>
+<span class="nc" id="L409">      double zlambdaX = zlambda[x] + pcond(y, x) * zlambda[x] * (Math.exp(deltaL * val) - 1);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">      for (int y1 = 0; y1 &lt; probConds[x].length; y1++) {</span>
+<span class="nc" id="L411">        probConds[x][y1] = (probConds[x][y1] * zlambda[x]) / zlambdaX;</span>
+<span class="nc" id="L412">        s = s + probConds[x][y1];</span>
+      }
+<span class="nc" id="L414">      s = s - probConds[x][y];</span>
+<span class="nc" id="L415">      probConds[x][y] = probConds[x][y] * Math.exp(deltaL * val);</span>
+<span class="nc" id="L416">      s = s + probConds[x][y];</span>
+<span class="nc" id="L417">      zlambda[x] = zlambdaX;</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">      if (Math.abs(s - 1) &gt; 0.001) {</span>
+        //log.info(x+&quot; index &quot;+i+&quot; deltaL &quot; +deltaL+&quot; tag &quot;+yTag+&quot; zlambda &quot;+zlambda[x]);
+      }
+    }
+<span class="nc" id="L422">  }</span>
+
+
+  public double pcond(int y, int x) {
+<span class="nc" id="L426">    return probConds[x][y];</span>
+  }
+
+
+  protected double fnum(int x, int y) {
+<span class="nc" id="L431">    return fnumArr[x][y];</span>
+  }
+
+  double g(double lambdaP, int index) {
+<span class="nc" id="L435">    double s = 0.0;</span>
+
+<span class="nc bnc" id="L437" title="All 2 branches missed.">    for (int i = 0; i &lt; p.functions.get(index).len(); i++) {</span>
+<span class="nc" id="L438">      int y = p.functions.get(index).getY(i);</span>
+<span class="nc" id="L439">      int x = p.functions.get(index).getX(i);</span>
+<span class="nc" id="L440">      double exponent = Math.exp(lambdaP * fnum(x, y));</span>
+<span class="nc" id="L441">      s = s + p.data.ptildeX(x) * pcond(y, x) * p.functions.get(index).getVal(i) * exponent;</span>
+    }
+<span class="nc" id="L443">    s = s - ftildeArr[index];</span>
+
+<span class="nc" id="L445">    return s;</span>
+  }
+
+
+  double gprime(double lambdaP, int index) {
+<span class="nc" id="L450">    double s = 0.0;</span>
+
+<span class="nc bnc" id="L452" title="All 2 branches missed.">    for (int i = 0; i &lt; p.functions.get(index).len(); i++) {</span>
+<span class="nc" id="L453">      int y = ((p.functions.get(index))).getY(i);</span>
+<span class="nc" id="L454">      int x = p.functions.get(index).getX(i);</span>
+<span class="nc" id="L455">      s = s + p.data.ptildeX(x) * pcond(y, x) * p.functions.get(index).getVal(i) * Math.exp(lambdaP * fnum(x, y)) * fnum(x, y);</span>
+    }
+<span class="nc" id="L457">    return s;</span>
+  }
+
+
+  /**
+   * Computes the expected value of a feature for the current model.
+   *
+   * @param f a feature
+   * @return The expectation of f according to p(y|x)
+   */
+  double fExpected(Feature f) {
+<span class="nc" id="L468">    double s = 0.0;</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">    for (int i = 0; i &lt; f.len(); i++) {</span>
+<span class="nc" id="L470">      int x = f.getX(i);</span>
+<span class="nc" id="L471">      int y = f.getY(i);</span>
+<span class="nc" id="L472">      s += p.data.ptildeX(x) * pcond(y, x) * f.getVal(i);</span>
+    }//for
+
+<span class="nc" id="L475">    return s;</span>
+  }
+
+  /**
+   * Check whether the constraints are satisfied, the probabilities sum to one, etc. Prints out a message
+   * if there is something wrong.
+   */
+  public boolean checkCorrectness() {
+<span class="nc" id="L483">    boolean flag = true;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">    for (int f = 0; f &lt; lambda.length; f++) {</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">      if (Math.abs(lambda[f]) &gt; 100) {</span>
+<span class="nc" id="L486">        log.info(&quot;lambda &quot; + f + &quot; too big &quot; + lambda[f]);</span>
+<span class="nc" id="L487">        log.info(&quot;empirical &quot; + ftildeArr[f] + &quot; expected &quot; + fExpected(p.functions.get(f)));</span>
+      }
+    }
+<span class="nc" id="L490">    log.info(&quot; x size&quot; + p.data.xSize + &quot; &quot; + &quot; ysize &quot; + p.data.ySize);</span>
+<span class="nc" id="L491">    double summAllExp = 0;</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">    for (int i = 0; i &lt; ftildeArr.length; i++) {</span>
+<span class="nc" id="L493">      double exp = Math.abs(ftildeArr[i] - fExpected(p.functions.get(i)));</span>
+<span class="nc" id="L494">      summAllExp += ftildeArr[i];</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">      if (exp &gt; 0.001)</span>
+      //if(true)
+      {
+<span class="nc" id="L498">        flag = false;</span>
+<span class="nc" id="L499">        log.info(&quot;Constraint not satisfied  &quot; + i + &quot; &quot; + fExpected(p.functions.get(i)) + &quot; &quot; + ftildeArr[i] + &quot; lambda &quot; + lambda[i]);</span>
+      }
+    }
+
+<span class="nc" id="L503">    log.info(&quot; The sum of all empirical expectations is &quot; + summAllExp);</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+<span class="nc" id="L505">      double s = 0.0;</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">      for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L507">        s = s + probConds[x][y];</span>
+      }
+<span class="nc bnc" id="L509" title="All 2 branches missed.">      if (Math.abs(s - 1) &gt; 0.0001) {</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        for (int y = 0; y &lt; probConds[x].length; y++)</span>
+            //log.info(y+&quot; : &quot;+ probConds[x][y]);
+        {
+<span class="nc" id="L513">          log.info(&quot;probabilities do not sum to one &quot; + x + &quot; &quot; + (float) s);</span>
+        }
+      }
+    }
+<span class="nc" id="L517">    return flag;</span>
+  }
+
+
+  double ZAlfa(double alfa, Feature f, int x) {
+<span class="nc" id="L522">    double s = 0.0;</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">    for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L524">      s = s + pcond(y, x) * Math.exp(alfa * f.getVal(x, y));</span>
+    }
+<span class="nc" id="L526">    return s;</span>
+  }
+
+
+  double GSF(double alfa, Feature f, int index) {
+<span class="nc" id="L531">    double s = 0.0;</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+
+<span class="nc" id="L534">      s = s - p.data.ptildeX(x) * Math.log(ZAlfa(alfa, f, x));</span>
+    }
+<span class="nc" id="L536">    return s + alfa * ftildeArr[index];</span>
+
+  }
+
+
+  double GSF(double alfa, Feature f) {
+<span class="nc" id="L542">    double s = 0.0;</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+
+<span class="nc" id="L545">      s = s - p.data.ptildeX(x) * Math.log(ZAlfa(alfa, f, x));</span>
+    }
+<span class="nc" id="L547">    return s + alfa * f.ftilde();</span>
+
+  }
+
+
+  double pcondFAlfa(double alfa, int x, int y, Feature f) {
+    double s;
+<span class="nc" id="L554">    s = (1 / ZAlfa(alfa, f, x)) * pcond(y, x) * Math.exp(alfa * f.getVal(x, y));</span>
+<span class="nc" id="L555">    return s;</span>
+  }
+
+
+  double GSFPrime(double alfa, Feature f, int index) {
+<span class="nc" id="L560">    double s = 0.0;</span>
+<span class="nc" id="L561">    s = s + ftildeArr[index];</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">    for (int x1 = 0; x1 &lt; f.indexedValues.length; x1++) {</span>
+<span class="nc" id="L563">      double s1 = 0.0;</span>
+<span class="nc" id="L564">      int x = f.getX(x1);</span>
+<span class="nc" id="L565">      int y = f.getY(x1);</span>
+<span class="nc" id="L566">      s1 = s1 + pcondFAlfa(alfa, x, y, f) * f.getVal(x1);</span>
+<span class="nc" id="L567">      s = s - p.data.ptildeX(x) * s1;</span>
+    }
+<span class="nc" id="L569">    return s;</span>
+  }
+
+
+  double GSFPrime(double alfa, Feature f) {
+<span class="nc" id="L574">    double s = 0.0;</span>
+<span class="nc" id="L575">    s = s + f.ftilde();</span>
+
+<span class="nc bnc" id="L577" title="All 2 branches missed.">    for (int x1 = 0; x1 &lt; f.indexedValues.length; x1++) {</span>
+<span class="nc" id="L578">      double s1 = 0.0;</span>
+<span class="nc" id="L579">      int x = f.getX(x1);</span>
+<span class="nc" id="L580">      int y = f.getY(x1);</span>
+<span class="nc" id="L581">      s1 = s1 + pcondFAlfa(alfa, x, y, f) * f.getVal(x1);</span>
+<span class="nc" id="L582">      s = s - p.data.ptildeX(x) * s1;</span>
+    }
+<span class="nc" id="L584">    return s;</span>
+  }
+
+
+  double GSFSecond(double alfa, Feature f) {
+<span class="nc" id="L589">    double s = 0.0;</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">    for (int x = 0; x &lt; p.data.xSize; x++) {</span>
+<span class="nc" id="L591">      double s1 = 0.0;</span>
+<span class="nc" id="L592">      double psff = 0.0;</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">      for (int y1 = 0; y1 &lt; p.data.ySize; y1++) {</span>
+<span class="nc" id="L594">        psff = psff + pcondFAlfa(alfa, x, y1, f) * f.getVal(x, y1);</span>
+      }
+<span class="nc bnc" id="L596" title="All 2 branches missed.">      for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L597">        s1 = s1 + pcondFAlfa(alfa, x, y, f) * (f.getVal(x, y) - psff) * (f.getVal(x, y) - psff);</span>
+      }
+<span class="nc" id="L599">      s = s - s1 * p.data.ptildeX(x);</span>
+    }
+<span class="nc" id="L601">    return s;</span>
+  }
+
+
+  /**
+   * Computes the gain from a feature. Used for feature selection.
+   */
+
+  public double GainCompute(Feature f, double errorGain) {
+<span class="nc bnc" id="L610" title="All 2 branches missed.">    double r = (f.ftilde() &gt; fExpected(f) ? 1.0 : -1.0);</span>
+<span class="nc" id="L611">    f.initHashVals();</span>
+<span class="nc" id="L612">    int iterations = 0;</span>
+<span class="nc" id="L613">    double alfa = 0.0;</span>
+<span class="nc" id="L614">    GSF(alfa, f);</span>
+<span class="nc" id="L615">    double gsfValNew = 0.0;</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">    while (iterations &lt; 30) {</span>
+<span class="nc" id="L617">      iterations++;</span>
+<span class="nc" id="L618">      double alfanext = alfa + r * Math.log(1 - r * GSFPrime(alfa, f) / GSFSecond(alfa, f));</span>
+<span class="nc" id="L619">      gsfValNew = GSF(alfanext, f);</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">      if (Math.abs(alfanext - alfa) &lt; errorGain) {</span>
+<span class="nc" id="L621">        return gsfValNew;</span>
+      }
+<span class="nc" id="L623">      alfa = alfanext;</span>
+<span class="nc" id="L624">    }</span>
+<span class="nc" id="L625">    return gsfValNew;</span>
+  }
+
+
+  /**
+   * Print out p(y|x) for all pairs to the standard output.
+   */
+  public void print() {
+<span class="nc bnc" id="L633" title="All 2 branches missed.">    for (int i = 0; i &lt; p.data.xSize; i++) {</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">      for (int j = 0; j &lt; probConds[i].length; j++) {</span>
+<span class="nc" id="L635">        System.out.println(&quot;P(&quot; + j + &quot; | &quot; + i + &quot;) = &quot; + pcond(j, i));</span>
+      }
+    }
+<span class="nc" id="L638">  }</span>
+
+
+  /**
+   * Writes the lambda feature weights to the file.
+   * Can be read later with readL.
+   * This method opens a new file and closes it after writing it.
+   *
+   * @param filename The file to write the weights to.
+   */
+  public void save_lambdas(String filename) {
+    try {
+<span class="nc" id="L650">      DataOutputStream rf = IOUtils.getDataOutputStream(filename);</span>
+<span class="nc" id="L651">      save_lambdas(rf, lambda);</span>
+<span class="nc" id="L652">      rf.close();</span>
+<span class="nc" id="L653">    } catch (IOException e) {</span>
+<span class="nc" id="L654">      e.printStackTrace();</span>
+<span class="nc" id="L655">    }</span>
+<span class="nc" id="L656">  }</span>
+
+
+  /**
+   * Writes the lambdas to a stream.
+   */
+  public static void save_lambdas(DataOutputStream rf, double[] lambdas) {
+    try {
+<span class="nc" id="L664">      ObjectOutputStream oos = new ObjectOutputStream(rf);</span>
+<span class="nc" id="L665">      oos.writeObject(lambdas);</span>
+<span class="nc" id="L666">      oos.flush();</span>
+<span class="nc" id="L667">    } catch (IOException e) {</span>
+<span class="nc" id="L668">      e.printStackTrace();</span>
+<span class="nc" id="L669">    }</span>
+<span class="nc" id="L670">  }</span>
+
+
+  /**
+   * Read the lambdas from the file.
+   * The file contains the number of lambda weights (int) followed by
+   * the weights.
+   * &lt;i&gt;Historical note:&lt;/i&gt; The file does not contain
+   * xSize and ySize as for the method read(String).
+   *
+   * @param filename The file to read from
+   */
+  public void readL(String filename) {
+    try {
+<span class="nc" id="L684">      DataInputStream rf = IOUtils.getDataInputStream(filename);</span>
+<span class="nc" id="L685">      lambda = read_lambdas(rf);</span>
+<span class="nc" id="L686">      rf.close();</span>
+<span class="nc" id="L687">    } catch (Exception e) {</span>
+<span class="nc" id="L688">      e.printStackTrace();</span>
+<span class="nc" id="L689">    }</span>
+<span class="nc" id="L690">  }</span>
+
+
+  /**
+   * Read the lambdas from the file.
+   *
+   * @param modelFilename A filename. It will be read and closed
+   * @return An array of lambda values read from the file.
+   */
+  static double[] read_lambdas(String modelFilename) {
+    try {
+<span class="nc" id="L701">      DataInputStream rf = IOUtils.getDataInputStream(modelFilename);</span>
+<span class="nc" id="L702">      double[] lamb = read_lambdas(rf);</span>
+<span class="nc" id="L703">      rf.close();</span>
+<span class="nc" id="L704">      return lamb;</span>
+<span class="nc" id="L705">    } catch (IOException e) {</span>
+<span class="nc" id="L706">      e.printStackTrace();</span>
+    }
+<span class="nc" id="L708">    return null;</span>
+  }
+
+
+  /**
+   * Read the lambdas from the stream.
+   *
+   * @param rf Stream to read from.
+   * @return An array of lambda values read from the stream.
+   */
+  public static double[] read_lambdas(DataInputStream rf) {
+    if (VERBOSE) {
+      log.info(&quot;Entering read_lambdas&quot;);
+    }
+    try {
+<span class="nc" id="L723">      ObjectInputStream ois = new ObjectInputStream(rf);</span>
+<span class="nc" id="L724">      Object o = ois.readObject();</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">      if (o instanceof double[]) {</span>
+<span class="nc" id="L726">        return (double[]) o;</span>
+      }
+<span class="nc" id="L728">      throw new RuntimeIOException(&quot;Failed to read lambdas from given input stream&quot;);</span>
+<span class="nc" id="L729">    } catch (IOException e) {</span>
+<span class="nc" id="L730">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L731">    } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L732">      throw new RuntimeIOException(e);</span>
+    }
+  }
+
+
+  /**
+   * This method writes the problem data into a file, which is good for reading
+   * with MatLab.  It could also have other applications,
+   * like reducing the memory requirements
+   */
+
+  void save_problem(String filename) {
+    try {
+<span class="nc" id="L745">      PrintFile pf = new PrintFile(filename);</span>
+<span class="nc" id="L746">      int N = p.data.xSize;</span>
+<span class="nc" id="L747">      int M = p.data.ySize;</span>
+<span class="nc" id="L748">      int F = p.fSize;</span>
+      // byte[] nl = &quot;\n&quot;.getBytes();
+      // byte[] dotsp = &quot;. &quot;.getBytes();
+      // int space = (int) ' ';
+      // write the sizes of X, Y, and F( number of features );
+<span class="nc" id="L753">      pf.println(N);</span>
+<span class="nc" id="L754">      pf.println(M);</span>
+<span class="nc" id="L755">      pf.println(F);</span>
+      // save the objective vector like 1.c0, ... ,N*M. cN*M-1
+<span class="nc bnc" id="L757" title="All 2 branches missed.">      for (int i = 0; i &lt; N * M; i++) {</span>
+<span class="nc" id="L758">        pf.print(i + 1);</span>
+<span class="nc" id="L759">        pf.print(&quot;. &quot;);</span>
+<span class="nc" id="L760">        pf.println(p.data.ptildeX(i / M));</span>
+      }// for i
+
+      // save the constraints matrix B
+      // for each feature , save its row
+<span class="nc bnc" id="L765" title="All 2 branches missed.">      for (int i = 0; i &lt; p.fSize; i++) {</span>
+<span class="nc" id="L766">        int[] values = p.functions.get(i).indexedValues;</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">        for (int value : values) {</span>
+<span class="nc" id="L768">          pf.print(i + 1);</span>
+<span class="nc" id="L769">          pf.print(&quot;. &quot;);</span>
+<span class="nc" id="L770">          pf.print(value);</span>
+<span class="nc" id="L771">          pf.print(&quot; &quot;);</span>
+<span class="nc" id="L772">          pf.println(1);</span>
+        }// k
+
+      }// i
+
+      // save the constraints vector
+      // for each feature, save its empirical expectation
+
+<span class="nc bnc" id="L780" title="All 2 branches missed.">      for (int i = 0; i &lt; p.fSize; i++) {</span>
+<span class="nc" id="L781">        pf.print(i + 1);</span>
+<span class="nc" id="L782">        pf.print(&quot;. &quot;);</span>
+<span class="nc" id="L783">        pf.println(ftildeArr[i]);</span>
+      }// end
+<span class="nc" id="L785">      pf.close();</span>
+
+<span class="nc" id="L787">    } catch (Exception e) {</span>
+<span class="nc" id="L788">      e.printStackTrace();</span>
+<span class="nc" id="L789">    }</span>
+<span class="nc" id="L790">  }</span>
+
+
+  /**
+   * @return The loglikelihood of the empirical distribution as predicted by the model p.
+   */
+  public double logLikelihood() {
+    //L=sumx,y log(p(y|x))*#x,y
+<span class="nc" id="L798">    double sum = 0.0;</span>
+<span class="nc" id="L799">    int sz = p.data.size();</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">    for (int index = 0; index &lt; sz; index++) {</span>
+<span class="nc" id="L801">      int[] example = p.data.get(index);</span>
+<span class="nc" id="L802">      sum += Math.log(pcond(example[1], example[0]));</span>
+    }// index
+<span class="nc" id="L804">    return sum / sz;</span>
+  }
+
+
+  /**
+   * Given a numerator and denominator in log form, this calculates
+   * the conditional model probabilities.
+   *
+   * @return Math.exp(first)/Math.exp(second);
+   */
+  public static double divide(double first, double second) {
+<span class="nc" id="L815">    return Math.exp(first - second);  // cpu samples #3,#14: 5.3%</span>
+  }
+
+
+  /**
+   * With arguments, this will print out the lambda parameters of a
+   * bunch of .lam files (which are assumed to all be the same size).
+   * (Without arguments, it does some creaky old self-test.)
+   *
+   * @param args command line arguments
+   */
+  public static void main(String[] args) {
+<span class="nc bnc" id="L827" title="All 2 branches missed.">    if (args.length &gt; 0) {</span>
+<span class="nc" id="L828">      NumberFormat nf = NumberFormat.getNumberInstance();</span>
+<span class="nc" id="L829">      nf.setMaximumFractionDigits(6);</span>
+<span class="nc" id="L830">      nf.setMinimumFractionDigits(6);</span>
+<span class="nc" id="L831">      LambdaSolve[] lambdas = new LambdaSolve[args.length];</span>
+<span class="nc" id="L832">      System.out.print(&quot;           &quot;);</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">      for (int i = 0; i &lt; args.length; i++) {</span>
+<span class="nc" id="L834">        lambdas[i] = new LambdaSolve();</span>
+<span class="nc" id="L835">        lambdas[i].readL(args[i]);</span>
+<span class="nc" id="L836">        System.out.print(&quot;  &quot; + args[i]);</span>
+      }
+<span class="nc" id="L838">      System.out.println();</span>
+
+<span class="nc" id="L840">      int numLambda = lambdas[0].lambda.length;</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">      for (int j = 0; j &lt; numLambda; j++) {</span>
+<span class="nc" id="L842">        System.out.print(&quot;lambda[&quot; + j + &quot;] = &quot;);</span>
+<span class="nc bnc" id="L843" title="All 2 branches missed.">        for (int i = 0; i &lt; args.length; i++) {</span>
+<span class="nc" id="L844">          System.out.print(nf.format(lambdas[i].lambda[j]) + &quot;  &quot;);</span>
+        }
+<span class="nc" id="L846">        System.out.println();</span>
+      }
+<span class="nc" id="L848">    } else {</span>
+<span class="nc" id="L849">      LambdaSolve prob = new LambdaSolve(&quot;trainhuge.txt.holder.prob&quot;);</span>
+<span class="nc" id="L850">      prob.save_lambdas(&quot;trainhuge.txt.holder.prob&quot;);</span>
+<span class="nc" id="L851">      prob.readL(&quot;trainhuge.txt.holder.prob&quot;);</span>
+    }
+<span class="nc" id="L853">  }</span>
+
+  /**
+   * Calculate the log-likelihood from scratch, hashing the conditional
+   * probabilities in pcond, which we will use later. This is for
+   * a different model, in which all features effectively get negative weights
+   * this model is easier to use for heauristic search
+   * p(ti|s)=exp(sum_j{-(e^lambda_j)*f_j(ti)})
+   *
+   * @return The negative log likelihood of the data
+   */
+  public double logLikelihoodNeg() {
+    // zero all the variables
+<span class="nc" id="L866">    double s = 0;</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">    for (int i = 0; i &lt; probConds.length; i++) {</span>
+<span class="nc bnc" id="L868" title="All 2 branches missed.">      for (int j = 0; j &lt; probConds[i].length; j++) {</span>
+<span class="nc" id="L869">        probConds[i][j] = 0;</span>
+      }
+<span class="nc" id="L871">      zlambda[i] = 0;</span>
+    }
+
+    //add up in pcond y|x the unnormalized scores
+
+<span class="nc bnc" id="L876" title="All 2 branches missed.">    for (int fNo = 0, fSize = p.fSize; fNo &lt; fSize; fNo++) {</span>
+      // add for all occurences of the function the values to probConds
+<span class="nc" id="L878">      Feature f = p.functions.get(fNo);</span>
+<span class="nc" id="L879">      double fLambda = -Math.exp(lambda[fNo]);</span>
+<span class="nc" id="L880">      double sum = ftildeArr[fNo];</span>
+
+      //if(sum==0){continue;}
+<span class="nc" id="L883">      sum *= p.data.getNumber();</span>
+<span class="nc" id="L884">      s -= sum * fLambda;</span>
+
+<span class="nc bnc" id="L886" title="All 2 branches missed.">      if (Math.abs(fLambda) &gt; 200) {   // was 50</span>
+<span class="nc" id="L887">        log.info(&quot;lambda &quot; + fNo + &quot; too big: &quot; + fLambda);</span>
+      }
+
+<span class="nc bnc" id="L890" title="All 2 branches missed.">      for (int i = 0, length = f.len(); i &lt; length; i++) {</span>
+<span class="nc" id="L891">        int x = f.getX(i);</span>
+<span class="nc" id="L892">        int y = f.getY(i);</span>
+<span class="nc bnc" id="L893" title="All 2 branches missed.">        if (ASSUME_BINARY) {</span>
+<span class="nc" id="L894">          probConds[x][y] += fLambda;</span>
+        } else {
+<span class="nc" id="L896">          double val = f.getVal(i);</span>
+<span class="nc" id="L897">          probConds[x][y] += (val * fLambda);</span>
+        }
+      } //for
+
+    } //for fNo
+
+<span class="nc bnc" id="L903" title="All 2 branches missed.">    for (int x = 0; x &lt; probConds.length; x++) {</span>
+      //again
+<span class="nc" id="L905">      zlambda[x] = ArrayMath.logSum(probConds[x]); // cpu samples #4,#15: 4.5%</span>
+      //log.info(&quot;zlambda &quot;+x+&quot; &quot;+zlambda[x]);
+<span class="nc" id="L907">      s += zlambda[x] * p.data.ptildeX(x) * p.data.getNumber();</span>
+
+<span class="nc bnc" id="L909" title="All 2 branches missed.">      for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L910">        probConds[x][y] = divide(probConds[x][y], zlambda[x]); // cpu samples #13: 1.6%</span>
+        //log.info(&quot;prob &quot;+x+&quot; &quot;+y+&quot; &quot;+probConds[x][y]);
+      } //y
+
+    }//x
+
+<span class="nc bnc" id="L916" title="All 2 branches missed.">    if (s &lt; 0) {</span>
+<span class="nc" id="L917">      throw new IllegalStateException(&quot;neg log lik smaller than 0: &quot; + s);</span>
+    }
+
+<span class="nc" id="L920">    return s;</span>
+  }
+
+  // -- stuff for CG version below -------
+
+  /**
+   * calculate the log likelihood from scratch, hashing the conditional
+   * probabilities in pcond which we will use for the derivative later.
+   *
+   * @return The log likelihood of the data
+   */
+  public double logLikelihoodScratch() {
+    // zero all the variables
+<span class="nc" id="L933">    double s = 0;</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">    for (int i = 0; i &lt; probConds.length; i++) {</span>
+<span class="nc bnc" id="L935" title="All 2 branches missed.">      for (int j = 0; j &lt; probConds[i].length; j++) {</span>
+<span class="nc" id="L936">        probConds[i][j] = 0;</span>
+      }
+<span class="nc" id="L938">      zlambda[i] = 0;</span>
+    }
+
+    //add up in pcond y|x the unnormalized scores
+
+<span class="nc" id="L943">    Experiments exp = p.data;</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">    for (int fNo = 0, fSize = p.fSize; fNo &lt; fSize; fNo++) {</span>
+      // add for all occurences of the function the values to probConds
+<span class="nc" id="L946">      Feature f = p.functions.get(fNo);</span>
+<span class="nc" id="L947">      double fLambda = lambda[fNo];</span>
+<span class="nc" id="L948">      double sum = ftildeArr[fNo];</span>
+
+      //if(sum==0){continue;}
+<span class="nc" id="L951">      sum *= exp.getNumber();</span>
+<span class="nc" id="L952">      s -= sum * fLambda;</span>
+
+<span class="nc bnc" id="L954" title="All 2 branches missed.">      if (Math.abs(fLambda) &gt; 200) {   // was 50</span>
+<span class="nc" id="L955">        log.info(&quot;lambda &quot; + fNo + &quot; too big: &quot; + fLambda);</span>
+      }
+
+<span class="nc bnc" id="L958" title="All 2 branches missed.">      for (int i = 0, length = f.len(); i &lt; length; i++) {</span>
+<span class="nc" id="L959">        int x = f.getX(i);</span>
+<span class="nc" id="L960">        int y = f.getY(i);</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">        if (ASSUME_BINARY) {</span>
+<span class="nc" id="L962">          probConds[x][y] += fLambda;</span>
+        } else {
+<span class="nc" id="L964">          double val = f.getVal(i);</span>
+<span class="nc" id="L965">          probConds[x][y] += (val * fLambda);</span>
+        }
+      } //for
+
+    } //for fNo
+
+<span class="nc bnc" id="L971" title="All 2 branches missed.">    for (int x = 0; x &lt; probConds.length; x++) {</span>
+      //again
+<span class="nc" id="L973">      zlambda[x] = ArrayMath.logSum(probConds[x]); // cpu samples #4,#15: 4.5%</span>
+      //log.info(&quot;zlambda &quot;+x+&quot; &quot;+zlambda[x]);
+<span class="nc" id="L975">      s += zlambda[x] * exp.ptildeX(x) * exp.getNumber();</span>
+
+<span class="nc bnc" id="L977" title="All 2 branches missed.">      for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L978">        probConds[x][y] = divide(probConds[x][y], zlambda[x]); // cpu samples #13: 1.6%</span>
+        //log.info(&quot;prob &quot;+x+&quot; &quot;+y+&quot; &quot;+probConds[x][y]);
+      } //y
+
+    }//x
+
+<span class="nc bnc" id="L984" title="All 2 branches missed.">    if (s &lt; 0) {</span>
+<span class="nc" id="L985">      throw new IllegalStateException(&quot;neg log lik smaller than 0: &quot; + s);</span>
+    }
+
+<span class="nc" id="L988">    return s;</span>
+  }
+
+
+  /**
+   * assuming we have the lambdas in the array and we need only the
+   * derivatives now.
+   */
+  public double[] getDerivatives() {
+
+<span class="nc" id="L998">    double[] drvs = new double[lambda.length];</span>
+<span class="nc" id="L999">    Experiments exp = p.data;</span>
+
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">    for (int fNo = 0; fNo &lt; drvs.length; fNo++) {  // cpu samples #2,#10,#12: 27.3%</span>
+<span class="nc" id="L1002">      Feature f = p.functions.get(fNo);</span>
+<span class="nc" id="L1003">      double sum = ftildeArr[fNo] * exp.getNumber();</span>
+<span class="nc" id="L1004">      drvs[fNo] = -sum;</span>
+<span class="nc bnc" id="L1005" title="All 2 branches missed.">      for (int index = 0, length = f.len(); index &lt; length; index++) {</span>
+<span class="nc" id="L1006">        int x = f.getX(index);</span>
+<span class="nc" id="L1007">        int y = f.getY(index);</span>
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">        if (ASSUME_BINARY) {</span>
+<span class="nc" id="L1009">          drvs[fNo] += probConds[x][y] * exp.ptildeX(x) * exp.getNumber();</span>
+        } else {
+<span class="nc" id="L1011">          double val = f.getVal(index);</span>
+<span class="nc" id="L1012">          drvs[fNo] += probConds[x][y] * val * exp.ptildeX(x) * exp.getNumber();</span>
+        }
+      }//for
+      //if(sum==0){drvs[fNo]=0;}
+    }
+<span class="nc" id="L1017">    return drvs;</span>
+  }
+
+
+  /**
+   * assuming we have the lambdas in the array and we need only the
+   * derivatives now.
+   * this is for the case where the model is parameterezied such that all weights are negative
+   * see also logLikelihoodNeg
+   */
+  public double[] getDerivativesNeg() {
+
+<span class="nc" id="L1029">    double[] drvs = new double[lambda.length];</span>
+<span class="nc" id="L1030">    Experiments exp = p.data;</span>
+<span class="nc bnc" id="L1031" title="All 2 branches missed.">    for (int fNo = 0; fNo &lt; drvs.length; fNo++) {  // cpu samples #2,#10,#12: 27.3%</span>
+<span class="nc" id="L1032">      Feature f = p.functions.get(fNo);</span>
+<span class="nc" id="L1033">      double sum = ftildeArr[fNo] * exp.getNumber();</span>
+<span class="nc" id="L1034">      double lam = -Math.exp(lambda[fNo]);</span>
+<span class="nc" id="L1035">      drvs[fNo] = -sum * lam;</span>
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">      for (int index = 0, length = f.len(); index &lt; length; index++) {</span>
+<span class="nc" id="L1037">        int x = f.getX(index);</span>
+<span class="nc" id="L1038">        int y = f.getY(index);</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">        if (ASSUME_BINARY) {</span>
+<span class="nc" id="L1040">          drvs[fNo] += probConds[x][y] * exp.ptildeX(x) * exp.getNumber() * lam;</span>
+        } else {
+<span class="nc" id="L1042">          double val = f.getVal(index);</span>
+<span class="nc" id="L1043">          drvs[fNo] += probConds[x][y] * val * exp.ptildeX(x) * exp.getNumber() * lam;</span>
+        }
+      }//for
+      //if(sum==0){drvs[fNo]=0;}
+    }
+<span class="nc" id="L1048">    return drvs;</span>
+  }
+
+
+  /**
+   * Each pair x,y has a value in p.data.values[x][y]
+   *
+   * @return - expected value of corpus -sum_xy (ptilde(x,y)*value(x,y)*pcond(x,y))
+   */
+  public double expectedValue() {
+    // zero all the variables
+<span class="nc" id="L1059">    double s = 0;</span>
+
+<span class="nc" id="L1061">    aux = new double[probConds.length];</span>
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">    for (int i = 0; i &lt; probConds.length; i++) {</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">      for (int j = 0; j &lt; probConds[i].length; j++) {</span>
+<span class="nc" id="L1064">        probConds[i][j] = 0;</span>
+      }
+<span class="nc" id="L1066">      zlambda[i] = 0;</span>
+    }
+
+    //add up in pcond y|x the unnormalized scores
+
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">    for (int fNo = 0, fSize = p.fSize; fNo &lt; fSize; fNo++) {</span>
+      // add for all occurrences of the function the values to probConds
+<span class="nc" id="L1073">      Feature f = p.functions.get(fNo);</span>
+<span class="nc" id="L1074">      double fLambda = lambda[fNo];</span>
+
+
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">      if (Math.abs(fLambda) &gt; 200) {   // was 50</span>
+<span class="nc" id="L1078">        log.info(&quot;lambda &quot; + fNo + &quot; too big: &quot; + fLambda);</span>
+      }
+
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">      for (int i = 0, length = f.len(); i &lt; length; i++) {</span>
+<span class="nc" id="L1082">        int x = f.getX(i);</span>
+<span class="nc" id="L1083">        int y = f.getY(i);</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">        if (ASSUME_BINARY) {</span>
+<span class="nc" id="L1085">          probConds[x][y] += fLambda;</span>
+        } else {
+<span class="nc" id="L1087">          double val = f.getVal(i);</span>
+<span class="nc" id="L1088">          probConds[x][y] += (val * fLambda);</span>
+        }
+      } //for
+
+    } //for fNo
+
+<span class="nc" id="L1094">    Experiments exp = p.data;</span>
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">    for (int x = 0; x &lt; probConds.length; x++) {</span>
+      //again
+<span class="nc" id="L1097">      zlambda[x] = ArrayMath.logSum(probConds[x]); // cpu samples #4,#15: 4.5%</span>
+      //log.info(&quot;zlambda &quot;+x+&quot; &quot;+zlambda[x]);
+
+
+<span class="nc bnc" id="L1101" title="All 2 branches missed.">      for (int y = 0; y &lt; probConds[x].length; y++) {</span>
+<span class="nc" id="L1102">        probConds[x][y] = divide(probConds[x][y], zlambda[x]); // cpu samples #13: 1.6%</span>
+        //log.info(&quot;prob &quot;+x+&quot; &quot;+y+&quot; &quot;+probConds[x][y]);
+
+<span class="nc" id="L1105">        s -= exp.values[x][y] * probConds[x][y] * exp.ptildeX(x) * exp.getNumber();</span>
+<span class="nc" id="L1106">        aux[x] += exp.values[x][y] * probConds[x][y];</span>
+      }
+    }//x
+
+<span class="nc" id="L1110">    return s;</span>
+  }
+
+
+  /**
+   * assuming we have the probConds[x][y] , compute the derivatives for the expectedValue function
+   *
+   * @return The derivatives of the expected
+   */
+  public double[] getDerivativesExpectedValue() {
+
+<span class="nc" id="L1121">    double[] drvs = new double[lambda.length];</span>
+<span class="nc" id="L1122">    Experiments exp = p.data;</span>
+<span class="nc bnc" id="L1123" title="All 2 branches missed.">    for (int fNo = 0; fNo &lt; drvs.length; fNo++) {  // cpu samples #2,#10,#12: 27.3%</span>
+<span class="nc" id="L1124">      Feature f = p.functions.get(fNo);</span>
+      //double sum = ftildeArr[fNo] * exp.getNumber();
+      //drvs[fNo] = -sum;
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">      for (int index = 0, length = f.len(); index &lt; length; index++) {</span>
+<span class="nc" id="L1128">        int x = f.getX(index);</span>
+<span class="nc" id="L1129">        int y = f.getY(index);</span>
+
+<span class="nc" id="L1131">        double val = f.getVal(index);</span>
+<span class="nc" id="L1132">        double mult = val * probConds[x][y] * exp.ptildeX(x) * exp.getNumber();</span>
+<span class="nc" id="L1133">        drvs[fNo] -= mult * exp.values[x][y];</span>
+<span class="nc" id="L1134">        drvs[fNo] += mult * aux[x];</span>
+
+      }//for
+      //if(sum==0){drvs[fNo]=0;}
+    }
+<span class="nc" id="L1139">    return drvs;</span>
+  }
+
+
+  /**
+   * calculate the loss for Dom ranking
+   * using the numbers in p.data.values to determine domination relationships in the graphs
+   * if values[x][y]&gt; values[x][y'] then there is an edge (x,y)-&gt;(x,y')
+   *
+   * @return The loss
+   */
+  public double lossDomination() {
+    // zero all the variables
+<span class="nc" id="L1152">    double s = 0;</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">    for (int i = 0; i &lt; probConds.length; i++) {</span>
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">      for (int j = 0; j &lt; probConds[i].length; j++) {</span>
+<span class="nc" id="L1155">        probConds[i][j] = 0;</span>
+      }
+<span class="nc" id="L1157">      zlambda[i] = 0;</span>
+    }
+
+    //add up in pcond y|x the unnormalized scores
+
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">    for (int fNo = 0, fSize = p.fSize; fNo &lt; fSize; fNo++) {</span>
+      // add for all occurrences of the function the values to probConds
+<span class="nc" id="L1164">      Feature f = p.functions.get(fNo);</span>
+<span class="nc" id="L1165">      double fLambda = lambda[fNo];</span>
+
+      //if(sum==0){continue;}
+
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">      if (Math.abs(fLambda) &gt; 200) {   // was 50</span>
+<span class="nc" id="L1170">        log.info(&quot;lambda &quot; + fNo + &quot; too big: &quot; + fLambda);</span>
+      }
+
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">      for (int i = 0, length = f.len(); i &lt; length; i++) {</span>
+<span class="nc" id="L1174">        int x = f.getX(i);</span>
+<span class="nc" id="L1175">        int y = f.getY(i);</span>
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">        if (ASSUME_BINARY) {</span>
+<span class="nc" id="L1177">          probConds[x][y] += fLambda;</span>
+        } else {
+<span class="nc" id="L1179">          double val = f.getVal(i);</span>
+<span class="nc" id="L1180">          probConds[x][y] += (val * fLambda);</span>
+        }
+      } //for
+
+    } //for fNo
+
+    //will use zlambda[x] for the number of domination graphs for x
+    // keeping track of other arrays as well - sum[x][y], and sub[x][y]
+
+    //now two double loops over (x,y) to collect zlambda[x], sum[x][y], and sub[x][y];
+
+<span class="nc" id="L1191">    sum = new double[probConds.length][];</span>
+<span class="nc" id="L1192">    sub = new double[probConds.length][];</span>
+
+<span class="nc bnc" id="L1194" title="All 2 branches missed.">    for (int x = 0; x &lt; probConds.length; x++) {</span>
+<span class="nc" id="L1195">      sum[x] = new double[probConds[x].length];</span>
+<span class="nc" id="L1196">      sub[x] = new double[probConds[x].length];</span>
+<span class="nc" id="L1197">      double localloss = 0;</span>
+
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">      for (int u = 0; u &lt; sum[x].length; u++) {</span>
+<span class="nc" id="L1200">        boolean hasgraph = false;</span>
+
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">        for (int v = 0; v &lt; sum[x].length; v++) {</span>
+          //see if u dominates v
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">          if (p.data.values[x][u] &gt; p.data.values[x][v]) {</span>
+<span class="nc" id="L1205">            hasgraph = true;</span>
+<span class="nc" id="L1206">            sum[x][u] += Math.exp(probConds[x][v] - probConds[x][u]);</span>
+          }
+        }
+<span class="nc" id="L1209">        sum[x][u] += 1;</span>
+
+<span class="nc" id="L1211">        double weight = 1;</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">        if (weightRanks) {</span>
+<span class="nc" id="L1213">          weight = p.data.values[x][u];</span>
+        }
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">        if (hasgraph) {</span>
+<span class="nc" id="L1216">          zlambda[x] += weight;</span>
+        }
+<span class="nc" id="L1218">        localloss += weight * Math.log(sum[x][u]);</span>
+      }
+
+      //another loop to get the sub[x][y]
+
+<span class="nc bnc" id="L1223" title="All 2 branches missed.">      for (int u = 0; u &lt; sum[x].length; u++) {</span>
+
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">        for (int v = 0; v &lt; sum[x].length; v++) {</span>
+          //see if u dominates v
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">          if (p.data.values[x][u] &gt; p.data.values[x][v]) {</span>
+
+<span class="nc" id="L1229">            double weight = 1;</span>
+<span class="nc bnc" id="L1230" title="All 2 branches missed.">            if (weightRanks) {</span>
+<span class="nc" id="L1231">              weight = p.data.values[x][u];</span>
+            }
+
+<span class="nc" id="L1234">            sub[x][v] += weight * Math.exp(probConds[x][v] - probConds[x][u]) / sum[x][u];</span>
+          }
+        }
+      }
+
+<span class="nc" id="L1239">      log.info(&quot; for x &quot; + x + &quot; number graphs &quot; + zlambda[x]);</span>
+
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">      if (zlambda[x] &gt; 0) {</span>
+<span class="nc" id="L1242">        localloss /= zlambda[x];</span>
+<span class="nc" id="L1243">        s += p.data.ptildeX(x) * p.data.getNumber() * localloss;</span>
+      }
+
+    }//x
+
+<span class="nc" id="L1248">    return s;</span>
+  }
+
+
+  /**
+   * Using the arrays calculated when computing the loss, it should not be
+   * too hard to get the derivatives.
+   *
+   * @return The derivative of the loss
+   */
+  public double[] getDerivativesLossDomination() {
+
+<span class="nc" id="L1260">    double[] drvs = new double[lambda.length];</span>
+
+<span class="nc bnc" id="L1262" title="All 2 branches missed.">    for (int fNo = 0; fNo &lt; drvs.length; fNo++) {  // cpu samples #2,#10,#12: 27.3%</span>
+<span class="nc" id="L1263">      Feature f = p.functions.get(fNo);</span>
+
+<span class="nc bnc" id="L1265" title="All 2 branches missed.">      for (int index = 0, length = f.len(); index &lt; length; index++) {</span>
+<span class="nc" id="L1266">        int x = f.getX(index);</span>
+<span class="nc" id="L1267">        int y = f.getY(index);</span>
+
+<span class="nc" id="L1269">        double val = f.getVal(index);</span>
+        //add the sub and sum components
+<span class="nc bnc" id="L1271" title="All 2 branches missed.">        if (zlambda[x] == 0) {</span>
+<span class="nc" id="L1272">          continue;</span>
+        }
+<span class="nc" id="L1274">        double mult = val * p.data.ptildeX(x) * p.data.getNumber() * (1 / zlambda[x]);</span>
+<span class="nc" id="L1275">        double weight = 1;</span>
+<span class="nc bnc" id="L1276" title="All 2 branches missed.">        if (weightRanks) {</span>
+<span class="nc" id="L1277">          weight = p.data.values[x][y];</span>
+        }
+<span class="nc" id="L1279">        drvs[fNo] += mult * sub[x][y];</span>
+<span class="nc" id="L1280">        drvs[fNo] -= mult * weight * (sum[x][y] - 1) / sum[x][y];</span>
+
+      }//for
+      //if(sum==0){drvs[fNo]=0;}
+    }
+<span class="nc" id="L1285">    return drvs;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

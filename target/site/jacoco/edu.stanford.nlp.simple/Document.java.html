@@ -1,0 +1,1174 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Document.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.simple</a> &gt; <span class="el_source">Document.java</span></div><h1>Document.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.simple;
+
+import edu.stanford.nlp.coref.CorefCoreAnnotations;
+import edu.stanford.nlp.coref.data.CorefChain;
+import edu.stanford.nlp.coref.data.Dictionaries;
+import edu.stanford.nlp.ie.util.RelationTriple;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.naturalli.NaturalLogicAnnotations;
+import edu.stanford.nlp.naturalli.OperatorSpec;
+import edu.stanford.nlp.naturalli.Polarity;
+import edu.stanford.nlp.pipeline.*;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.sentiment.SentimentCoreAnnotations;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeCoreAnnotations;
+import edu.stanford.nlp.util.*;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.ref.SoftReference;
+import java.util.*;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static edu.stanford.nlp.simple.Sentence.SINGLE_SENTENCE_DOCUMENT;
+
+/**
+ * A representation of a Document. Most blobs of raw text should become documents.
+ *
+ * @author Gabor Angeli
+ */
+@SuppressWarnings(&quot;unused&quot;)
+public class Document {
+
+  /**
+   * The empty {@link java.util.Properties} object, for use with creating default annotators.
+   */
+<span class="fc" id="L41">  static final Properties EMPTY_PROPS = PropertiesUtils.asProperties(</span>
+      &quot;language&quot;, &quot;english&quot;,
+      &quot;annotators&quot;, &quot;&quot;,
+      &quot;tokenize.class&quot;, &quot;PTBTokenizer&quot;,
+      &quot;tokenize.language&quot;, &quot;en&quot;,
+      &quot;parse.binaryTrees&quot;, &quot;true&quot;);
+
+
+  /**
+   * The caseless {@link java.util.Properties} object.
+   *
+   * @see Document#caseless()
+   * @see Sentence#caseless()
+   */
+<span class="fc" id="L55">  static final Properties CASELESS_PROPS = PropertiesUtils.asProperties(</span>
+        &quot;language&quot;, &quot;english&quot;,
+        &quot;annotators&quot;, &quot;&quot;,
+        &quot;tokenize.class&quot;, &quot;PTBTokenizer&quot;,
+        &quot;tokenize.language&quot;, &quot;en&quot;,
+        &quot;parse.binaryTrees&quot;, &quot;true&quot;,
+        &quot;pos.model&quot;, &quot;edu/stanford/nlp/models/pos-tagger/wsj-0-18-caseless-left3words-distsim.tagger&quot;,
+        &quot;parse.model&quot;, &quot;edu/stanford/nlp/models/lexparser/englishPCFG.caseless.ser.gz&quot;,
+        &quot;ner.model&quot;, &quot;edu/stanford/nlp/models/ner/english.muc.7class.caseless.distsim.crf.ser.gz,&quot; +
+                             &quot;edu/stanford/nlp/models/ner/english.conll.4class.caseless.distsim.crf.ser.gz,&quot; +
+                             &quot;edu/stanford/nlp/models/ner/english.all.3class.caseless.distsim.crf.ser.gz&quot;);
+
+
+  /**
+   * The backend to use for constructing {@link edu.stanford.nlp.pipeline.AnnotatorFactory}s.
+   */
+<span class="fc" id="L71">  private static AnnotatorImplementations backend = new AnnotatorImplementations();</span>
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.TokenizerAnnotator} implementation
+   */
+<span class="fc" id="L76">  private static final Annotator defaultTokenize = AnnotatorFactories.tokenize(EMPTY_PROPS, backend).create();</span>
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.WordsToSentencesAnnotator} implementation
+   */
+<span class="fc" id="L80">  private static final Annotator defaultSSplit = AnnotatorFactories.sentenceSplit(EMPTY_PROPS, backend).create();</span>
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.POSTaggerAnnotator} implementation
+   */
+<span class="fc" id="L84">  private static Supplier&lt;Annotator&gt; defaultPOS = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L85">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L89" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L90">        impl = AnnotatorFactories.posTag(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L92">      return impl;</span>
+    }
+  };
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.MorphaAnnotator} implementation
+   */
+<span class="pc" id="L98">  private static final Supplier&lt;Annotator&gt; defaultLemma = () -&gt; AnnotatorFactories.lemma(EMPTY_PROPS, backend).create();</span>
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.NERCombinerAnnotator} implementation
+   */
+<span class="fc" id="L103">  private static Supplier&lt;Annotator&gt; defaultNER = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L104">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L108" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L109">        impl = AnnotatorFactories.nerTag(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L111">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.RegexNERAnnotator} implementation
+   */
+<span class="fc" id="L118">  private static Supplier&lt;Annotator&gt; defaultRegexner = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L119">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L123" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L124">        impl = AnnotatorFactories.regexNER(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L126">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.ParserAnnotator} implementation
+   */
+<span class="fc" id="L133">  private static Supplier&lt;Annotator&gt; defaultParse = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L134">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L139">        impl = AnnotatorFactories.parse(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L141">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.DependencyParseAnnotator} implementation
+   */
+<span class="fc" id="L148">  private static Supplier&lt;Annotator&gt; defaultDepparse = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L149">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L154">        impl = AnnotatorFactories.dependencies(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L156">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.naturalli.NaturalLogicAnnotator} implementation
+   */
+<span class="fc" id="L163">  private static Supplier&lt;Annotator&gt; defaultNatlog = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L164">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L169">        impl = AnnotatorFactories.natlog(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L171">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link EntityMentionsAnnotator} implementation
+   */
+<span class="fc" id="L178">  private static Supplier&lt;Annotator&gt; defaultEntityMentions = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L179">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L183" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L184">        impl = AnnotatorFactories.entityMentions(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L186">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link KBPAnnotator} implementation
+   */
+<span class="fc" id="L193">  private static Supplier&lt;Annotator&gt; defaultKBP = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L194">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L199">        impl = AnnotatorFactories.kbp(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L201">      return impl;</span>
+    }
+  };
+
+
+  /**
+   * The default {@link edu.stanford.nlp.naturalli.OpenIE} implementation
+   */
+<span class="fc" id="L209">  private static Supplier&lt;Annotator&gt; defaultOpenie = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L210">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L215">        impl = AnnotatorFactories.openie(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L217">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.MentionAnnotator} implementation
+   */
+<span class="fc" id="L224">  private static Supplier&lt;Annotator&gt; defaultMention = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L225">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L230">        impl = AnnotatorFactories.mention(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L232">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.CorefAnnotator} implementation
+   */
+<span class="fc" id="L239">  private static Supplier&lt;Annotator&gt; defaultCoref = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L240">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L244" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L245">        impl = AnnotatorFactories.coref(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L247">      return impl;</span>
+    }
+  };
+
+  /**
+   * The default {@link edu.stanford.nlp.pipeline.SentimentAnnotator} implementation
+   */
+<span class="fc" id="L254">  private static Supplier&lt;Annotator&gt; defaultSentiment = new Supplier&lt;Annotator&gt;() {</span>
+<span class="fc" id="L255">    Annotator impl = null;</span>
+
+    @Override
+    public synchronized Annotator get() {
+<span class="nc bnc" id="L259" title="All 2 branches missed.">      if (impl == null) {</span>
+<span class="nc" id="L260">        impl = AnnotatorFactories.sentiment(EMPTY_PROPS, backend).create();</span>
+      }
+<span class="nc" id="L262">      return impl;</span>
+    }
+  };
+
+  /**
+   * Cache the most recently used custom annotators.
+   */
+<span class="fc" id="L269">  private static final LinkedHashMap&lt;String,Annotator&gt; customAnnotators = new LinkedHashMap&lt;&gt;();</span>
+
+  /**
+   * Either get a custom annotator which was recently defined, or create it if it has never been defined.
+   * This method is synchronized to avoid race conditions when loading the annotators.
+   * @param factory The factory specifying the annotator.
+   * @return An annotator created by that factory.
+   */
+  private synchronized static Supplier&lt;Annotator&gt; getOrCreate(AnnotatorFactory factory) {
+<span class="nc" id="L278">    return () -&gt; {</span>
+<span class="nc" id="L279">      Annotator rtn = customAnnotators.get(factory.signature());</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">      if (rtn == null) {</span>
+        // Create the annotator
+<span class="nc" id="L282">        rtn = factory.create();</span>
+        // Register the annotator
+<span class="nc" id="L284">        customAnnotators.put(factory.signature(), factory.create());</span>
+        // Clean up memory if needed
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        while (customAnnotators.size() &gt; 10) {</span>
+<span class="nc" id="L287">          customAnnotators.keySet().iterator().remove();</span>
+        }
+      }
+<span class="nc" id="L290">      return rtn;</span>
+    };
+  }
+
+  /** The protocol buffer representing this document */
+  protected final CoreNLPProtos.Document.Builder impl;
+
+  /** The list of sentences associated with this document */
+<span class="pc" id="L298">  protected List&lt;Sentence&gt; sentences = null;</span>
+
+  /** A serializer to assist in serializing and deserializing from Protocol buffers */
+<span class="pc" id="L301">  protected final ProtobufAnnotationSerializer serializer = new ProtobufAnnotationSerializer(false );</span>
+
+  /**
+   * THIS IS NONSTANDARD.
+   * An indicator of whether we have run the OpenIE annotator.
+   * Unlike most other annotators, it's quite common for a sentence to not have any extracted triples,
+   * and therefore it's hard to determine whether we should rerun the annotator based solely on the saved
+   * annotation.
+   * At the same time, the proto file should not have this flag in it.
+   * So, here it is.
+   */
+<span class="pc" id="L312">  private boolean haveRunOpenie = false;</span>
+
+  /**
+   * THIS IS NONSTANDARD.
+   * An indicator of whether we have run the KBP annotator.
+   * Unlike most other annotators, it's quite common for a sentence to not have any extracted triples,
+   * and therefore it's hard to determine whether we should rerun the annotator based solely on the saved
+   * annotation.
+   * At the same time, the proto file should not have this flag in it.
+   * So, here it is.
+   */
+<span class="pc" id="L323">  private boolean haveRunKBP = false;</span>
+
+  /** The default properties to use for annotating things (e.g., coref for the document level) */
+<span class="pc" id="L326">  private Properties defaultProps = EMPTY_PROPS;</span>
+
+
+  /**
+   * Set the backend implementations for our CoreNLP pipeline.
+   * For example, to a {@link ServerAnnotatorImplementations}.
+   *
+   * @param backend The backend to use from now on for annotating
+   *                documents.
+   */
+  public static void setBackend(AnnotatorImplementations backend) {
+<span class="nc" id="L337">    Document.backend = backend;</span>
+<span class="nc" id="L338">  }</span>
+
+
+  /**
+   * Use the CoreNLP Server ({@link StanfordCoreNLPServer}) for the
+   * heavyweight backend annotation job.
+   *
+   * @param host The hostname of the server.
+   * @param port The port the server is running on.
+   */
+  public static void useServer(String host, int port) {
+<span class="nc" id="L349">    backend = new ServerAnnotatorImplementations(host, port);</span>
+<span class="nc" id="L350">  }</span>
+
+
+  /**
+   * Use the CoreNLP Server ({@link StanfordCoreNLPServer}) for the
+   * heavyweight backend annotation job, authenticating with the given
+   * credentials.
+   *
+   * @param host The hostname of the server.
+   * @param port The port the server is running on.
+   * @param apiKey The api key to use as the username for authentication
+   * @param apiSecret The api secrete to use as the password for authentication
+   * @param lazy Only run the annotations that are required at this time. If this is
+   *             false, we will also run a bunch of standard annotations, to cut down on
+   *             expected number of round-trips.
+   */
+  public static void useServer(String host, int port,
+                               String apiKey, String apiSecret,
+                               boolean lazy) {
+<span class="nc" id="L369">    backend = new ServerAnnotatorImplementations(host, port, apiKey, apiSecret, lazy);</span>
+<span class="nc" id="L370">  }</span>
+
+
+  /** @see Document#useServer(String, int, String, String, boolean) */
+  public static void useServer(String host,
+                               String apiKey, String apiSecret,
+                               boolean lazy) {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    useServer(host, host.startsWith(&quot;http://&quot;) ? 80 : 443, apiKey, apiSecret, lazy);</span>
+<span class="nc" id="L378">  }</span>
+
+  /** @see Document#useServer(String, int, String, String, boolean) */
+  public static void useServer(String host,
+                               String apiKey, String apiSecret) {
+<span class="nc bnc" id="L383" title="All 2 branches missed.">    useServer(host, host.startsWith(&quot;http://&quot;) ? 80 : 443, apiKey, apiSecret, true);</span>
+<span class="nc" id="L384">  }</span>
+
+
+  /*
+   * A static block that'll automatically fault in the CoreNLP server, if the appropriate environment
+   * variables are set.
+   * These are:
+   *
+   * &lt;ul&gt;
+   *     &lt;li&gt;CORENLP_HOST&lt;/li&gt; -- this is already sufficient to trigger creating a server
+   *     &lt;li&gt;CORENLP_PORT&lt;/li&gt;
+   *     &lt;li&gt;CORENLP_KEY&lt;/li&gt;
+   *     &lt;li&gt;CORENLP_SECRET&lt;/li&gt;
+   *     &lt;li&gt;CORENLP_LAZY&lt;/li&gt;  (if true, do as much annotation on a single round-trip as possible)
+   * &lt;/ul&gt;
+   */
+  static {
+<span class="fc" id="L401">    String host    = System.getenv(&quot;CORENLP_HOST&quot;);</span>
+<span class="fc" id="L402">    String portStr = System.getenv(&quot;CORENLP_PORT&quot;);</span>
+<span class="fc" id="L403">    String key     = System.getenv(&quot;CORENLP_KEY&quot;);</span>
+<span class="fc" id="L404">    String secret  = System.getenv(&quot;CORENLP_SECRET&quot;);</span>
+<span class="fc" id="L405">    String lazystr = System.getenv(&quot;CORENLP_LAZY&quot;);</span>
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">    if (host != null) {</span>
+<span class="nc" id="L407">      int port = 443;</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">      if (portStr == null) {</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        if (host.startsWith(&quot;http://&quot;)) {</span>
+<span class="nc" id="L410">          port = 80;</span>
+        }
+      } else {
+<span class="nc" id="L413">        port = Integer.parseInt(portStr);</span>
+      }
+<span class="nc" id="L415">      boolean lazy = true;</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">      if (lazystr != null) {</span>
+<span class="nc" id="L417">        lazy = Boolean.parseBoolean(lazystr);</span>
+      }
+<span class="nc bnc" id="L419" title="All 4 branches missed.">      if (key != null &amp;&amp; secret != null) {</span>
+<span class="nc" id="L420">        useServer(host, port, key, secret, lazy);</span>
+      } else {
+<span class="nc" id="L422">        useServer(host, port);</span>
+      }
+    }
+<span class="fc" id="L425">  }</span>
+
+
+  /**
+   * Create a new document from the passed in text and the given properties.
+   * @param text The text of the document.
+   */
+<span class="fc" id="L432">  public Document(Properties props, String text) {</span>
+<span class="fc" id="L433">    this.impl = CoreNLPProtos.Document.newBuilder().setText(text);</span>
+<span class="fc" id="L434">  }</span>
+
+
+  /**
+   * Create a new document from the passed in text.
+   * @param text The text of the document.
+   */
+  public Document(String text) {
+<span class="fc" id="L442">    this(EMPTY_PROPS, text);</span>
+<span class="fc" id="L443">  }</span>
+
+  /**
+   * Convert a CoreNLP Annotation object to a Document.
+   * @param ann The CoreNLP Annotation object.
+   */
+  @SuppressWarnings(&quot;Convert2streamapi&quot;)
+<span class="fc" id="L450">  public Document(Properties props, Annotation ann) {</span>
+<span class="fc" id="L451">    StanfordCoreNLP.getDefaultAnnotatorPool(props, new AnnotatorImplementations());  // cache the annotator pool</span>
+<span class="fc" id="L452">    this.impl = new ProtobufAnnotationSerializer(false).toProtoBuilder(ann);</span>
+<span class="fc" id="L453">    List&lt;CoreMap&gt; sentences = ann.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="fc" id="L454">    this.sentences = new ArrayList&lt;&gt;(sentences.size());</span>
+<span class="fc bfc" id="L455" title="All 2 branches covered.">    for (CoreMap sentence : sentences) {</span>
+<span class="fc" id="L456">      this.sentences.add(new Sentence(this, this.serializer.toProtoBuilder(sentence), sentence.get(CoreAnnotations.TextAnnotation.class), defaultProps));</span>
+<span class="fc" id="L457">    }</span>
+<span class="fc" id="L458">  }</span>
+
+
+  /** @see Document#Document(Properties, Annotation) */
+  public Document(Annotation ann) {
+<span class="fc" id="L463">    this(Document.EMPTY_PROPS, ann);</span>
+<span class="fc" id="L464">  }</span>
+
+  /**
+   * Create a Document object from a read Protocol Buffer.
+   * @see edu.stanford.nlp.simple.Document#serialize()
+   * @param proto The protocol buffer representing this document.
+   */
+  @SuppressWarnings(&quot;Convert2streamapi&quot;)
+<span class="nc" id="L472">  public Document(Properties props, CoreNLPProtos.Document proto) {</span>
+<span class="nc" id="L473">    StanfordCoreNLP.getDefaultAnnotatorPool(props, new AnnotatorImplementations());  // cache the annotator pool</span>
+<span class="nc" id="L474">    this.impl = proto.toBuilder();</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">    if (proto.getSentenceCount() &gt; 0) {</span>
+<span class="nc" id="L476">      this.sentences = new ArrayList&lt;&gt;(proto.getSentenceCount());</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">      for (CoreNLPProtos.Sentence sentence : proto.getSentenceList()) {</span>
+<span class="nc" id="L478">        this.sentences.add(new Sentence(this, sentence.toBuilder(), defaultProps));</span>
+<span class="nc" id="L479">      }</span>
+    }
+<span class="nc" id="L481">  }</span>
+
+
+  /** @see Document#Document(Properties, CoreNLPProtos.Document)  */
+  public Document(CoreNLPProtos.Document proto) {
+<span class="nc" id="L486">    this(Document.EMPTY_PROPS, proto);</span>
+<span class="nc" id="L487">  }</span>
+
+
+  /**
+   * Make this document caseless. That is, from now on, run the caseless models
+   * on the document by default rather than the standard CoreNLP models.
+   *
+   * @return This same document, but with the default properties swapped out.
+   */
+  public Document caseless() {
+<span class="nc" id="L497">    this.defaultProps = CASELESS_PROPS;</span>
+<span class="nc" id="L498">    return this;</span>
+  }
+
+  /**
+   * Make this document case sensitive.
+   * A document is case sensitive by default; this only has an effect if you have previously
+   * called {@link Sentence#caseless()}.
+   *
+   * @return This same document, but with the default properties swapped out.
+   */
+  public Document cased() {
+<span class="nc" id="L509">    this.defaultProps = EMPTY_PROPS;</span>
+<span class="nc" id="L510">    return this;</span>
+  }
+
+  /**
+   * Serialize this Document as a Protocol Buffer.
+   * This can be deserialized with the constructor {@link Document#Document(edu.stanford.nlp.pipeline.CoreNLPProtos.Document)}.
+   *
+   * @return The document as represented by a Protocol Buffer.
+   */
+  public CoreNLPProtos.Document serialize() {
+<span class="nc" id="L520">    synchronized (impl) {</span>
+      // Serialize sentences
+<span class="nc" id="L522">      this.impl.clearSentence();</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">      for (Sentence sent : sentences()) {</span>
+<span class="nc" id="L524">        this.impl.addSentence(sent.serialize());</span>
+<span class="nc" id="L525">      }</span>
+      // Serialize document
+<span class="nc" id="L527">      return impl.build();</span>
+<span class="nc" id="L528">    }</span>
+  }
+
+  /**
+   * Write this document to an output stream.
+   * Internally, this stores the document as a protocol buffer, and saves that buffer to the output stream.
+   * This method does not close the stream after writing.
+   *
+   * @param out The output stream to write to. The stream is not closed after the method returns.
+   * @throws IOException Thrown from the underlying write() implementation.
+   *
+   * @see Document#deserialize(InputStream)
+   */
+  public void serialize(OutputStream out) throws IOException {
+<span class="nc" id="L542">    serialize().writeDelimitedTo(out);</span>
+<span class="nc" id="L543">    out.flush();</span>
+<span class="nc" id="L544">  }</span>
+
+  /**
+   * Read a document from an input stream.
+   * This does not close the input stream.
+   *
+   * @param in The input stream to deserialize from.
+   * @return The next document encoded in the input stream.
+   * @throws IOException Thrown by the underlying parse() implementation.
+   *
+   * @see Document#serialize(java.io.OutputStream)
+   */
+  public static Document deserialize(InputStream in) throws IOException {
+<span class="nc" id="L557">    return new Document(CoreNLPProtos.Document.parseDelimitedFrom(in));</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   *  Write this annotation as a JSON string.
+   *  Optionally, you can also specify a number of operations to call on the document before
+   *  dumping it to JSON.
+   *  This allows the user to ensure that certain annotations have been computed before the document
+   *  is dumped.
+   *  For example:
+   * &lt;/p&gt;
+   *
+   * &lt;pre&gt;{@code
+   *   String json = new Document(&quot;Lucy in the sky with diamonds&quot;).json(Sentence::parse, Sentence::ner);
+   * }&lt;/pre&gt;
+   *
+   * &lt;p&gt;
+   *   will create a JSON dump of the document, ensuring that at least the parse tree and ner tags are populated.
+   * &lt;/p&gt;
+   *
+   * @param functions The (possibly empty) list of annotations to populate on the document before dumping it
+   *                  to JSON.
+   * @return The JSON String for this document.
+   */
+  @SafeVarargs
+  public final String json(Function&lt;Sentence, Object&gt;... functions) {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">    for (Function&lt;Sentence, Object&gt; f : functions) {</span>
+<span class="nc" id="L585">      f.apply(this.sentence(0));</span>
+    }
+    try {
+<span class="nc" id="L588">      return new JSONOutputter().print(this.asAnnotation());</span>
+<span class="nc" id="L589">    } catch (IOException e) {</span>
+<span class="nc" id="L590">      throw new RuntimeIOException(e);</span>
+    }
+  }
+
+  /**
+   * Like the {@link Document@json(Function...)} function, but with minified JSON more suitable
+   * for sending over the wire.
+   *
+   * @param functions The (possibly empty) list of annotations to populate on the document before dumping it
+   *                  to JSON.
+   * @return The JSON String for this document, without unnecessary whitespace.
+   *
+   */
+  @SafeVarargs
+  public final String jsonMinified(Function&lt;Sentence, Object&gt;... functions) {
+<span class="nc bnc" id="L605" title="All 2 branches missed.">    for (Function&lt;Sentence, Object&gt; f : functions) {</span>
+<span class="nc" id="L606">      f.apply(this.sentence(0));</span>
+    }
+    try {
+<span class="nc" id="L609">      AnnotationOutputter.Options options = new AnnotationOutputter.Options();</span>
+<span class="nc" id="L610">      options.pretty = false;</span>
+<span class="nc" id="L611">      return new JSONOutputter().print(this.asAnnotation(), options);</span>
+<span class="nc" id="L612">    } catch (IOException e) {</span>
+<span class="nc" id="L613">      throw new RuntimeIOException(e);</span>
+    }
+  }
+
+  /**
+   * &lt;p&gt;
+   *  Write this annotation as an XML string.
+   *  Optionally, you can also specify a number of operations to call on the document before
+   *  dumping it to XML.
+   *  This allows the user to ensure that certain annotations have been computed before the document
+   *  is dumped.
+   *  For example:
+   * &lt;/p&gt;
+   *
+   * &lt;pre&gt;{@code
+   *   String xml = new Document(&quot;Lucy in the sky with diamonds&quot;).xml(Document::parse, Document::ner);
+   * }&lt;/pre&gt;
+   *
+   * &lt;p&gt;
+   *   will create a XML dump of the document, ensuring that at least the parse tree and ner tags are populated.
+   * &lt;/p&gt;
+   *
+   * @param functions The (possibly empty) list of annotations to populate on the document before dumping it
+   *                  to XML.
+   * @return The XML String for this document.
+   */
+  @SafeVarargs
+  public final String xml(Function&lt;Sentence, Object&gt;... functions) {
+<span class="nc bnc" id="L641" title="All 2 branches missed.">    for (Function&lt;Sentence, Object&gt; f : functions) {</span>
+<span class="nc" id="L642">      f.apply(this.sentence(0));</span>
+    }
+    try {
+<span class="nc" id="L645">      return new XMLOutputter().print(this.asAnnotation());</span>
+<span class="nc" id="L646">    } catch (IOException e) {</span>
+<span class="nc" id="L647">      throw new RuntimeIOException(e);</span>
+    }
+  }
+
+  /**
+   * Like the {@link Document@xml(Function...)} function, but with minified XML more suitable
+   * for sending over the wire.
+   *
+   * @param functions The (possibly empty) list of annotations to populate on the document before dumping it
+   *                  to XML.
+   * @return The XML String for this document, without unecessary whitespace.
+   *
+   */
+  @SafeVarargs
+  public final String xmlMinified(Function&lt;Sentence, Object&gt;... functions) {
+<span class="nc bnc" id="L662" title="All 2 branches missed.">    for (Function&lt;Sentence, Object&gt; f : functions) {</span>
+<span class="nc" id="L663">      f.apply(this.sentence(0));</span>
+    }
+    try {
+<span class="nc" id="L666">      AnnotationOutputter.Options options = new AnnotationOutputter.Options();</span>
+<span class="nc" id="L667">      options.pretty = false;</span>
+<span class="nc" id="L668">      return new XMLOutputter().print(this.asAnnotation(false), options);</span>
+<span class="nc" id="L669">    } catch (IOException e) {</span>
+<span class="nc" id="L670">      throw new RuntimeIOException(e);</span>
+    }
+  }
+
+  /**
+   * Get the sentences in this document, as a list.
+   * @param props The properties to use in the {@link edu.stanford.nlp.pipeline.WordsToSentencesAnnotator}.
+   * @return A list of Sentence objects representing the sentences in the document.
+   */
+  public List&lt;Sentence&gt; sentences(Properties props) {
+<span class="fc bfc" id="L680" title="All 2 branches covered.">    return this.sentences(props,</span>
+<span class="fc" id="L681">        props == EMPTY_PROPS ? defaultTokenize : AnnotatorFactories.tokenize(props, backend).create());</span>
+  }
+
+  /**
+   * Get the sentences in this document, as a list.
+   * @param props The properties to use in the {@link edu.stanford.nlp.pipeline.WordsToSentencesAnnotator}.
+   * @return A list of Sentence objects representing the sentences in the document.
+   */
+  protected List&lt;Sentence&gt; sentences(Properties props, Annotator tokenizer) {
+<span class="fc bfc" id="L690" title="All 2 branches covered.">    if (sentences == null) {</span>
+<span class="fc bfc" id="L691" title="All 2 branches covered.">      Annotator ssplit = props == EMPTY_PROPS ? defaultSSplit : AnnotatorFactories.sentenceSplit(props, backend).create();</span>
+      // Annotate
+<span class="fc" id="L693">      Annotation ann = new Annotation(this.impl.getText());</span>
+<span class="fc" id="L694">      tokenizer.annotate(ann);</span>
+<span class="fc" id="L695">      ssplit.annotate(ann);</span>
+      // Grok results
+      // (docid)
+<span class="pc bpc" id="L698" title="1 of 2 branches missed.">      if (ann.containsKey(CoreAnnotations.DocIDAnnotation.class)) {</span>
+<span class="nc" id="L699">        impl.setDocID(ann.get(CoreAnnotations.DocIDAnnotation.class));</span>
+      }
+      // (sentences)
+<span class="fc" id="L702">      List&lt;CoreMap&gt; sentences = ann.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="fc" id="L703">      this.sentences = new ArrayList&lt;&gt;(sentences.size());</span>
+<span class="fc bfc" id="L704" title="All 2 branches covered.">      for (CoreMap sentence : sentences) {</span>
+        //Sentence sent = new Sentence(this, sentence);
+<span class="fc" id="L706">        Sentence sent = new Sentence(this, this.serializer.toProtoBuilder(sentence), sentence.get(CoreAnnotations.TextAnnotation.class), defaultProps);</span>
+<span class="fc" id="L707">        this.sentences.add(sent);</span>
+<span class="fc" id="L708">        this.impl.addSentence(sent.serialize());</span>
+<span class="fc" id="L709">      }</span>
+    }
+
+<span class="fc" id="L712">    return sentences;</span>
+  }
+
+  /** @see Document#sentences(java.util.Properties) */
+  public List&lt;Sentence&gt; sentences() {
+<span class="fc" id="L717">    return sentences(EMPTY_PROPS);</span>
+  }
+
+  /** @see Document#sentences(java.util.Properties) */
+  public Sentence sentence(int sentenceIndex, Properties props) {
+<span class="fc" id="L722">    return sentences(props).get(sentenceIndex);</span>
+  }
+
+  /** @see Document#sentences(java.util.Properties) */
+  public Sentence sentence(int sentenceIndex) {
+<span class="fc" id="L727">    return sentences().get(sentenceIndex);</span>
+  }
+
+  /** Get the raw text of the document, as input by, e.g., {@link Document#Document(String)}. */
+  public String text() {
+<span class="fc" id="L732">    synchronized (impl) {</span>
+<span class="fc" id="L733">      return impl.getText();</span>
+<span class="nc" id="L734">    }</span>
+  }
+
+  /**
+   * Returns the coref chains in the document. This is a map from coref cluster IDs, to the coref chain
+   * with that ID.
+   * @param props The properties to use in the {@link edu.stanford.nlp.pipeline.DeterministicCorefAnnotator}.
+   */
+  public Map&lt;Integer, CorefChain&gt; coref(Properties props) {
+<span class="nc" id="L743">    synchronized (this.impl) {</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">      if (impl.getCorefChainCount() == 0) {</span>
+        // Run prerequisites
+<span class="nc" id="L746">        this.runLemma(props).runNER(props).runParse(props);  // default is rule mention annotator</span>
+        // Run mention
+<span class="nc bnc" id="L748" title="All 4 branches missed.">        Supplier&lt;Annotator&gt; mention = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultMention : getOrCreate(AnnotatorFactories.mention(props, backend));</span>
+        // Run coref
+<span class="nc bnc" id="L750" title="All 4 branches missed.">        Supplier&lt;Annotator&gt; coref = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultCoref : getOrCreate(AnnotatorFactories.coref(props, backend));</span>
+<span class="nc" id="L751">        Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L752">        mention.get().annotate(ann);</span>
+<span class="nc" id="L753">        coref.get().annotate(ann);</span>
+        // Convert to proto
+<span class="nc" id="L755">        synchronized (serializer) {</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">          for (CorefChain chain : ann.get(CorefCoreAnnotations.CorefChainAnnotation.class).values()) {</span>
+<span class="nc" id="L757">            impl.addCorefChain(serializer.toProto(chain));</span>
+<span class="nc" id="L758">          }</span>
+<span class="nc" id="L759">        }</span>
+      }
+<span class="nc" id="L761">      Map&lt;Integer, CorefChain&gt; corefs = Generics.newHashMap();</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">      for (CoreNLPProtos.CorefChain chain : impl.getCorefChainList()) {</span>
+<span class="nc" id="L763">        corefs.put(chain.getChainID(), fromProto(chain));</span>
+<span class="nc" id="L764">      }</span>
+<span class="nc" id="L765">      return corefs;</span>
+<span class="nc" id="L766">    }</span>
+  }
+
+  /** @see Document#coref(java.util.Properties) */
+  public Map&lt;Integer, CorefChain&gt; coref() {
+<span class="nc" id="L771">    return coref(defaultProps);</span>
+  }
+
+  /** Returns the document id of the document, if one was found */
+  public Optional&lt;String&gt; docid() {
+<span class="fc" id="L776">    synchronized (impl) {</span>
+<span class="fc bfc" id="L777" title="All 2 branches covered.">      if (impl.hasDocID()) {</span>
+<span class="fc" id="L778">        return Optional.of(impl.getDocID());</span>
+      } else {
+<span class="fc" id="L780">        return Optional.empty();</span>
+      }
+<span class="nc" id="L782">    }</span>
+  }
+
+  /** Sets the document id of the document, returning this. */
+  public Document setDocid(String docid) {
+<span class="fc" id="L787">    synchronized (impl) {</span>
+<span class="fc" id="L788">      this.impl.setDocID(docid);</span>
+<span class="pc" id="L789">    }</span>
+<span class="fc" id="L790">    return this;</span>
+  }
+
+
+  /**
+   * &lt;p&gt;
+   *   Bypass the tokenizer and sentence splitter -- axiomatically set the sentences for this document.
+   *   This is a VERY dangerous method to call if you don't know what you're doing.
+   *   The primary use case is for forcing single-sentence documents, where most of the fields in the document
+   *   do not matter.
+   * &lt;/p&gt;
+   *
+   * @param sentences The sentences to force for the sentence list of this document.
+   */
+  void forceSentences(List&lt;Sentence&gt; sentences) {
+<span class="nc" id="L805">    this.sentences = sentences;</span>
+<span class="nc" id="L806">    synchronized (impl) {</span>
+<span class="nc" id="L807">      this.impl.clearSentence();</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">      for (Sentence sent : sentences) {</span>
+<span class="nc" id="L809">        this.impl.addSentence(sent.serialize());</span>
+<span class="nc" id="L810">      }</span>
+<span class="nc" id="L811">    }</span>
+<span class="nc" id="L812">  }</span>
+
+
+
+  //
+  // Begin helpers
+  //
+
+  Document runPOS(Properties props) {
+    // Cached result
+<span class="nc bnc" id="L822" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawToken(0).hasPos()) {</span>
+<span class="nc" id="L823">      return this;</span>
+    }
+    // Prerequisites
+<span class="nc" id="L826">    sentences();</span>
+    // Run annotator
+<span class="nc bnc" id="L828" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; pos = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultPOS : getOrCreate(AnnotatorFactories.posTag(props, backend));</span>
+<span class="nc" id="L829">    Annotation ann = asAnnotation(false);</span>
+<span class="nc" id="L830">    pos.get().annotate(ann);</span>
+    // Update data
+<span class="nc bnc" id="L832" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L833">      sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (pair) -&gt; pair.first.setPos(pair.second), CoreLabel::tag);</span>
+    }
+<span class="nc" id="L835">    return this;</span>
+  }
+
+  Document runLemma(Properties props) {
+    // Cached result
+<span class="nc bnc" id="L840" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawToken(0).hasLemma()) {</span>
+<span class="nc" id="L841">      return this;</span>
+    }
+    // Prerequisites
+<span class="nc" id="L844">    runPOS(props);</span>
+    // Run annotator
+<span class="nc bnc" id="L846" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; lemma = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultLemma : getOrCreate(AnnotatorFactories.lemma(props, backend));</span>
+<span class="nc" id="L847">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L848">    lemma.get().annotate(ann);</span>
+    // Update data
+<span class="nc bnc" id="L850" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L851">      sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (pair) -&gt; pair.first.setLemma(pair.second), CoreLabel::lemma);</span>
+    }
+<span class="nc" id="L853">    return this;</span>
+  }
+
+  Document mockLemma(Properties props) {
+    // Cached result
+<span class="nc bnc" id="L858" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawToken(0).hasLemma()) {</span>
+<span class="nc" id="L859">      return this;</span>
+    }
+    // Prerequisites
+<span class="nc" id="L862">    runPOS(props);</span>
+    // Mock lemma with word
+<span class="nc" id="L864">    Annotation ann = asAnnotation(true);</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L866">      sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (pair) -&gt; pair.first.setLemma(pair.second), CoreLabel::word);</span>
+    }
+<span class="nc" id="L868">    return this;</span>
+
+  }
+
+  Document runNER(Properties props) {
+<span class="nc bnc" id="L873" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawToken(0).hasNer()) {</span>
+<span class="nc" id="L874">      return this;</span>
+    }
+    // Run prerequisites
+<span class="nc" id="L877">    runPOS(props);</span>
+    // Run annotator
+<span class="nc bnc" id="L879" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; ner = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultNER : getOrCreate(AnnotatorFactories.nerTag(props, backend));</span>
+<span class="nc" id="L880">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L881">    ner.get().annotate(ann);</span>
+    // Update data
+<span class="nc bnc" id="L883" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L884">      sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (pair) -&gt; pair.first.setNer(pair.second), CoreLabel::ner);</span>
+    }
+<span class="nc" id="L886">    return this;</span>
+  }
+
+  Document runRegexner(Properties props) {
+    // Run prerequisites
+<span class="nc" id="L891">    runNER(props);</span>
+    // Run annotator
+<span class="nc bnc" id="L893" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; ner = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultRegexner : getOrCreate(AnnotatorFactories.regexNER(props, backend));</span>
+<span class="nc" id="L894">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L895">    ner.get().annotate(ann);</span>
+    // Update data
+<span class="nc bnc" id="L897" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L898">      sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (pair) -&gt; pair.first.setNer(pair.second), CoreLabel::ner);</span>
+    }
+<span class="nc" id="L900">    return this;</span>
+  }
+
+  Document runParse(Properties props) {
+<span class="nc bnc" id="L904" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawSentence().hasParseTree()) {</span>
+<span class="nc" id="L905">      return this;</span>
+    }
+    // Run annotator
+<span class="nc" id="L908">    boolean cacheAnnotation = false;</span>
+<span class="nc bnc" id="L909" title="All 4 branches missed.">    Annotator parse = ((props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultParse : getOrCreate(AnnotatorFactories.parse(props, backend))).get();</span>
+<span class="nc bnc" id="L910" title="All 4 branches missed.">    if (parse.requires().contains(CoreAnnotations.PartOfSpeechAnnotation.class) || System.getenv(&quot;CORENLP_HOST&quot;) != null) {</span>
+      // Run the POS tagger if we are (or may be) using the shift reduce parser
+<span class="nc" id="L912">      runPOS(props);</span>
+<span class="nc" id="L913">      cacheAnnotation = true;</span>
+    } else {
+<span class="nc" id="L915">      sentences();</span>
+    }
+<span class="nc" id="L917">    Annotation ann = asAnnotation(cacheAnnotation);</span>
+<span class="nc" id="L918">    parse.annotate(ann);</span>
+    // Update data
+<span class="nc" id="L920">    synchronized (serializer) {</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L922">        CoreMap sentence = ann.get(CoreAnnotations.SentencesAnnotation.class).get(i);</span>
+<span class="nc" id="L923">        Tree tree = sentence.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc" id="L924">        Tree binaryTree = sentence.get(TreeCoreAnnotations.BinarizedTreeAnnotation.class);</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">        sentences.get(i).updateParse(serializer.toProto(tree),</span>
+<span class="nc" id="L926">                                     binaryTree == null ? null : serializer.toProto(binaryTree));</span>
+<span class="nc" id="L927">        sentences.get(i).updateDependencies(</span>
+<span class="nc" id="L928">            ProtobufAnnotationSerializer.toProto(sentence.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class)),</span>
+<span class="nc" id="L929">            ProtobufAnnotationSerializer.toProto(sentence.get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class)),</span>
+<span class="nc" id="L930">            ProtobufAnnotationSerializer.toProto(sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class)));</span>
+      }
+<span class="nc" id="L932">    }</span>
+<span class="nc" id="L933">    return this;</span>
+  }
+
+  Document runDepparse(Properties props) {
+<span class="nc bnc" id="L937" title="All 4 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">        this.sentences.get(0).rawSentence().hasBasicDependencies()) {</span>
+<span class="nc" id="L939">      return this;</span>
+    }
+    // Run prerequisites
+<span class="nc" id="L942">    runPOS(props);</span>
+    // Run annotator
+<span class="nc bnc" id="L944" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; depparse = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultDepparse : getOrCreate(AnnotatorFactories.dependencies(props, backend));</span>
+<span class="nc" id="L945">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L946">    depparse.get().annotate(ann);</span>
+    // Update data
+<span class="nc" id="L948">    synchronized (serializer) {</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L950">        CoreMap sentence = ann.get(CoreAnnotations.SentencesAnnotation.class).get(i);</span>
+<span class="nc" id="L951">        sentences.get(i).updateDependencies(</span>
+<span class="nc" id="L952">            ProtobufAnnotationSerializer.toProto(sentence.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class)),</span>
+<span class="nc" id="L953">            ProtobufAnnotationSerializer.toProto(sentence.get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class)),</span>
+<span class="nc" id="L954">            ProtobufAnnotationSerializer.toProto(sentence.get(SemanticGraphCoreAnnotations.EnhancedPlusPlusDependenciesAnnotation.class)));</span>
+      }
+<span class="nc" id="L956">    }</span>
+<span class="nc" id="L957">    return this;</span>
+  }
+
+  Document runNatlog(Properties props) {
+<span class="nc bnc" id="L961" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawToken(0).hasPolarity()) {</span>
+<span class="nc" id="L962">      return this;</span>
+    }
+    // Run prerequisites
+<span class="nc" id="L965">    runLemma(props);</span>
+<span class="nc" id="L966">    runDepparse(props);</span>
+    // Run annotator
+<span class="nc bnc" id="L968" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; natlog = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultNatlog : getOrCreate(AnnotatorFactories.natlog(props, backend));</span>
+<span class="nc" id="L969">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L970">    natlog.get().annotate(ann);</span>
+    // Update data
+<span class="nc" id="L972">    synchronized (serializer) {</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L974">        sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (Pair&lt;CoreNLPProtos.Token.Builder, Polarity&gt; pair) -&gt; pair.first().setPolarity(ProtobufAnnotationSerializer.toProto(pair.second())), x -&gt; x.get(NaturalLogicAnnotations.PolarityAnnotation.class));</span>
+<span class="nc" id="L975">        sentences.get(i).updateTokens(ann.get(CoreAnnotations.SentencesAnnotation.class).get(i).get(CoreAnnotations.TokensAnnotation.class), (Pair&lt;CoreNLPProtos.Token.Builder, OperatorSpec&gt; pair) -&gt; pair.first().setOperator(ProtobufAnnotationSerializer.toProto(pair.second())), x -&gt; x.get(NaturalLogicAnnotations.OperatorAnnotation.class));</span>
+      }
+<span class="nc" id="L977">    }</span>
+<span class="nc" id="L978">    return this;</span>
+  }
+
+  Document runOpenie(Properties props) {
+<span class="nc bnc" id="L982" title="All 2 branches missed.">    if (haveRunOpenie) {</span>
+<span class="nc" id="L983">      return this;</span>
+    }
+    // Run prerequisites
+<span class="nc" id="L986">    runNatlog(props);</span>
+    // Run annotator
+<span class="nc bnc" id="L988" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; openie = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultOpenie : getOrCreate(AnnotatorFactories.openie(props, backend));</span>
+<span class="nc" id="L989">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L990">    openie.get().annotate(ann);</span>
+    // Update data
+<span class="nc" id="L992">    synchronized (serializer) {</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L994">        CoreMap sentence = ann.get(CoreAnnotations.SentencesAnnotation.class).get(i);</span>
+<span class="nc" id="L995">        Collection&lt;RelationTriple&gt; triples = sentence.get(NaturalLogicAnnotations.RelationTriplesAnnotation.class);</span>
+<span class="nc" id="L996">        sentences.get(i).updateOpenIE(triples.stream().map(ProtobufAnnotationSerializer::toProto));</span>
+      }
+<span class="nc" id="L998">    }</span>
+    // Return
+<span class="nc" id="L1000">    haveRunOpenie = true;</span>
+<span class="nc" id="L1001">    return this;</span>
+  }
+
+
+  Document runKBP(Properties props) {
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">    if (haveRunKBP) {</span>
+<span class="nc" id="L1007">      return this;</span>
+    }
+    // Run prerequisites
+<span class="nc" id="L1010">    coref(props);</span>
+<span class="nc bnc" id="L1011" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; entityMention = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultEntityMentions : getOrCreate(AnnotatorFactories.entityMentions(props, backend));</span>
+<span class="nc" id="L1012">    Annotation ann = asAnnotation(true);</span>
+<span class="nc" id="L1013">    entityMention.get().annotate(ann);</span>
+    // Run annotator
+<span class="nc bnc" id="L1015" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; kbp = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultKBP : getOrCreate(AnnotatorFactories.kbp(props, backend));</span>
+<span class="nc" id="L1016">    kbp.get().annotate(ann);</span>
+    // Update data
+<span class="nc" id="L1018">    synchronized (serializer) {</span>
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L1020">        CoreMap sentence = ann.get(CoreAnnotations.SentencesAnnotation.class).get(i);</span>
+<span class="nc" id="L1021">        Collection&lt;RelationTriple&gt; triples = sentence.get(CoreAnnotations.KBPTriplesAnnotation.class);</span>
+<span class="nc" id="L1022">        sentences.get(i).updateKBP(triples.stream().map(ProtobufAnnotationSerializer::toProto));</span>
+      }
+<span class="nc" id="L1024">    }</span>
+    // Return
+<span class="nc" id="L1026">    haveRunKBP = true;</span>
+<span class="nc" id="L1027">    return this;</span>
+  }
+
+
+  Document runSentiment(Properties props) {
+<span class="nc bnc" id="L1032" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; this.sentences.get(0).rawSentence().hasSentiment()) {</span>
+<span class="nc" id="L1033">        return this;</span>
+    }
+    // Run prerequisites
+<span class="nc" id="L1036">    runParse(props);</span>
+<span class="nc bnc" id="L1037" title="All 6 branches missed.">    if (this.sentences != null &amp;&amp; this.sentences.size() &gt; 0 &amp;&amp; !this.sentences.get(0).rawSentence().hasBinarizedParseTree()) {</span>
+<span class="nc" id="L1038">      throw new IllegalStateException(&quot;No binarized parse tree (perhaps it's not supported in this language?)&quot;);</span>
+    }
+    // Run annotator
+<span class="nc" id="L1041">    Annotation ann = asAnnotation(true);</span>
+<span class="nc bnc" id="L1042" title="All 4 branches missed.">    Supplier&lt;Annotator&gt; sentiment = (props == EMPTY_PROPS || props == SINGLE_SENTENCE_DOCUMENT) ? defaultSentiment : getOrCreate(AnnotatorFactories.sentiment(props, backend));</span>
+<span class="nc" id="L1043">    sentiment.get().annotate(ann);</span>
+    // Update data
+<span class="nc" id="L1045">    synchronized (serializer) {</span>
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">      for (int i = 0; i &lt; sentences.size(); ++i) {</span>
+<span class="nc" id="L1047">        CoreMap sentence = ann.get(CoreAnnotations.SentencesAnnotation.class).get(i);</span>
+<span class="nc" id="L1048">        String sentimentClass = sentence.get(SentimentCoreAnnotations.SentimentClass.class);</span>
+<span class="nc" id="L1049">        sentences.get(i).updateSentiment(sentimentClass);</span>
+      }
+<span class="nc" id="L1051">    }</span>
+    // Return
+<span class="nc" id="L1053">    return this;</span>
+  }
+
+  /**
+   * Return this Document as an Annotation object.
+   * Note that, importantly, only the fields which have already been called will be populated in
+   * the Annotation!
+   *
+   * &lt;p&gt;Therefore, this method is generally NOT recommended.&lt;/p&gt;
+   */
+  public Annotation asAnnotation() {
+<span class="nc" id="L1064">    return asAnnotation(false);</span>
+  }
+
+
+  /**
+   * A cached version of this document as an Annotation.
+   * This will get garbage collected when necessary.
+   */
+<span class="pc" id="L1072">  private SoftReference&lt;Annotation&gt; cachedAnnotation = null;</span>
+
+  /**
+   * Return this Document as an Annotation object.
+   * Note that, importantly, only the fields which have already been called will be populated in
+   * the Annotation!
+   *
+   * &lt;p&gt;Therefore, this method is generally NOT recommended.&lt;/p&gt;
+   *
+   * @param cache If true, allow retrieving this object from the cache.
+   */
+  Annotation asAnnotation(boolean cache) {
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">    Annotation ann = cachedAnnotation == null ? null : cachedAnnotation.get();</span>
+<span class="nc bnc" id="L1085" title="All 4 branches missed.">    if (!cache || ann == null) {</span>
+<span class="nc" id="L1086">      ann = serializer.fromProto(serialize());</span>
+    }
+<span class="nc" id="L1088">    cachedAnnotation = new SoftReference&lt;&gt;(ann);</span>
+<span class="nc" id="L1089">    return ann;</span>
+  }
+
+
+  /**
+   * Read a CorefChain from its serialized representation.
+   * This is private due to the need for an additional partial document. Also, why on Earth are you trying to use
+   * this on its own anyways?
+   *
+   * @see edu.stanford.nlp.pipeline.ProtobufAnnotationSerializer#fromProto(edu.stanford.nlp.pipeline.CoreNLPProtos.CorefChain, edu.stanford.nlp.pipeline.Annotation)
+   *
+   * @param proto The serialized representation of the coref chain, missing information on its mention span string.
+   *
+   * @return A coreference chain.
+   */
+  private CorefChain fromProto(CoreNLPProtos.CorefChain proto) {
+    // Get chain ID
+<span class="nc" id="L1106">    int cid = proto.getChainID();</span>
+    // Get mentions
+<span class="nc" id="L1108">    Map&lt;IntPair, Set&lt;CorefChain.CorefMention&gt;&gt; mentions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1109">    CorefChain.CorefMention representative = null;</span>
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">    for (int i = 0; i &lt; proto.getMentionCount(); ++i) {</span>
+<span class="nc" id="L1111">      CoreNLPProtos.CorefChain.CorefMention mentionProto = proto.getMention(i);</span>
+      // Create mention
+<span class="nc" id="L1113">      StringBuilder mentionSpan = new StringBuilder();</span>
+<span class="nc" id="L1114">      Sentence sentence = sentence(mentionProto.getSentenceIndex());</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">      for (int k = mentionProto.getBeginIndex(); k &lt; mentionProto.getEndIndex(); ++k) {</span>
+<span class="nc" id="L1116">        mentionSpan.append(' ').append(sentence.word(k));</span>
+      }
+      // Set the coref cluster id for the token
+<span class="nc" id="L1119">      CorefChain.CorefMention mention = new CorefChain.CorefMention(</span>
+<span class="nc" id="L1120">          Dictionaries.MentionType.valueOf(mentionProto.getMentionType()),</span>
+<span class="nc" id="L1121">          Dictionaries.Number.valueOf(mentionProto.getNumber()),</span>
+<span class="nc" id="L1122">          Dictionaries.Gender.valueOf(mentionProto.getGender()),</span>
+<span class="nc" id="L1123">          Dictionaries.Animacy.valueOf(mentionProto.getAnimacy()),</span>
+<span class="nc" id="L1124">          mentionProto.getBeginIndex() + 1,</span>
+<span class="nc" id="L1125">          mentionProto.getEndIndex() + 1,</span>
+<span class="nc" id="L1126">          mentionProto.getHeadIndex() + 1,</span>
+          cid,
+<span class="nc" id="L1128">          mentionProto.getMentionID(),</span>
+<span class="nc" id="L1129">          mentionProto.getSentenceIndex() + 1,</span>
+<span class="nc" id="L1130">          new IntTuple(new int[]{ mentionProto.getSentenceIndex() + 1, mentionProto.getPosition() }),</span>
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">          mentionSpan.substring(mentionSpan.length() &gt; 0 ? 1 : 0));</span>
+      // Register mention
+<span class="nc" id="L1133">      IntPair key = new IntPair(mentionProto.getSentenceIndex() - 1, mentionProto.getHeadIndex() - 1);</span>
+<span class="nc bnc" id="L1134" title="All 2 branches missed.">      if (!mentions.containsKey(key)) { mentions.put(key, new HashSet&lt;&gt;()); }</span>
+<span class="nc" id="L1135">      mentions.get(key).add(mention);</span>
+      // Check for representative
+<span class="nc bnc" id="L1137" title="All 4 branches missed.">      if (proto.hasRepresentative() &amp;&amp; i == proto.getRepresentative()) {</span>
+<span class="nc" id="L1138">        representative = mention;</span>
+      }
+    }
+    // Return
+<span class="nc" id="L1142">    return new CorefChain(cid, mentions, representative);</span>
+  }
+
+
+  @SuppressWarnings(&quot;SimplifiableIfStatement&quot;)
+  @Override
+  public boolean equals(Object o) {
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">    if (this == o) return true;</span>
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">    if (!(o instanceof Document)) return false;</span>
+<span class="nc" id="L1151">    Document document = (Document) o;</span>
+<span class="nc bnc" id="L1152" title="All 4 branches missed.">    if (impl.hasText() &amp;&amp; !impl.getText().equals(document.impl.getText())) {</span>
+<span class="nc" id="L1153">      return false;</span>
+    }
+<span class="nc bnc" id="L1155" title="All 4 branches missed.">    return impl.build().equals(document.impl.build()) &amp;&amp; sentences.equals(document.sentences);</span>
+  }
+
+  @Override
+  public int hashCode() {
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">    if (impl.hasText()) {</span>
+<span class="nc" id="L1161">      return impl.getText().hashCode();</span>
+    } else {
+<span class="nc" id="L1163">      return impl.build().hashCode();</span>
+    }
+  }
+
+  @Override
+  public String toString() {
+<span class="nc" id="L1169">    return impl.getText();</span>
+  }
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

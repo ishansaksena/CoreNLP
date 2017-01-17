@@ -1,0 +1,316 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BasicRelationExtractor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.machinereading</a> &gt; <span class="el_source">BasicRelationExtractor.java</span></div><h1>BasicRelationExtractor.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.machinereading;
+
+import java.io.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import edu.stanford.nlp.classify.*;
+import edu.stanford.nlp.ie.machinereading.structure.*;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.ArgumentParser.Option;
+
+<span class="nc bnc" id="L23" title="All 2 branches missed.">public class BasicRelationExtractor implements Extractor {</span>
+
+  private static final long serialVersionUID = 2606577772115897869L;
+
+<span class="nc" id="L27">  private static final Logger logger = Logger.getLogger(BasicRelationExtractor.class.getName());</span>
+
+  protected LinearClassifier&lt;String, String&gt; classifier;
+
+<span class="nc" id="L31">  @Option(name=&quot;featureCountThreshold&quot;, gloss=&quot;feature count threshold to apply to dataset&quot;)</span>
+  public int featureCountThreshold = 2;
+
+  @Option(name=&quot;featureFactory&quot;, gloss=&quot;Feature factory for the relation extractor&quot;)
+  public RelationFeatureFactory featureFactory;
+  /**
+   * strength of the prior on the linear classifier (passed to LinearClassifierFactory) or the C constant if relationExtractorClassifierType=svm
+   */
+<span class="nc" id="L39">  @Option(name=&quot;sigma&quot;, gloss=&quot;strength of the prior on the linear classifier (passed to LinearClassifierFactory) or the C constant if relationExtractorClassifierType=svm&quot;)</span>
+  public double sigma = 1.0;
+
+  /**
+   * which classifier to use (can be 'linear' or 'svm')
+   */
+<span class="nc" id="L45">  public String relationExtractorClassifierType = &quot;linear&quot;;</span>
+  
+
+  /**
+   * If true, it creates automatically negative examples by generating all combinations between EntityMentions in a sentence
+   * This is the common behavior, but for some domain (i.e., KBP) it must disabled. In these domains, the negative relation examples are created in the reader
+   */
+  protected boolean createUnrelatedRelations;
+
+  /** Verifies that predicted labels are compatible with the relation arguments */
+  private LabelValidator validator;
+
+  protected RelationMentionFactory relationMentionFactory;
+
+<span class="nc" id="L59">  public void setValidator(LabelValidator lv) { validator = lv; }</span>
+<span class="nc" id="L60">  public void setRelationExtractorClassifierType(String s) { relationExtractorClassifierType = s; }</span>
+<span class="nc" id="L61">  public void setFeatureCountThreshold(int i) {featureCountThreshold = i; }</span>
+<span class="nc" id="L62">  public void setSigma(double d) { sigma = d; }</span>
+
+<span class="nc" id="L64">  public BasicRelationExtractor(RelationFeatureFactory featureFac, Boolean createUnrelatedRelations, RelationMentionFactory factory) {</span>
+<span class="nc" id="L65">    featureFactory = featureFac;</span>
+<span class="nc" id="L66">    this.createUnrelatedRelations = createUnrelatedRelations;</span>
+<span class="nc" id="L67">    this.relationMentionFactory = factory;</span>
+
+<span class="nc" id="L69">    logger.setLevel(Level.INFO);</span>
+<span class="nc" id="L70">  }</span>
+
+  public void setCreateUnrelatedRelations(boolean b) {
+<span class="nc" id="L73">    createUnrelatedRelations = b;</span>
+<span class="nc" id="L74">  }</span>
+
+  public static BasicRelationExtractor load(String modelPath) throws IOException, ClassNotFoundException {
+<span class="nc" id="L77">    return IOUtils.readObjectFromURLOrClasspathOrFileSystem(modelPath);</span>
+  }
+
+  @Override
+  public void save(String modelpath) throws IOException {
+    // make sure modelpath directory exists
+<span class="nc" id="L83">    int lastSlash = modelpath.lastIndexOf(File.separator);</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">    if(lastSlash &gt; 0){</span>
+<span class="nc" id="L85">      String path = modelpath.substring(0, lastSlash);</span>
+<span class="nc" id="L86">      File f = new File(path);</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">      if (! f.exists()) {</span>
+<span class="nc" id="L88">        f.mkdirs();</span>
+      }
+    }
+
+<span class="nc" id="L92">    FileOutputStream fos = new FileOutputStream(modelpath);</span>
+<span class="nc" id="L93">    ObjectOutputStream out = new ObjectOutputStream(fos);</span>
+<span class="nc" id="L94">    out.writeObject(this);</span>
+<span class="nc" id="L95">    out.close();</span>
+<span class="nc" id="L96">  }</span>
+
+  /**
+   * Train on a list of ExtractionSentence containing labeled RelationMention objects
+   */
+  @Override
+  public void train(Annotation sentences) {
+    // Train a single multi-class classifier
+<span class="nc" id="L104">    GeneralDataset&lt;String, String&gt; trainSet = createDataset(sentences);</span>
+<span class="nc" id="L105">    trainMulticlass(trainSet);</span>
+<span class="nc" id="L106">  }</span>
+
+  public void trainMulticlass(GeneralDataset&lt;String, String&gt; trainSet) {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">    if (relationExtractorClassifierType.equalsIgnoreCase(&quot;linear&quot;)) {</span>
+<span class="nc" id="L110">      LinearClassifierFactory&lt;String, String&gt; lcFactory = new LinearClassifierFactory&lt;&gt;(1e-4, false, sigma);</span>
+<span class="nc" id="L111">      lcFactory.setVerbose(false);</span>
+      // use in-place SGD instead of QN. this is faster but much worse!
+      // lcFactory.useInPlaceStochasticGradientDescent(-1, -1, 1.0);
+      // use a hybrid minimizer: start with in-place SGD, continue with QN
+      // lcFactory.useHybridMinimizerWithInPlaceSGD(50, -1, sigma);
+<span class="nc" id="L116">      classifier = lcFactory.trainClassifier(trainSet);</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">    } else if (relationExtractorClassifierType.equalsIgnoreCase(&quot;svm&quot;)) {</span>
+<span class="nc" id="L118">      SVMLightClassifierFactory&lt;String, String&gt; svmFactory = new SVMLightClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L119">      svmFactory.setC(sigma);</span>
+<span class="nc" id="L120">      classifier = svmFactory.trainClassifier(trainSet);</span>
+<span class="nc" id="L121">    } else {</span>
+<span class="nc" id="L122">      throw new RuntimeException(&quot;Invalid classifier type: &quot; + relationExtractorClassifierType);</span>
+    }
+<span class="nc bnc" id="L124" title="All 2 branches missed.">    if (logger.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L125">      reportWeights(classifier, null);</span>
+    }
+<span class="nc" id="L127">  }</span>
+
+  protected static void reportWeights(LinearClassifier&lt;String, String&gt; classifier, String classLabel) {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    if (classLabel != null) logger.fine(&quot;CLASSIFIER WEIGHTS FOR LABEL &quot; + classLabel);</span>
+<span class="nc" id="L131">    Map&lt;String, Counter&lt;String&gt;&gt; labelsToFeatureWeights = classifier.weightsAsMapOfCounters();</span>
+<span class="nc" id="L132">    List&lt;String&gt; labels = new ArrayList&lt;&gt;(labelsToFeatureWeights.keySet());</span>
+<span class="nc" id="L133">    Collections.sort(labels);</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">    for (String label: labels) {</span>
+<span class="nc" id="L135">      Counter&lt;String&gt; featWeights = labelsToFeatureWeights.get(label);</span>
+<span class="nc" id="L136">      List&lt;Pair&lt;String, Double&gt;&gt; sorted = Counters.toSortedListWithCounts(featWeights);</span>
+<span class="nc" id="L137">      StringBuilder bos = new StringBuilder();</span>
+<span class="nc" id="L138">      bos.append(&quot;WEIGHTS FOR LABEL &quot;).append(label).append(':');</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">      for (Pair&lt;String, Double&gt; feat: sorted) {</span>
+<span class="nc" id="L140">        bos.append(' ').append(feat.first()).append(':').append(feat.second()+&quot;\n&quot;);</span>
+<span class="nc" id="L141">      }</span>
+<span class="nc" id="L142">      logger.fine(bos.toString());</span>
+<span class="nc" id="L143">    }</span>
+<span class="nc" id="L144">  }</span>
+
+  protected String classOf(Datum&lt;String, String&gt; datum, ExtractionObject rel) {
+<span class="nc" id="L147">    Counter&lt;String&gt; probs = classifier.probabilityOf(datum);</span>
+<span class="nc" id="L148">    List&lt;Pair&lt;String, Double&gt;&gt; sortedProbs = Counters.toDescendingMagnitudeSortedListWithCounts(probs);</span>
+<span class="nc" id="L149">    double nrProb = probs.getCount(RelationMention.UNRELATED);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">    for(Pair&lt;String, Double&gt; choice: sortedProbs){</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">      if(choice.first.equals(RelationMention.UNRELATED)) return choice.first;</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">      if(nrProb &gt;= choice.second) return RelationMention.UNRELATED; // no prediction, all probs have the same value</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      if(compatibleLabel(choice.first, rel)) return choice.first;</span>
+<span class="nc" id="L154">    }</span>
+<span class="nc" id="L155">    return RelationMention.UNRELATED;</span>
+  }
+
+  private boolean compatibleLabel(String label, ExtractionObject rel) {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    if(rel == null) return true;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">    if(validator != null) return validator.validLabel(label, rel);</span>
+<span class="nc" id="L161">    return true;</span>
+  }
+
+  protected Counter&lt;String&gt; probabilityOf(Datum&lt;String, String&gt; testDatum) {
+<span class="nc" id="L165">    return classifier.probabilityOf(testDatum);</span>
+  }
+
+  protected void justificationOf(Datum&lt;String, String&gt; testDatum, PrintWriter pw, String label) {
+<span class="nc" id="L169">    classifier.justificationOf(testDatum, pw);</span>
+<span class="nc" id="L170">  }</span>
+
+  /**
+   * Predict a relation for each pair of entities in the sentence; including relations of type unrelated.
+   * This creates new RelationMention objects!
+   */
+  protected List&lt;RelationMention&gt; extractAllRelations(CoreMap sentence) {
+<span class="nc" id="L177">    List&lt;RelationMention&gt; extractions = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L179">    List&lt;RelationMention&gt; cands = null;</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">    if(createUnrelatedRelations){</span>
+      // creates all possible relations between all entities in the sentence
+<span class="nc" id="L182">      cands = AnnotationUtils.getAllUnrelatedRelations(relationMentionFactory, sentence, false);</span>
+    } else {
+      // just take the candidates produced by the reader (in KBP)
+<span class="nc" id="L185">      cands = sentence.get(MachineReadingAnnotations.RelationMentionsAnnotation.class);</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">      if(cands == null){</span>
+<span class="nc" id="L187">        cands = new ArrayList&lt;&gt;();</span>
+      }
+    }
+
+    // the actual classification takes place here!
+<span class="nc bnc" id="L192" title="All 2 branches missed.">    for (RelationMention rel : cands) {</span>
+<span class="nc" id="L193">      Datum&lt;String, String&gt; testDatum = createDatum(rel);</span>
+<span class="nc" id="L194">      String label = classOf(testDatum, rel);</span>
+<span class="nc" id="L195">      Counter&lt;String&gt; probs = probabilityOf(testDatum);</span>
+<span class="nc" id="L196">      double prob = probs.getCount(label);</span>
+<span class="nc" id="L197">      StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L198">      PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">      if (logger.isLoggable(Level.INFO)) {</span>
+<span class="nc" id="L200">        justificationOf(testDatum, pw, label);</span>
+      }
+<span class="nc" id="L202">      logger.info(&quot;Current sentence: &quot; + AnnotationUtils.tokensAndNELabelsToString(rel.getArg(0).getSentence()) + &quot;\n&quot;</span>
+              + &quot;Classifying relation: &quot; + rel + &quot;\n&quot;
+<span class="nc" id="L204">              + &quot;JUSTIFICATION for label GOLD:&quot; + rel.getType() + &quot; SYS:&quot; + label + &quot; (prob:&quot; + prob + &quot;):\n&quot;</span>
+<span class="nc" id="L205">              + sw.toString());</span>
+<span class="nc" id="L206">      logger.info(&quot;Justification done.&quot;);</span>
+<span class="nc" id="L207">      RelationMention relation = relationMentionFactory.constructRelationMention(</span>
+<span class="nc" id="L208">              rel.getObjectId(),</span>
+              sentence,
+<span class="nc" id="L210">              rel.getExtent(),</span>
+              label,
+              null,
+<span class="nc" id="L213">              rel.getArgs(),</span>
+              probs);
+<span class="nc" id="L215">      extractions.add(relation);</span>
+
+<span class="nc bnc" id="L217" title="All 2 branches missed.">      if(! relation.getType().equals(rel.getType())){</span>
+<span class="nc" id="L218">        logger.info(&quot;Classification: found different type &quot; + relation.getType() + &quot; for relation: &quot; + rel);</span>
+<span class="nc" id="L219">        logger.info(&quot;The predicted relation is: &quot; + relation);</span>
+<span class="nc" id="L220">        logger.info(&quot;Current sentence: &quot; + AnnotationUtils.tokensAndNELabelsToString(rel.getArg(0).getSentence()));</span>
+      } else{
+<span class="nc" id="L222">        logger.info(&quot;Classification: found similar type &quot; + relation.getType() + &quot; for relation: &quot; + rel);</span>
+<span class="nc" id="L223">        logger.info(&quot;The predicted relation is: &quot; + relation);</span>
+<span class="nc" id="L224">        logger.info(&quot;Current sentence: &quot; + AnnotationUtils.tokensAndNELabelsToString(rel.getArg(0).getSentence()));</span>
+      }
+<span class="nc" id="L226">    }</span>
+<span class="nc" id="L227">    return extractions;</span>
+  }
+
+  public List&lt;String&gt; annotateMulticlass(List&lt;Datum&lt;String, String&gt;&gt; testDatums) {
+<span class="nc" id="L231">    List&lt;String&gt; predictedLabels = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L233" title="All 2 branches missed.">    for (Datum&lt;String, String&gt; testDatum: testDatums) {</span>
+<span class="nc" id="L234">      String label = classOf(testDatum, null);</span>
+<span class="nc" id="L235">      Counter&lt;String&gt; probs = probabilityOf(testDatum);</span>
+<span class="nc" id="L236">      double prob = probs.getCount(label);</span>
+
+<span class="nc" id="L238">      StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L239">      PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">      if (logger.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L241">        justificationOf(testDatum, pw, label);</span>
+      }
+<span class="nc" id="L243">      logger.fine(&quot;JUSTIFICATION for label GOLD:&quot; + testDatum.label() + &quot; SYS:&quot; + label + &quot; (prob:&quot; + prob + &quot;):\n&quot;</span>
+<span class="nc" id="L244">              + sw.toString() + &quot;\nJustification done.&quot;);</span>
+<span class="nc" id="L245">      predictedLabels.add(label);</span>
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">      if(! testDatum.label().equals(label)){</span>
+<span class="nc" id="L248">        logger.info(&quot;Classification: found different type &quot; + label + &quot; for relation: &quot; + testDatum);</span>
+      } else{
+<span class="nc" id="L250">        logger.info(&quot;Classification: found similar type &quot; + label + &quot; for relation: &quot; + testDatum);</span>
+      }
+<span class="nc" id="L252">    }</span>
+
+<span class="nc" id="L254">    return predictedLabels;</span>
+  }
+
+  public void annotateSentence(CoreMap sentence) {
+    // this stores all relation mentions generated by this extractor
+<span class="nc" id="L259">    List&lt;RelationMention&gt; relations = new ArrayList&lt;&gt;();</span>
+
+    // extractAllRelations creates new objects for every predicted relation
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    for (RelationMention rel : extractAllRelations(sentence)) {</span>
+      // add all relations. potentially useful for a joint model
+      // if (! RelationMention.isUnrelatedLabel(rel.getType()))
+<span class="nc" id="L265">      relations.add(rel);</span>
+
+<span class="nc" id="L267">    }</span>
+
+    // caution: this removes the old list of relation mentions!
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    for (RelationMention r: relations) {</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">      if (! r.getType().equals(RelationMention.UNRELATED)) {</span>
+<span class="nc" id="L272">        logger.fine(&quot;Found positive relation in annotateSentence: &quot; + r);</span>
+      }
+<span class="nc" id="L274">    }</span>
+<span class="nc" id="L275">    sentence.set(MachineReadingAnnotations.RelationMentionsAnnotation.class, relations);</span>
+<span class="nc" id="L276">  }</span>
+
+  @Override
+  public void annotate(Annotation dataset) {
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    for (CoreMap sentence : dataset.get(CoreAnnotations.SentencesAnnotation.class)){</span>
+<span class="nc" id="L281">      annotateSentence(sentence);</span>
+<span class="nc" id="L282">    }</span>
+<span class="nc" id="L283">  }</span>
+
+  protected GeneralDataset&lt;String, String&gt; createDataset(Annotation corpus) {
+<span class="nc" id="L286">    GeneralDataset&lt;String, String&gt; dataset = new RVFDataset&lt;&gt;();</span>
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    for (CoreMap sentence : corpus.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">      for (RelationMention rel : AnnotationUtils.getAllRelations(relationMentionFactory, sentence, createUnrelatedRelations)) {</span>
+<span class="nc" id="L290">        dataset.add(createDatum(rel));</span>
+<span class="nc" id="L291">      }</span>
+<span class="nc" id="L292">    }</span>
+
+<span class="nc" id="L294">    dataset.applyFeatureCountThreshold(featureCountThreshold);</span>
+<span class="nc" id="L295">    return dataset;</span>
+  }
+
+  protected Datum&lt;String, String&gt; createDatum(RelationMention rel) {
+<span class="nc bnc" id="L299" title="All 4 branches missed.">    assert(featureFactory != null);</span>
+<span class="nc" id="L300">    return featureFactory.createDatum(rel);</span>
+  }
+
+  protected Datum&lt;String, String&gt; createDatum(RelationMention rel, String label) {
+<span class="nc bnc" id="L304" title="All 4 branches missed.">    assert(featureFactory != null);</span>
+<span class="nc" id="L305">    Datum&lt;String, String&gt; datum = featureFactory.createDatum(rel, label);</span>
+<span class="nc" id="L306">    return datum;</span>
+  }
+
+  @Override
+  public void setLoggerLevel(Level level) {
+<span class="nc" id="L311">    logger.setLevel(level);</span>
+<span class="nc" id="L312">  }</span>
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

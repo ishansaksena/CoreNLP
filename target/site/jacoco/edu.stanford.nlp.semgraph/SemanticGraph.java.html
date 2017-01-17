@@ -1,0 +1,2043 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SemanticGraph.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.semgraph</a> &gt; <span class="el_source">SemanticGraph.java</span></div><h1>SemanticGraph.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.semgraph;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.graph.DirectedMultiGraph;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.TwoDimensionalCounter;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.util.CollectionUtils;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.MapFactory;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringParsingTask;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.io.Serializable;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static edu.stanford.nlp.trees.GrammaticalRelation.ROOT;
+
+// todo [cdm 2013]: The treatment of roots in this class should probably be redone.
+// todo [cdm 2013]: Probably we should put fake root node in graph and arc(s) from it.
+// todo [cdm 2013]: At any rate, printing methods should print the root
+
+/**
+ * Represents a semantic graph of a sentence or document, with IndexedWord
+ * objects for nodes.
+ * &lt;p&gt;
+ * Notes:
+ * &lt;br&gt;
+ * The root is not at present represented as a vertex in the graph.
+ * At present you need to get a root/roots
+ * from the separate roots variable and to know about it.
+ * This should maybe be changed, because otherwise, doing things like
+ * simply getting the set of nodes or edges from the graph doesn't give
+ * you root nodes or edges.
+ * &lt;br&gt;
+ * Given the kinds of representations that we normally use with
+ * typedDependenciesCollapsed, there can be (small) cycles in a
+ * SemanticGraph, and these cycles may involve the node that is conceptually the
+ * root of the graph, so there may be no node without a parent node. You can
+ * better get at the root(s) via the variable and methods provided.
+ * &lt;br&gt;
+ * There is no mechanism for returning all edges at once (eg &lt;code&gt;edgeSet()&lt;/code&gt;).
+ * This is intentional.  Use &lt;code&gt;edgeIterable()&lt;/code&gt; to iterate over the edges if necessary.
+ *
+ * @author Christopher Cox
+ * @author Teg Grenager
+ * @see SemanticGraphEdge
+ * @see IndexedWord
+ */
+public class SemanticGraph implements Serializable  {
+
+  /** A logger for this class */
+<span class="fc" id="L60">  private static Redwood.RedwoodChannels log = Redwood.channels(SemanticGraph.class);</span>
+
+  public static final boolean addSRLArcs = false;
+
+<span class="fc" id="L64">  private static final SemanticGraphFormatter formatter = new SemanticGraphFormatter();</span>
+
+  /**
+   * The distinguished root vertices, if known.
+   */
+  private final Collection&lt;IndexedWord&gt; roots;
+
+  private final DirectedMultiGraph&lt;IndexedWord, SemanticGraphEdge&gt; graph;
+
+<span class="fc" id="L73">  private static final MapFactory&lt;IndexedWord, Map&lt;IndexedWord, List&lt;SemanticGraphEdge&gt;&gt;&gt; outerMapFactory = MapFactory.hashMapFactory();</span>
+<span class="fc" id="L74">  private static final MapFactory&lt;IndexedWord, List&lt;SemanticGraphEdge&gt;&gt; innerMapFactory = MapFactory.hashMapFactory();</span>
+<span class="fc" id="L75">  private static final MapFactory&lt;IndexedWord, IndexedWord&gt; wordMapFactory = MapFactory.hashMapFactory();</span>
+
+<span class="pc" id="L77">  private LinkedList&lt;String&gt; comments = new LinkedList&lt;&gt;();</span>
+
+  public int edgeCount() {
+<span class="nc" id="L80">    return graph.getNumEdges();</span>
+  }
+
+  public int outDegree(IndexedWord vertex) {
+<span class="fc" id="L84">    return graph.getOutDegree(vertex);</span>
+  }
+
+  public int inDegree(IndexedWord vertex) {
+<span class="fc" id="L88">    return graph.getInDegree(vertex);</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; getAllEdges(IndexedWord gov,
+                                             IndexedWord dep) {
+<span class="fc" id="L93">    return graph.getEdges(gov, dep);</span>
+  }
+
+  // TODO: this is a bad method to use because there can be multiple
+  // edges.  All users of this method should be switched to iterating
+  // over getAllEdges.  This has already been done for all uses
+  // outside RTE.
+  public SemanticGraphEdge getEdge(IndexedWord gov, IndexedWord dep) {
+<span class="fc" id="L101">    List&lt;SemanticGraphEdge&gt; edges = graph.getEdges(gov, dep);</span>
+<span class="pc bpc" id="L102" title="2 of 4 branches missed.">    if (edges == null || edges.isEmpty())</span>
+<span class="nc" id="L103">      return null;</span>
+<span class="fc" id="L104">    return edges.get(0);</span>
+  }
+
+  public void addVertex(IndexedWord vertex) {
+<span class="fc" id="L108">    graph.addVertex(vertex);</span>
+<span class="fc" id="L109">  }</span>
+
+  public boolean containsVertex(IndexedWord vertex) {
+<span class="fc" id="L112">    return graph.containsVertex(vertex);</span>
+  }
+
+  public boolean containsEdge(IndexedWord source, IndexedWord target) {
+<span class="fc" id="L116">    return graph.isEdge(source, target);</span>
+  }
+
+  public boolean containsEdge(SemanticGraphEdge edge) {
+<span class="nc" id="L120">    return containsEdge(edge.getSource(), edge.getTarget());</span>
+  }
+
+  public Set&lt;IndexedWord&gt; vertexSet() {
+<span class="fc" id="L124">    return graph.getAllVertices();</span>
+  }
+
+  public boolean removeEdge(SemanticGraphEdge e) {
+<span class="fc" id="L128">    return graph.removeEdge(e.getSource(), e.getTarget(), e);</span>
+  }
+
+  public boolean removeVertex(IndexedWord vertex) {
+<span class="fc" id="L132">    return graph.removeVertex(vertex);</span>
+  }
+
+  /**
+   * This returns an ordered list of vertices (based upon their
+   * indices in the sentence). This creates and sorts a list, so
+   * prefer vertexSet unless you have a good reason to want nodes in
+   * index order.
+   *
+   * @return Ordered list of vertices
+   */
+  public List&lt;IndexedWord&gt; vertexListSorted() {
+<span class="fc" id="L144">    ArrayList&lt;IndexedWord&gt; vlist = new ArrayList&lt;&gt;(vertexSet());</span>
+<span class="fc" id="L145">    Collections.sort(vlist);</span>
+<span class="fc" id="L146">    return vlist;</span>
+  }
+
+  /**
+   * Returns an ordered list of edges in the graph.
+   * This creates and sorts a list, so prefer edgeIterable().
+   *
+   * @return A ordered list of edges in the graph.
+   */
+  public List&lt;SemanticGraphEdge&gt; edgeListSorted() {
+<span class="nc" id="L156">    ArrayList&lt;SemanticGraphEdge&gt; edgeList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">    for (SemanticGraphEdge edge : edgeIterable()) {</span>
+<span class="nc" id="L158">      edgeList.add(edge);</span>
+<span class="nc" id="L159">    }</span>
+<span class="nc" id="L160">    Collections.sort(edgeList, SemanticGraphEdge.orderByTargetComparator());</span>
+<span class="nc" id="L161">    return edgeList;</span>
+  }
+
+  public Iterable&lt;SemanticGraphEdge&gt; edgeIterable() {
+<span class="fc" id="L165">    return graph.edgeIterable();</span>
+  }
+
+  public Iterator&lt;SemanticGraphEdge&gt; outgoingEdgeIterator(IndexedWord v) {
+<span class="fc" id="L169">    return graph.outgoingEdgeIterator(v);</span>
+  }
+
+  public Iterable&lt;SemanticGraphEdge&gt; outgoingEdgeIterable(IndexedWord v) {
+<span class="fc" id="L173">    return graph.outgoingEdgeIterable(v);</span>
+  }
+
+  public Iterator&lt;SemanticGraphEdge&gt; incomingEdgeIterator(IndexedWord v) {
+<span class="fc" id="L177">    return graph.incomingEdgeIterator(v);</span>
+  }
+
+  public Iterable&lt;SemanticGraphEdge&gt; incomingEdgeIterable(IndexedWord v) {
+<span class="fc" id="L181">    return graph.incomingEdgeIterable(v);</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; outgoingEdgeList(IndexedWord v) {
+<span class="fc" id="L185">    return CollectionUtils.toList(outgoingEdgeIterable(v));</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; incomingEdgeList(IndexedWord v) {
+<span class="nc" id="L189">    return CollectionUtils.toList(incomingEdgeIterable(v));</span>
+  }
+
+  public boolean isEmpty() {
+<span class="fc" id="L193">    return graph.isEmpty();</span>
+  }
+
+  /**
+   * Searches up to 2 levels to determine how far ancestor is from child (i.e.,
+   * returns 1 if &quot;ancestor&quot; is a parent, or 2 if ancestor is a grandparent.
+   *
+   * @param child
+   *          candidate child
+   * @param ancestor
+   *          candidate ancestor
+   * @return the number of generations between &quot;child&quot; and &quot;ancestor&quot; (1 is an
+   *         immediate parent), or -1 if there is no relationship found.
+   */
+  public int isAncestor(IndexedWord child, IndexedWord ancestor) {
+
+<span class="fc" id="L209">    Set&lt;IndexedWord&gt; parents = this.getParents(child);</span>
+<span class="fc bfc" id="L210" title="All 2 branches covered.">    if (parents.contains(ancestor)) {</span>
+<span class="fc" id="L211">      return 1;</span>
+    }
+<span class="fc bfc" id="L213" title="All 2 branches covered.">    for (IndexedWord parent : parents) {</span>
+<span class="fc" id="L214">      Set&lt;IndexedWord&gt; grandparents = this.getParents(parent);</span>
+<span class="fc bfc" id="L215" title="All 2 branches covered.">      if (grandparents.contains(ancestor)) {</span>
+<span class="fc" id="L216">        return 2;</span>
+      }
+<span class="fc" id="L218">    }</span>
+<span class="fc" id="L219">    return -1;</span>
+  }
+
+  /**
+   * Return the maximum distance to a least common ancestor. We only search as
+   * high as grandparents. We return -1 if no common parent or grandparent is
+   * found.
+   *
+   * @return The maximum distance to a least common ancestor.
+   */
+  public int commonAncestor(IndexedWord v1, IndexedWord v2) {
+<span class="fc bfc" id="L230" title="All 2 branches covered.">    if (v1.equals(v2)) {</span>
+<span class="fc" id="L231">      return 0;</span>
+    }
+
+<span class="fc" id="L234">    Set&lt;IndexedWord&gt; v1Parents = this.getParents(v1);</span>
+<span class="fc" id="L235">    Set&lt;IndexedWord&gt; v2Parents = this.getParents(v2);</span>
+<span class="fc" id="L236">    Set&lt;IndexedWord&gt; v1GrandParents = wordMapFactory.newSet();</span>
+<span class="fc" id="L237">    Set&lt;IndexedWord&gt; v2GrandParents = wordMapFactory.newSet();</span>
+
+<span class="fc bfc" id="L239" title="All 4 branches covered.">    if (v1Parents.contains(v2) || v2Parents.contains(v1)) {</span>
+<span class="fc" id="L240">      return 1;</span>
+    }
+
+    // does v1 have any parents that are v2's parents?
+<span class="fc bfc" id="L244" title="All 2 branches covered.">    for (IndexedWord v1Parent : v1Parents) {</span>
+<span class="fc bfc" id="L245" title="All 2 branches covered.">      if (v2Parents.contains(v1Parent)) {</span>
+<span class="fc" id="L246">        return 1;</span>
+      }
+<span class="fc" id="L248">      v1GrandParents.addAll(this.getParents(v1Parent));</span>
+<span class="fc" id="L249">    }</span>
+    // build v2 grandparents
+<span class="fc bfc" id="L251" title="All 2 branches covered.">    for (IndexedWord v2Parent : v2Parents) {</span>
+<span class="fc" id="L252">      v2GrandParents.addAll(this.getParentList(v2Parent));</span>
+<span class="fc" id="L253">    }</span>
+<span class="fc bfc" id="L254" title="All 4 branches covered.">    if (v1GrandParents.contains(v2) || v2GrandParents.contains(v1)) {</span>
+<span class="fc" id="L255">      return 2;</span>
+    }
+    // Are any of v1's parents a grandparent of v2?
+<span class="fc bfc" id="L258" title="All 2 branches covered.">    for (IndexedWord v2GrandParent : v2GrandParents) {</span>
+<span class="fc bfc" id="L259" title="All 2 branches covered.">      if (v1Parents.contains(v2GrandParent)) {</span>
+<span class="fc" id="L260">        return 2;</span>
+      }
+<span class="fc" id="L262">    }</span>
+    // Are any of v2's parents a grandparent of v1?
+<span class="fc bfc" id="L264" title="All 2 branches covered.">    for (IndexedWord v1GrandParent : v1GrandParents) {</span>
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">      if (v2Parents.contains(v1GrandParent)) {</span>
+<span class="fc" id="L266">        return 2;</span>
+      }
+<span class="nc" id="L268">    }</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">    for (IndexedWord v2GrandParent : v2GrandParents) {</span>
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">      if (v1GrandParents.contains(v2GrandParent)) {</span>
+<span class="nc" id="L271">        return 2;</span>
+      }
+<span class="fc" id="L273">    }</span>
+<span class="fc" id="L274">    return -1;</span>
+  }
+
+  /**
+   * Returns the least common ancestor. We only search as high as grandparents.
+   * We return null if no common parent or grandparent is found. Any of the
+   * input words can also be the answer if one is the parent or grandparent of
+   * other, or if the input words are the same.
+   *
+   * @return The least common ancestor.
+   */
+  public IndexedWord getCommonAncestor(IndexedWord v1, IndexedWord v2) {
+<span class="fc bfc" id="L286" title="All 2 branches covered.">    if (v1.equals(v2)) {</span>
+<span class="fc" id="L287">      return v1;</span>
+    }
+
+<span class="fc bfc" id="L290" title="All 2 branches covered.">    if (this.isAncestor(v1, v2) &gt;= 1) {</span>
+<span class="fc" id="L291">      return v2;</span>
+    }
+
+<span class="fc bfc" id="L294" title="All 2 branches covered.">    if (this.isAncestor(v2, v1) &gt;= 1) {</span>
+<span class="fc" id="L295">      return v1;</span>
+    }
+
+<span class="fc" id="L298">    Set&lt;IndexedWord&gt; v1Parents = this.getParents(v1);</span>
+<span class="fc" id="L299">    Set&lt;IndexedWord&gt; v2Parents = this.getParents(v2);</span>
+<span class="fc" id="L300">    Set&lt;IndexedWord&gt; v1GrandParents = wordMapFactory.newSet();</span>
+<span class="fc" id="L301">    Set&lt;IndexedWord&gt; v2GrandParents = wordMapFactory.newSet();</span>
+    // does v1 have any parents that are v2's parents?
+
+<span class="fc bfc" id="L304" title="All 2 branches covered.">    for (IndexedWord v1Parent : v1Parents) {</span>
+<span class="fc bfc" id="L305" title="All 2 branches covered.">      if (v2Parents.contains(v1Parent)) {</span>
+<span class="fc" id="L306">        return v1Parent;</span>
+      }
+<span class="fc" id="L308">      v1GrandParents.addAll(this.getParents(v1Parent));</span>
+<span class="fc" id="L309">    }</span>
+    // does v1 have any grandparents that are v2's parents?
+<span class="fc bfc" id="L311" title="All 2 branches covered.">    for (IndexedWord v1GrandParent : v1GrandParents) {</span>
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">      if (v2Parents.contains(v1GrandParent)) {</span>
+<span class="nc" id="L313">        return v1GrandParent;</span>
+      }
+<span class="fc" id="L315">    }</span>
+    // build v2 grandparents
+<span class="fc bfc" id="L317" title="All 2 branches covered.">    for (IndexedWord v2Parent : v2Parents) {</span>
+<span class="fc" id="L318">      v2GrandParents.addAll(this.getParents(v2Parent));</span>
+<span class="fc" id="L319">    }</span>
+    // does v1 have any parents or grandparents that are v2's grandparents?
+<span class="fc bfc" id="L321" title="All 2 branches covered.">    for (IndexedWord v2GrandParent : v2GrandParents) {</span>
+<span class="fc bfc" id="L322" title="All 2 branches covered.">      if (v1Parents.contains(v2GrandParent)) {</span>
+<span class="fc" id="L323">        return v2GrandParent;</span>
+      }
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">      if (v1GrandParents.contains(v2GrandParent)) {</span>
+<span class="nc" id="L326">        return v2GrandParent;</span>
+      }
+<span class="fc" id="L328">    }</span>
+<span class="fc" id="L329">    return null;</span>
+  }
+
+  // todo [cdm 2013]: Completely RTE-specific methods like this one should be used to a static class of helper methods under RTE
+  // If &quot;det&quot; is true, the search for a child is restricted to the &quot;determiner&quot;
+  // grammatical relation.
+  public boolean matchPatternToVertex(String pattern, IndexedWord vertex, boolean det) {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L337">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc" id="L339">    String pat = pattern.replaceAll(&quot;&lt;&quot;, &quot;,&lt;&quot;);</span>
+<span class="nc" id="L340">    pat = pat.replaceAll(&quot;&gt;&quot;, &quot;,&gt;&quot;);</span>
+<span class="nc" id="L341">    String[] nodePath = pat.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">    for (String s : nodePath) {</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">      if (s.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L344">        continue;</span>
+      }
+<span class="nc" id="L346">      String word = s.substring(1);</span>
+<span class="nc" id="L347">      char dir = s.charAt(0);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">      if (dir == '&lt;') {</span>
+        // look for a matching parent
+<span class="nc" id="L350">        boolean match = false;</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        for (IndexedWord parent : getParents(vertex)) {</span>
+<span class="nc" id="L352">          String lemma = parent.get(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">          if (lemma.equals(word)) {</span>
+<span class="nc" id="L354">            match = true;</span>
+<span class="nc" id="L355">            break;</span>
+          }
+<span class="nc" id="L357">        }</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        if (!match) {</span>
+<span class="nc" id="L359">          return false;</span>
+        }
+<span class="nc bnc" id="L361" title="All 2 branches missed.">      } else if (dir == '&gt;') {</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        if (det) {</span>
+          // look for a matching child with &quot;det&quot; relation
+<span class="nc" id="L364">          Set&lt;IndexedWord&gt; children = wordMapFactory.newSet();</span>
+<span class="nc" id="L365">          children.addAll(getChildrenWithReln(vertex, EnglishGrammaticalRelations.DETERMINER));</span>
+<span class="nc" id="L366">          children.addAll(getChildrenWithReln(vertex, EnglishGrammaticalRelations.PREDETERMINER));</span>
+<span class="nc" id="L367">          boolean match = false;</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">          for (IndexedWord child : children) {</span>
+<span class="nc" id="L369">            String lemma = child.get(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            if (lemma.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L371">              lemma = child.word().toLowerCase();</span>
+            }
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            if (lemma.equals(word)) {</span>
+<span class="nc" id="L374">              match = true;</span>
+<span class="nc" id="L375">              break;</span>
+            }
+<span class="nc" id="L377">          }</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">          if (!match) {</span>
+<span class="nc" id="L379">            return false;</span>
+          }
+<span class="nc" id="L381">        } else {// take any relation, except &quot;det&quot;</span>
+<span class="nc" id="L382">          List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; children = childPairs(vertex);</span>
+<span class="nc" id="L383">          boolean match = false;</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">          for (Pair&lt;GrammaticalRelation, IndexedWord&gt; pair : children) {</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">            if (pair.first().toString().equals(&quot;det&quot;))</span>
+<span class="nc" id="L386">              continue;</span>
+<span class="nc" id="L387">            IndexedWord child = pair.second();</span>
+<span class="nc" id="L388">            String lemma = child.get(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (lemma.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L390">              lemma = child.word().toLowerCase();</span>
+            }
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (lemma.equals(word)) {</span>
+<span class="nc" id="L393">              match = true;</span>
+<span class="nc" id="L394">              break;</span>
+            }
+<span class="nc" id="L396">          }</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">          if (!match) {</span>
+<span class="nc" id="L398">            return false;</span>
+          }
+<span class="nc" id="L400">        }</span>
+      } else {
+<span class="nc" id="L402">        throw new RuntimeException(&quot;Warning: bad pattern \&quot;%s\&quot;\n&quot; + pattern);</span>
+      }
+    }
+<span class="nc" id="L405">    return true;</span>
+  }
+
+  // todo [cdm 2013]: Completely RTE-specific methods like this one should be used to a static class of helper methods under RTE
+  public boolean matchPatternToVertex(String pattern, IndexedWord vertex) {
+<span class="nc bnc" id="L410" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L411">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc" id="L413">    String pat = pattern.replaceAll(&quot;&lt;&quot;, &quot;,&lt;&quot;);</span>
+<span class="nc" id="L414">    pat = pat.replaceAll(&quot;&gt;&quot;, &quot;,&gt;&quot;);</span>
+<span class="nc" id="L415">    String[] nodePath = pat.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">    for (String s : nodePath) {</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">      if (s.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L418">        continue;</span>
+      }
+<span class="nc" id="L420">      String word = s.substring(1);</span>
+<span class="nc" id="L421">      char dir = s.charAt(0);</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">      if (dir == '&lt;') {</span>
+        // look for a matching parent
+<span class="nc" id="L424">        boolean match = false;</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        for (IndexedWord parent : getParents(vertex)) {</span>
+<span class="nc" id="L426">          String lemma = parent.get(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">          if (lemma.equals(word)) {</span>
+<span class="nc" id="L428">            match = true;</span>
+<span class="nc" id="L429">            break;</span>
+          }
+<span class="nc" id="L431">        }</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        if (!match) {</span>
+<span class="nc" id="L433">          return false;</span>
+        }
+<span class="nc bnc" id="L435" title="All 2 branches missed.">      } else if (dir == '&gt;') {</span>
+        // look for a matching child
+<span class="nc" id="L437">        boolean match = false;</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        for (IndexedWord child : getChildren(vertex)) {</span>
+<span class="nc" id="L439">          String lemma = child.get(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L440" title="All 4 branches missed.">          if (lemma == null || lemma.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L441">            lemma = child.word().toLowerCase();</span>
+          }
+<span class="nc bnc" id="L443" title="All 2 branches missed.">          if (lemma.equals(word)) {</span>
+<span class="nc" id="L444">            match = true;</span>
+<span class="nc" id="L445">            break;</span>
+          }
+<span class="nc" id="L447">        }</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        if (!match) {</span>
+<span class="nc" id="L449">          return false;</span>
+        }
+<span class="nc" id="L451">      } else {</span>
+<span class="nc" id="L452">        throw new RuntimeException(&quot;Warning: bad pattern \&quot;%s\&quot;\n&quot; + pattern);</span>
+      }
+    }
+<span class="nc" id="L455">    return true;</span>
+  }
+
+  public List&lt;IndexedWord&gt; getChildList(IndexedWord vertex) {
+<span class="nc bnc" id="L459" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L460">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc" id="L462">    List&lt;IndexedWord&gt; result = new ArrayList&lt;&gt;(getChildren(vertex));</span>
+<span class="nc" id="L463">    Collections.sort(result);</span>
+<span class="nc" id="L464">    return result;</span>
+  }
+
+  public Set&lt;IndexedWord&gt; getChildren(IndexedWord vertex) {
+<span class="pc bpc" id="L468" title="1 of 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L469">      throw new IllegalArgumentException();</span>
+    }
+<span class="fc" id="L471">    return graph.getChildren(vertex);</span>
+  }
+
+  public boolean hasChildren(IndexedWord vertex) {
+<span class="fc" id="L475">    return outgoingEdgeIterator(vertex).hasNext();</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; getIncomingEdgesSorted(IndexedWord vertex) {
+<span class="nc" id="L479">    List&lt;SemanticGraphEdge&gt; edges = incomingEdgeList(vertex);</span>
+<span class="nc" id="L480">    Collections.sort(edges);</span>
+<span class="nc" id="L481">    return edges;</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; getOutEdgesSorted(IndexedWord vertex) {
+<span class="fc" id="L485">    List&lt;SemanticGraphEdge&gt; edges = outgoingEdgeList(vertex);</span>
+<span class="fc" id="L486">    Collections.sort(edges);</span>
+<span class="fc" id="L487">    return edges;</span>
+  }
+
+  public List&lt;IndexedWord&gt; getParentList(IndexedWord vertex) {
+<span class="pc bpc" id="L491" title="1 of 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L492">      throw new IllegalArgumentException();</span>
+    }
+<span class="fc" id="L494">    List&lt;IndexedWord&gt; result = new ArrayList&lt;&gt;(getParents(vertex));</span>
+<span class="fc" id="L495">    Collections.sort(result);</span>
+<span class="fc" id="L496">    return result;</span>
+  }
+
+  public Set&lt;IndexedWord&gt; getParents(IndexedWord vertex) {
+<span class="pc bpc" id="L500" title="1 of 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L501">      throw new IllegalArgumentException();</span>
+    }
+<span class="fc" id="L503">    return graph.getParents(vertex);</span>
+  }
+
+  /**
+   * Method for getting the siblings of a particular node. Siblings are the
+   * other children of your parent, where parent is determined as the parent
+   * returned by getParent
+   *
+   * @return collection of sibling nodes (does not include vertex)
+   *         the collection is empty if your parent is null
+   */
+  public Collection&lt;IndexedWord&gt; getSiblings(IndexedWord vertex) {
+<span class="fc" id="L515">    IndexedWord parent = this.getParent(vertex);</span>
+<span class="fc bfc" id="L516" title="All 2 branches covered.">    if (parent != null) {</span>
+<span class="fc" id="L517">      Set&lt;IndexedWord&gt; result = wordMapFactory.newSet();</span>
+<span class="fc" id="L518">      result.addAll(this.getChildren(parent));</span>
+<span class="fc" id="L519">      result.remove(vertex);//remove this vertex - you're not your own sibling</span>
+<span class="fc" id="L520">      return result;</span>
+    } else {
+<span class="fc" id="L522">      return Collections.emptySet();</span>
+    }
+  }
+
+  /**
+   * Helper function for the public function with the same name.
+   * &lt;br&gt;
+   * Builds up the list backwards.
+   */
+  private List&lt;IndexedWord&gt; getPathToRoot(IndexedWord vertex, List&lt;IndexedWord&gt; used) {
+<span class="fc" id="L532">    used.add(vertex);</span>
+
+    // TODO: Apparently the order of the nodes in the path to the root
+    // makes a difference for the RTE system.  Look into this some more
+<span class="fc" id="L536">    List&lt;IndexedWord&gt; parents = getParentList(vertex);</span>
+    // Set&lt;IndexedWord&gt; parents = wordMapFactory.newSet();
+    // parents.addAll(getParents(vertex));
+<span class="fc" id="L539">    parents.removeAll(used);</span>
+
+<span class="fc bfc" id="L541" title="All 4 branches covered.">    if (roots.contains(vertex) || (parents.isEmpty())) {</span>
+<span class="fc" id="L542">      used.remove(used.size() - 1);</span>
+<span class="fc bfc" id="L543" title="All 2 branches covered.">      if (roots.contains(vertex))</span>
+<span class="fc" id="L544">        return Generics.newArrayList();</span>
+      else
+<span class="fc" id="L546">        return null; // no path found</span>
+    }
+
+<span class="pc bpc" id="L549" title="1 of 2 branches missed.">    for (IndexedWord parent : parents) {</span>
+<span class="fc" id="L550">      List&lt;IndexedWord&gt; path = getPathToRoot(parent, used);</span>
+<span class="pc bpc" id="L551" title="1 of 2 branches missed.">      if (path != null) {</span>
+<span class="fc" id="L552">        path.add(parent);</span>
+<span class="fc" id="L553">        used.remove(used.size() - 1);</span>
+<span class="fc" id="L554">        return path;</span>
+      }
+<span class="nc" id="L556">    }</span>
+
+<span class="nc" id="L558">    used.remove(used.size() - 1);</span>
+<span class="nc" id="L559">    return null;</span>
+
+  }
+
+  /**
+   * Find the path from the given node to a root. The path does not include the
+   * given node. Returns an empty list if vertex is a root. Returns null if a
+   * root is inaccessible (should never happen).
+   */
+  public List&lt;IndexedWord&gt; getPathToRoot(IndexedWord vertex) {
+<span class="fc" id="L569">    List&lt;IndexedWord&gt; path = getPathToRoot(vertex, Generics.&lt;IndexedWord&gt;newArrayList());</span>
+<span class="fc bfc" id="L570" title="All 2 branches covered.">    if (path != null) Collections.reverse(path);</span>
+<span class="fc" id="L571">    return path;</span>
+  }
+
+  /**
+   * Return the real syntactic parent of vertex.
+   */
+  public IndexedWord getParent(IndexedWord vertex) {
+<span class="fc" id="L578">    List&lt;IndexedWord&gt; path = getPathToRoot(vertex);</span>
+
+<span class="fc bfc" id="L580" title="All 4 branches covered.">    if (path != null &amp;&amp; path.size() &gt; 0)</span>
+<span class="fc" id="L581">      return path.get(0);</span>
+    else
+<span class="fc" id="L583">      return null;</span>
+  }
+
+  /**
+   * Returns the &lt;em&gt;first&lt;/em&gt; {@link edu.stanford.nlp.ling.IndexedWord
+   * IndexedWord} in this {@code SemanticGraph} having the given integer index,
+   * or throws {@code IllegalArgumentException} if no such node is found.
+   */
+  public IndexedWord getNodeByIndex(int index) throws IllegalArgumentException {
+<span class="fc" id="L592">    IndexedWord node = getNodeByIndexSafe(index);</span>
+<span class="pc bpc" id="L593" title="1 of 2 branches missed.">    if (node == null)</span>
+<span class="nc" id="L594">      throw new IllegalArgumentException(&quot;No SemanticGraph vertex with index &quot; + index);</span>
+    else
+<span class="fc" id="L596">      return node;</span>
+  }
+
+  /**
+   * Same as above, but returns {@code null} if the index does not exist
+   * (instead of throwing an exception).
+   */
+  public IndexedWord getNodeByIndexSafe(int index) {
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">    for (IndexedWord vertex : vertexSet()) {</span>
+<span class="fc bfc" id="L605" title="All 2 branches covered.">      if (vertex.index() == index) {</span>
+<span class="fc" id="L606">        return vertex;</span>
+      }
+<span class="fc" id="L608">    }</span>
+<span class="nc" id="L609">    return null;</span>
+  }
+
+  /**
+   * Returns the &lt;i&gt;first&lt;/i&gt; {@link edu.stanford.nlp.ling.IndexedWord
+   * IndexedWord} in this &lt;code&gt;SemanticGraph&lt;/code&gt; having the given word or
+   * regex, or return null if no such found.
+   */
+  public IndexedWord getNodeByWordPattern(String pattern) {
+<span class="fc" id="L618">    Pattern p = Pattern.compile(pattern);</span>
+<span class="pc bpc" id="L619" title="1 of 2 branches missed.">    for (IndexedWord vertex : vertexSet()) {</span>
+<span class="fc" id="L620">      String w = vertex.word();</span>
+<span class="pc bpc" id="L621" title="4 of 8 branches missed.">      if ((w == null &amp;&amp; pattern == null) || w != null &amp;&amp; p.matcher(w).matches()) {</span>
+<span class="fc" id="L622">        return vertex;</span>
+      }
+<span class="fc" id="L624">    }</span>
+<span class="nc" id="L625">    return null;</span>
+  }
+
+  /**
+   * Returns all nodes of type {@link edu.stanford.nlp.ling.IndexedWord
+   * IndexedWord} in this &lt;code&gt;SemanticGraph&lt;/code&gt; having the given word or
+   * regex, or returns empty list if no such found.
+   */
+  public List&lt;IndexedWord&gt; getAllNodesByWordPattern(String pattern) {
+<span class="nc" id="L634">    Pattern p = Pattern.compile(pattern);</span>
+<span class="nc" id="L635">    List&lt;IndexedWord&gt; nodes = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">    for (IndexedWord vertex : vertexSet()) {</span>
+<span class="nc" id="L637">      String w = vertex.word();</span>
+<span class="nc bnc" id="L638" title="All 8 branches missed.">      if ((w == null &amp;&amp; pattern == null) || w != null &amp;&amp; p.matcher(w).matches()) {</span>
+<span class="nc" id="L639">        nodes.add(vertex);</span>
+      }
+<span class="nc" id="L641">    }</span>
+<span class="nc" id="L642">    return nodes;</span>
+  }
+
+  public List&lt;IndexedWord&gt; getAllNodesByPartOfSpeechPattern(String pattern) {
+<span class="nc" id="L646">    Pattern p = Pattern.compile(pattern);</span>
+<span class="nc" id="L647">    List&lt;IndexedWord&gt; nodes = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">    for (IndexedWord vertex : vertexSet()) {</span>
+<span class="nc" id="L649">      String pos = vertex.tag();</span>
+<span class="nc bnc" id="L650" title="All 8 branches missed.">      if ((pos == null &amp;&amp; pattern == null) || pos != null &amp;&amp; p.matcher(pos).matches()) {</span>
+<span class="nc" id="L651">        nodes.add(vertex);</span>
+      }
+<span class="nc" id="L653">    }</span>
+<span class="nc" id="L654">    return nodes;</span>
+  }
+
+  /**
+   * Returns the set of descendants governed by this node in the graph.
+   *
+   */
+  public Set&lt;IndexedWord&gt; descendants(IndexedWord vertex) {
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L663">      throw new IllegalArgumentException();</span>
+    }
+    // Do a depth first search
+<span class="fc" id="L666">    Set&lt;IndexedWord&gt; descendantSet = wordMapFactory.newSet();</span>
+<span class="fc" id="L667">    descendantsHelper(vertex, descendantSet);</span>
+<span class="fc" id="L668">    return descendantSet;</span>
+  }
+
+  private void descendantsHelper(IndexedWord curr, Set&lt;IndexedWord&gt; descendantSet) {
+<span class="pc bpc" id="L672" title="1 of 2 branches missed.">    if (descendantSet.contains(curr)) {</span>
+<span class="nc" id="L673">      return;</span>
+    }
+<span class="fc" id="L675">    descendantSet.add(curr);</span>
+<span class="fc bfc" id="L676" title="All 2 branches covered.">    for (IndexedWord child : getChildren(curr)) {</span>
+<span class="fc" id="L677">      descendantsHelper(child, descendantSet);</span>
+<span class="fc" id="L678">    }</span>
+<span class="fc" id="L679">  }</span>
+
+  /**
+   * Returns a list of pairs of a relation name and the child
+   * IndexedFeatureLabel that bears that relation.
+   */
+  public List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; childPairs(IndexedWord vertex) {
+<span class="pc bpc" id="L686" title="1 of 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L687">      throw new IllegalArgumentException();</span>
+    }
+    List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; childPairs =
+<span class="fc" id="L690">      Generics.newArrayList();</span>
+<span class="fc bfc" id="L691" title="All 2 branches covered.">    for (SemanticGraphEdge e : outgoingEdgeIterable(vertex)) {</span>
+<span class="fc" id="L692">      childPairs.add(new Pair&lt;&gt;(e.getRelation(), e.getTarget()));</span>
+<span class="fc" id="L693">    }</span>
+<span class="fc" id="L694">    return childPairs;</span>
+  }
+
+  /**
+   * Returns a list of pairs of a relation name and the parent
+   * IndexedFeatureLabel to which we bear that relation.
+   */
+  public List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; parentPairs(IndexedWord vertex) {
+<span class="pc bpc" id="L702" title="1 of 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L703">      throw new IllegalArgumentException();</span>
+    }
+<span class="fc" id="L705">    List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; parentPairs = Generics.newArrayList();</span>
+<span class="fc bfc" id="L706" title="All 2 branches covered.">    for (SemanticGraphEdge e : incomingEdgeIterable(vertex)) {</span>
+<span class="fc" id="L707">      parentPairs.add(new Pair&lt;&gt;(e.getRelation(), e.getSource()));</span>
+<span class="fc" id="L708">    }</span>
+<span class="fc" id="L709">    return parentPairs;</span>
+  }
+
+  /**
+   * Returns a set of relations which this node has with its parents.
+   *
+   * @return The set of relations which this node has with its parents.
+   */
+  public Set&lt;GrammaticalRelation&gt; relns(IndexedWord vertex) {
+<span class="nc bnc" id="L718" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L719">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc" id="L721">    Set&lt;GrammaticalRelation&gt; relns = Generics.newHashSet();</span>
+<span class="nc" id="L722">    List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; pairs = parentPairs(vertex);</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">    for (Pair&lt;GrammaticalRelation, IndexedWord&gt; p : pairs) {</span>
+<span class="nc" id="L724">      relns.add(p.first());</span>
+<span class="nc" id="L725">    }</span>
+<span class="nc" id="L726">    return relns;</span>
+  }
+
+  /**
+   * Returns the relation that node a has with node b.
+   * &lt;br&gt;
+   * Note: there may be multiple arcs between &lt;code&gt;a&lt;/code&gt; and
+   * &lt;code&gt;b&lt;/code&gt;, and this method only returns one relation.
+   */
+  public GrammaticalRelation reln(IndexedWord a, IndexedWord b) {
+<span class="pc bpc" id="L736" title="1 of 2 branches missed.">    if (!containsVertex(a)) {</span>
+<span class="nc" id="L737">      throw new IllegalArgumentException();</span>
+    }
+
+<span class="fc" id="L740">    List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; pairs = childPairs(a);</span>
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">    for (Pair&lt;GrammaticalRelation, IndexedWord&gt; p : pairs)</span>
+<span class="fc bfc" id="L742" title="All 2 branches covered.">      if (p.second().equals(b))</span>
+<span class="fc" id="L743">        return p.first();</span>
+
+<span class="nc" id="L745">    return null;</span>
+  }
+
+  /**
+   * Returns a list of relations which this node has with its children.
+   */
+  public Set&lt;GrammaticalRelation&gt; childRelns(IndexedWord vertex) {
+<span class="nc bnc" id="L752" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L753">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc" id="L755">    Set&lt;GrammaticalRelation&gt; relns = Generics.newHashSet();</span>
+<span class="nc" id="L756">    List&lt;Pair&lt;GrammaticalRelation, IndexedWord&gt;&gt; pairs = childPairs(vertex);</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">    for (Pair&lt;GrammaticalRelation, IndexedWord&gt; p : pairs) {</span>
+<span class="nc" id="L758">      relns.add(p.first());</span>
+<span class="nc" id="L759">    }</span>
+<span class="nc" id="L760">    return relns;</span>
+  }
+
+  public Collection&lt;IndexedWord&gt; getRoots() {
+<span class="fc" id="L764">    return roots;</span>
+  }
+
+  /**
+   * Initially looks for nodes which have no incoming arcs. If there are any, it
+   * returns a list of them. If not, it looks for nodes from which every other
+   * node is reachable. If there are any, it returns a list of them. Otherwise,
+   * it returns an empty list.
+   *
+   * @return A list of root nodes or an empty list.
+   */
+  private List&lt;IndexedWord&gt; getVerticesWithoutParents() {
+<span class="fc" id="L776">    List&lt;IndexedWord&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L777" title="All 2 branches covered.">    for (IndexedWord v : vertexSet()) {</span>
+<span class="fc" id="L778">      int inDegree = inDegree(v);</span>
+<span class="fc bfc" id="L779" title="All 2 branches covered.">      if (inDegree == 0) {</span>
+<span class="fc" id="L780">        result.add(v);</span>
+      }
+<span class="fc" id="L782">    }</span>
+<span class="fc" id="L783">    Collections.sort(result);</span>
+<span class="fc" id="L784">    return result;</span>
+  }
+
+  /** Returns the (first) root of this SemanticGraph. */
+  public IndexedWord getFirstRoot() {
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">    if (roots.isEmpty())</span>
+<span class="nc" id="L790">      throw new RuntimeException(&quot;No roots in graph:\n&quot; + this</span>
+          + &quot;\nFind where this graph was created and make sure you're adding roots.&quot;);
+<span class="fc" id="L792">    return roots.iterator().next();</span>
+  }
+
+  public void addRoot(IndexedWord root) {
+<span class="fc" id="L796">    addVertex(root);</span>
+<span class="fc" id="L797">    roots.add(root);</span>
+<span class="fc" id="L798">  }</span>
+
+  /**
+   * This method should not be used if possible. TODO: delete it
+   *
+   * Recomputes the roots, based of actual candidates. This is done to
+   * ensure a rooted tree after a sequence of edits. If the none of the vertices
+   * can act as a root (due to a cycle), keep old rootset, retaining only the
+   * existing vertices on that list.
+   *
+   * TODO: this cannot deal with &quot;Hamburg is a city which everyone likes&quot;, as
+   * the intended root node,'Hamburg, is also the dobj of the relative clause. A
+   * possible solution would be to create edgeset routines that allow filtering
+   * over a predicate, and specifically filter out dobj relations for choosing
+   * next best candidate. This could also be useful for dealing with
+   * non-syntactic arcs in the future. TODO: There is also the possibility the
+   * roots could be empty at the end, and will need to be resolved. TODO:
+   * determine if this is a reasonably correct solution.
+   */
+  public void resetRoots() {
+<span class="fc" id="L818">    Collection&lt;IndexedWord&gt; newRoots = getVerticesWithoutParents();</span>
+<span class="pc bpc" id="L819" title="1 of 2 branches missed.">    if (newRoots.size() &gt; 0) {</span>
+<span class="fc" id="L820">      roots.clear();</span>
+<span class="fc" id="L821">      roots.addAll(newRoots);</span>
+<span class="fc" id="L822">      return;</span>
+    }
+
+    /*
+     * else { Collection&lt;IndexedWord&gt; oldRoots = new
+     * ArrayList&lt;IndexedWord&gt;(roots); for (IndexedWord oldRoot : oldRoots) { if
+     * (!containsVertex(oldRoot)) removeVertex(oldRoot); } }
+     */
+
+    // If no apparent root candidates are available, likely due to loop back
+    // edges (rcmod), find the node that dominates the most nodes, and let
+    // that be the new root. Note this implementation epitomizes K.I.S.S., and
+    // is brain dead and non-optimal, and will require further work.
+<span class="nc" id="L835">    TwoDimensionalCounter&lt;IndexedWord, IndexedWord&gt; nodeDists = TwoDimensionalCounter.identityHashMapCounter();</span>
+<span class="nc bnc" id="L836" title="All 2 branches missed.">    for (IndexedWord node1 : vertexSet()) {</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">      for (IndexedWord node2 : vertexSet()) {</span>
+        // want directed paths only
+<span class="nc" id="L839">        List&lt;SemanticGraphEdge&gt; path = getShortestDirectedPathEdges(node1, node2);</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        if (path != null) {</span>
+<span class="nc" id="L841">          int dist = path.size();</span>
+<span class="nc" id="L842">          nodeDists.setCount(node1, node2, dist);</span>
+        }
+<span class="nc" id="L844">      }</span>
+<span class="nc" id="L845">    }</span>
+
+    // K.I.S.S. alg: just sum up and see who's on top, values don't have much
+    // meaning outside of determining dominance.
+<span class="nc" id="L849">    ClassicCounter&lt;IndexedWord&gt; dominatedEdgeCount = ClassicCounter.identityHashMapCounter();</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">    for (IndexedWord outer : vertexSet()) {</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">      for (IndexedWord inner : vertexSet()) {</span>
+<span class="nc" id="L852">        dominatedEdgeCount.incrementCount(outer, nodeDists.getCount(outer, inner));</span>
+<span class="nc" id="L853">      }</span>
+<span class="nc" id="L854">    }</span>
+
+<span class="nc" id="L856">    IndexedWord winner = Counters.argmax(dominatedEdgeCount);</span>
+    // TODO: account for multiply rooted graphs later
+<span class="nc" id="L858">    setRoot(winner);</span>
+
+<span class="nc" id="L860">  }</span>
+
+  public void setRoot(IndexedWord word) {
+<span class="fc" id="L863">    roots.clear();</span>
+<span class="fc" id="L864">    roots.add(word);</span>
+<span class="fc" id="L865">  }</span>
+
+  public void setRoots(Collection&lt;IndexedWord&gt; words) {
+<span class="fc" id="L868">    roots.clear();</span>
+<span class="fc" id="L869">    roots.addAll(words);</span>
+<span class="fc" id="L870">  }</span>
+
+  /**
+   *
+   * @return A sorted list of the vertices
+   * @throws IllegalStateException if this graph is not a DAG
+   */
+  public List&lt;IndexedWord&gt; topologicalSort() {
+<span class="fc" id="L878">    return graph.topologicalSort();</span>
+  }
+
+  /**
+   * Does the given &lt;code&gt;vertex&lt;/code&gt; have at least one child with the given {@code reln} and the lemma &lt;code&gt;childLemma&lt;/code&gt;?
+   */
+  public boolean hasChild(IndexedWord vertex, GrammaticalRelation reln, String childLemma) {
+<span class="nc bnc" id="L885" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L886">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc bnc" id="L888" title="All 2 branches missed.">    for (SemanticGraphEdge edge : outgoingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">      if (edge.getRelation().equals(reln)) {</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        if (edge.getTarget().get(CoreAnnotations.LemmaAnnotation.class).equals(childLemma)) {</span>
+<span class="nc" id="L891">          return true;</span>
+        }
+      }
+<span class="nc" id="L894">    }</span>
+<span class="nc" id="L895">    return false;</span>
+  }
+
+  /**
+   * Does the given &lt;code&gt;vertex&lt;/code&gt; have at least one child with the given {@code reln}?
+   */
+  public boolean hasChildWithReln(IndexedWord vertex, GrammaticalRelation reln) {
+<span class="nc bnc" id="L902" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L903">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc bnc" id="L905" title="All 2 branches missed.">    for (SemanticGraphEdge edge : outgoingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L906" title="All 2 branches missed.">      if (edge.getRelation().equals(reln)) {</span>
+<span class="nc" id="L907">        return true;</span>
+      }
+<span class="nc" id="L909">    }</span>
+<span class="nc" id="L910">    return false;</span>
+  }
+
+  /**
+   * Returns true if vertex has an incoming relation reln
+   *
+   * @param vertex A node in this graph
+   * @param reln The relation we want to check
+   * @return true if vertex has an incoming relation reln
+   */
+  public boolean hasParentWithReln(IndexedWord vertex, GrammaticalRelation reln) {
+<span class="nc bnc" id="L921" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L922">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc bnc" id="L924" title="All 2 branches missed.">    for (SemanticGraphEdge edge : incomingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">      if (edge.getRelation().equals(reln)) {</span>
+<span class="nc" id="L926">        return true;</span>
+      }
+<span class="nc" id="L928">    }</span>
+<span class="nc" id="L929">    return false;</span>
+  }
+
+  /**
+   * Returns the first IndexedFeatureLabel bearing a certain grammatical
+   * relation, or null if none.
+   */
+  public IndexedWord getChildWithReln(IndexedWord vertex, GrammaticalRelation reln) {
+<span class="nc bnc" id="L937" title="All 2 branches missed.">    if (vertex.equals(IndexedWord.NO_WORD))</span>
+<span class="nc" id="L938">      return null;</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">    if (!containsVertex(vertex))</span>
+<span class="nc" id="L940">      throw new IllegalArgumentException();</span>
+
+<span class="nc bnc" id="L942" title="All 2 branches missed.">    for (SemanticGraphEdge edge : outgoingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">      if (edge.getRelation().equals(reln)) {</span>
+<span class="nc" id="L944">        return edge.getTarget();</span>
+      }
+<span class="nc" id="L946">    }</span>
+<span class="nc" id="L947">    return null;</span>
+  }
+
+  /**
+   * Returns a set of all parents bearing a certain grammatical relation, or an
+   * empty set if none.
+   */
+  public Set&lt;IndexedWord&gt; getParentsWithReln(IndexedWord vertex, GrammaticalRelation reln) {
+<span class="nc bnc" id="L955" title="All 2 branches missed.">    if (vertex.equals(IndexedWord.NO_WORD))</span>
+<span class="nc" id="L956">      return Collections.emptySet();</span>
+<span class="nc bnc" id="L957" title="All 2 branches missed.">    if (!containsVertex(vertex))</span>
+<span class="nc" id="L958">      throw new IllegalArgumentException();</span>
+
+<span class="nc" id="L960">    Set&lt;IndexedWord&gt; parentList = wordMapFactory.newSet();</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">    for (SemanticGraphEdge edge : incomingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L962" title="All 2 branches missed.">      if (edge.getRelation().equals(reln)) {</span>
+<span class="nc" id="L963">        parentList.add(edge.getSource());</span>
+      }
+<span class="nc" id="L965">    }</span>
+<span class="nc" id="L966">    return parentList;</span>
+  }
+
+  /**
+   * Returns a set of all children bearing a certain grammatical relation, or
+   * an empty set if none.
+   */
+  public Set&lt;IndexedWord&gt; getChildrenWithReln(IndexedWord vertex, GrammaticalRelation reln) {
+<span class="nc bnc" id="L974" title="All 2 branches missed.">    if (vertex.equals(IndexedWord.NO_WORD))</span>
+<span class="nc" id="L975">      return Collections.emptySet();</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">    if (!containsVertex(vertex))</span>
+<span class="nc" id="L977">      throw new IllegalArgumentException();</span>
+
+<span class="nc" id="L979">    Set&lt;IndexedWord&gt; childList = wordMapFactory.newSet();</span>
+<span class="nc bnc" id="L980" title="All 2 branches missed.">    for (SemanticGraphEdge edge : outgoingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L981" title="All 2 branches missed.">      if (edge.getRelation().equals(reln)) {</span>
+<span class="nc" id="L982">        childList.add(edge.getTarget());</span>
+      }
+<span class="nc" id="L984">    }</span>
+<span class="nc" id="L985">    return childList;</span>
+  }
+
+  /**
+   * Returns a set of all children bearing one of a set of grammatical
+   * relations, or an empty set if none.
+   *
+   * NOTE: this will only work for relation types that are classes. Those that
+   * are collapsed are currently not handled correctly since they are identified
+   * by strings.
+   */
+  public Set&lt;IndexedWord&gt; getChildrenWithRelns(IndexedWord vertex, Collection&lt;GrammaticalRelation&gt; relns) {
+<span class="nc bnc" id="L997" title="All 2 branches missed.">    if (vertex.equals(IndexedWord.NO_WORD))</span>
+<span class="nc" id="L998">      return Collections.emptySet();</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L1000">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc" id="L1002">    Set&lt;IndexedWord&gt; childList = wordMapFactory.newSet();</span>
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">    for (SemanticGraphEdge edge : outgoingEdgeIterable(vertex)) {</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">      if (relns.contains(edge.getRelation())) {</span>
+<span class="nc" id="L1005">        childList.add(edge.getTarget());</span>
+      }
+<span class="nc" id="L1007">    }</span>
+<span class="nc" id="L1008">    return childList;</span>
+  }
+
+  /**
+   * Given a governor, dependent, and the relation between them, returns the
+   * SemanticGraphEdge object of that arc if it exists, otherwise returns null.
+   */
+  public SemanticGraphEdge getEdge(IndexedWord gov, IndexedWord dep, GrammaticalRelation reln) {
+<span class="fc" id="L1016">    Collection&lt;SemanticGraphEdge&gt; edges = getAllEdges(gov, dep);</span>
+<span class="pc bpc" id="L1017" title="1 of 2 branches missed.">    if (edges != null) {</span>
+<span class="fc bfc" id="L1018" title="All 2 branches covered.">      for (SemanticGraphEdge edge : edges) {</span>
+<span class="pc bpc" id="L1019" title="1 of 2 branches missed.">        if (!edge.getSource().equals(gov))</span>
+<span class="nc" id="L1020">          continue;</span>
+<span class="pc bpc" id="L1021" title="1 of 2 branches missed.">        if ((edge.getRelation().equals(reln))) {</span>
+<span class="fc" id="L1022">          return edge;</span>
+        }
+<span class="nc" id="L1024">      }</span>
+    }
+<span class="fc" id="L1026">    return null;</span>
+  }
+
+  public boolean isNegatedVertex(IndexedWord vertex) {
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">    if (vertex == IndexedWord.NO_WORD) {</span>
+<span class="nc" id="L1031">      return false;</span>
+    }
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L1034">      throw new IllegalArgumentException(&quot;Vertex &quot; + vertex + &quot; not in graph &quot; + this);</span>
+    }
+
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">    return (hasChildWithReln(vertex, EnglishGrammaticalRelations.NEGATION_MODIFIER) ||</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">            hasChild(vertex, GrammaticalRelation.DEPENDENT, &quot;nor&quot;));</span>
+  }
+
+  private boolean isNegatedVerb(IndexedWord vertex) {
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">    if (!containsVertex(vertex)) {</span>
+<span class="nc" id="L1043">      throw new IllegalArgumentException();</span>
+    }
+<span class="nc bnc" id="L1045" title="All 4 branches missed.">    return (vertex.tag().startsWith(&quot;VB&quot;) &amp;&amp; isNegatedVertex(vertex));</span>
+  }
+
+  /**
+   * Check if the vertex is in a &quot;conditional&quot; context. Right now it's only
+   * returning true if vertex has an &quot;if&quot; marker attached to it, i.e. the vertex
+   * is in a clause headed by &quot;if&quot;.
+   */
+  public boolean isInConditionalContext(IndexedWord vertex) {
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">    for (IndexedWord child : getChildrenWithReln(vertex, EnglishGrammaticalRelations.MARKER)) {</span>
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">      if (child.word().equalsIgnoreCase(&quot;if&quot;)) {</span>
+<span class="nc" id="L1056">        return true;</span>
+      }
+<span class="nc" id="L1058">    }</span>
+<span class="nc" id="L1059">    return false;</span>
+  }
+
+  // Obsolete; use functions in rte.feat.NegPolarityFeaturizers instead
+
+  public boolean attachedNegatedVerb(IndexedWord vertex) {
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">    for (IndexedWord parent : getParents(vertex)) {</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">      if (isNegatedVerb(parent)) {</span>
+<span class="nc" id="L1067">        return true;</span>
+      }
+<span class="nc" id="L1069">    }</span>
+<span class="nc" id="L1070">    return false;</span>
+  }
+
+  /** Returns true iff this vertex stands in the &quot;aux&quot; relation to (any of)
+   *  its parent(s).
+   */
+  public boolean isAuxiliaryVerb(IndexedWord vertex) {
+<span class="nc" id="L1077">    Set&lt;GrammaticalRelation&gt; relns = relns(vertex);</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">    if (relns.isEmpty())</span>
+<span class="nc" id="L1079">      return false;</span>
+
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">    boolean result = relns.contains(EnglishGrammaticalRelations.AUX_MODIFIER)</span>
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">        || relns.contains(EnglishGrammaticalRelations.AUX_PASSIVE_MODIFIER);</span>
+    // log.info(&quot;I say &quot; + vertex + (result ? &quot; is&quot; : &quot; is not&quot;) +
+    // &quot; an aux&quot;);
+<span class="nc" id="L1085">    return result;</span>
+  }
+
+  public Set&lt;IndexedWord&gt; getLeafVertices() {
+<span class="fc" id="L1089">    Set&lt;IndexedWord&gt; result = wordMapFactory.newSet();</span>
+<span class="fc bfc" id="L1090" title="All 2 branches covered.">    for (IndexedWord v : vertexSet()) {</span>
+<span class="fc bfc" id="L1091" title="All 2 branches covered.">      if (outDegree(v) == 0) {</span>
+<span class="fc" id="L1092">        result.add(v);</span>
+      }
+<span class="fc" id="L1094">    }</span>
+<span class="fc" id="L1095">    return result;</span>
+  }
+
+  /**
+   * Returns the number of nodes in the graph
+   */
+  public int size() {
+<span class="fc" id="L1102">    return this.vertexSet().size();</span>
+  }
+
+
+  /**
+   * Returns all nodes reachable from &lt;code&gt;root&lt;/code&gt;.
+   *
+   * @param root the root node of the subgraph
+   * @return all nodes in subgraph
+   */
+  public Set&lt;IndexedWord&gt; getSubgraphVertices(IndexedWord root) {
+<span class="nc" id="L1113">    Set&lt;IndexedWord&gt; result = wordMapFactory.newSet();</span>
+<span class="nc" id="L1114">    result.add(root);</span>
+<span class="nc" id="L1115">    List&lt;IndexedWord&gt; queue = Generics.newLinkedList();</span>
+<span class="nc" id="L1116">    queue.add(root);</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">    while (! queue.isEmpty()) {</span>
+<span class="nc" id="L1118">      IndexedWord current = queue.remove(0);</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">      for (IndexedWord child : this.getChildren(current)) {</span>
+<span class="nc bnc" id="L1120" title="All 2 branches missed.">        if ( ! result.contains(child)) {</span>
+<span class="nc" id="L1121">          result.add(child);</span>
+<span class="nc" id="L1122">          queue.add(child);</span>
+        }
+<span class="nc" id="L1124">      }</span>
+<span class="nc" id="L1125">    }</span>
+<span class="nc" id="L1126">    return result;</span>
+  }
+
+  /**
+   * @return true if the graph contains no cycles.
+   */
+  public boolean isDag() {
+<span class="nc" id="L1133">    Set&lt;IndexedWord&gt; unused = wordMapFactory.newSet();</span>
+<span class="nc" id="L1134">    unused.addAll(vertexSet());</span>
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">    while (!unused.isEmpty()) {</span>
+<span class="nc" id="L1136">      IndexedWord arbitrary = unused.iterator().next();</span>
+<span class="nc" id="L1137">      boolean result = isDagHelper(arbitrary, unused, wordMapFactory.newSet());</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">      if (result) {</span>
+<span class="nc" id="L1139">        return false;</span>
+      }
+<span class="nc" id="L1141">    }</span>
+<span class="nc" id="L1142">    return true;</span>
+  }
+
+  /**
+   *
+   * @param root root node of the subgraph.
+   * @return true if the subgraph rooted at &lt;code&gt;root&lt;/code&gt; contains no cycles.
+   */
+
+  public boolean isDag(IndexedWord root) {
+<span class="nc" id="L1152">    Set&lt;IndexedWord&gt; unused = wordMapFactory.newSet();</span>
+<span class="nc" id="L1153">    unused.addAll(this.getSubgraphVertices(root));</span>
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">    while (!unused.isEmpty()) {</span>
+<span class="nc" id="L1155">      IndexedWord arbitrary = unused.iterator().next();</span>
+<span class="nc" id="L1156">      boolean result = isDagHelper(arbitrary, unused, wordMapFactory.newSet());</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">      if (result) {</span>
+<span class="nc" id="L1158">        return false;</span>
+      }
+<span class="nc" id="L1160">    }</span>
+<span class="nc" id="L1161">    return true;</span>
+  }
+
+
+  private boolean isDagHelper(IndexedWord current, Set&lt;IndexedWord&gt; unused, Set&lt;IndexedWord&gt; trail) {
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">    if (trail.contains(current)) {</span>
+<span class="nc" id="L1167">      return true;</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">    } else if (!unused.contains(current)) {</span>
+<span class="nc" id="L1169">      return false;</span>
+    }
+<span class="nc" id="L1171">    unused.remove(current);</span>
+<span class="nc" id="L1172">    trail.add(current);</span>
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">    for (IndexedWord child : getChildren(current)) {</span>
+<span class="nc" id="L1174">      boolean result = isDagHelper(child, unused, trail);</span>
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">      if (result) {</span>
+<span class="nc" id="L1176">        return true;</span>
+      }
+<span class="nc" id="L1178">    }</span>
+
+<span class="nc" id="L1180">    trail.remove(current);</span>
+<span class="nc" id="L1181">    return false;</span>
+  }
+
+  // ============================================================================
+  // String display
+  // ============================================================================
+
+  /**
+   * Recursive depth first traversal. Returns a structured representation of the
+   * dependency graph.
+   *
+   * Example:
+   *
+   * &lt;pre&gt;
+   *  -&gt; need-3 (root)
+   *    -&gt; We-0 (nsubj)
+   *    -&gt; do-1 (aux)
+   *    -&gt; n't-2 (neg)
+   *    -&gt; badges-6 (dobj)
+   *      -&gt; no-4 (det)
+   *      -&gt; stinking-5 (amod)
+   * &lt;/pre&gt;
+   *
+   * This is a quite ugly way to print a SemanticGraph.
+   * You might instead want to try {@link #toString(OutputFormat)}.
+   */
+  @Override
+  public String toString() {
+<span class="fc" id="L1209">    return toString(CoreLabel.OutputFormat.VALUE_TAG);</span>
+  }
+
+  public String toString(CoreLabel.OutputFormat wordFormat) {
+<span class="fc" id="L1213">    Collection&lt;IndexedWord&gt; rootNodes = getRoots();</span>
+<span class="pc bpc" id="L1214" title="1 of 2 branches missed.">    if (rootNodes.isEmpty()) {</span>
+      // Shouldn't happen, but return something!
+<span class="nc" id="L1216">      return toString(OutputFormat.READABLE);</span>
+    }
+
+<span class="fc" id="L1219">    StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L1220">    Set&lt;IndexedWord&gt; used = wordMapFactory.newSet();</span>
+<span class="fc bfc" id="L1221" title="All 2 branches covered.">    for (IndexedWord root : rootNodes) {</span>
+<span class="fc" id="L1222">      sb.append(&quot;-&gt; &quot;).append(root.toString(wordFormat)).append(&quot; (root)\n&quot;);</span>
+<span class="fc" id="L1223">      recToString(root, wordFormat, sb, 1, used);</span>
+<span class="fc" id="L1224">    }</span>
+<span class="fc" id="L1225">    Set&lt;IndexedWord&gt; nodes = wordMapFactory.newSet();</span>
+<span class="fc" id="L1226">    nodes.addAll(vertexSet());</span>
+<span class="fc" id="L1227">    nodes.removeAll(used);</span>
+<span class="pc bpc" id="L1228" title="1 of 2 branches missed.">    while (!nodes.isEmpty()) {</span>
+<span class="nc" id="L1229">      IndexedWord node = nodes.iterator().next();</span>
+<span class="nc" id="L1230">      sb.append(node.toString(wordFormat)).append(&quot;\n&quot;);</span>
+<span class="nc" id="L1231">      recToString(node, wordFormat, sb, 1, used);</span>
+<span class="nc" id="L1232">      nodes.removeAll(used);</span>
+<span class="nc" id="L1233">    }</span>
+<span class="fc" id="L1234">    return sb.toString();</span>
+  }
+
+  // helper for toString()
+  private void recToString(IndexedWord curr, CoreLabel.OutputFormat wordFormat, StringBuilder sb, int offset, Set&lt;IndexedWord&gt; used) {
+<span class="fc" id="L1239">    used.add(curr);</span>
+<span class="fc" id="L1240">    List&lt;SemanticGraphEdge&gt; edges = outgoingEdgeList(curr);</span>
+<span class="fc" id="L1241">    Collections.sort(edges);</span>
+<span class="fc bfc" id="L1242" title="All 2 branches covered.">    for (SemanticGraphEdge edge : edges) {</span>
+<span class="fc" id="L1243">      IndexedWord target = edge.getTarget();</span>
+<span class="fc" id="L1244">      sb.append(space(2 * offset)).append(&quot;-&gt; &quot;).append(target.toString(wordFormat)).append(&quot; (&quot;).append(edge.getRelation()).append(&quot;)\n&quot;);</span>
+<span class="pc bpc" id="L1245" title="1 of 2 branches missed.">      if (!used.contains(target)) { // recurse</span>
+<span class="fc" id="L1246">        recToString(target, wordFormat, sb, offset + 1, used);</span>
+      }
+<span class="fc" id="L1248">    }</span>
+<span class="fc" id="L1249">  }</span>
+
+  private static String space(int width) {
+<span class="fc" id="L1252">    StringBuilder b = new StringBuilder();</span>
+<span class="fc bfc" id="L1253" title="All 2 branches covered.">    for (int i = 0; i &lt; width; i++) {</span>
+<span class="fc" id="L1254">      b.append(' ');</span>
+    }
+<span class="fc" id="L1256">    return b.toString();</span>
+  }
+
+  public String toRecoveredSentenceString() {
+<span class="nc" id="L1260">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L1261">    boolean pastFirst = false;</span>
+<span class="nc bnc" id="L1262" title="All 2 branches missed.">    for (IndexedWord word : vertexListSorted()) {</span>
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">      if (pastFirst) {</span>
+<span class="nc" id="L1264">        sb.append(' ');</span>
+      }
+<span class="nc" id="L1266">      pastFirst = true;</span>
+<span class="nc" id="L1267">      sb.append(word.word());</span>
+<span class="nc" id="L1268">    }</span>
+<span class="nc" id="L1269">    return sb.toString();</span>
+  }
+
+  public String toRecoveredSentenceStringWithIndexMarking() {
+<span class="nc" id="L1273">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L1274">    boolean pastFirst = false;</span>
+<span class="nc" id="L1275">    int index = 0;</span>
+<span class="nc bnc" id="L1276" title="All 2 branches missed.">    for (IndexedWord word : vertexListSorted()) {</span>
+<span class="nc bnc" id="L1277" title="All 2 branches missed.">      if (pastFirst) {</span>
+<span class="nc" id="L1278">        sb.append(' ');</span>
+      }
+<span class="nc" id="L1280">      pastFirst = true;</span>
+<span class="nc" id="L1281">      sb.append(word.word());</span>
+<span class="nc" id="L1282">      sb.append(&quot;(&quot;);</span>
+<span class="nc" id="L1283">      sb.append(index++);</span>
+<span class="nc" id="L1284">      sb.append(&quot;)&quot;);</span>
+<span class="nc" id="L1285">    }</span>
+<span class="nc" id="L1286">    return sb.toString();</span>
+  }
+
+  /**
+   * Similar to &lt;code&gt;toRecoveredString&lt;/code&gt;, but will fill in words that were
+   * collapsed into relations (i.e. prep_for --&gt; 'for'). Mostly to deal with
+   * collapsed dependency trees.
+   *
+   * TODO: consider merging with toRecoveredString() NOTE: assumptions currently
+   * are for English. NOTE: currently takes immediate successors to current word
+   * and expands them. This assumption may not be valid for other conditions or
+   * languages?
+   */
+  public String toEnUncollapsedSentenceString() {
+<span class="nc" id="L1300">    List&lt;IndexedWord&gt; uncompressedList = Generics.newLinkedList(vertexSet());</span>
+<span class="nc" id="L1301">    List&lt;Pair&lt;String, IndexedWord&gt;&gt; specifics = Generics.newArrayList();</span>
+
+    // Collect the specific relations and the governed nodes, and then process
+    // them one by one,
+    // to avoid concurrent modification exceptions.
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">    for (IndexedWord word : vertexSet()) {</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">      for (SemanticGraphEdge edge : getIncomingEdgesSorted(word)) {</span>
+<span class="nc" id="L1308">        GrammaticalRelation relation = edge.getRelation();</span>
+        // Extract the specific: need to account for possibility that relation
+        // can
+        // be a String or GrammaticalRelation (how did it happen this way?)
+<span class="nc" id="L1312">        String specific = relation.getSpecific();</span>
+
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">        if (specific == null) {</span>
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">          if (edge.getRelation().equals(EnglishGrammaticalRelations.AGENT)) {</span>
+<span class="nc" id="L1316">            specific = &quot;by&quot;;</span>
+          }
+        }
+
+        // Insert the specific at the leftmost token that is not governed by
+        // this node.
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">        if (specific != null) {</span>
+<span class="nc" id="L1323">          Pair&lt;String, IndexedWord&gt; specPair = new Pair&lt;&gt;(specific, word);</span>
+<span class="nc" id="L1324">          specifics.add(specPair);</span>
+        }
+<span class="nc" id="L1326">      }</span>
+<span class="nc" id="L1327">    }</span>
+
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">    for (Pair&lt;String, IndexedWord&gt; tuple : specifics) {</span>
+<span class="nc" id="L1330">      insertSpecificIntoList(tuple.first(), tuple.second(), uncompressedList);</span>
+<span class="nc" id="L1331">    }</span>
+
+<span class="nc" id="L1333">    return StringUtils.join(uncompressedList, &quot; &quot;);</span>
+  }
+
+  /**
+   * Inserts the given specific portion of an uncollapsed relation back into the
+   * targetList
+   *
+   * @param specific Specific relation to put in.
+   * @param relnTgtNode Node governed by the uncollapsed relation
+   * @param tgtList Target List of words
+   */
+  private void insertSpecificIntoList(String specific, IndexedWord relnTgtNode, List&lt;IndexedWord&gt; tgtList) {
+<span class="nc" id="L1345">    int currIndex = tgtList.indexOf(relnTgtNode);</span>
+<span class="nc" id="L1346">    Set&lt;IndexedWord&gt; descendants = descendants(relnTgtNode);</span>
+<span class="nc" id="L1347">    IndexedWord specificNode = new IndexedWord();</span>
+<span class="nc" id="L1348">    specificNode.set(CoreAnnotations.LemmaAnnotation.class, specific);</span>
+<span class="nc" id="L1349">    specificNode.set(CoreAnnotations.TextAnnotation.class, specific);</span>
+<span class="nc" id="L1350">    specificNode.set(CoreAnnotations.OriginalTextAnnotation.class, specific);</span>
+<span class="nc bnc" id="L1351" title="All 4 branches missed.">    while ((currIndex &gt;= 1) &amp;&amp; descendants.contains(tgtList.get(currIndex - 1))) {</span>
+<span class="nc" id="L1352">      currIndex--;</span>
+    }
+<span class="nc" id="L1354">    tgtList.add(currIndex, specificNode);</span>
+<span class="nc" id="L1355">  }</span>
+
+
+
+<span class="nc" id="L1359">  public enum OutputFormat {</span>
+<span class="nc" id="L1360">    LIST, XML, READABLE, RECURSIVE</span>
+  }
+
+  /**
+   * Returns a String representation of the result of this set of typed
+   * dependencies in a user-specified format. Currently, four formats are
+   * supported ({@link OutputFormat}):
+   * &lt;dl&gt;
+   * &lt;dt&gt;list&lt;/dt&gt;
+   * &lt;dd&gt;(Default.) Formats the dependencies as logical relations, as
+   * exemplified by the following:
+   *
+   * &lt;pre&gt;
+   *  nsubj(died-1, Sam-0)
+   *  tmod(died-1, today-2)
+   * &lt;/pre&gt;
+   *
+   * &lt;/dd&gt;
+   * &lt;dt&gt;readable&lt;/dt&gt;
+   * &lt;dd&gt;Formats the dependencies as a table with columns &lt;code&gt;dependent&lt;/code&gt;, &lt;code&gt;relation&lt;/code&gt;, and &lt;code&gt;governor&lt;/code&gt;, as exemplified by the
+   * following:
+   *
+   * &lt;pre&gt;
+   *  Sam-0               nsubj               died-1
+   *  today-2             tmod                died-1
+   * &lt;/pre&gt;
+   *
+   * &lt;/dd&gt;
+   * &lt;dt&gt;xml&lt;/dt&gt;
+   * &lt;dd&gt;Formats the dependencies as XML, as exemplified by the following:
+   *
+   * &lt;pre&gt;
+   *  &amp;lt;dependencies&amp;gt;
+   *    &amp;lt;dep type=&quot;nsubj&quot;&amp;gt;
+   *      &amp;lt;governor idx=&quot;1&quot;&amp;gt;died&amp;lt;/governor&amp;gt;
+   *      &amp;lt;dependent idx=&quot;0&quot;&amp;gt;Sam&amp;lt;/dependent&amp;gt;
+   *    &amp;lt;/dep&amp;gt;
+   *    &amp;lt;dep type=&quot;tmod&quot;&amp;gt;
+   *      &amp;lt;governor idx=&quot;1&quot;&amp;gt;died&amp;lt;/governor&amp;gt;
+   *      &amp;lt;dependent idx=&quot;2&quot;&amp;gt;today&amp;lt;/dependent&amp;gt;
+   *    &amp;lt;/dep&amp;gt;
+   *  &amp;lt;/dependencies&amp;gt;
+   * &lt;/pre&gt;
+   * &lt;/dd&gt;
+   *
+   * &lt;dt&gt;recursive&lt;/dt&gt;
+   * &lt;dd&gt;
+   * The default output for {@link #toString()}
+   * &lt;/dd&gt;
+   *
+   * &lt;/dl&gt;
+   *
+   * @param format A {@code String} specifying the desired format
+   * @return A {@code String} representation of the typed dependencies in
+   *         this {@code GrammaticalStructure}
+   */
+  public String toString(OutputFormat format) {
+<span class="nc bnc" id="L1417" title="All 5 branches missed.">    switch(format) {</span>
+    case XML:
+<span class="nc" id="L1419">      return toXMLString();</span>
+    case READABLE:
+<span class="nc" id="L1421">      return toReadableString();</span>
+    case LIST:
+<span class="nc" id="L1423">      return toList();</span>
+    case RECURSIVE:
+<span class="nc" id="L1425">      return toString();</span>
+    default:
+<span class="nc" id="L1427">      throw new IllegalArgumentException(&quot;Unsupported format &quot; + format);</span>
+    }
+  }
+
+  /**
+   * Returns a String representation of this graph as a list of typed
+   * dependencies, as exemplified by the following:
+   *
+   * &lt;pre&gt;
+   *  nsubj(died-6, Sam-3)
+   *  tmod(died-6, today-9)
+   * &lt;/pre&gt;
+   *
+   * @return a &lt;code&gt;String&lt;/code&gt; representation of this set of typed
+   *         dependencies
+   */
+  public String toList() {
+<span class="nc" id="L1444">    StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L1445" title="All 2 branches missed.">    for (IndexedWord root : getRoots()) {</span>
+<span class="nc" id="L1446">      buf.append(&quot;root(ROOT-0, &quot;);</span>
+<span class="nc" id="L1447">      buf.append(root.toString(CoreLabel.OutputFormat.VALUE_INDEX)).append(&quot;)\n&quot;);</span>
+<span class="nc" id="L1448">    }</span>
+<span class="nc bnc" id="L1449" title="All 2 branches missed.">    for (SemanticGraphEdge edge : this.edgeListSorted()) {</span>
+<span class="nc" id="L1450">      buf.append(edge.getRelation().toString()).append(&quot;(&quot;);</span>
+<span class="nc" id="L1451">      buf.append(edge.getSource().toString(CoreLabel.OutputFormat.VALUE_INDEX)).append(&quot;, &quot;);</span>
+<span class="nc" id="L1452">      buf.append(edge.getTarget().toString(CoreLabel.OutputFormat.VALUE_INDEX)).append(&quot;)\n&quot;);</span>
+<span class="nc" id="L1453">    }</span>
+<span class="nc" id="L1454">    return buf.toString();</span>
+  }
+
+  /**
+   * Similar to toList(), but uses POS tags instead of word and index.
+   */
+  public String toPOSList() {
+<span class="nc" id="L1461">    StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L1462" title="All 2 branches missed.">    for (SemanticGraphEdge edge : this.edgeListSorted()) {</span>
+<span class="nc" id="L1463">      buf.append(edge.getRelation().toString()).append(&quot;(&quot;);</span>
+<span class="nc" id="L1464">      buf.append(edge.getSource().toString()).append(&quot;,&quot;);</span>
+<span class="nc" id="L1465">      buf.append(edge.getTarget()).append(&quot;)\n&quot;);</span>
+<span class="nc" id="L1466">    }</span>
+<span class="nc" id="L1467">    return buf.toString();</span>
+  }
+
+  private String toReadableString() {
+<span class="nc" id="L1471">    StringBuilder buf = new StringBuilder();</span>
+<span class="nc" id="L1472">    buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;, &quot;dep&quot;, &quot;reln&quot;, &quot;gov&quot;));</span>
+<span class="nc" id="L1473">    buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;, &quot;---&quot;, &quot;----&quot;, &quot;---&quot;));</span>
+<span class="nc bnc" id="L1474" title="All 2 branches missed.">    for (IndexedWord root : getRoots()) {</span>
+<span class="nc" id="L1475">      buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;, root.toString(CoreLabel.OutputFormat.VALUE_TAG_INDEX), &quot;root&quot;, &quot;root&quot;));</span>
+<span class="nc" id="L1476">    }</span>
+<span class="nc bnc" id="L1477" title="All 2 branches missed.">    for (SemanticGraphEdge edge : this.edgeListSorted()) {</span>
+<span class="nc" id="L1478">      buf.append(String.format(&quot;%-20s%-20s%-20s%n&quot;,</span>
+<span class="nc" id="L1479">          edge.getTarget().toString(CoreLabel.OutputFormat.VALUE_TAG_INDEX),</span>
+<span class="nc" id="L1480">          edge.getRelation().toString(),</span>
+<span class="nc" id="L1481">          edge.getSource().toString(CoreLabel.OutputFormat.VALUE_TAG_INDEX)));</span>
+<span class="nc" id="L1482">    }</span>
+<span class="nc" id="L1483">    return buf.toString();</span>
+  }
+
+  private String toXMLString() {
+<span class="nc" id="L1487">    StringBuilder buf = new StringBuilder(&quot;&lt;dependencies style=\&quot;typed\&quot;&gt;\n&quot;);</span>
+<span class="nc bnc" id="L1488" title="All 2 branches missed.">    for (SemanticGraphEdge edge : this.edgeListSorted()) {</span>
+<span class="nc" id="L1489">      String reln = edge.getRelation().toString();</span>
+<span class="nc" id="L1490">      String gov = (edge.getSource()).word();</span>
+<span class="nc" id="L1491">      int govIdx = (edge.getSource()).index();</span>
+<span class="nc" id="L1492">      String dep = (edge.getTarget()).word();</span>
+<span class="nc" id="L1493">      int depIdx = (edge.getTarget()).index();</span>
+<span class="nc" id="L1494">      buf.append(&quot;  &lt;dep type=\&quot;&quot;).append(reln).append(&quot;\&quot;&gt;\n&quot;);</span>
+<span class="nc" id="L1495">      buf.append(&quot;    &lt;governor idx=\&quot;&quot;).append(govIdx).append(&quot;\&quot;&gt;&quot;).append(gov).append(&quot;&lt;/governor&gt;\n&quot;);</span>
+<span class="nc" id="L1496">      buf.append(&quot;    &lt;dependent idx=\&quot;&quot;).append(depIdx).append(&quot;\&quot;&gt;&quot;).append(dep).append(&quot;&lt;/dependent&gt;\n&quot;);</span>
+<span class="nc" id="L1497">      buf.append(&quot;  &lt;/dep&gt;\n&quot;);</span>
+<span class="nc" id="L1498">    }</span>
+<span class="nc" id="L1499">    buf.append(&quot;&lt;/dependencies&gt;\n&quot;);</span>
+<span class="nc" id="L1500">    return buf.toString();</span>
+  }
+
+  public String toCompactString() {
+<span class="fc" id="L1504">    return toCompactString(false);</span>
+  }
+
+  public String toCompactString(boolean showTags) {
+<span class="fc" id="L1508">    StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L1509">    Set&lt;IndexedWord&gt; used = wordMapFactory.newSet();</span>
+<span class="fc" id="L1510">    Collection&lt;IndexedWord&gt; roots = getRoots();</span>
+<span class="pc bpc" id="L1511" title="1 of 2 branches missed.">    if (roots.isEmpty()) {</span>
+<span class="nc bnc" id="L1512" title="All 2 branches missed.">      if (size() == 0) {</span>
+<span class="nc" id="L1513">        return &quot;[EMPTY_SEMANTIC_GRAPH]&quot;;</span>
+      } else {
+<span class="nc" id="L1515">        return &quot;[UNROOTED_SEMANTIC_GRAPH]&quot;;</span>
+      }
+      // return toString(&quot;readable&quot;);
+    }
+<span class="fc bfc" id="L1519" title="All 2 branches covered.">    for (IndexedWord root : roots) {</span>
+<span class="fc" id="L1520">      toCompactStringHelper(root, sb, used, showTags);</span>
+<span class="fc" id="L1521">    }</span>
+<span class="fc" id="L1522">    return sb.toString();</span>
+  }
+
+  private void toCompactStringHelper(IndexedWord node, StringBuilder sb, Set&lt;IndexedWord&gt; used, boolean showTags) {
+<span class="fc" id="L1526">    used.add(node);</span>
+    try {
+<span class="fc bfc" id="L1528" title="All 2 branches covered.">      boolean isntLeaf = (outDegree(node) &gt; 0);</span>
+<span class="fc bfc" id="L1529" title="All 2 branches covered.">      if (isntLeaf) {</span>
+<span class="fc" id="L1530">        sb.append(&quot;[&quot;);</span>
+      }
+<span class="fc" id="L1532">      sb.append(node.word());</span>
+<span class="fc bfc" id="L1533" title="All 2 branches covered.">      if (showTags) {</span>
+<span class="fc" id="L1534">        sb.append(&quot;/&quot;);</span>
+<span class="fc" id="L1535">        sb.append(node.tag());</span>
+      }
+<span class="fc bfc" id="L1537" title="All 2 branches covered.">      for (SemanticGraphEdge edge : getOutEdgesSorted(node)) {</span>
+<span class="fc" id="L1538">        IndexedWord target = edge.getTarget();</span>
+<span class="fc" id="L1539">        sb.append(&quot; &quot;).append(edge.getRelation()).append(&quot;&gt;&quot;);</span>
+<span class="fc bfc" id="L1540" title="All 2 branches covered.">        if (!used.contains(target)) { // avoid infinite loop</span>
+<span class="fc" id="L1541">          toCompactStringHelper(target, sb, used, showTags);</span>
+        } else {
+<span class="fc" id="L1543">          sb.append(target.word());</span>
+<span class="pc bpc" id="L1544" title="1 of 2 branches missed.">          if (showTags) {</span>
+<span class="nc" id="L1545">            sb.append(&quot;/&quot;);</span>
+<span class="nc" id="L1546">            sb.append(target.tag());</span>
+          }
+        }
+<span class="fc" id="L1549">      }</span>
+<span class="fc bfc" id="L1550" title="All 2 branches covered.">      if (isntLeaf) {</span>
+<span class="fc" id="L1551">        sb.append(&quot;]&quot;);</span>
+      }
+<span class="nc" id="L1553">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1554">      log.info(&quot;WHOA!  SemanticGraph.toCompactStringHelper() ran into problems at node &quot; + node);</span>
+<span class="nc" id="L1555">      throw new IllegalArgumentException(e);</span>
+<span class="fc" id="L1556">    }</span>
+<span class="fc" id="L1557">  }</span>
+
+  /**
+   * Returns a &lt;code&gt;String&lt;/code&gt; representation of this semantic graph,
+   * formatted by the default semantic graph formatter.
+   */
+  public String toFormattedString() {
+<span class="nc" id="L1564">    return formatter.formatSemanticGraph(this);</span>
+  }
+
+  /**
+   * Returns a &lt;code&gt;String&lt;/code&gt; representation of this semantic graph,
+   * formatted by the supplied semantic graph formatter.
+   */
+  public String toFormattedString(SemanticGraphFormatter formatter) {
+<span class="nc" id="L1572">    return formatter.formatSemanticGraph(this);</span>
+  }
+
+  /**
+   * Pretty-prints this semantic graph to &lt;code&gt;System.out&lt;/code&gt;, formatted by
+   * the supplied semantic graph formatter.
+   */
+  public void prettyPrint(SemanticGraphFormatter formatter) {
+<span class="nc" id="L1580">    System.out.println(formatter.formatSemanticGraph(this));</span>
+<span class="nc" id="L1581">  }</span>
+
+  /**
+   * Pretty-prints this semantic graph to &lt;code&gt;System.out&lt;/code&gt;, formatted by
+   * the default semantic graph formatter.
+   */
+  public void prettyPrint() {
+<span class="fc" id="L1588">    System.out.println(formatter.formatSemanticGraph(this));</span>
+<span class="fc" id="L1589">  }</span>
+
+  /**
+   * Returns an unnamed dot format digraph.
+   * Nodes will be labeled with the word and edges will be labeled
+   * with the dependency.
+   */
+  public String toDotFormat() {
+<span class="nc" id="L1597">    return toDotFormat(&quot;&quot;);</span>
+  }
+
+  /**
+   * Returns a dot format digraph with the given name.
+   * Nodes will be labeled with the word and edges will be labeled
+   * with the dependency.
+   */
+  public String toDotFormat(String graphname) {
+<span class="nc" id="L1606">    return toDotFormat(graphname, CoreLabel.OutputFormat.VALUE_TAG_INDEX);</span>
+  }
+
+  public String toDotFormat(String graphname, CoreLabel.OutputFormat indexedWordFormat) {
+<span class="nc" id="L1610">    StringBuilder output = new StringBuilder();</span>
+<span class="nc" id="L1611">    output.append(&quot;digraph &quot; + graphname + &quot; {\n&quot;);</span>
+<span class="nc bnc" id="L1612" title="All 2 branches missed.">    for (IndexedWord word : graph.getAllVertices()) {</span>
+<span class="nc" id="L1613">      output.append(&quot;  N_&quot; + word.index() + &quot; [label=\&quot;&quot; +</span>
+<span class="nc" id="L1614">                    word.toString(indexedWordFormat) +</span>
+                    &quot;\&quot;];\n&quot;);
+<span class="nc" id="L1616">    }</span>
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">    for (SemanticGraphEdge edge : graph.edgeIterable()) {</span>
+<span class="nc" id="L1618">      output.append(&quot;  N_&quot; + edge.getSource().index() +</span>
+<span class="nc" id="L1619">                    &quot; -&gt; N_&quot; + edge.getTarget().index() +</span>
+<span class="nc" id="L1620">                    &quot; [label=\&quot;&quot; + edge.getRelation() + &quot;\&quot;];\n&quot;);</span>
+<span class="nc" id="L1621">    }</span>
+<span class="nc" id="L1622">    output.append(&quot;}\n&quot;);</span>
+<span class="nc" id="L1623">    return output.toString();</span>
+  }
+
+  public SemanticGraphEdge addEdge(IndexedWord s, IndexedWord d, GrammaticalRelation reln, double weight, boolean isExtra) {
+<span class="fc" id="L1627">    SemanticGraphEdge newEdge = new SemanticGraphEdge(s, d, reln, weight, isExtra);</span>
+<span class="fc" id="L1628">    graph.add(s, d, newEdge);</span>
+<span class="fc" id="L1629">    return newEdge;</span>
+  }
+
+  public SemanticGraphEdge addEdge(SemanticGraphEdge edge) {
+<span class="nc" id="L1633">    SemanticGraphEdge newEdge = new SemanticGraphEdge(edge.getGovernor(), edge.getDependent(),</span>
+<span class="nc" id="L1634">        edge.getRelation(), edge.getWeight(), edge.isExtra());</span>
+<span class="nc" id="L1635">    graph.add(edge.getGovernor(), edge.getDependent(), newEdge);</span>
+<span class="nc" id="L1636">    return newEdge;</span>
+  }
+
+  // =======================================================================
+
+  /**
+   * Tries to parse a String representing a SemanticGraph. Right now it's fairly
+   * dumb, could be made more sophisticated.
+   * &lt;p/&gt;
+   *
+   * Example: &quot;[ate subj&gt;Bill dobj&gt;[muffins compound&gt;blueberry]]&quot;
+   * &lt;p/&gt;
+   *
+   * This is the same format generated by toCompactString().
+   */
+  public static SemanticGraph valueOf(String s) {
+<span class="fc" id="L1652">    return (new SemanticGraphParsingTask(s)).parse();</span>
+  }
+
+<span class="fc" id="L1655">  public SemanticGraph() {</span>
+<span class="fc" id="L1656">    graph = new DirectedMultiGraph&lt;&gt;(outerMapFactory, innerMapFactory);</span>
+<span class="fc" id="L1657">    roots = wordMapFactory.newSet();</span>
+<span class="fc" id="L1658">  }</span>
+
+  /**
+   * Returns a new SemanticGraph which is a copy of the supplied SemanticGraph.
+   * Both the nodes ({@link IndexedWord}s) and the edges (SemanticGraphEdges)
+   * are copied.
+   */
+<span class="fc" id="L1665">  public SemanticGraph(SemanticGraph g) {</span>
+<span class="fc" id="L1666">    graph = new DirectedMultiGraph&lt;&gt;(g.graph);</span>
+<span class="fc" id="L1667">    roots = wordMapFactory.newSet(g.roots);</span>
+<span class="fc" id="L1668">  }</span>
+
+  /**
+   * Copies a the current graph, but also sets the mapping from the old to new
+   * graph.
+   */
+  public SemanticGraph(SemanticGraph g,
+<span class="nc" id="L1675">                       Map&lt;IndexedWord, IndexedWord&gt; prevToNewMap) {</span>
+<span class="nc" id="L1676">    graph = new DirectedMultiGraph&lt;&gt;(outerMapFactory, innerMapFactory);</span>
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">    if (prevToNewMap == null) {</span>
+<span class="nc" id="L1678">      prevToNewMap = wordMapFactory.newMap();</span>
+    }
+<span class="nc" id="L1680">    Set&lt;IndexedWord&gt; vertexes = g.vertexSet();</span>
+<span class="nc bnc" id="L1681" title="All 2 branches missed.">    for (IndexedWord vertex : vertexes) {</span>
+<span class="nc" id="L1682">      IndexedWord newVertex = new IndexedWord(vertex);</span>
+<span class="nc" id="L1683">      newVertex.setCopyCount(vertex.copyCount());</span>
+<span class="nc" id="L1684">      addVertex(newVertex);</span>
+<span class="nc" id="L1685">      prevToNewMap.put(vertex, newVertex);</span>
+<span class="nc" id="L1686">    }</span>
+
+<span class="nc" id="L1688">    roots = wordMapFactory.newSet();</span>
+<span class="nc bnc" id="L1689" title="All 2 branches missed.">    for (IndexedWord oldRoot : g.getRoots()) {</span>
+<span class="nc" id="L1690">      roots.add(prevToNewMap.get(oldRoot));</span>
+<span class="nc" id="L1691">    }</span>
+<span class="nc bnc" id="L1692" title="All 2 branches missed.">    for (SemanticGraphEdge edge : g.edgeIterable()) {</span>
+<span class="nc" id="L1693">      IndexedWord newGov = prevToNewMap.get(edge.getGovernor());</span>
+<span class="nc" id="L1694">      IndexedWord newDep = prevToNewMap.get(edge.getDependent());</span>
+<span class="nc" id="L1695">      addEdge(newGov, newDep, edge.getRelation(), edge.getWeight(), edge.isExtra());</span>
+<span class="nc" id="L1696">    }</span>
+<span class="nc" id="L1697">  }</span>
+
+  /**
+   * This is the constructor used by the parser.
+   */
+<span class="fc" id="L1702">  public SemanticGraph(Collection&lt;TypedDependency&gt; dependencies) {</span>
+<span class="fc" id="L1703">    graph = new DirectedMultiGraph&lt;&gt;(outerMapFactory, innerMapFactory);</span>
+<span class="fc" id="L1704">    roots = wordMapFactory.newSet();</span>
+
+<span class="fc bfc" id="L1706" title="All 2 branches covered.">    for (TypedDependency d : dependencies) {</span>
+<span class="fc" id="L1707">      IndexedWord gov = d.gov();</span>
+<span class="fc" id="L1708">      IndexedWord dep = d.dep();</span>
+<span class="fc" id="L1709">      GrammaticalRelation reln = d.reln();</span>
+
+<span class="fc bfc" id="L1711" title="All 2 branches covered.">      if (reln != ROOT) { // the root relation only points to the root: the governor is a fake node that we don't want to add in the graph</span>
+        // It is unnecessary to call addVertex, since addEdge will
+        // implicitly add vertices if needed
+        //addVertex(gov);
+        //addVertex(dep);
+<span class="fc" id="L1716">        addEdge(gov, dep, reln, Double.NEGATIVE_INFINITY, d.extra());</span>
+      } else { //it's the root and we add it
+<span class="fc" id="L1718">        addVertex(dep);</span>
+<span class="fc" id="L1719">        roots.add(dep);</span>
+      }
+<span class="fc" id="L1721">    }</span>
+
+    // there used to be an if clause that filtered out the case of empty
+    // dependencies. However, I could not understand (or replicate) the error
+    // it alluded to, and it led to empty dependency graphs for very short
+    // fragments,
+    // which meant they were ignored by the RTE system. Changed. (pado)
+    // See also SemanticGraphFactory.makeGraphFromTree().
+<span class="fc" id="L1729">  }</span>
+
+  /**
+   * Returns the nodes in the shortest undirected path between two edges in the
+   * graph. if source == target, returns a singleton list
+   *
+   * @param source
+   *          node
+   * @param target
+   *          node
+   * @return nodes along shortest undirected path from source to target, in
+   *         order
+   */
+  public List&lt;IndexedWord&gt; getShortestUndirectedPathNodes(IndexedWord source, IndexedWord target) {
+<span class="fc" id="L1743">    return graph.getShortestPath(source, target, false);</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; getShortestUndirectedPathEdges(IndexedWord source, IndexedWord target) {
+<span class="fc" id="L1747">    return graph.getShortestPathEdges(source, target, false);</span>
+  }
+
+  /**
+   * Returns the shortest directed path between two edges in the graph.
+   *
+   * @param source
+   *          node
+   * @param target
+   *          node
+   * @return shortest directed path from source to target
+   */
+  public List&lt;IndexedWord&gt; getShortestDirectedPathNodes(IndexedWord source, IndexedWord target) {
+<span class="nc" id="L1760">    return graph.getShortestPath(source, target, true);</span>
+  }
+
+  public List&lt;SemanticGraphEdge&gt; getShortestDirectedPathEdges(IndexedWord source, IndexedWord target) {
+<span class="nc" id="L1764">    return graph.getShortestPathEdges(source, target, true);</span>
+  }
+
+  public SemanticGraph makeSoftCopy() {
+<span class="fc" id="L1768">    SemanticGraph newSg = new SemanticGraph();</span>
+<span class="pc bpc" id="L1769" title="1 of 2 branches missed.">    if ( ! this.roots.isEmpty())</span>
+<span class="fc" id="L1770">      newSg.setRoot(this.getFirstRoot());</span>
+<span class="fc bfc" id="L1771" title="All 2 branches covered.">    for (SemanticGraphEdge edge : this.edgeIterable()) {</span>
+<span class="fc" id="L1772">      newSg.addEdge(edge.getSource(), edge.getTarget(), edge.getRelation(), edge.getWeight(), edge.isExtra());</span>
+<span class="fc" id="L1773">    }</span>
+<span class="fc" id="L1774">    return newSg;</span>
+  }
+
+  // ============================================================================
+
+<span class="fc" id="L1779">  private static final Pattern WORD_AND_INDEX_PATTERN = Pattern.compile(&quot;([^-]+)-([0-9]+)&quot;);</span>
+
+  /**
+   * This nested class is a helper for valueOf(). It represents the task of
+   * parsing a specific String representing a SemanticGraph.
+   */
+  private static class SemanticGraphParsingTask extends StringParsingTask&lt;SemanticGraph&gt; {
+
+    private SemanticGraph sg;
+<span class="fc" id="L1788">    private Set&lt;Integer&gt; indexesUsed = Generics.newHashSet();</span>
+
+    public SemanticGraphParsingTask(String s) {
+<span class="fc" id="L1791">      super(s);</span>
+<span class="fc" id="L1792">    }</span>
+
+    @Override
+    public SemanticGraph parse() {
+<span class="fc" id="L1796">      sg = new SemanticGraph();</span>
+      try {
+<span class="fc" id="L1798">        readWhiteSpace();</span>
+<span class="pc bpc" id="L1799" title="1 of 2 branches missed.">        if (!isLeftBracket(peek()))</span>
+<span class="nc" id="L1800">          return null;</span>
+<span class="fc" id="L1801">        readDep(null, null);</span>
+<span class="fc" id="L1802">        return sg;</span>
+<span class="nc" id="L1803">      } catch (ParserException e) {</span>
+<span class="nc" id="L1804">        log.info(&quot;SemanticGraphParser warning: &quot; + e.getMessage());</span>
+<span class="nc" id="L1805">        return null;</span>
+      }
+    }
+
+    private void readDep(IndexedWord gov, String reln) {
+<span class="fc" id="L1810">      readWhiteSpace();</span>
+<span class="fc bfc" id="L1811" title="All 2 branches covered.">      if (!isLeftBracket(peek())) { // it's a leaf</span>
+<span class="fc" id="L1812">        String label = readName();</span>
+<span class="fc" id="L1813">        IndexedWord dep = makeVertex(label);</span>
+<span class="fc" id="L1814">        sg.addVertex(dep);</span>
+<span class="pc bpc" id="L1815" title="1 of 2 branches missed.">        if (gov == null)</span>
+<span class="nc" id="L1816">          sg.roots.add(dep);</span>
+<span class="fc" id="L1817">        sg.addEdge(gov, dep, GrammaticalRelation.valueOf(reln), Double.NEGATIVE_INFINITY, false);</span>
+<span class="fc" id="L1818">      } else {</span>
+<span class="fc" id="L1819">        readLeftBracket();</span>
+<span class="fc" id="L1820">        String label = readName();</span>
+<span class="fc" id="L1821">        IndexedWord dep = makeVertex(label);</span>
+<span class="fc" id="L1822">        sg.addVertex(dep);</span>
+<span class="fc bfc" id="L1823" title="All 2 branches covered.">        if (gov == null)</span>
+<span class="fc" id="L1824">          sg.roots.add(dep);</span>
+<span class="pc bpc" id="L1825" title="1 of 4 branches missed.">        if (gov != null &amp;&amp; reln != null) {</span>
+<span class="fc" id="L1826">          sg.addEdge(gov, dep, GrammaticalRelation.valueOf(reln), Double.NEGATIVE_INFINITY, false);</span>
+        }
+<span class="fc" id="L1828">        readWhiteSpace();</span>
+<span class="pc bpc" id="L1829" title="1 of 4 branches missed.">        while (!isRightBracket(peek()) &amp;&amp; !isEOF) {</span>
+<span class="fc" id="L1830">          reln = readName();</span>
+<span class="fc" id="L1831">          readRelnSeparator();</span>
+<span class="fc" id="L1832">          readDep(dep, reln);</span>
+<span class="fc" id="L1833">          readWhiteSpace();</span>
+        }
+<span class="fc" id="L1835">        readRightBracket();</span>
+      }
+<span class="fc" id="L1837">    }</span>
+
+    private IndexedWord makeVertex(String word) {
+      Integer index; // initialized below
+<span class="fc" id="L1841">      Pair&lt;String, Integer&gt; wordAndIndex = readWordAndIndex(word);</span>
+<span class="fc bfc" id="L1842" title="All 2 branches covered.">      if (wordAndIndex != null) {</span>
+<span class="fc" id="L1843">        word = wordAndIndex.first();</span>
+<span class="fc" id="L1844">        index = wordAndIndex.second();</span>
+      } else {
+<span class="fc" id="L1846">        index = getNextFreeIndex();</span>
+      }
+<span class="fc" id="L1848">      indexesUsed.add(index);</span>
+      // Note that, despite the use of indexesUsed and getNextFreeIndex(),
+      // nothing is actually enforcing that no indexes are used twice. This
+      // could occur if some words in the string representation being parsed
+      // come with index markers and some do not.
+<span class="fc" id="L1853">      IndexedWord ifl = new IndexedWord(null, 0, index);</span>
+      // log.info(&quot;SemanticGraphParsingTask&gt;&gt;&gt; word = &quot; + word);
+      // log.info(&quot;SemanticGraphParsingTask&gt;&gt;&gt; index = &quot; + index);
+      // log.info(&quot;SemanticGraphParsingTask&gt;&gt;&gt; indexesUsed = &quot; +
+      // indexesUsed);
+<span class="fc" id="L1858">      String[] wordAndTag = word.split(&quot;/&quot;);</span>
+<span class="fc" id="L1859">      ifl.set(CoreAnnotations.TextAnnotation.class, wordAndTag[0]);</span>
+<span class="fc" id="L1860">      ifl.set(CoreAnnotations.ValueAnnotation.class, wordAndTag[0]);</span>
+<span class="fc bfc" id="L1861" title="All 2 branches covered.">      if (wordAndTag.length &gt; 1)</span>
+<span class="fc" id="L1862">        ifl.set(CoreAnnotations.PartOfSpeechAnnotation.class, wordAndTag[1]);</span>
+<span class="fc" id="L1863">      return ifl;</span>
+    }
+
+    private static Pair&lt;String, Integer&gt; readWordAndIndex(String word) {
+<span class="fc" id="L1867">      Matcher matcher = WORD_AND_INDEX_PATTERN.matcher(word);</span>
+<span class="fc bfc" id="L1868" title="All 2 branches covered.">      if (!matcher.matches()) {</span>
+<span class="fc" id="L1869">        return null;</span>
+      } else {
+<span class="fc" id="L1871">        word = matcher.group(1);</span>
+<span class="fc" id="L1872">        Integer index = Integer.valueOf(matcher.group(2));</span>
+<span class="fc" id="L1873">        return new Pair&lt;&gt;(word, index);</span>
+      }
+    }
+
+    private Integer getNextFreeIndex() {
+<span class="fc" id="L1878">      int i = 0;</span>
+<span class="fc bfc" id="L1879" title="All 2 branches covered.">      while (indexesUsed.contains(i))</span>
+<span class="fc" id="L1880">        i++;</span>
+<span class="fc" id="L1881">      return i;</span>
+    }
+
+    private void readLeftBracket() {
+      // System.out.println(&quot;Read left.&quot;);
+<span class="fc" id="L1886">      readWhiteSpace();</span>
+<span class="fc" id="L1887">      char ch = read();</span>
+<span class="pc bpc" id="L1888" title="1 of 2 branches missed.">      if (!isLeftBracket(ch))</span>
+<span class="nc" id="L1889">        throw new ParserException(&quot;Expected left paren!&quot;);</span>
+<span class="fc" id="L1890">    }</span>
+
+    private void readRightBracket() {
+      // System.out.println(&quot;Read right.&quot;);
+<span class="fc" id="L1894">      readWhiteSpace();</span>
+<span class="fc" id="L1895">      char ch = read();</span>
+<span class="pc bpc" id="L1896" title="1 of 2 branches missed.">      if (!isRightBracket(ch))</span>
+<span class="nc" id="L1897">        throw new ParserException(&quot;Expected right paren!&quot;);</span>
+<span class="fc" id="L1898">    }</span>
+
+    private void readRelnSeparator() {
+<span class="fc" id="L1901">      readWhiteSpace();</span>
+<span class="pc bpc" id="L1902" title="1 of 2 branches missed.">      if (isRelnSeparator(peek()))</span>
+<span class="fc" id="L1903">        read();</span>
+<span class="fc" id="L1904">    }</span>
+
+    private static boolean isLeftBracket(char ch) {
+<span class="fc bfc" id="L1907" title="All 2 branches covered.">      return ch == '[';</span>
+    }
+
+    private static boolean isRightBracket(char ch) {
+<span class="fc bfc" id="L1911" title="All 2 branches covered.">      return ch == ']';</span>
+    }
+
+    private static boolean isRelnSeparator(char ch) {
+<span class="fc bfc" id="L1915" title="All 2 branches covered.">      return ch == '&gt;';</span>
+    }
+
+    @Override
+    protected boolean isPunct(char ch) {
+<span class="pc bpc" id="L1920" title="1 of 6 branches missed.">      return isLeftBracket(ch) || isRightBracket(ch) || isRelnSeparator(ch);</span>
+    }
+
+  } // end SemanticGraphParsingTask
+
+  // =======================================================================
+
+  @Override
+  public boolean equals(Object o) {
+<span class="nc bnc" id="L1929" title="All 2 branches missed.">    if (o == this) {</span>
+<span class="nc" id="L1930">      return true;</span>
+    }
+<span class="nc bnc" id="L1932" title="All 2 branches missed.">    if (!(o instanceof SemanticGraph)) {</span>
+<span class="nc" id="L1933">      return false;</span>
+    }
+<span class="nc" id="L1935">    SemanticGraph g = (SemanticGraph) o;</span>
+<span class="nc bnc" id="L1936" title="All 4 branches missed.">    return graph.equals(g.graph) &amp;&amp; roots.equals(g.roots);</span>
+  }
+
+  @Override
+  public int hashCode() {
+<span class="nc" id="L1941">    return graph.hashCode();</span>
+  }
+
+  /**
+   * Given a semantic graph, and a target relation, returns a list of all
+   * relations (edges) matching.
+   *
+   */
+  public List&lt;SemanticGraphEdge&gt; findAllRelns(GrammaticalRelation tgtRelation) {
+<span class="fc" id="L1950">    ArrayList&lt;SemanticGraphEdge&gt; relns = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1951" title="All 2 branches covered.">    for (SemanticGraphEdge edge : edgeIterable()) {</span>
+<span class="fc" id="L1952">      GrammaticalRelation edgeRelation = edge.getRelation();</span>
+<span class="pc bpc" id="L1953" title="1 of 4 branches missed.">      if ((edgeRelation != null) &amp;&amp; (edgeRelation.equals(tgtRelation))) {</span>
+<span class="fc" id="L1954">        relns.add(edge);</span>
+      }
+<span class="fc" id="L1956">    }</span>
+<span class="fc" id="L1957">    return relns;</span>
+  }
+
+  /**
+   * Delete all duplicate edges.
+   *
+   */
+  public void deleteDuplicateEdges() {
+<span class="fc" id="L1965">    graph.deleteDuplicateEdges();</span>
+<span class="fc" id="L1966">  }</span>
+
+
+  /** Returns a list of TypedDependency in the graph.
+   *  This method goes through all SemanticGraphEdge and converts them
+   *  to TypedDependency.
+   *
+   *  @return A List of TypedDependency in the graph
+   */
+  public Collection&lt;TypedDependency&gt; typedDependencies() {
+<span class="fc" id="L1976">    Collection&lt;TypedDependency&gt; dependencies = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1977">    IndexedWord root = null;</span>
+<span class="fc bfc" id="L1978" title="All 2 branches covered.">    for (IndexedWord node : roots) {</span>
+<span class="pc bpc" id="L1979" title="1 of 2 branches missed.">      if (root == null) {</span>
+<span class="fc" id="L1980">        root = new IndexedWord(node.docID(), node.sentIndex(), 0);</span>
+<span class="fc" id="L1981">        root.setValue(&quot;ROOT&quot;);</span>
+      }
+<span class="fc" id="L1983">      TypedDependency dependency = new TypedDependency(ROOT, root, node);</span>
+<span class="fc" id="L1984">      dependencies.add(dependency);</span>
+<span class="fc" id="L1985">    }</span>
+<span class="fc bfc" id="L1986" title="All 2 branches covered.">    for (SemanticGraphEdge e : this.edgeIterable()){</span>
+<span class="fc" id="L1987">      TypedDependency dependency = new TypedDependency(e.getRelation(), e.getGovernor(), e.getDependent());</span>
+<span class="fc bfc" id="L1988" title="All 2 branches covered.">      if (e.isExtra()) {</span>
+<span class="fc" id="L1989">        dependency.setExtra();</span>
+      }
+<span class="fc" id="L1991">      dependencies.add(dependency);</span>
+<span class="fc" id="L1992">    }</span>
+<span class="fc" id="L1993">    return dependencies;</span>
+  }
+
+  /**
+   * Returns the span of the subtree yield of this node. That is, the span of all the nodes under it.
+   * In the case of projective graphs, the words in this span are also the yield of the constituent rooted
+   * at this node.
+   *
+   * @param word The word acting as the root of the constituent we are finding.
+   * @return A span, represented as a pair of integers. The span is zero indexed. The begin is inclusive and the end is exclusive.
+   */
+  public Pair&lt;Integer, Integer&gt; yieldSpan(IndexedWord word) {
+<span class="nc" id="L2005">    int min = Integer.MAX_VALUE;</span>
+<span class="nc" id="L2006">    int max = Integer.MIN_VALUE;</span>
+<span class="nc" id="L2007">    Stack&lt;IndexedWord&gt; fringe = new Stack&lt;&gt;();</span>
+<span class="nc" id="L2008">    fringe.push(word);</span>
+<span class="nc bnc" id="L2009" title="All 2 branches missed.">    while (!fringe.isEmpty()) {</span>
+<span class="nc" id="L2010">      IndexedWord parent = fringe.pop();</span>
+<span class="nc" id="L2011">      min = Math.min(min, parent.index() - 1);</span>
+<span class="nc" id="L2012">      max = Math.max(max, parent.index());</span>
+<span class="nc bnc" id="L2013" title="All 2 branches missed.">      for (SemanticGraphEdge edge : outgoingEdgeIterable(parent)) {</span>
+<span class="nc bnc" id="L2014" title="All 2 branches missed.">        if (!edge.isExtra()) {</span>
+<span class="nc" id="L2015">          fringe.push(edge.getDependent());</span>
+        }
+<span class="nc" id="L2017">      }</span>
+<span class="nc" id="L2018">    }</span>
+<span class="nc" id="L2019">    return Pair.makePair(min, max);</span>
+  }
+
+  /**
+   * Store a comment line with this semantic graph.
+   *
+   * @param comment
+   */
+  public void addComment(String comment) {
+<span class="fc" id="L2028">    this.comments.add(comment);</span>
+<span class="fc" id="L2029">  }</span>
+
+  /**
+   * Return the list of comments stored with this graph.
+   *
+   * @return A list of comments.
+   */
+  public List&lt;String&gt; getComments() {
+<span class="fc" id="L2037">    return this.comments;</span>
+  }
+
+  private static final long serialVersionUID = 1L;
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

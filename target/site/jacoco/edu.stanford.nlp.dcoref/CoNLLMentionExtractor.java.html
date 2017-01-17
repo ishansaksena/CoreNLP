@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoNLLMentionExtractor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.dcoref</a> &gt; <span class="el_source">CoNLLMentionExtractor.java</span></div><h1>CoNLLMentionExtractor.java</h1><pre class="source lang-java linenums">//
+// StanfordCoreNLP -- a suite of NLP tools
+// Copyright (c) 2009-2010 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//
+
+package edu.stanford.nlp.dcoref;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import edu.stanford.nlp.classify.LogisticClassifier;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.trees.GrammaticalStructure;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeCoreAnnotations;
+import edu.stanford.nlp.trees.TreeLemmatizer;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.semgraph.SemanticGraphFactory;
+import edu.stanford.nlp.util.CollectionValuedMap;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Pair;
+
+/**
+ * Extracts coref mentions from CoNLL2011 data files.
+ *
+ * @author Angel Chang
+ */
+public class CoNLLMentionExtractor extends MentionExtractor {
+
+  private final CoNLL2011DocumentReader reader;
+  private final String corpusPath;
+  private final boolean replicateCoNLL;
+
+<span class="nc" id="L64">  private static final Logger logger = SieveCoreferenceSystem.logger;</span>
+
+  public CoNLLMentionExtractor(Dictionaries dict, Properties props, Semantics semantics) throws Exception {
+<span class="nc" id="L67">    super(dict, semantics);</span>
+
+    // Initialize reader for reading from CONLL2011 corpus
+<span class="nc" id="L70">    corpusPath = props.getProperty(Constants.CONLL2011_PROP);</span>
+<span class="nc" id="L71">    replicateCoNLL = Boolean.parseBoolean(props.getProperty(Constants.REPLICATECONLL_PROP, &quot;false&quot;));</span>
+
+<span class="nc" id="L73">    CoNLL2011DocumentReader.Options options = new CoNLL2011DocumentReader.Options();</span>
+<span class="nc" id="L74">    options.annotateTokenCoref = false;</span>
+<span class="nc" id="L75">    options.annotateTokenSpeaker = Constants.USE_GOLD_SPEAKER_TAGS || replicateCoNLL;</span>
+<span class="nc" id="L76">    options.annotateTokenNer = Constants.USE_GOLD_NE || replicateCoNLL;</span>
+<span class="nc" id="L77">    options.annotateTokenPos = Constants.USE_GOLD_POS || replicateCoNLL;</span>
+<span class="nc" id="L78">    if (Constants.USE_CONLL_AUTO) options.setFilter(&quot;.*_auto_conll$&quot;);</span>
+<span class="nc" id="L79">    reader = new CoNLL2011DocumentReader(corpusPath, options);</span>
+
+<span class="nc" id="L81">    stanfordProcessor = loadStanfordProcessor(props);</span>
+<span class="nc" id="L82">  }</span>
+
+  public CoNLLMentionExtractor(Dictionaries dict, Properties props, Semantics semantics,
+      LogisticClassifier&lt;String, String&gt; singletonModel) throws Exception {
+<span class="nc" id="L86">    this(dict, props, semantics);</span>
+<span class="nc" id="L87">    singletonPredictor = singletonModel;</span>
+<span class="nc" id="L88">  }</span>
+
+  private static final boolean LEMMATIZE = true;
+  private static final boolean threadSafe = true;
+
+<span class="nc" id="L93">  private static final TreeLemmatizer treeLemmatizer = new TreeLemmatizer();</span>
+
+  public void resetDocs() {
+<span class="nc" id="L96">    super.resetDocs();</span>
+<span class="nc" id="L97">    reader.reset();</span>
+<span class="nc" id="L98">  }</span>
+
+  @Override
+  public Document nextDoc() throws Exception {
+<span class="nc" id="L102">    List&lt;List&lt;CoreLabel&gt;&gt; allWords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L103">    List&lt;Tree&gt; allTrees = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L105">    CoNLL2011DocumentReader.Document conllDoc = reader.getNextDocument();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">    if (conllDoc == null) {</span>
+<span class="nc" id="L107">      return null;</span>
+    }
+
+<span class="nc" id="L110">    Annotation anno = conllDoc.getAnnotation();</span>
+<span class="nc" id="L111">    List&lt;CoreMap&gt; sentences = anno.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">    for (CoreMap sentence:sentences) {</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">      if (!Constants.USE_GOLD_PARSES &amp;&amp; !replicateCoNLL) {</span>
+        // Remove tree from annotation and replace with parse using stanford parser
+<span class="nc" id="L115">        sentence.remove(TreeCoreAnnotations.TreeAnnotation.class);</span>
+      } else {
+<span class="nc" id="L117">        Tree tree = sentence.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+        if (LEMMATIZE) {
+<span class="nc" id="L119">          treeLemmatizer.transformTree(tree);</span>
+        }
+        // generate the dependency graph
+        try {
+<span class="nc" id="L123">          SemanticGraph deps = SemanticGraphFactory.makeFromTree(tree, SemanticGraphFactory.Mode.ENHANCED, GrammaticalStructure.Extras.NONE);</span>
+<span class="nc" id="L124">          SemanticGraph basicDeps = SemanticGraphFactory.makeFromTree(tree, SemanticGraphFactory.Mode.BASIC, GrammaticalStructure.Extras.NONE);</span>
+<span class="nc" id="L125">          sentence.set(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class, basicDeps);</span>
+<span class="nc" id="L126">          sentence.set(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class, deps);</span>
+<span class="nc" id="L127">        } catch(Exception e) {</span>
+<span class="nc" id="L128">          logger.log(Level.WARNING, &quot;Exception caught during extraction of Stanford dependencies. Will ignore and continue...&quot;, e);</span>
+<span class="nc" id="L129">        }</span>
+      }
+<span class="nc" id="L131">    }</span>
+
+<span class="nc" id="L133">    String preSpeaker = null;</span>
+<span class="nc" id="L134">    int utterance = -1;</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">    for (CoreLabel token:anno.get(CoreAnnotations.TokensAnnotation.class)) {</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">      if (!token.containsKey(CoreAnnotations.SpeakerAnnotation.class))  {</span>
+<span class="nc" id="L137">        token.set(CoreAnnotations.SpeakerAnnotation.class, &quot;&quot;);</span>
+      }
+<span class="nc" id="L139">      String curSpeaker = token.get(CoreAnnotations.SpeakerAnnotation.class);</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">      if (!curSpeaker.equals(preSpeaker)) {</span>
+<span class="nc" id="L141">        utterance++;</span>
+<span class="nc" id="L142">        preSpeaker = curSpeaker;</span>
+      }
+<span class="nc" id="L144">      token.set(CoreAnnotations.UtteranceAnnotation.class, utterance);</span>
+<span class="nc" id="L145">    }</span>
+
+    // Run pipeline
+<span class="nc" id="L148">    stanfordProcessor.annotate(anno);</span>
+
+<span class="nc bnc" id="L150" title="All 2 branches missed.">    for (CoreMap sentence:anno.get(CoreAnnotations.SentencesAnnotation.class)) {</span>
+<span class="nc" id="L151">      allWords.add(sentence.get(CoreAnnotations.TokensAnnotation.class));</span>
+<span class="nc" id="L152">      allTrees.add(sentence.get(TreeCoreAnnotations.TreeAnnotation.class));</span>
+<span class="nc" id="L153">    }</span>
+
+    // Initialize gold mentions
+<span class="nc" id="L156">    List&lt;List&lt;Mention&gt;&gt; allGoldMentions = extractGoldMentions(conllDoc);</span>
+
+    List&lt;List&lt;Mention&gt;&gt; allPredictedMentions;
+    if (Constants.USE_GOLD_MENTIONS) {
+      //allPredictedMentions = allGoldMentions;
+      // Make copy of gold mentions since mentions may be later merged, mentionID's changed and stuff
+      allPredictedMentions = makeCopy(allGoldMentions);
+    } else if (Constants.USE_GOLD_MENTION_BOUNDARIES) {
+      allPredictedMentions = ((RuleBasedCorefMentionFinder) mentionFinder).filterPredictedMentions(allGoldMentions, anno, dictionaries);
+    } else {
+<span class="nc" id="L166">      allPredictedMentions = mentionFinder.extractPredictedMentions(anno, maxID, dictionaries);</span>
+    }
+
+    try {
+<span class="nc" id="L170">      recallErrors(allGoldMentions,allPredictedMentions,anno);</span>
+<span class="nc" id="L171">    } catch (IOException e) {</span>
+<span class="nc" id="L172">      throw new RuntimeException(e);</span>
+<span class="nc" id="L173">    }</span>
+<span class="nc" id="L174">    Document doc = arrange(anno, allWords, allTrees, allPredictedMentions, allGoldMentions, true);</span>
+<span class="nc" id="L175">    doc.conllDoc = conllDoc;</span>
+<span class="nc" id="L176">    return doc;</span>
+  }
+
+  private static List&lt;List&lt;Mention&gt;&gt; makeCopy(List&lt;List&lt;Mention&gt;&gt; mentions) {
+<span class="nc" id="L180">    List&lt;List&lt;Mention&gt;&gt; copy = new ArrayList&lt;&gt;(mentions.size());</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">    for (List&lt;Mention&gt; sm:mentions) {</span>
+<span class="nc" id="L182">      List&lt;Mention&gt; sm2 = new ArrayList&lt;&gt;(sm.size());</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">      for (Mention m:sm) {</span>
+<span class="nc" id="L184">        Mention m2 = new Mention();</span>
+<span class="nc" id="L185">        m2.goldCorefClusterID = m.goldCorefClusterID;</span>
+<span class="nc" id="L186">        m2.mentionID = m.mentionID;</span>
+<span class="nc" id="L187">        m2.startIndex = m.startIndex;</span>
+<span class="nc" id="L188">        m2.endIndex = m.endIndex;</span>
+<span class="nc" id="L189">        m2.originalSpan = m.originalSpan;</span>
+<span class="nc" id="L190">        m2.dependency = m.dependency;</span>
+<span class="nc" id="L191">        sm2.add(m2);</span>
+<span class="nc" id="L192">      }</span>
+<span class="nc" id="L193">      copy.add(sm2);</span>
+<span class="nc" id="L194">    }</span>
+<span class="nc" id="L195">    return copy;</span>
+  }
+
+  private static void recallErrors(List&lt;List&lt;Mention&gt;&gt; goldMentions, List&lt;List&lt;Mention&gt;&gt; predictedMentions, Annotation doc) throws IOException {
+<span class="nc" id="L199">    List&lt;CoreMap&gt; coreMaps = doc.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc" id="L200">    int numSentences = goldMentions.size();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">    for (int i=0;i&lt;numSentences;i++){</span>
+<span class="nc" id="L202">      CoreMap coreMap = coreMaps.get(i);</span>
+<span class="nc" id="L203">      List&lt;CoreLabel&gt; words = coreMap.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc" id="L204">      Tree tree = coreMap.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc" id="L205">      List&lt;Mention&gt; goldMentionsSent = goldMentions.get(i);</span>
+<span class="nc" id="L206">      List&lt;Pair&lt;Integer,Integer&gt;&gt; goldMentionsSpans = extractSpans(goldMentionsSent);</span>
+
+<span class="nc bnc" id="L208" title="All 2 branches missed.">      for (Pair&lt;Integer,Integer&gt; mentionSpan: goldMentionsSpans){</span>
+<span class="nc" id="L209">        logger.finer(&quot;RECALL ERROR\n&quot;);</span>
+<span class="nc" id="L210">        logger.finer(coreMap + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        for (int x=mentionSpan.first;x&lt;mentionSpan.second;x++){</span>
+<span class="nc" id="L212">          logger.finer(words.get(x).value() + &quot; &quot;);</span>
+        }
+<span class="nc" id="L214">        logger.finer(&quot;\n&quot;+tree + &quot;\n&quot;);</span>
+<span class="nc" id="L215">      }</span>
+    }
+<span class="nc" id="L217">  }</span>
+
+  private static List&lt;Pair&lt;Integer,Integer&gt;&gt; extractSpans(List&lt;Mention&gt; listOfMentions) {
+<span class="nc" id="L220">    List&lt;Pair&lt;Integer,Integer&gt;&gt; mentionSpans = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    for (Mention mention: listOfMentions){</span>
+<span class="nc" id="L222">      Pair&lt;Integer,Integer&gt; mentionSpan = new Pair&lt;&gt;(mention.startIndex, mention.endIndex);</span>
+<span class="nc" id="L223">      mentionSpans.add(mentionSpan);</span>
+<span class="nc" id="L224">    }</span>
+<span class="nc" id="L225">    return mentionSpans;</span>
+  }
+
+  public List&lt;List&lt;Mention&gt;&gt; extractGoldMentions(CoNLL2011DocumentReader.Document conllDoc) {
+<span class="nc" id="L229">    List&lt;CoreMap&gt; sentences = conllDoc.getAnnotation().get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc" id="L230">    List&lt;List&lt;Mention&gt;&gt; allGoldMentions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L231">    CollectionValuedMap&lt;String,CoreMap&gt; corefChainMap = conllDoc.getCorefChainMap();</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    for (int i = 0; i &lt; sentences.size(); i++) {</span>
+<span class="nc" id="L233">      allGoldMentions.add(new ArrayList&lt;&gt;());</span>
+    }
+<span class="nc" id="L235">    int maxCorefClusterId = -1;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">    for (String corefIdStr:corefChainMap.keySet()) {</span>
+<span class="nc" id="L237">      int id = Integer.parseInt(corefIdStr);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">      if (id &gt; maxCorefClusterId) {</span>
+<span class="nc" id="L239">        maxCorefClusterId = id;</span>
+      }
+<span class="nc" id="L241">    }</span>
+<span class="nc" id="L242">    int newMentionID = maxCorefClusterId + 1;</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    for (Map.Entry&lt;String, Collection&lt;CoreMap&gt;&gt; idChainEntry : corefChainMap.entrySet()) {</span>
+<span class="nc" id="L244">      int id = Integer.parseInt(idChainEntry.getKey());</span>
+<span class="nc" id="L245">      int clusterMentionCnt = 0;</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">      for (CoreMap m : idChainEntry.getValue()) {</span>
+<span class="nc" id="L247">        clusterMentionCnt++;</span>
+<span class="nc" id="L248">        Mention mention = new Mention();</span>
+
+<span class="nc" id="L250">        mention.goldCorefClusterID = id;</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (clusterMentionCnt == 1) {</span>
+          // First mention in cluster
+<span class="nc" id="L253">          mention.mentionID = id;</span>
+<span class="nc" id="L254">          mention.originalRef = -1;</span>
+        } else {
+<span class="nc" id="L256">          mention.mentionID = newMentionID;</span>
+<span class="nc" id="L257">          mention.originalRef = id;</span>
+<span class="nc" id="L258">          newMentionID++;</span>
+        }
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if(maxID &lt; mention.mentionID) maxID = mention.mentionID;</span>
+<span class="nc" id="L261">        int sentIndex = m.get(CoreAnnotations.SentenceIndexAnnotation.class);</span>
+<span class="nc" id="L262">        CoreMap sent = sentences.get(sentIndex);</span>
+<span class="nc" id="L263">        mention.startIndex = m.get(CoreAnnotations.TokenBeginAnnotation.class) - sent.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+<span class="nc" id="L264">        mention.endIndex = m.get(CoreAnnotations.TokenEndAnnotation.class) - sent.get(CoreAnnotations.TokenBeginAnnotation.class);</span>
+
+        // will be set by arrange
+<span class="nc" id="L267">        mention.originalSpan = m.get(CoreAnnotations.TokensAnnotation.class);</span>
+
+        // Mention dependency graph is the enhanced dependency graph of the sentence
+<span class="nc" id="L270">        mention.dependency = sentences.get(sentIndex).get(SemanticGraphCoreAnnotations.EnhancedDependenciesAnnotation.class);</span>
+
+<span class="nc" id="L272">        allGoldMentions.get(sentIndex).add(mention);</span>
+<span class="nc" id="L273">      }</span>
+<span class="nc" id="L274">    }</span>
+<span class="nc" id="L275">    return allGoldMentions;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

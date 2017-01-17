@@ -1,0 +1,1042 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LinearClassifierFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.classify</a> &gt; <span class="el_source">LinearClassifierFactory.java</span></div><h1>LinearClassifierFactory.java</h1><pre class="source lang-java linenums">// Stanford Classifier - a multiclass maxent classifier
+// LinearClassifierFactory
+// Copyright (c) 2003-2016 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    Support/Questions: java-nlp-user@lists.stanford.edu
+//    Licensing: java-nlp-support@lists.stanford.edu
+//    http://www-nlp.stanford.edu/software/classifier.shtml
+
+package edu.stanford.nlp.classify;
+
+import java.io.BufferedReader;
+import java.util.List;
+import java.util.function.Function;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.optimization.*;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.MultiClassAccuracyStats;
+import edu.stanford.nlp.stats.Scorer;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+/**
+ * Builds various types of linear classifiers, with functionality for
+ * setting objective function, optimization method, and other parameters.
+ * Classifiers can be defined with passed constructor arguments or using setter methods.
+ * Defaults to Quasi-newton optimization of a {@code LogConditionalObjectiveFunction}.
+ * (Merges old classes: CGLinearClassifierFactory, QNLinearClassifierFactory, and MaxEntClassifierFactory.)
+ * Note that a bias term is not assumed, and so if you want to learn
+ * a bias term you should add an &quot;always-on&quot; feature to your examples.
+ *
+ * @author Jenny Finkel
+ * @author Chris Cox (merged factories, 8/11/04)
+ * @author Dan Klein (CGLinearClassifierFactory, MaxEntClassifierFactory)
+ * @author Galen Andrew (tuneSigma),
+ * @author Marie-Catherine de Marneffe (CV in tuneSigma)
+ * @author Sarah Spikes (Templatization, though I don't know what to do with the Minimizer)
+ * @author Ramesh Nallapati (nmramesh@cs.stanford.edu) {@link #trainSemiSupGE} methods
+ */
+
+public class LinearClassifierFactory&lt;L, F&gt; extends AbstractLinearClassifierFactory&lt;L, F&gt;  {
+
+  private static final long serialVersionUID = 7893768984379107397L;
+  private double TOL;
+  //public double sigma;
+<span class="pc" id="L72">  private int mem = 15;</span>
+<span class="pc" id="L73">  private boolean verbose = false;</span>
+  //private int prior;
+  //private double epsilon = 0.0;
+  private LogPrior logPrior;
+  //private Minimizer&lt;DiffFunction&gt; minimizer;
+  //private boolean useSum = false;
+<span class="pc" id="L79">  private boolean tuneSigmaHeldOut = false;</span>
+<span class="pc" id="L80">  private boolean tuneSigmaCV = false;</span>
+  //private boolean resetWeight = true;
+  private int folds;
+  // range of values to tune sigma across
+<span class="pc" id="L84">  private double min = 0.1;</span>
+<span class="pc" id="L85">  private double max = 10.0;</span>
+<span class="pc" id="L86">  private boolean retrainFromScratchAfterSigmaTuning = false;</span>
+
+<span class="pc" id="L88">  private Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; minimizerCreator = null;</span>
+<span class="pc" id="L89">  private int evalIters = -1;</span>
+  private Evaluator[] evaluators; // = null;
+
+  /** A logger for this class */
+<span class="fc" id="L93">  private final static Redwood.RedwoodChannels logger = Redwood.channels(LinearClassifierFactory.class);</span>
+
+  /** This is the {@code Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;} that we use over and over again. */
+<span class="fc" id="L96">  private class QNFactory implements Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; {</span>
+
+    private static final long serialVersionUID = 9028306475652690036L;
+
+    @Override
+    public Minimizer&lt;DiffFunction&gt; create() {
+<span class="fc" id="L102">      QNMinimizer qnMinimizer = new QNMinimizer(LinearClassifierFactory.this.mem);</span>
+<span class="pc bpc" id="L103" title="1 of 2 branches missed.">      if (! verbose) {</span>
+<span class="fc" id="L104">        qnMinimizer.shutUp();</span>
+      }
+<span class="fc" id="L106">      return qnMinimizer;</span>
+    }
+
+  } // end class QNFactory
+
+
+  public LinearClassifierFactory() {
+<span class="fc" id="L113">    this((Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;) null);</span>
+<span class="fc" id="L114">  }</span>
+
+  /** NOTE: Constructors that take in a Minimizer create a LinearClassifierFactory that will reuse the minimizer
+   *  and will not be threadsafe (unless the Minimizer itself is ThreadSafe, which is probably not the case).
+   */
+  public LinearClassifierFactory(Minimizer&lt;DiffFunction&gt; min) {
+<span class="nc" id="L120">    this(min, 1e-4, false);</span>
+<span class="nc" id="L121">  }</span>
+
+  public LinearClassifierFactory(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; min) {
+<span class="fc" id="L124">    this(min, 1e-4, false);</span>
+<span class="fc" id="L125">  }</span>
+
+  public LinearClassifierFactory(Minimizer&lt;DiffFunction&gt; min, double tol, boolean useSum) {
+<span class="nc" id="L128">    this(min, tol, useSum, 1.0);</span>
+<span class="nc" id="L129">  }</span>
+
+  public LinearClassifierFactory(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; min, double tol, boolean useSum) {
+<span class="fc" id="L132">    this(min, tol, useSum, 1.0);</span>
+<span class="fc" id="L133">  }</span>
+
+  public LinearClassifierFactory(double tol, boolean useSum, double sigma) {
+<span class="nc" id="L136">    this((Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;) null, tol, useSum, sigma);</span>
+<span class="nc" id="L137">  }</span>
+
+  public LinearClassifierFactory(Minimizer&lt;DiffFunction&gt; min, double tol, boolean useSum, double sigma) {
+<span class="nc" id="L140">    this(min, tol, useSum, LogPrior.LogPriorType.QUADRATIC.ordinal(), sigma);</span>
+<span class="nc" id="L141">  }</span>
+
+  public LinearClassifierFactory(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; min, double tol, boolean useSum, double sigma) {
+<span class="fc" id="L144">    this(min, tol, useSum, LogPrior.LogPriorType.QUADRATIC.ordinal(), sigma);</span>
+<span class="fc" id="L145">  }</span>
+
+  public LinearClassifierFactory(Minimizer&lt;DiffFunction&gt; min, double tol, boolean useSum, int prior, double sigma) {
+<span class="nc" id="L148">    this(min, tol, useSum, prior, sigma, 0.0);</span>
+<span class="nc" id="L149">  }</span>
+
+  public LinearClassifierFactory(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; min, double tol, boolean useSum, int prior, double sigma) {
+<span class="fc" id="L152">    this(min, tol, useSum, prior, sigma, 0.0);</span>
+<span class="fc" id="L153">  }</span>
+
+  public LinearClassifierFactory(double tol, boolean useSum, int prior, double sigma, double epsilon) {
+<span class="nc" id="L156">    this((Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;) null, tol, useSum, new LogPrior(prior, sigma, epsilon));</span>
+<span class="nc" id="L157">  }</span>
+
+  public LinearClassifierFactory(double tol, boolean useSum, int prior, double sigma, double epsilon, final int mem) {
+<span class="nc" id="L160">    this((Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;) null, tol, useSum, new LogPrior(prior, sigma, epsilon));</span>
+<span class="nc" id="L161">    this.mem = mem;</span>
+<span class="nc" id="L162">  }</span>
+
+  /**
+   * Create a factory that builds linear classifiers from training data.
+   *
+   * @param min     The method to be used for optimization (minimization) (default: {@link QNMinimizer})
+   * @param tol     The convergence threshold for the minimization (default: 1e-4)
+   * @param useSum  Asks to the optimizer to minimize the sum of the
+   *                likelihoods of individual data items rather than their product (default: false)
+   *                NOTE: this is currently ignored!!!
+   * @param prior   What kind of prior to use, as an enum constant from class
+   *                LogPrior
+   * @param sigma   The strength of the prior (smaller is stronger for most
+   *                standard priors) (default: 1.0)
+   * @param epsilon A second parameter to the prior (currently only used
+   *                by the Huber prior)
+   */
+  public LinearClassifierFactory(Minimizer&lt;DiffFunction&gt; min, double tol, boolean useSum, int prior, double sigma, double epsilon) {
+<span class="nc" id="L180">    this(min, tol, useSum, new LogPrior(prior, sigma, epsilon));</span>
+<span class="nc" id="L181">  }</span>
+
+  public LinearClassifierFactory(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; min, double tol, boolean useSum, int prior, double sigma, double epsilon) {
+<span class="fc" id="L184">    this(min, tol, useSum, new LogPrior(prior, sigma, epsilon));</span>
+<span class="fc" id="L185">  }</span>
+
+<span class="nc" id="L187">  public LinearClassifierFactory(final Minimizer&lt;DiffFunction&gt; min, double tol, boolean useSum, LogPrior logPrior) {</span>
+<span class="nc" id="L188">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = -6439748445540743949L;
+
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L193">        return min;</span>
+      }
+    };
+<span class="nc" id="L196">    this.TOL = tol;</span>
+    //this.useSum = useSum;
+<span class="nc" id="L198">    this.logPrior = logPrior;</span>
+<span class="nc" id="L199">  }</span>
+
+  /**
+   * Create a factory that builds linear classifiers from training data. This is the recommended constructor to
+   * bottom out with. Use of a minimizerCreator makes the classifier threadsafe.
+   *
+   * @param minimizerCreator A Factory for creating minimizers. If this is null, a standard quasi-Newton minimizer
+   *                         factory will be used.
+   * @param tol     The convergence threshold for the minimization (default: 1e-4)
+   * @param useSum  Asks to the optimizer to minimize the sum of the
+   *                likelihoods of individual data items rather than their product (Klein and Manning 2001 WSD.)
+   *                NOTE: this is currently ignored!!! At some point support for this option was deleted
+   * @param logPrior What kind of prior to use, this class specifies its type and hyperparameters.
+   */
+<span class="fc" id="L213">  public LinearClassifierFactory(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; minimizerCreator, double tol, boolean useSum, LogPrior logPrior) {</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">    if (minimizerCreator == null) {</span>
+<span class="fc" id="L215">      this.minimizerCreator = new QNFactory();</span>
+    } else {
+<span class="nc" id="L217">      this.minimizerCreator = minimizerCreator;</span>
+    }
+<span class="fc" id="L219">    this.TOL = tol;</span>
+    //this.useSum = useSum;
+<span class="fc" id="L221">    this.logPrior = logPrior;</span>
+<span class="fc" id="L222">  }</span>
+
+  /**
+   * Set the tolerance.  1e-4 is the default.
+   */
+  public void setTol(double tol) {
+<span class="nc" id="L228">    this.TOL = tol;</span>
+<span class="nc" id="L229">  }</span>
+
+  /**
+   * Set the prior.
+   *
+   * @param logPrior One of the priors defined in
+   *              {@code LogConditionalObjectiveFunction}.
+   *              {@code LogPrior.QUADRATIC} is the default.
+   */
+  public void setPrior(LogPrior logPrior) {
+<span class="nc" id="L239">    this.logPrior = logPrior;</span>
+<span class="nc" id="L240">  }</span>
+
+  /**
+   * Set the verbose flag for {@link CGMinimizer}.
+   * {@code false} is the default.
+   */
+  public void setVerbose(boolean verbose) {
+<span class="nc" id="L247">    this.verbose = verbose;</span>
+<span class="nc" id="L248">  }</span>
+
+  /**
+   * Sets the minimizer.  {@link QNMinimizer} is the default.
+   */
+  public void setMinimizerCreator(Factory&lt;Minimizer&lt;DiffFunction&gt;&gt; minimizerCreator) {
+<span class="nc" id="L254">    this.minimizerCreator = minimizerCreator;</span>
+<span class="nc" id="L255">  }</span>
+
+  /**
+   * Sets the epsilon value for {@link LogConditionalObjectiveFunction}.
+   */
+  public void setEpsilon(double eps) {
+<span class="nc" id="L261">    logPrior.setEpsilon(eps);</span>
+<span class="nc" id="L262">  }</span>
+
+  public void setSigma(double sigma) {
+<span class="nc" id="L265">    logPrior.setSigma(sigma);</span>
+<span class="nc" id="L266">  }</span>
+
+  public double getSigma() {
+<span class="nc" id="L269">    return logPrior.getSigma();</span>
+  }
+
+  /**
+   * Sets the minimizer to QuasiNewton. {@link QNMinimizer} is the default.
+   */
+  public void useQuasiNewton() {
+<span class="nc" id="L276">    this.minimizerCreator = new QNFactory();</span>
+<span class="nc" id="L277">  }</span>
+
+  public void useQuasiNewton(final boolean useRobust) {
+<span class="nc" id="L280">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = -9108222058357693242L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L284">          QNMinimizer qnMinimizer = new QNMinimizer(LinearClassifierFactory.this.mem, useRobust);</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L286">              qnMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L288">          return qnMinimizer;</span>
+      }
+    };
+<span class="nc" id="L291">  }</span>
+
+  public void useStochasticQN(final double initialSMDGain, final int stochasticBatchSize){
+<span class="nc" id="L294">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = -7760753348350678588L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L298">          SQNMinimizer&lt;DiffFunction&gt; sqnMinimizer = new SQNMinimizer&lt;&gt;(LinearClassifierFactory.this.mem, initialSMDGain, stochasticBatchSize, false);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L300">              sqnMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L302">          return sqnMinimizer;</span>
+      }
+    };
+<span class="nc" id="L305">  }</span>
+
+  public void useStochasticMetaDescent(){
+<span class="nc" id="L308">    useStochasticMetaDescent(0.1, 15, StochasticCalculateMethods.ExternalFiniteDifference, 20);</span>
+<span class="nc" id="L309">  }</span>
+
+  public void useStochasticMetaDescent(final double initialSMDGain, final int stochasticBatchSize,
+                                       final StochasticCalculateMethods stochasticMethod,final int passes) {
+<span class="nc" id="L313">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = 6860437108371914482L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L317">          SMDMinimizer&lt;DiffFunction&gt; smdMinimizer = new SMDMinimizer&lt;&gt;(initialSMDGain, stochasticBatchSize, stochasticMethod, passes);</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L319">              smdMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L321">          return smdMinimizer;</span>
+      }
+    };
+<span class="nc" id="L324">  }</span>
+
+  public void useStochasticGradientDescent(){
+<span class="nc" id="L327">    useStochasticGradientDescent(0.1,15);</span>
+<span class="nc" id="L328">  }</span>
+
+  public void useStochasticGradientDescent(final double gainSGD, final int stochasticBatchSize){
+<span class="nc" id="L331">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = 2564615420955196299L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L335">          InefficientSGDMinimizer&lt;DiffFunction&gt; sgdMinimizer = new InefficientSGDMinimizer&lt;&gt;(gainSGD, stochasticBatchSize);</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L337">              sgdMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L339">          return sgdMinimizer;</span>
+      }
+    };
+<span class="nc" id="L342">  }</span>
+
+  public void useInPlaceStochasticGradientDescent() {
+<span class="nc" id="L345">    useInPlaceStochasticGradientDescent(-1, -1, 1.0);</span>
+<span class="nc" id="L346">  }</span>
+
+  public void useInPlaceStochasticGradientDescent(final int SGDPasses, final int tuneSampleSize, final double sigma) {
+<span class="nc" id="L349">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = -5319225231759162616L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L353">          SGDMinimizer&lt;DiffFunction&gt; sgdMinimizer = new SGDMinimizer&lt;&gt;(sigma, SGDPasses, tuneSampleSize);</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L355">              sgdMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L357">          return sgdMinimizer;</span>
+      }
+    };
+<span class="nc" id="L360">  }</span>
+
+  public void useHybridMinimizerWithInPlaceSGD(final int SGDPasses, final int tuneSampleSize, final double sigma) {
+<span class="nc" id="L363">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = -3042400543337763144L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L367">          SGDMinimizer&lt;DiffFunction&gt; firstMinimizer = new SGDMinimizer&lt;&gt;(sigma, SGDPasses, tuneSampleSize);</span>
+<span class="nc" id="L368">          QNMinimizer secondMinimizer = new QNMinimizer(mem);</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L370">              firstMinimizer.shutUp();</span>
+<span class="nc" id="L371">              secondMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L373">          return new HybridMinimizer(firstMinimizer, secondMinimizer, SGDPasses);</span>
+      }
+    };
+<span class="nc" id="L376">  }</span>
+
+  public void useStochasticGradientDescentToQuasiNewton(final double SGDGain, final int batchSize, final int sgdPasses,
+                                                        final int qnPasses, final int hessSamples, final int QNMem,
+                                                        final boolean outputToFile) {
+<span class="nc" id="L381">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = 5823852936137599566L;
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc" id="L385">          SGDToQNMinimizer sgdToQNMinimizer = new SGDToQNMinimizer(SGDGain, batchSize, sgdPasses,</span>
+                  qnPasses, hessSamples, QNMem, outputToFile);
+<span class="nc bnc" id="L387" title="All 2 branches missed.">          if (!verbose) {</span>
+<span class="nc" id="L388">              sgdToQNMinimizer.shutUp();</span>
+          }
+<span class="nc" id="L390">          return sgdToQNMinimizer;</span>
+      }
+    };
+<span class="nc" id="L393">  }</span>
+
+  public void useHybridMinimizer() {
+<span class="nc" id="L396">    useHybridMinimizer(0.1, 15, StochasticCalculateMethods.ExternalFiniteDifference, 0);</span>
+<span class="nc" id="L397">  }</span>
+
+  public void useHybridMinimizer(final double initialSMDGain, final int stochasticBatchSize,
+                                 final StochasticCalculateMethods stochasticMethod, final int cutoffIteration){
+<span class="nc" id="L401">    this.minimizerCreator = () -&gt; {</span>
+<span class="nc" id="L402">        SMDMinimizer&lt;DiffFunction&gt; firstMinimizer = new SMDMinimizer&lt;&gt;(initialSMDGain, stochasticBatchSize, stochasticMethod, cutoffIteration);</span>
+<span class="nc" id="L403">        QNMinimizer secondMinimizer = new QNMinimizer(mem);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (!verbose) {</span>
+<span class="nc" id="L405">            firstMinimizer.shutUp();</span>
+<span class="nc" id="L406">            secondMinimizer.shutUp();</span>
+        }
+<span class="nc" id="L408">        return new HybridMinimizer(firstMinimizer, secondMinimizer, cutoffIteration);</span>
+    };
+<span class="nc" id="L410">  }</span>
+
+  /**
+   * Set the mem value for {@link QNMinimizer}.
+   * Only used with quasi-newton minimization.  15 is the default.
+   *
+   * @param mem Number of previous function/derivative evaluations to store
+   *            to estimate second derivative.  Storing more previous evaluations
+   *            improves training convergence speed.  This number can be very
+   *            small, if memory conservation is the priority.  For large
+   *            optimization systems (of 100,000-1,000,000 dimensions), setting this
+   *            to 15 produces quite good results, but setting it to 50 can
+   *            decrease the iteration count by about 20% over a value of 15.
+   */
+  public void setMem(int mem) {
+<span class="nc" id="L425">    this.mem = mem;</span>
+<span class="nc" id="L426">  }</span>
+
+  /**
+   * Sets the minimizer to {@link CGMinimizer}, with the passed {@code verbose} flag.
+   */
+  public void useConjugateGradientAscent(boolean verbose) {
+<span class="nc" id="L432">    this.verbose = verbose;</span>
+<span class="nc" id="L433">    useConjugateGradientAscent();</span>
+<span class="nc" id="L434">  }</span>
+
+  /**
+   * Sets the minimizer to {@link CGMinimizer}.
+   */
+  public void useConjugateGradientAscent() {
+<span class="nc" id="L440">    this.minimizerCreator = new Factory&lt;Minimizer&lt;DiffFunction&gt;&gt;() {</span>
+      private static final long serialVersionUID = -561168861131879990L;
+
+      @Override
+      public Minimizer&lt;DiffFunction&gt; create() {
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        return new CGMinimizer(!LinearClassifierFactory.this.verbose);</span>
+      }
+    };
+<span class="nc" id="L448">  }</span>
+
+  /**
+   * NOTE: nothing is actually done with this value!
+   *
+   * SetUseSum sets the {@code useSum} flag: when turned on,
+   * the Summed Conditional Objective Function is used.  Otherwise, the
+   * LogConditionalObjectiveFunction is used.  The default is false.
+   */
+  public void setUseSum(boolean useSum) {
+    //this.useSum = useSum;
+<span class="nc" id="L459">  }</span>
+
+
+  private Minimizer&lt;DiffFunction&gt; getMinimizer() {
+    // Create a new minimizer
+<span class="fc" id="L464">    Minimizer&lt;DiffFunction&gt; minimizer = minimizerCreator.create();</span>
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">    if (minimizer instanceof HasEvaluators) {</span>
+<span class="fc" id="L466">      ((HasEvaluators) minimizer).setEvaluators(evalIters, evaluators);</span>
+    }
+<span class="fc" id="L468">    return minimizer;</span>
+  }
+
+
+  /**
+   * Adapt classifier (adjust the mean of Gaussian prior).
+   * Under construction -pichuan
+   *
+   * @param origWeights the original weights trained from the training data
+   * @param adaptDataset the Dataset used to adapt the trained weights
+   * @return adapted weights
+   */
+  public double[][] adaptWeights(double[][] origWeights, GeneralDataset&lt;L, F&gt; adaptDataset) {
+<span class="nc" id="L481">    Minimizer&lt;DiffFunction&gt; minimizer = getMinimizer();</span>
+<span class="nc" id="L482">    logger.info(&quot;adaptWeights in LinearClassifierFactory. increase weight dim only&quot;);</span>
+<span class="nc" id="L483">    double[][] newWeights = new double[adaptDataset.featureIndex.size()][adaptDataset.labelIndex.size()];</span>
+
+<span class="nc" id="L485">    synchronized (System.class) {</span>
+<span class="nc" id="L486">      System.arraycopy(origWeights, 0, newWeights, 0, origWeights.length);</span>
+<span class="nc" id="L487">    }</span>
+
+<span class="nc" id="L489">    AdaptedGaussianPriorObjectiveFunction&lt;L, F&gt; objective = new AdaptedGaussianPriorObjectiveFunction&lt;&gt;(adaptDataset, logPrior, newWeights);</span>
+
+<span class="nc" id="L491">    double[] initial = objective.initial();</span>
+
+<span class="nc" id="L493">    double[] weights = minimizer.minimize(objective, TOL, initial);</span>
+<span class="nc" id="L494">    return objective.to2D(weights);</span>
+
+    //Question: maybe the adaptWeights can be done just in LinearClassifier ?? (pichuan)
+  }
+
+  @Override
+  public double[][] trainWeights(GeneralDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L501">    return trainWeights(dataset, null);</span>
+  }
+
+  public double[][] trainWeights(GeneralDataset&lt;L, F&gt; dataset, double[] initial) {
+<span class="nc" id="L505">    return trainWeights(dataset, initial, false);</span>
+  }
+
+  public double[][] trainWeights(GeneralDataset&lt;L, F&gt; dataset, double[] initial, boolean bypassTuneSigma) {
+<span class="fc" id="L509">    Minimizer&lt;DiffFunction&gt; minimizer = getMinimizer();</span>
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">    if(dataset instanceof RVFDataset)</span>
+<span class="nc" id="L511">      ((RVFDataset&lt;L,F&gt;)dataset).ensureRealValues();</span>
+<span class="fc" id="L512">    double[] interimWeights = null;</span>
+<span class="pc bpc" id="L513" title="1 of 2 branches missed.">    if(! bypassTuneSigma) {</span>
+<span class="pc bpc" id="L514" title="1 of 2 branches missed.">      if (tuneSigmaHeldOut) {</span>
+<span class="nc" id="L515">        interimWeights = heldOutSetSigma(dataset); // the optimum interim weights from held-out training data have already been found.</span>
+<span class="pc bpc" id="L516" title="1 of 2 branches missed.">      } else if (tuneSigmaCV) {</span>
+<span class="nc" id="L517">        crossValidateSetSigma(dataset,folds); // TODO: assign optimum interim weights as part of this process.</span>
+      }
+    }
+<span class="fc" id="L520">    LogConditionalObjectiveFunction&lt;L, F&gt; objective = new LogConditionalObjectiveFunction&lt;&gt;(dataset, logPrior);</span>
+<span class="pc bpc" id="L521" title="4 of 6 branches missed.">    if(initial == null &amp;&amp; interimWeights != null &amp;&amp; ! retrainFromScratchAfterSigmaTuning) {</span>
+      //logger.info(&quot;## taking advantage of interim weights as starting point.&quot;);
+<span class="nc" id="L523">      initial = interimWeights;</span>
+    }
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">    if (initial == null) {</span>
+<span class="fc" id="L526">      initial = objective.initial();</span>
+    }
+
+<span class="fc" id="L529">    double[] weights = minimizer.minimize(objective, TOL, initial);</span>
+<span class="fc" id="L530">    return objective.to2D(weights);</span>
+  }
+
+  /**
+   * IMPORTANT: dataset and biasedDataset must have same featureIndex, labelIndex
+   */
+  public Classifier&lt;L, F&gt; trainClassifierSemiSup(GeneralDataset&lt;L, F&gt; data, GeneralDataset&lt;L, F&gt; biasedData, double[][] confusionMatrix, double[] initial) {
+<span class="nc" id="L537">    double[][] weights =  trainWeightsSemiSup(data, biasedData, confusionMatrix, initial);</span>
+<span class="nc" id="L538">    LinearClassifier&lt;L, F&gt; classifier = new LinearClassifier&lt;&gt;(weights, data.featureIndex(), data.labelIndex());</span>
+<span class="nc" id="L539">    return classifier;</span>
+  }
+
+  public double[][] trainWeightsSemiSup(GeneralDataset&lt;L, F&gt; data, GeneralDataset&lt;L, F&gt; biasedData, double[][] confusionMatrix, double[] initial) {
+<span class="nc" id="L543">    Minimizer&lt;DiffFunction&gt; minimizer = getMinimizer();</span>
+<span class="nc" id="L544">    LogConditionalObjectiveFunction&lt;L, F&gt; objective = new LogConditionalObjectiveFunction&lt;&gt;(data, new LogPrior(LogPrior.LogPriorType.NULL));</span>
+<span class="nc" id="L545">    BiasedLogConditionalObjectiveFunction biasedObjective = new BiasedLogConditionalObjectiveFunction(biasedData, confusionMatrix, new LogPrior(LogPrior.LogPriorType.NULL));</span>
+<span class="nc" id="L546">    SemiSupervisedLogConditionalObjectiveFunction semiSupObjective = new SemiSupervisedLogConditionalObjectiveFunction(objective, biasedObjective, logPrior);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    if (initial == null) {</span>
+<span class="nc" id="L548">      initial = objective.initial();</span>
+    }
+<span class="nc" id="L550">    double[] weights = minimizer.minimize(semiSupObjective, TOL, initial);</span>
+<span class="nc" id="L551">    return objective.to2D(weights);</span>
+  }
+
+  /**
+   * Trains the linear classifier using Generalized Expectation criteria as described in
+   * &lt;tt&gt;Generalized Expectation Criteria for Semi Supervised Learning of Conditional Random Fields&lt;/tt&gt;, Mann and McCallum, ACL 2008.
+   * The original algorithm is proposed for CRFs but has been adopted to LinearClassifier (which is a simpler special case of a CRF).
+   * IMPORTANT: the labeled features that are passed as an argument are assumed to be binary valued, although
+   * other features are allowed to be real valued.
+   */
+  public LinearClassifier&lt;L,F&gt; trainSemiSupGE(GeneralDataset&lt;L, F&gt; labeledDataset, List&lt;? extends Datum&lt;L, F&gt;&gt; unlabeledDataList, List&lt;F&gt; GEFeatures, double convexComboCoeff) {
+<span class="nc" id="L562">    Minimizer&lt;DiffFunction&gt; minimizer = getMinimizer();</span>
+<span class="nc" id="L563">    LogConditionalObjectiveFunction&lt;L, F&gt; objective = new LogConditionalObjectiveFunction&lt;&gt;(labeledDataset, new LogPrior(LogPrior.LogPriorType.NULL));</span>
+<span class="nc" id="L564">    GeneralizedExpectationObjectiveFunction&lt;L,F&gt; geObjective = new GeneralizedExpectationObjectiveFunction&lt;&gt;(labeledDataset, unlabeledDataList, GEFeatures);</span>
+<span class="nc" id="L565">    SemiSupervisedLogConditionalObjectiveFunction semiSupObjective = new SemiSupervisedLogConditionalObjectiveFunction(objective, geObjective, null,convexComboCoeff);</span>
+<span class="nc" id="L566">    double[] initial = objective.initial();</span>
+<span class="nc" id="L567">    double[] weights = minimizer.minimize(semiSupObjective, TOL, initial);</span>
+<span class="nc" id="L568">    return new LinearClassifier&lt;&gt;(objective.to2D(weights), labeledDataset.featureIndex(), labeledDataset.labelIndex());</span>
+  }
+
+
+  /**
+   * Trains the linear classifier using Generalized Expectation criteria as described in
+   * &lt;tt&gt;Generalized Expectation Criteria for Semi Supervised Learning of Conditional Random Fields&lt;/tt&gt;, Mann and McCallum, ACL 2008.
+   * The original algorithm is proposed for CRFs but has been adopted to LinearClassifier (which is a simpler, special case of a CRF).
+   * Automatically discovers high precision, high frequency labeled features to be used as GE constraints.
+   * IMPORTANT: the current feature selector assumes the features are binary. The GE constraints assume the constraining features are binary anyway, although
+   * it doesn't make such assumptions about other features.
+   */
+  public LinearClassifier&lt;L,F&gt; trainSemiSupGE(GeneralDataset&lt;L, F&gt; labeledDataset, List&lt;? extends Datum&lt;L, F&gt;&gt; unlabeledDataList) {
+<span class="nc" id="L581">    List&lt;F&gt; GEFeatures = getHighPrecisionFeatures(labeledDataset,0.9,10);</span>
+<span class="nc" id="L582">    return trainSemiSupGE(labeledDataset, unlabeledDataList, GEFeatures, 0.5);</span>
+  }
+
+  public LinearClassifier&lt;L,F&gt; trainSemiSupGE(GeneralDataset&lt;L, F&gt; labeledDataset, List&lt;? extends Datum&lt;L, F&gt;&gt; unlabeledDataList, double convexComboCoeff) {
+<span class="nc" id="L586">    List&lt;F&gt; GEFeatures = getHighPrecisionFeatures(labeledDataset,0.9,10);</span>
+<span class="nc" id="L587">    return trainSemiSupGE(labeledDataset, unlabeledDataList, GEFeatures, convexComboCoeff);</span>
+  }
+
+
+  /**
+   * Returns a list of featured thresholded by minPrecision and sorted by their frequency of occurrence.
+   * precision in this case, is defined as the frequency of majority label over total frequency for that feature.
+   *
+   * @return list of high precision features.
+   */
+  private List&lt;F&gt; getHighPrecisionFeatures(GeneralDataset&lt;L,F&gt; dataset, double minPrecision, int maxNumFeatures){
+<span class="nc" id="L598">    int[][] feature2label = new int[dataset.numFeatures()][dataset.numClasses()];</span>
+    // shouldn't be necessary as Java zero fills arrays
+    // for(int f = 0; f &lt; dataset.numFeatures(); f++)
+    //   Arrays.fill(feature2label[f],0);
+
+<span class="nc" id="L603">    int[][] data = dataset.data;</span>
+<span class="nc" id="L604">    int[] labels = dataset.labels;</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">    for(int d = 0; d &lt; data.length; d++){</span>
+<span class="nc" id="L606">      int label = labels[d];</span>
+      //System.out.println(&quot;datum id:&quot;+d+&quot; label id: &quot;+label);
+<span class="nc bnc" id="L608" title="All 2 branches missed.">      if(data[d] != null){</span>
+        //System.out.println(&quot; number of features:&quot;+data[d].length);
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        for(int n = 0; n &lt; data[d].length; n++){</span>
+<span class="nc" id="L611">          feature2label[data[d][n]][label]++;</span>
+        }
+      }
+    }
+<span class="nc" id="L615">    Counter&lt;F&gt; feature2freq = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">    for(int f = 0; f &lt; dataset.numFeatures(); f++){</span>
+<span class="nc" id="L617">     int maxF = ArrayMath.max(feature2label[f]);</span>
+<span class="nc" id="L618">     int total = ArrayMath.sum(feature2label[f]);</span>
+<span class="nc" id="L619">     double precision = ((double)maxF)/total;</span>
+<span class="nc" id="L620">     F feature = dataset.featureIndex.get(f);</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">     if(precision &gt;= minPrecision){</span>
+<span class="nc" id="L622">       feature2freq.incrementCount(feature, total);</span>
+     }
+    }
+<span class="nc bnc" id="L625" title="All 2 branches missed.">    if(feature2freq.size() &gt; maxNumFeatures){</span>
+<span class="nc" id="L626">      Counters.retainTop(feature2freq, maxNumFeatures);</span>
+    }
+    //for(F feature : feature2freq.keySet())
+      //System.out.println(feature+&quot; &quot;+feature2freq.getCount(feature));
+    //System.exit(0);
+<span class="nc" id="L631">    return Counters.toSortedList(feature2freq);</span>
+  }
+
+  /**
+   * Train a classifier with a sigma tuned on a validation set.
+   *
+   * @return The constructed classifier
+   */
+  public LinearClassifier&lt;L, F&gt; trainClassifierV(GeneralDataset&lt;L, F&gt; train, GeneralDataset&lt;L, F&gt; validation, double min, double max, boolean accuracy) {
+<span class="nc" id="L640">    labelIndex = train.labelIndex();</span>
+<span class="nc" id="L641">    featureIndex = train.featureIndex();</span>
+<span class="nc" id="L642">    this.min = min;</span>
+<span class="nc" id="L643">    this.max = max;</span>
+<span class="nc" id="L644">    heldOutSetSigma(train, validation);</span>
+<span class="nc" id="L645">    double[][] weights = trainWeights(train);</span>
+<span class="nc" id="L646">    return new LinearClassifier&lt;&gt;(weights, train.featureIndex(), train.labelIndex());</span>
+  }
+
+  /**
+   * Train a classifier with a sigma tuned on a validation set.
+   * In this case we are fitting on the last 30% of the training data.
+   *
+   * @param train The data to train (and validate) on.
+   * @return The constructed classifier
+   */
+  public LinearClassifier&lt;L, F&gt; trainClassifierV(GeneralDataset&lt;L, F&gt; train, double min, double max, boolean accuracy) {
+<span class="nc" id="L657">    labelIndex = train.labelIndex();</span>
+<span class="nc" id="L658">    featureIndex = train.featureIndex();</span>
+<span class="nc" id="L659">    tuneSigmaHeldOut = true;</span>
+<span class="nc" id="L660">    this.min = min;</span>
+<span class="nc" id="L661">    this.max = max;</span>
+<span class="nc" id="L662">    heldOutSetSigma(train);</span>
+<span class="nc" id="L663">    double[][] weights = trainWeights(train);</span>
+<span class="nc" id="L664">    return new LinearClassifier&lt;&gt;(weights, train.featureIndex(), train.labelIndex());</span>
+  }
+
+  /**
+   * setTuneSigmaHeldOut sets the {@code tuneSigmaHeldOut} flag: when turned on,
+   * the sigma is tuned by means of held-out (70%-30%). Otherwise no tuning on sigma is done.
+   * The default is false.
+   */
+  public void setTuneSigmaHeldOut() {
+<span class="nc" id="L673">    tuneSigmaHeldOut = true;</span>
+<span class="nc" id="L674">    tuneSigmaCV = false;</span>
+<span class="nc" id="L675">  }</span>
+
+  /**
+   * setTuneSigmaCV sets the {@code tuneSigmaCV} flag: when turned on,
+   * the sigma is tuned by cross-validation. The number of folds is the parameter.
+   * If there is less data than the number of folds, leave-one-out is used.
+   * The default is false.
+   */
+  public void setTuneSigmaCV(int folds) {
+<span class="nc" id="L684">    tuneSigmaCV = true;</span>
+<span class="nc" id="L685">    tuneSigmaHeldOut = false;</span>
+<span class="nc" id="L686">    this.folds = folds;</span>
+<span class="nc" id="L687">  }</span>
+
+  /**
+   * NOTE: Nothing is actually done with this value.
+   *
+   * resetWeight sets the {@code restWeight} flag. This flag makes sense only if sigma is tuned:
+   * when turned on, the weights output by the tuneSigma method will be reset to zero when training the
+   * classifier.
+   * The default is false.
+   */
+  public void resetWeight() {
+    //resetWeight = true;
+<span class="nc" id="L699">  }</span>
+
+<span class="fc" id="L701">  protected static final double[] sigmasToTry = {0.5,1.0,2.0,4.0,10.0, 20.0, 100.0};</span>
+
+  /**
+   * Calls the method {@link #crossValidateSetSigma(GeneralDataset, int)} with 5-fold cross-validation.
+   * @param dataset the data set to optimize sigma on.
+   */
+  public void crossValidateSetSigma(GeneralDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L708">    crossValidateSetSigma(dataset, 5);</span>
+<span class="nc" id="L709">  }</span>
+
+  /**
+   * Calls the method {@link #crossValidateSetSigma(GeneralDataset, int, Scorer, LineSearcher)} with
+   * multi-class log-likelihood scoring (see {@link MultiClassAccuracyStats}) and golden-section line search
+   * (see {@link GoldenSectionLineSearch}).
+   *
+   * @param dataset the data set to optimize sigma on.
+   */
+  public void crossValidateSetSigma(GeneralDataset&lt;L, F&gt; dataset,int kfold) {
+<span class="nc" id="L719">    logger.info(&quot;##you are here.&quot;);</span>
+<span class="nc" id="L720">    crossValidateSetSigma(dataset, kfold, new MultiClassAccuracyStats&lt;&gt;(MultiClassAccuracyStats.USE_LOGLIKELIHOOD), new GoldenSectionLineSearch(true, 1e-2, min, max));</span>
+<span class="nc" id="L721">  }</span>
+
+  public void crossValidateSetSigma(GeneralDataset&lt;L, F&gt; dataset,int kfold, final Scorer&lt;L&gt; scorer) {
+<span class="nc" id="L724">    crossValidateSetSigma(dataset, kfold, scorer, new GoldenSectionLineSearch(true, 1e-2, min, max));</span>
+<span class="nc" id="L725">  }</span>
+  public void crossValidateSetSigma(GeneralDataset&lt;L, F&gt; dataset,int kfold, LineSearcher minimizer) {
+<span class="nc" id="L727">    crossValidateSetSigma(dataset, kfold, new MultiClassAccuracyStats&lt;&gt;(MultiClassAccuracyStats.USE_LOGLIKELIHOOD), minimizer);</span>
+<span class="nc" id="L728">  }</span>
+  /**
+   * Sets the sigma parameter to a value that optimizes the cross-validation score given by {@code scorer}.  Search for an optimal value
+   * is carried out by {@code minimizer}.
+   *
+   * @param dataset the data set to optimize sigma on.
+   */
+  public void crossValidateSetSigma(GeneralDataset&lt;L, F&gt; dataset,int kfold, final Scorer&lt;L&gt; scorer, LineSearcher minimizer) {
+<span class="nc" id="L736">    logger.info(&quot;##in Cross Validate, folds = &quot; + kfold);</span>
+<span class="nc" id="L737">    logger.info(&quot;##Scorer is &quot; + scorer);</span>
+
+<span class="nc" id="L739">    featureIndex = dataset.featureIndex;</span>
+<span class="nc" id="L740">    labelIndex = dataset.labelIndex;</span>
+
+<span class="nc" id="L742">    final CrossValidator&lt;L, F&gt; crossValidator = new CrossValidator&lt;&gt;(dataset, kfold);</span>
+<span class="nc" id="L743">    final Function&lt;Triple&lt;GeneralDataset&lt;L, F&gt;,GeneralDataset&lt;L, F&gt;,CrossValidator.SavedState&gt;,Double&gt; scoreFn =</span>
+        fold -&gt; {
+<span class="nc" id="L745">          GeneralDataset&lt;L, F&gt; trainSet = fold.first();</span>
+<span class="nc" id="L746">          GeneralDataset&lt;L, F&gt; devSet   = fold.second();</span>
+
+<span class="nc" id="L748">          double[] weights = (double[])fold.third().state;</span>
+          double[][] weights2D;
+
+<span class="nc" id="L751">          weights2D = trainWeights(trainSet, weights,true); // must of course bypass sigma tuning here.</span>
+
+<span class="nc" id="L753">          fold.third().state = ArrayUtils.flatten(weights2D);</span>
+
+<span class="nc" id="L755">          LinearClassifier&lt;L, F&gt; classifier = new LinearClassifier&lt;&gt;(weights2D, trainSet.featureIndex, trainSet.labelIndex);</span>
+
+<span class="nc" id="L757">          double score = scorer.score(classifier, devSet);</span>
+          //System.out.println(&quot;score: &quot;+score);
+<span class="nc" id="L759">          System.out.print(&quot;.&quot;);</span>
+<span class="nc" id="L760">          return score;</span>
+        };
+
+<span class="nc" id="L763">    Function&lt;Double,Double&gt; negativeScorer =</span>
+        sigmaToTry -&gt; {
+          //sigma = sigmaToTry;
+<span class="nc" id="L766">          setSigma(sigmaToTry);</span>
+<span class="nc" id="L767">          Double averageScore = crossValidator.computeAverage(scoreFn);</span>
+<span class="nc" id="L768">          logger.info(&quot;##sigma = &quot;+getSigma() + &quot; -&gt; average Score: &quot; + averageScore);</span>
+<span class="nc" id="L769">          return -averageScore;</span>
+        };
+
+<span class="nc" id="L772">    double bestSigma = minimizer.minimize(negativeScorer);</span>
+<span class="nc" id="L773">    logger.info(&quot;##best sigma: &quot; + bestSigma);</span>
+<span class="nc" id="L774">    setSigma(bestSigma);</span>
+<span class="nc" id="L775">  }</span>
+
+  /**
+   * Set the {@link LineSearcher} to be used in {@link #heldOutSetSigma(GeneralDataset, GeneralDataset)}.
+   */
+  public void setHeldOutSearcher(LineSearcher heldOutSearcher) {
+<span class="nc" id="L781">    this.heldOutSearcher = heldOutSearcher;</span>
+<span class="nc" id="L782">  }</span>
+
+  private LineSearcher heldOutSearcher; // = null;
+
+  public double[] heldOutSetSigma(GeneralDataset&lt;L, F&gt; train) {
+<span class="nc" id="L787">    Pair&lt;GeneralDataset&lt;L, F&gt;, GeneralDataset&lt;L, F&gt;&gt; data = train.split(0.3);</span>
+<span class="nc" id="L788">    return heldOutSetSigma(data.first(), data.second());</span>
+  }
+
+  public double[] heldOutSetSigma(GeneralDataset&lt;L, F&gt; train, Scorer&lt;L&gt; scorer) {
+<span class="nc" id="L792">    Pair&lt;GeneralDataset&lt;L, F&gt;, GeneralDataset&lt;L, F&gt;&gt; data = train.split(0.3);</span>
+<span class="nc" id="L793">    return heldOutSetSigma(data.first(), data.second(), scorer);</span>
+  }
+
+  public double[] heldOutSetSigma(GeneralDataset&lt;L, F&gt; train, GeneralDataset&lt;L, F&gt; dev) {
+<span class="nc bnc" id="L797" title="All 2 branches missed.">    return heldOutSetSigma(train, dev, new MultiClassAccuracyStats&lt;&gt;(MultiClassAccuracyStats.USE_LOGLIKELIHOOD), heldOutSearcher == null ? new GoldenSectionLineSearch(true, 1e-2, min, max) : heldOutSearcher);</span>
+  }
+
+  public double[] heldOutSetSigma(GeneralDataset&lt;L, F&gt; train, GeneralDataset&lt;L, F&gt; dev, final Scorer&lt;L&gt; scorer) {
+<span class="nc" id="L801">    return heldOutSetSigma(train, dev, scorer, new GoldenSectionLineSearch(true, 1e-2, min, max));</span>
+  }
+
+  public double[] heldOutSetSigma(GeneralDataset&lt;L, F&gt; train, GeneralDataset&lt;L, F&gt; dev, LineSearcher minimizer) {
+<span class="nc" id="L805">    return heldOutSetSigma(train, dev, new MultiClassAccuracyStats&lt;&gt;(MultiClassAccuracyStats.USE_LOGLIKELIHOOD), minimizer);</span>
+  }
+
+  /**
+   * Sets the sigma parameter to a value that optimizes the held-out score given by {@code scorer}.  Search for an
+   * optimal value is carried out by {@code minimizer} dataset the data set to optimize sigma on. kfold
+   *
+   * @return an interim set of optimal weights: the weights
+   */
+  public double[] heldOutSetSigma(final GeneralDataset&lt;L, F&gt; trainSet, final GeneralDataset&lt;L, F&gt; devSet, final Scorer&lt;L&gt; scorer, LineSearcher minimizer) {
+
+<span class="nc" id="L816">    featureIndex = trainSet.featureIndex;</span>
+<span class="nc" id="L817">    labelIndex = trainSet.labelIndex;</span>
+    //double[] resultWeights = null;
+<span class="nc" id="L819">    Timing timer = new Timing();</span>
+
+<span class="nc" id="L821">    NegativeScorer negativeScorer = new NegativeScorer(trainSet,devSet,scorer,timer);</span>
+
+<span class="nc" id="L823">    timer.start();</span>
+<span class="nc" id="L824">    double bestSigma = minimizer.minimize(negativeScorer);</span>
+<span class="nc" id="L825">    logger.info(&quot;##best sigma: &quot; + bestSigma);</span>
+<span class="nc" id="L826">    setSigma(bestSigma);</span>
+
+<span class="nc" id="L828">    return ArrayUtils.flatten(trainWeights(trainSet,negativeScorer.weights,true)); // make sure it's actually the interim weights from best sigma</span>
+  }
+
+  class NegativeScorer implements Function&lt;Double, Double&gt; {
+    public double[] weights; // = null;
+    GeneralDataset&lt;L, F&gt; trainSet;
+    GeneralDataset&lt;L, F&gt; devSet;
+    Scorer&lt;L&gt; scorer;
+    Timing timer;
+
+<span class="nc" id="L838">    public NegativeScorer(GeneralDataset&lt;L, F&gt; trainSet, GeneralDataset&lt;L, F&gt; devSet, Scorer&lt;L&gt; scorer,Timing timer) {</span>
+<span class="nc" id="L839">      super();</span>
+<span class="nc" id="L840">      this.trainSet = trainSet;</span>
+<span class="nc" id="L841">      this.devSet = devSet;</span>
+<span class="nc" id="L842">      this.scorer = scorer;</span>
+<span class="nc" id="L843">      this.timer = timer;</span>
+<span class="nc" id="L844">    }</span>
+
+    @Override
+    public Double apply(Double sigmaToTry) {
+      double[][] weights2D;
+<span class="nc" id="L849">      setSigma(sigmaToTry);</span>
+
+<span class="nc" id="L851">      weights2D = trainWeights(trainSet, weights,true); //bypass.</span>
+
+<span class="nc" id="L853">      weights = ArrayUtils.flatten(weights2D);</span>
+
+<span class="nc" id="L855">      LinearClassifier&lt;L, F&gt; classifier = new LinearClassifier&lt;&gt;(weights2D, trainSet.featureIndex, trainSet.labelIndex);</span>
+
+<span class="nc" id="L857">      double score = scorer.score(classifier, devSet);</span>
+      //System.out.println(&quot;score: &quot;+score);
+      //System.out.print(&quot;.&quot;);
+<span class="nc" id="L860">      logger.info(&quot;##sigma = &quot; + getSigma() + &quot; -&gt; average Score: &quot; + score);</span>
+<span class="nc" id="L861">      logger.info(&quot;##time elapsed: &quot; + timer.stop() + &quot; milliseconds.&quot;);</span>
+<span class="nc" id="L862">      timer.restart();</span>
+<span class="nc" id="L863">      return -score;</span>
+    }
+  }
+
+  /** If set to true, then when training a classifier, after an optimal sigma is chosen a model is relearned from
+   * scratch. If set to false (the default), then the model is updated from wherever it wound up in the sigma-tuning process.
+   * The latter is likely to be faster, but it's not clear which model will wind up better.  */
+  public void setRetrainFromScratchAfterSigmaTuning( boolean retrainFromScratchAfterSigmaTuning) {
+<span class="nc" id="L871">    this.retrainFromScratchAfterSigmaTuning = retrainFromScratchAfterSigmaTuning;</span>
+<span class="nc" id="L872">  }</span>
+
+
+  public Classifier&lt;L, F&gt; trainClassifier(Iterable&lt;Datum&lt;L, F&gt;&gt; dataIterable) {
+<span class="nc" id="L876">    Minimizer&lt;DiffFunction&gt; minimizer = getMinimizer();</span>
+<span class="nc" id="L877">    Index&lt;F&gt; featureIndex = Generics.newIndex();</span>
+<span class="nc" id="L878">    Index&lt;L&gt; labelIndex = Generics.newIndex();</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">    for (Datum&lt;L, F&gt; d : dataIterable) {</span>
+<span class="nc" id="L880">      labelIndex.add(d.label());</span>
+<span class="nc" id="L881">      featureIndex.addAll(d.asFeatures());//If there are duplicates, it doesn't add them again.</span>
+<span class="nc" id="L882">    }</span>
+<span class="nc" id="L883">    logger.info(String.format(&quot;Training linear classifier with %d features and %d labels&quot;, featureIndex.size(), labelIndex.size()));</span>
+
+<span class="nc" id="L885">    LogConditionalObjectiveFunction&lt;L, F&gt; objective = new LogConditionalObjectiveFunction&lt;&gt;(dataIterable, logPrior, featureIndex, labelIndex);</span>
+    // [cdm 2014] Commented out next line. Why not use the logPrior set up previously and used at creation???
+    // objective.setPrior(new LogPrior(LogPrior.LogPriorType.QUADRATIC));
+
+<span class="nc" id="L889">    double[] initial = objective.initial();</span>
+<span class="nc" id="L890">    double[] weights = minimizer.minimize(objective, TOL, initial);</span>
+
+<span class="nc" id="L892">    LinearClassifier&lt;L, F&gt; classifier = new LinearClassifier&lt;&gt;(objective.to2D(weights), featureIndex, labelIndex);</span>
+<span class="nc" id="L893">    return classifier;</span>
+  }
+
+  public Classifier&lt;L, F&gt; trainClassifier(GeneralDataset&lt;L, F&gt; dataset, float[] dataWeights, LogPrior prior) {
+<span class="nc" id="L897">    Minimizer&lt;DiffFunction&gt; minimizer = getMinimizer();</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">    if (dataset instanceof RVFDataset) {</span>
+<span class="nc" id="L899">      ((RVFDataset&lt;L,F&gt;)dataset).ensureRealValues();</span>
+    }
+<span class="nc" id="L901">    LogConditionalObjectiveFunction&lt;L, F&gt; objective = new LogConditionalObjectiveFunction&lt;&gt;(dataset, dataWeights, prior);</span>
+
+<span class="nc" id="L903">    double[] initial = objective.initial();</span>
+<span class="nc" id="L904">    double[] weights = minimizer.minimize(objective, TOL, initial);</span>
+
+<span class="nc" id="L906">    LinearClassifier&lt;L, F&gt; classifier = new LinearClassifier&lt;&gt;(objective.to2D(weights), dataset.featureIndex(), dataset.labelIndex());</span>
+<span class="nc" id="L907">    return classifier;</span>
+  }
+
+
+  @Override
+  public LinearClassifier&lt;L, F&gt; trainClassifier(GeneralDataset&lt;L, F&gt; dataset) {
+<span class="fc" id="L913">    return trainClassifier(dataset, null);</span>
+  }
+
+  public LinearClassifier&lt;L, F&gt; trainClassifier(GeneralDataset&lt;L, F&gt; dataset, double[] initial) {
+    // Sanity check
+<span class="pc bpc" id="L918" title="1 of 2 branches missed.">    if (dataset instanceof RVFDataset) {</span>
+<span class="nc" id="L919">      ((RVFDataset&lt;L, F&gt;) dataset).ensureRealValues();</span>
+    }
+<span class="pc bpc" id="L921" title="1 of 2 branches missed.">    if (initial != null) {</span>
+<span class="nc bnc" id="L922" title="All 2 branches missed.">      for (double weight : initial) {</span>
+<span class="nc bnc" id="L923" title="All 4 branches missed.">        if (Double.isNaN(weight) || Double.isInfinite(weight)) {</span>
+<span class="nc" id="L924">          throw new IllegalArgumentException(&quot;Initial weights are invalid!&quot;);</span>
+        }
+      }
+    }
+    // Train classifier
+<span class="fc" id="L929">    double[][] weights =  trainWeights(dataset, initial, false);</span>
+<span class="fc" id="L930">    LinearClassifier&lt;L, F&gt; classifier = new LinearClassifier&lt;&gt;(weights, dataset.featureIndex(), dataset.labelIndex());</span>
+<span class="fc" id="L931">    return classifier;</span>
+  }
+
+  public LinearClassifier&lt;L, F&gt; trainClassifierWithInitialWeights(GeneralDataset&lt;L, F&gt; dataset, double[][] initialWeights2D) {
+<span class="nc bnc" id="L935" title="All 2 branches missed.">    double[] initialWeights = (initialWeights2D != null)? ArrayUtils.flatten(initialWeights2D):null;</span>
+<span class="nc" id="L936">    return trainClassifier(dataset, initialWeights);</span>
+  }
+
+  public LinearClassifier&lt;L, F&gt; trainClassifierWithInitialWeights(GeneralDataset&lt;L, F&gt; dataset, LinearClassifier&lt;L,F&gt; initialClassifier) {
+<span class="nc bnc" id="L940" title="All 2 branches missed.">    double[][] initialWeights2D = (initialClassifier != null)? initialClassifier.weights():null;</span>
+<span class="nc" id="L941">    return trainClassifierWithInitialWeights(dataset, initialWeights2D);</span>
+  }
+
+
+  /**
+   * Given the path to a file representing the text based serialization of a
+   * Linear Classifier, reconstitutes and returns that LinearClassifier.
+   *
+   * TODO: Leverage Index
+   */
+  public static LinearClassifier&lt;String, String&gt; loadFromFilename(String file) {
+    try {
+<span class="nc" id="L953">      BufferedReader in = IOUtils.readerFromString(file);</span>
+
+      // Format: read indices first, weights, then thresholds
+<span class="nc" id="L956">      Index&lt;String&gt; labelIndex = HashIndex.loadFromReader(in);</span>
+<span class="nc" id="L957">      Index&lt;String&gt; featureIndex = HashIndex.loadFromReader(in);</span>
+<span class="nc" id="L958">      double[][] weights = new double[featureIndex.size()][labelIndex.size()];</span>
+<span class="nc" id="L959">      int currLine = 1;</span>
+<span class="nc" id="L960">      String line = in.readLine();</span>
+<span class="nc bnc" id="L961" title="All 4 branches missed.">      while (line != null &amp;&amp; line.length()&gt;0) {</span>
+<span class="nc" id="L962">        String[] tuples = line.split(LinearClassifier.TEXT_SERIALIZATION_DELIMITER);</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">        if (tuples.length != 3) {</span>
+<span class="nc" id="L964">            throw new Exception(&quot;Error: incorrect number of tokens in weight specifier, line=&quot;</span>
+                + currLine + &quot; in file &quot; + file);
+        }
+<span class="nc" id="L967">        currLine++;</span>
+<span class="nc" id="L968">        int feature = Integer.parseInt(tuples[0]);</span>
+<span class="nc" id="L969">        int label = Integer.parseInt(tuples[1]);</span>
+<span class="nc" id="L970">        double value = Double.parseDouble(tuples[2]);</span>
+<span class="nc" id="L971">        weights[feature][label] = value;</span>
+<span class="nc" id="L972">        line = in.readLine();</span>
+<span class="nc" id="L973">      }</span>
+
+      // First line in thresholds is the number of thresholds
+<span class="nc" id="L976">      int numThresholds = Integer.parseInt(in.readLine());</span>
+<span class="nc" id="L977">      double[] thresholds = new double[numThresholds];</span>
+<span class="nc" id="L978">      int curr = 0;</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">      while ((line = in.readLine()) != null) {</span>
+<span class="nc" id="L980">        double tval = Double.parseDouble(line.trim());</span>
+<span class="nc" id="L981">        thresholds[curr++] = tval;</span>
+<span class="nc" id="L982">      }</span>
+<span class="nc" id="L983">      in.close();</span>
+<span class="nc" id="L984">      LinearClassifier&lt;String, String&gt; classifier = new LinearClassifier&lt;&gt;(weights, featureIndex, labelIndex);</span>
+<span class="nc" id="L985">      return classifier;</span>
+<span class="nc" id="L986">    } catch (Exception e) {</span>
+<span class="nc" id="L987">      throw new RuntimeIOException(&quot;Error in LinearClassifierFactory, loading from file=&quot; + file, e);</span>
+    }
+  }
+
+  public void setEvaluators(int iters, Evaluator[] evaluators) {
+<span class="nc" id="L992">    this.evalIters = iters;</span>
+<span class="nc" id="L993">    this.evaluators = evaluators;</span>
+<span class="nc" id="L994">  }</span>
+
+  public LinearClassifierCreator&lt;L,F&gt; getClassifierCreator(GeneralDataset&lt;L, F&gt; dataset) {
+//    LogConditionalObjectiveFunction&lt;L, F&gt; objective = new LogConditionalObjectiveFunction&lt;L, F&gt;(dataset, logPrior);
+<span class="nc" id="L998">    return new LinearClassifierCreator&lt;&gt;(dataset.featureIndex, dataset.labelIndex);</span>
+  }
+
+  public static class LinearClassifierCreator&lt;L,F&gt; implements ClassifierCreator, ProbabilisticClassifierCreator
+  {
+    LogConditionalObjectiveFunction objective;
+    Index&lt;F&gt; featureIndex;
+    Index&lt;L&gt; labelIndex;
+
+    public LinearClassifierCreator(LogConditionalObjectiveFunction objective, Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex)
+<span class="nc" id="L1008">    {</span>
+<span class="nc" id="L1009">      this.objective = objective;</span>
+<span class="nc" id="L1010">      this.featureIndex = featureIndex;</span>
+<span class="nc" id="L1011">      this.labelIndex = labelIndex;</span>
+<span class="nc" id="L1012">    }</span>
+
+    public LinearClassifierCreator(Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex)
+<span class="nc" id="L1015">    {</span>
+<span class="nc" id="L1016">      this.featureIndex = featureIndex;</span>
+<span class="nc" id="L1017">      this.labelIndex = labelIndex;</span>
+<span class="nc" id="L1018">    }</span>
+
+    public LinearClassifier createLinearClassifier(double[] weights) {
+      double[][] weights2D;
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">      if (objective != null) {</span>
+<span class="nc" id="L1023">        weights2D = objective.to2D(weights);</span>
+      } else {
+<span class="nc" id="L1025">        weights2D = ArrayUtils.to2D(weights, featureIndex.size(), labelIndex.size());</span>
+      }
+<span class="nc" id="L1027">      return new LinearClassifier&lt;&gt;(weights2D, featureIndex, labelIndex);</span>
+    }
+
+    @Override
+    public Classifier createClassifier(double[] weights) {
+<span class="nc" id="L1032">      return createLinearClassifier(weights);</span>
+    }
+
+    @Override
+    public ProbabilisticClassifier createProbabilisticClassifier(double[] weights) {
+<span class="nc" id="L1037">      return createLinearClassifier(weights);</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

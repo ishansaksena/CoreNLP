@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>JointParsingModel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.arabic.parsesegment</a> &gt; <span class="el_source">JointParsingModel.java</span></div><h1>JointParsingModel.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.arabic.parsesegment; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+
+import edu.stanford.nlp.ling.CategoryWordTagFactory;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.parser.lexparser.*;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreePrint;
+import edu.stanford.nlp.trees.TreeTransformer;
+import edu.stanford.nlp.trees.Treebank;
+import edu.stanford.nlp.trees.TreebankLanguagePack;
+import edu.stanford.nlp.util.HashIndex;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.Timing;
+
+<span class="nc" id="L21">public class JointParsingModel  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L24">  private static Redwood.RedwoodChannels log = Redwood.channels(JointParsingModel.class);</span>
+
+<span class="nc" id="L26">  private boolean VERBOSE = false;</span>
+
+  //Factored parsing models (Klein and Manning, 2002)
+  private static ExhaustivePCFGParser pparser;
+  private static ExhaustiveDependencyParser dparser;
+  private BiLexPCFGParser bparser;
+
+  //Parser objects
+  private Options op;
+  private LexicalizedParser lp;
+  private TreeTransformer debinarizer;
+  private TreeTransformer subcategoryStripper;
+  private TreePrint treePrint;
+  private static List&lt;CoreLabel&gt; bestSegmentationB;
+
+<span class="nc" id="L41">  private boolean serInput = false;</span>
+<span class="nc" id="L42">  private int maxSentLen = 5000;</span>
+
+  private static final int trainLengthLimit = 100000;
+
+  public void setVerbose(boolean b) {
+<span class="nc" id="L47">    VERBOSE = b;</span>
+<span class="nc" id="L48">    op.testOptions.verbose = b;</span>
+<span class="nc" id="L49">    op.trainOptions.printAnnotatedStateCounts = b;</span>
+<span class="nc" id="L50">    op.trainOptions.printAnnotatedRuleCounts = b;</span>
+<span class="nc" id="L51">  }</span>
+
+<span class="nc" id="L53">  public void setSerInput(boolean ser_input) { serInput = ser_input; }</span>
+
+<span class="nc" id="L55">  public void setMaxEvalSentLen(int maxSentLen) { this.maxSentLen = maxSentLen; }</span>
+
+
+  private void removeDeleteSplittersFromSplitters(TreebankLanguagePack tlp) {
+<span class="nc bnc" id="L59" title="All 2 branches missed.">    if (op.trainOptions.deleteSplitters != null) {</span>
+<span class="nc" id="L60">      List&lt;String&gt; deleted = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L61" title="All 2 branches missed.">      for (String del : op.trainOptions.deleteSplitters) {</span>
+<span class="nc" id="L62">        String baseDel = tlp.basicCategory(del);</span>
+<span class="nc" id="L63">        boolean checkBasic = del.equals(baseDel);</span>
+<span class="nc bnc" id="L64" title="All 2 branches missed.">        for (Iterator&lt;String&gt; it = op.trainOptions.splitters.iterator(); it.hasNext(); ) {</span>
+<span class="nc" id="L65">          String elem = it.next();</span>
+<span class="nc" id="L66">          String baseElem = tlp.basicCategory(elem);</span>
+<span class="nc bnc" id="L67" title="All 6 branches missed.">          boolean delStr = checkBasic &amp;&amp; baseElem.equals(baseDel) || elem.equals(del);</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">          if (delStr) {</span>
+<span class="nc" id="L69">            it.remove();</span>
+<span class="nc" id="L70">            deleted.add(elem);</span>
+          }
+<span class="nc" id="L72">        }</span>
+<span class="nc" id="L73">      }</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L75">        log.info(&quot;Removed from vertical splitters: &quot; + deleted);</span>
+      }
+    }
+<span class="nc" id="L78">  }</span>
+
+  public List&lt;Tree&gt; getAnnotatedBinaryTreebankFromTreebank(Treebank trainTreebank) {
+<span class="nc" id="L81">    TreebankLangParserParams tlpParams = op.tlpParams;</span>
+<span class="nc" id="L82">    TreebankLanguagePack tlp = tlpParams.treebankLanguagePack();</span>
+
+<span class="nc bnc" id="L84" title="All 2 branches missed.">    if (VERBOSE) log.info(&quot;\n\n&quot; + trainTreebank.textualSummary(tlp));</span>
+
+<span class="nc" id="L86">    log.info(&quot;Binarizing trees...&quot;);</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">    TreeAnnotatorAndBinarizer binarizer = new TreeAnnotatorAndBinarizer(tlpParams, op.forceCNF, !op.trainOptions.outsideFactor(), true, op);</span>
+<span class="nc" id="L88">    Timing.tick(&quot;done.&quot;);</span>
+
+<span class="nc bnc" id="L90" title="All 2 branches missed.">    if (op.trainOptions.selectiveSplit) {</span>
+<span class="nc" id="L91">      op.trainOptions.splitters = ParentAnnotationStats.getSplitCategories(trainTreebank, op.trainOptions.tagSelectiveSplit, 0, op.trainOptions.selectiveSplitCutOff, op.trainOptions.tagSelectiveSplitCutOff, tlp);</span>
+<span class="nc" id="L92">      removeDeleteSplittersFromSplitters(tlp);</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L94">        List&lt;String&gt; list = new ArrayList&lt;&gt;(op.trainOptions.splitters);</span>
+<span class="nc" id="L95">        Collections.sort(list);</span>
+<span class="nc" id="L96">        log.info(&quot;Parent split categories: &quot; + list);</span>
+      }
+    }
+    //		if (op.trainOptions.selectivePostSplit) {
+    //			// Do all the transformations once just to learn selective splits on annotated categories
+    //			TreeTransformer myTransformer = new TreeAnnotator(tlpParams.headFinder(), tlpParams);
+    //			Treebank annotatedTB = trainTreebank.transform(myTransformer);
+    //			op.trainOptions.postSplitters = ParentAnnotationStats.getSplitCategories(annotatedTB, true, 0, op.trainOptions.selectivePostSplitCutOff, op.trainOptions.tagSelectivePostSplitCutOff, tlp);
+    //			if (op.testOptions.verbose) {
+    //				log.info(&quot;Parent post annotation split categories: &quot; + op.trainOptions.postSplitters);
+    //			}
+    //		}
+<span class="nc bnc" id="L108" title="All 2 branches missed.">    if (op.trainOptions.hSelSplit) {</span>
+      // We run through all the trees once just to gather counts for hSelSplit!
+<span class="nc" id="L110">      int ptt = op.trainOptions.printTreeTransformations;</span>
+<span class="nc" id="L111">      op.trainOptions.printTreeTransformations = 0;</span>
+<span class="nc" id="L112">      binarizer.setDoSelectiveSplit(false);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">      for (Tree tree : trainTreebank) {</span>
+<span class="nc" id="L114">        binarizer.transformTree(tree);</span>
+<span class="nc" id="L115">      }</span>
+<span class="nc" id="L116">      binarizer.setDoSelectiveSplit(true);</span>
+<span class="nc" id="L117">      op.trainOptions.printTreeTransformations = ptt;</span>
+    }
+
+    //Tree transformation
+    //
+<span class="nc" id="L122">    List&lt;Tree&gt; binaryTrainTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">    for (Tree tree : trainTreebank) {</span>
+<span class="nc" id="L124">      tree = binarizer.transformTree(tree);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">      if (tree.yield().size() - 1 &lt;= trainLengthLimit) {</span>
+<span class="nc" id="L126">        binaryTrainTrees.add(tree);</span>
+      }
+<span class="nc" id="L128">    }</span>
+
+    // WSGDEBUG: Lot's of stuff on the grammar
+    //    if(VERBOSE) {
+    //      binarizer.printStateCounts();
+    //      binarizer.printRuleCounts();
+    //    binarizer.dumpStats();
+    //    }
+
+<span class="nc" id="L137">    return binaryTrainTrees;</span>
+  }
+
+
+  public LexicalizedParser getParserDataFromTreebank(Treebank trainTreebank) {
+
+<span class="nc" id="L143">    log.info(&quot;Binarizing training trees...&quot;);</span>
+<span class="nc" id="L144">    List&lt;Tree&gt; binaryTrainTrees = getAnnotatedBinaryTreebankFromTreebank(trainTreebank);</span>
+<span class="nc" id="L145">    Timing.tick(&quot;done.&quot;);</span>
+
+<span class="nc" id="L147">    Index&lt;String&gt; stateIndex = new HashIndex&lt;&gt;();</span>
+
+<span class="nc" id="L149">    log.info(&quot;Extracting PCFG...&quot;);</span>
+<span class="nc" id="L150">    Extractor&lt;Pair&lt;UnaryGrammar,BinaryGrammar&gt;&gt; bgExtractor = new BinaryGrammarExtractor(op, stateIndex);</span>
+<span class="nc" id="L151">    Pair&lt;UnaryGrammar,BinaryGrammar&gt; bgug = bgExtractor.extract(binaryTrainTrees);</span>
+
+<span class="nc" id="L153">    BinaryGrammar bg = bgug.second;</span>
+<span class="nc" id="L154">    bg.splitRules();</span>
+
+<span class="nc" id="L156">    UnaryGrammar ug = bgug.first;</span>
+<span class="nc" id="L157">    ug.purgeRules();</span>
+<span class="nc" id="L158">    Timing.tick(&quot;done.&quot;);</span>
+
+<span class="nc" id="L160">    log.info(&quot;Extracting Lexicon...&quot;);</span>
+<span class="nc" id="L161">    Index&lt;String&gt; wordIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L162">    Index&lt;String&gt; tagIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L163">    Lexicon lex = op.tlpParams.lex(op, wordIndex, tagIndex);</span>
+<span class="nc" id="L164">    lex.initializeTraining(binaryTrainTrees.size());</span>
+<span class="nc" id="L165">    lex.train(binaryTrainTrees);</span>
+<span class="nc" id="L166">    lex.finishTraining();</span>
+<span class="nc" id="L167">    Timing.tick(&quot;done.&quot;);</span>
+
+<span class="nc" id="L169">    Extractor&lt;DependencyGrammar&gt; dgExtractor = op.tlpParams.dependencyGrammarExtractor(op, wordIndex, tagIndex);</span>
+<span class="nc" id="L170">    DependencyGrammar dg = null;</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    if (op.doDep) {</span>
+<span class="nc" id="L172">      log.info(&quot;Extracting Dependencies...&quot;);</span>
+<span class="nc" id="L173">      dg = dgExtractor.extract(binaryTrainTrees);</span>
+<span class="nc" id="L174">      dg.setLexicon(lex);</span>
+<span class="nc" id="L175">      Timing.tick(&quot;done.&quot;);</span>
+    }
+
+<span class="nc" id="L178">    log.info(&quot;Done extracting grammars and lexicon.&quot;);</span>
+
+<span class="nc" id="L180">    return new LexicalizedParser(lex, bg, ug, dg, stateIndex, wordIndex, tagIndex, op);</span>
+  }
+
+  private void makeParsers() {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">    if (lp == null)</span>
+<span class="nc" id="L185">      throw new RuntimeException(this.getClass().getName() + &quot;: Parser grammar does not exist&quot;);</span>
+
+    //a la (Klein and Manning, 2002)
+<span class="nc" id="L188">    pparser = new ExhaustivePCFGParser(lp.bg, lp.ug, lp.lex, op, lp.stateIndex, lp.wordIndex, lp.tagIndex);</span>
+<span class="nc" id="L189">    dparser = new ExhaustiveDependencyParser(lp.dg, lp.lex, op, lp.wordIndex, lp.tagIndex);</span>
+<span class="nc" id="L190">    bparser = new BiLexPCFGParser(new GenericLatticeScorer(), pparser, dparser, lp.bg, lp.ug, lp.dg, lp.lex, op, lp.stateIndex, lp.wordIndex, lp.tagIndex);</span>
+<span class="nc" id="L191">  }</span>
+
+  private boolean parse(InputStream inputStream) {
+<span class="nc" id="L194">    final LatticeXMLReader reader = new LatticeXMLReader();</span>
+
+<span class="nc bnc" id="L196" title="All 2 branches missed.">    if(!reader.load(inputStream,serInput)) {</span>
+<span class="nc" id="L197">      System.err.printf(&quot;%s: Error loading input lattice xml from stdin%n&quot;, this.getClass().getName());</span>
+<span class="nc" id="L198">      return false;</span>
+    }
+
+<span class="nc" id="L201">    System.err.printf(&quot;%s: Entering main parsing loop...%n&quot;, this.getClass().getName());</span>
+
+<span class="nc" id="L203">    int latticeNum = 0;</span>
+<span class="nc" id="L204">    int parseable = 0;</span>
+<span class="nc" id="L205">    int successes = 0;</span>
+<span class="nc" id="L206">    int fParseSucceeded = 0;</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">    for(final Lattice lattice : reader) {</span>
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">      if (lattice.getNumNodes() &gt; op.testOptions.maxLength + 1) {  // + 1 for boundary symbol</span>
+<span class="nc" id="L210">        System.err.printf(&quot;%s: Lattice %d too big! (%d nodes)%n&quot;,this.getClass().getName(),latticeNum,lattice.getNumNodes());</span>
+<span class="nc" id="L211">        latticeNum++;</span>
+<span class="nc" id="L212">        continue;</span>
+      }
+
+<span class="nc" id="L215">      parseable++;</span>
+
+      //TODO This doesn't work for what we want. Check the implementation in ExhaustivePCFG parser
+      //op.testOptions.constraints = lattice.getConstraints();
+
+      try {
+<span class="nc" id="L221">        Tree rawTree = null;</span>
+<span class="nc bnc" id="L222" title="All 4 branches missed.">        if(op.doPCFG &amp;&amp; pparser.parse(lattice)) {</span>
+<span class="nc" id="L223">          rawTree = pparser.getBestParse(); //1best segmentation</span>
+          //bestSegmentationB still has boundary symbol in it
+<span class="nc" id="L225">          bestSegmentationB = rawTree.yield(new ArrayList&lt;CoreLabel&gt;()); // NOTE! Type is need here for JDK8 compilation (maybe bad typing somewhere)</span>
+
+<span class="nc bnc" id="L227" title="All 4 branches missed.">          if(op.doDep &amp;&amp; dparser.parse(bestSegmentationB)) {</span>
+<span class="nc" id="L228">            System.err.printf(&quot;%s: Dependency parse succeeded!%n&quot;, this.getClass().getName());</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            if(bparser.parse(bestSegmentationB)) {</span>
+<span class="nc" id="L230">              System.err.printf(&quot;%s: Factored parse succeeded!%n&quot;, this.getClass().getName());</span>
+<span class="nc" id="L231">              rawTree = bparser.getBestParse();</span>
+<span class="nc" id="L232">              fParseSucceeded++;</span>
+            }
+
+          } else {
+<span class="nc" id="L236">            System.out.printf(&quot;%s: Dependency parse failed. Backing off to PCFG...%n&quot;, this.getClass().getName());</span>
+          }
+
+        } else {
+<span class="nc" id="L240">          System.out.printf(&quot;%s: WARNING: parsing failed for lattice %d%n&quot;, this.getClass().getName(), latticeNum);</span>
+        }
+
+        //Post-process the tree
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        if (rawTree == null) {</span>
+<span class="nc" id="L245">          System.out.printf(&quot;%s: WARNING: Could not extract best parse for lattice %d%n&quot;, this.getClass().getName(), latticeNum);</span>
+
+        } else {
+<span class="nc" id="L248">          Tree t = debinarizer.transformTree(rawTree);</span>
+<span class="nc" id="L249">          t = subcategoryStripper.transformTree(t);</span>
+<span class="nc" id="L250">          treePrint.printTree(t);</span>
+
+<span class="nc" id="L252">          successes++;</span>
+        }
+
+        //When a best parse can't be extracted
+<span class="nc" id="L256">      } catch (Exception e) {</span>
+<span class="nc" id="L257">        System.out.printf(&quot;%s: WARNING: Could not extract best parse for lattice %d%n&quot;, this.getClass().getName(), latticeNum);</span>
+<span class="nc" id="L258">        e.printStackTrace();</span>
+<span class="nc" id="L259">      }</span>
+
+<span class="nc" id="L261">      latticeNum++;</span>
+<span class="nc" id="L262">    }</span>
+
+<span class="nc" id="L264">    log.info(&quot;===================================================================&quot;);</span>
+<span class="nc" id="L265">    log.info(&quot;===================================================================&quot;);</span>
+<span class="nc" id="L266">    log.info(&quot;Post mortem:&quot;);</span>
+<span class="nc" id="L267">    log.info(&quot;  Input:     &quot; + latticeNum);</span>
+<span class="nc" id="L268">    log.info(&quot;  Parseable: &quot; + parseable);</span>
+<span class="nc" id="L269">    log.info(&quot;  Parsed:    &quot; + successes);</span>
+<span class="nc" id="L270">    log.info(&quot;  f_Parsed:  &quot; + fParseSucceeded);</span>
+<span class="nc" id="L271">    log.info(&quot;  String %:  &quot; + (int)((double) successes * 10000.0 / (double) parseable) / 100.0);</span>
+
+<span class="nc" id="L273">    return true;</span>
+  }
+
+
+  public boolean run(File trainTreebankFile, File testTreebankFile, InputStream inputStream) {
+<span class="nc" id="L278">    op = new Options();</span>
+<span class="nc" id="L279">    op.tlpParams = new ArabicTreebankParserParams();</span>
+<span class="nc" id="L280">    op.setOptions(&quot;-arabicFactored&quot;);</span>
+<span class="nc" id="L281">    op.testOptions.maxLength = maxSentLen;</span>
+<span class="nc" id="L282">    op.testOptions.MAX_ITEMS = 5000000; //500000 is the default for Arabic, but we have substantially more edges now</span>
+<span class="nc" id="L283">    op.testOptions.outputFormatOptions = &quot;removeTopBracket,includePunctuationDependencies&quot;;</span>
+
+    // WSG: Just set this to some high value so that extractBestParse()
+    // actually calls the lattice reader (e.g., this says that we can't have a word longer than
+    // 80 characters...seems sensible for Arabic
+<span class="nc" id="L288">    op.testOptions.maxSpanForTags = 80;</span>
+
+<span class="nc" id="L290">    treePrint = op.testOptions.treePrint(op.tlpParams);</span>
+<span class="nc" id="L291">    debinarizer = new Debinarizer(op.forceCNF, new CategoryWordTagFactory());</span>
+<span class="nc" id="L292">    subcategoryStripper = op.tlpParams.subcategoryStripper();</span>
+
+<span class="nc" id="L294">    Timing.startTime();</span>
+
+<span class="nc" id="L296">    final Treebank trainTreebank = op.tlpParams.diskTreebank();</span>
+<span class="nc" id="L297">    trainTreebank.loadPath(trainTreebankFile);</span>
+
+<span class="nc" id="L299">    lp = getParserDataFromTreebank(trainTreebank);</span>
+
+<span class="nc" id="L301">    makeParsers();</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L304">      op.display();</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">      String lexNumRules = (pparser != null) ? Integer.toString(lp.lex.numRules()): &quot;&quot;;</span>
+<span class="nc" id="L306">      log.info(&quot;Grammar\tStates\tTags\tWords\tUnaryR\tBinaryR\tTaggings&quot;);</span>
+<span class="nc" id="L307">      log.info(&quot;Grammar\t&quot; +</span>
+<span class="nc" id="L308">                         lp.stateIndex.size() + '\t' +</span>
+<span class="nc" id="L309">                         lp.tagIndex.size() + '\t' +</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                         lp.wordIndex.size() + '\t' +</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">                         (pparser != null ? lp.ug.numRules(): &quot;&quot;) + '\t' +</span>
+<span class="nc" id="L312">                         (pparser != null ? lp.bg.numRules(): &quot;&quot;) + '\t' +</span>
+                         lexNumRules);
+<span class="nc" id="L314">      log.info(&quot;ParserPack is &quot; + op.tlpParams.getClass().getName());</span>
+<span class="nc" id="L315">      log.info(&quot;Lexicon is &quot; + lp.lex.getClass().getName());</span>
+    }
+
+<span class="nc" id="L318">    return parse(inputStream);</span>
+  }
+
+
+  /*
+   * pparser chart uses segmentation interstices; dparser uses 1best word
+   * interstices. Convert between the two here for bparser.
+   */
+<span class="nc" id="L326">  private static class GenericLatticeScorer implements LatticeScorer {</span>
+
+    @Override
+    public Item convertItemSpan(Item item) {
+<span class="nc bnc" id="L330" title="All 4 branches missed.">      if(bestSegmentationB == null || bestSegmentationB.isEmpty())</span>
+<span class="nc" id="L331">        throw new RuntimeException(this.getClass().getName() + &quot;: No 1best segmentation available&quot;);</span>
+
+<span class="nc" id="L333">      item.start = bestSegmentationB.get(item.start).beginPosition();</span>
+<span class="nc" id="L334">      item.end = bestSegmentationB.get(item.end - 1).endPosition();</span>
+<span class="nc" id="L335">      return item;</span>
+    }
+
+    @Override
+    public double oScore(Edge edge) {
+<span class="nc" id="L340">      final Edge latticeEdge = (Edge) convertItemSpan(new Edge(edge));</span>
+
+<span class="nc" id="L342">      double pOscore = pparser.oScore(latticeEdge);</span>
+<span class="nc" id="L343">      double dOscore = dparser.oScore(edge);</span>
+
+<span class="nc" id="L345">      return pOscore + dOscore;</span>
+    }
+
+    @Override
+    public double iScore(Edge edge) {
+<span class="nc" id="L350">      final Edge latticeEdge = (Edge) convertItemSpan(new Edge(edge));</span>
+
+<span class="nc" id="L352">      double pIscore = pparser.iScore(latticeEdge);</span>
+<span class="nc" id="L353">      double dIscore = dparser.iScore(edge);</span>
+
+<span class="nc" id="L355">      return pIscore + dIscore;</span>
+    }
+
+    @Override
+    public boolean oPossible(Hook hook) {
+<span class="nc" id="L360">      final Hook latticeHook = (Hook) convertItemSpan(new Hook(hook));</span>
+
+<span class="nc bnc" id="L362" title="All 4 branches missed.">      return pparser.oPossible(latticeHook) &amp;&amp; dparser.oPossible(hook);</span>
+    }
+
+    @Override
+    public boolean iPossible(Hook hook) {
+<span class="nc" id="L367">      final Hook latticeHook = (Hook) convertItemSpan(new Hook(hook));</span>
+
+<span class="nc bnc" id="L369" title="All 4 branches missed.">      return pparser.iPossible(latticeHook) &amp;&amp; dparser.iPossible(hook);</span>
+    }
+
+    @Override
+    public boolean parse(List&lt;? extends HasWord&gt; words) {
+<span class="nc" id="L374">      throw new UnsupportedOperationException(this.getClass().getName() + &quot;: Does not support parse operation.&quot;);</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

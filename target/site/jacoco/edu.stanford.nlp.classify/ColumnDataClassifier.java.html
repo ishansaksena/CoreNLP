@@ -1,0 +1,2404 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ColumnDataClassifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.classify</a> &gt; <span class="el_source">ColumnDataClassifier.java</span></div><h1>ColumnDataClassifier.java</h1><pre class="source lang-java linenums">// Stanford Classifier, ColumnDataClassifier - a multiclass maxent classifier
+// Copyright (c) 2003-2012 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// This code is a parameter language for front-end feature
+// generation for the loglinear model classification code in
+// the Stanford Classifier package (mainly written by Dan Klein).
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    Support/Questions: java-nlp-user@lists.stanford.edu
+//    Licensing: java-nlp-support@lists.stanford.edu
+//    http://www-nlp.stanford.edu/software/classifier.shtml
+
+package edu.stanford.nlp.classify;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.BasicDatum;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.optimization.DiffFunction;
+import edu.stanford.nlp.optimization.Minimizer;
+import edu.stanford.nlp.process.PTBTokenizer;
+import edu.stanford.nlp.process.Tokenizer;
+import edu.stanford.nlp.process.TokenizerFactory;
+import edu.stanford.nlp.process.WordShapeClassifier;
+import edu.stanford.nlp.stats.*;
+import edu.stanford.nlp.util.*;
+
+import java.io.*;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+
+
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+/**
+ * ColumnDataClassifier provides a command-line interface for doing
+ * context-free (independent) classification of a series of data items,
+ * where each data item is represented by a line of
+ * a file, as a list of String variables, in tab-separated columns.  Some
+ * features will interpret these variables as numbers, but
+ * the code is mainly oriented towards generating features for string
+ * classification.  To designate a real-valued feature, use the realValued
+ * option described below. The classifier by default is a maxent classifier
+ * (also known as a softmax classifier or a discriminative loglinear classifier;
+ * equivalent to multiclass logistic regression apart from a slightly different
+ * symmetric parameterization. It also implements a Bernoulli Naive
+ * Bayes model and can implement an SVM by an external call to SVMlight.
+ *
+ * You can also use ColumnDataClassifier programmatically, where its main
+ * usefulness beyond simply building your own LinearClassifier is that it
+ * provides easy conversion of data items into features, using the same
+ * properties as the command-line version. You can see example of usage in
+ * the class {@link edu.stanford.nlp.classify.demo.ClassifierDemo}.
+ *
+ * Input files are expected to
+ * be one data item per line with two or more columns indicating the class
+ * of the item and one or more predictive features.  Columns are
+ * separated by tab characters.  Tab and newline characters cannot occur
+ * inside field values (there is no escaping mechanism); any other characters
+ * are legal in field values.
+ *
+ * Typical usage:
+ *
+ * {@code java edu.stanford.nlp.classify.ColumnDataClassifier -prop propFile }
+ *
+ * or
+ *
+ * {@code java -mx300m edu.stanford.nlp.classify.ColumnDataClassifier
+ * -trainFile trainFile -testFile testFile -useNGrams|... &amp;gt; output }
+ *
+ * (Note that for large data sets, you may wish to specify
+ * the amount of memory available to Java, such
+ * as in the second example above.)
+ *
+ * In the simplest case, there are just two tab-separated columns in the
+ * training input: the first for the class, and the second for the String
+ * datum which has that class.   In more complex uses, each datum can
+ * be multidimensional, and there are many columns of data attributes.
+ *
+ * To illustrate simple uses, and the behavior of Naive Bayes and Maximum
+ * entropy classifiers, example files corresponding to the examples from the
+ * Manning and Klein maxent classifier tutorial, slides 46-49, available at
+ * http://nlp.stanford.edu/downloads/classifier.shtml are included in the
+ * classify package source directory (files starting with &quot;easy&quot;).  Other
+ * examples appear in the {@code examples} directory of the distributed
+ * classifier.
+ *
+ * In many instances, parameters can either be given on the command line
+ * or provided using a Properties file
+ * (specified on the command-line with {@code -prop} &lt;i&gt;propFile&lt;/i&gt;).
+ * Option names are the same as property names with a preceding dash.  Boolean
+ * properties can simply be turned on via the command line.  Parameters of
+ * types int, String, and double take a following argument after the option.
+ * Command-line parameters can only define features for the first column
+ * describing the datum.  If you have multidimensional data, you need to use
+ * a properties file.  Property names, as below, are either global (things
+ * like the testFile name) or are seen as properties that define features
+ * for the first data column (NOTE: we count columns from 0 - unlike the Unix cut
+ * command!).  To specify features for a particular data column, precede a
+ * feature by a column number and then a period (for example,
+ * {@code 3.wordShape=chris4}).  If no number is specified, then the
+ * default interpretation is column 0. Note that in properties files you must
+ * give a value to boolean properties (e.g., {@code 2.useString=true});
+ * just giving the property name (as {@code 2.useString}) isn't
+ * sufficient.
+ *
+ * The following properties are recognized:
+ *
+ * &lt;table border=&quot;1&quot;&gt;
+ *   &lt;caption&gt;Properties for ColumnDataClassifier&lt;/caption&gt;
+ * &lt;tr&gt;&lt;th&gt;&lt;b&gt;Property Name&lt;/b&gt;&lt;/th&gt;&lt;th&gt;&lt;b&gt;Type&lt;/b&gt;&lt;/th&gt;&lt;th&gt;&lt;b&gt;Default Value&lt;/b&gt;&lt;/th&gt;&lt;th&gt;&lt;b&gt;Description&lt;/b&gt;&lt;/th&gt;&lt;th&gt;&lt;b&gt;FeatName&lt;/b&gt;&lt;/th&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; loadClassifier &lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path of serialized classifier file to load&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; serializeTo&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path to serialize classifier to&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printTo&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path to print a text representation of the linear classifier to&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; trainFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path of file to use as training data&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; testFile&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;n/a&lt;/td&gt;&lt;td&gt;Path of file to use as test data&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; encoding&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&lt;i&gt;utf-8&lt;/i&gt;&lt;/td&gt;&lt;td&gt;Character encoding of training and test file, e.g., utf-8, GB18030, or iso-8859-1&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; displayedColumn&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;Column number that will be printed out to stdout in the output next to the gold class and the chosen class.  This is just an aide memoire.  If the value is negative, nothing is printed. &lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; displayAllAnswers&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, print all classes and their probability, sorted by probability, rather than just the highest scoring and correct classes. &lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; goldAnswerColumn&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;0&lt;/td&gt;&lt;td&gt;Column number that contains the correct class for each data item (again, columns are numbered from 0 up).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; groupingColumn&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;Column for grouping multiple data items for the purpose of computing ranking accuracy.  This is appropriate when only one datum in a group can be correct, and the intention is to choose the highest probability one, rather than accepting all above a threshold.  Multiple items in the same group must be contiguous in the test file (otherwise it would be necessary to cache probabilities and groups for the entire test file to check matches).  If it is negative, no grouping column is used, and no ranking accuracy is reported.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; rankingScoreColumn&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;If this parameter is non-negative and a groupingColumn is defined, then an average ranking score will be calculated by scoring the chosen candidate from a group according to its value in this column (for instance, the values of this column can be set to a mean reciprocal rank of 1.0 for the best answer, 0.5 for the second best and so on, or the value of this column can be a similarity score reflecting the similarity of the answer to the true answer.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; rankingAccuracyClass&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If this and groupingColumn are defined (positive), then the system will compute a ranking accuracy under the assumption that there is (at most) one assignment of this class for each group, and ranking accuracy counts the classifier as right if that datum is the one with highest probability according to the model.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useString&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Gives you a feature for whole string s&lt;/td&gt;&lt;td&gt;S-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useClassFeature&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Include a feature for the class (as a class marginal).  This is the same thing as having a bias vector or having an always-on feature in a model.&lt;/td&gt;&lt;td&gt;CLASS&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; binnedLengths&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, treat as a sequence of comma separated integer bounds, where items above the previous bound (if any) up to the next bound (inclusive) are binned (e.g., &quot;1,5,15,30,60&quot;). The feature represents the length of the String in this column.&lt;/td&gt;&lt;td&gt;Len-&lt;i&gt;range&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; binnedLengthsStatistics&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, print to stderr contingency table of statistics for binnedLengths.&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; binnedValues&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, treat as a sequence of comma separated double bounds, where data items above the previous bound up to the next bound (inclusive) are binned. If a value in this column isn't a legal {@code double}, then the value is treated as {@code binnedValuesNaN}.&lt;/td&gt;&lt;td&gt;Val-&lt;i&gt;range&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; binnedValuesNaN&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;-1.0&lt;/td&gt;&lt;td&gt;If the value of a numeric binnedValues field is not a number, it will be given this value.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; binnedValuesStatistics&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, print to stderr a contingency table of statistics for binnedValues.&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; countChars&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, count the number of occurrences of each character in the String, and make a feature for each character, binned according to {@code countCharsBins}&lt;/td&gt;&lt;td&gt;Char-&lt;i&gt;ch&lt;/i&gt;-&lt;i&gt;range&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; countCharsBins&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;&quot;0,1&quot;&lt;/td&gt;&lt;td&gt;Treat as a sequence of comma separated integer bounds, where character counts above the previous bound up to and including the next bound are binned. For instance, a value of &quot;0,2&quot; will give 3 bins, dividing a character count into bins of 0, 1-or-2, and 3-or-more occurrences.&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; splitWordsRegexp&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If defined, use this as a regular expression on which to split the whole string (as in the String.split() function, which will return the things between delimiters, and discard the delimiters).  The resulting split-up &quot;words&quot; will be used in classifier features iff one of the other &quot;useSplit&quot; options is turned on.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; splitWordsTokenizerRegexp&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If defined, use this as a regular expression to cut initial pieces off a String.  Either this regular expression or {@code splitWordsIgnoreRegexp} &lt;i&gt;should always match&lt;/i&gt; the start of the String, and the size of the token is the number of characters matched.  So, for example, one can group letter and number characters but do nothing else with a regular expression like {@code ([A-Za-z]+|[0-9]+|.)}, where the last disjunct will match any other single character.  (If neither regular expression matches, the first character of the string is treated as a one character word, and then matching is tried again, but in this case a warning message is printed.)  Note that, for Java regular expressions with disjunctions like this, the match is the first matching disjunction, not the longest matching disjunction, so patterns with common prefixes need to be ordered from most specific (longest) to least specific (shortest).)  The resulting split up &quot;words&quot; will be used in classifier features iff one of the other &quot;useSplit&quot; options is turned on.  Note that as usual for Java String processing, backslashes must be doubled in the regular expressions that you write.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; splitWordsIgnoreRegexp&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;\\s+&lt;/td&gt;&lt;td&gt;If non-empty, this regexp is used to determine character sequences which should not be returned as tokens when using {@code splitWordsTokenizerRegexp} or {@code splitWordsRegexp}. With the former, first the program attempts to match this regular expression at the start of the string (with {@code lookingAt()}) and if it matches, those characters are discarded, but if it doesn't match then {@code splitWordsTokenizerRegexp} is tried. With {@code splitWordsRegexp}, this is used to filter tokens (with {@code matches()} resulting from the splitting.  By default this regular expression is set to be all whitespace tokens (i.e., \\s+). Set it to an empty string to get all tokens returned.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; splitWordsWithPTBTokenizer&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, and {@code splitWordsRegexp} and {@code splitWordsTokenizerRegexp} are false, then will tokenize using the {@code PTBTokenizer}&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitWords&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from the &quot;words&quot; that are returned by dividing the string on splitWordsRegexp or splitWordsTokenizerRegexp.  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;SW-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLowercaseSplitWords&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from the &quot;words&quot; that are returned by dividing the string on splitWordsRegexp or splitWordsTokenizerRegexp and then lowercasing the result.  Requires splitWordsRegexp or splitWordsTokenizerRegexp.  Note that this can be specified independently of useSplitWords. You can put either or both original cased and lowercased words in as features.&lt;/td&gt;&lt;td&gt;LSW-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitWordPairs&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from the pairs of adjacent &quot;words&quot; that are returned by dividing the string into splitWords.  Requires splitWordsRegexp or splitWordsTokenizerRegexp. This doesn't add features for the first and last words being next to a boundary; if you want those, also set useSplitFirstLastWords.&lt;/td&gt;&lt;td&gt;SWP-&lt;i&gt;str1&lt;/i&gt;-&lt;i&gt;str2&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLowercaseSplitWordPairs&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from the lowercased form of the pairs of adjacent &quot;words&quot; that are returned by dividing the string into splitWords.  Requires splitWordsRegexp or splitWordsTokenizerRegexp. This doesn't add features for the first and last words being next to a boundary; if you want those, also set useLowercaseSplitFirstLastWords.&lt;/td&gt;&lt;td&gt;LSWP-&lt;i&gt;str1&lt;/i&gt;-&lt;i&gt;str2&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useAllSplitWordPairs&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from all pairs of &quot;words&quot; that are returned by dividing the string into splitWords.  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;ASWP-&lt;i&gt;str1&lt;/i&gt;-&lt;i&gt;str2&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useAllSplitWordTriples&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from all triples of &quot;words&quot; that are returned by dividing the string into splitWords.  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;ASWT-&lt;i&gt;str1&lt;/i&gt;-&lt;i&gt;str2&lt;/i&gt;-&lt;i&gt;str3&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitWordNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features of adjacent word n-grams of lengths between minWordNGramLeng and maxWordNGramLeng inclusive. Note that these are word sequences, not character n-grams.&lt;/td&gt;&lt;td&gt;SW#-&lt;i&gt;str1-str2-strN&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ *
+ * &lt;tr&gt;&lt;td&gt; splitWordCount&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, the value of this real-valued feature is the number of split word tokens in the column.&lt;/td&gt;&lt;td&gt;SWNUM&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; logSplitWordCount&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, the value of this real-valued feature is the log of the number of split word tokens in the column.&lt;/td&gt;&lt;td&gt;LSWNUM&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; binnedSplitWordCounts&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, treat as a sequence of comma-separated integer bounds, where items above the previous bound (if any) up to the next bound (inclusive) are binned (e.g., &quot;1,5,15,30,60&quot;). The feature represents the number of split words in this column.&lt;/td&gt;&lt;td&gt;SWNUMBIN-&lt;i&gt;range&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+
+ * &lt;tr&gt;&lt;td&gt; maxWordNGramLeng&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;If this number is positive, word n-grams above this size will not be used in the model&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; minWordNGramLeng&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;Must be positive. word n-grams below this size will not be used in the model&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; wordNGramBoundaryRegexp&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If this is defined and the regexp matches, then the ngram stops&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitFirstLastWords&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make a feature from each of the first and last &quot;words&quot; that are returned as splitWords.  This is equivalent to having word bigrams with boundary tokens at each end of the sequence (they get a special feature).  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;SFW-&lt;i&gt;str&lt;/i&gt;, SLW-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useLowercaseSplitFirstLastWords&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make a feature from each of the first and last &quot;words&quot; that are returned as splitWords.  This is equivalent to having word bigrams with boundary tokens at each end of the sequence (they get a special feature).  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;LSFW-&lt;i&gt;str&lt;/i&gt;, LSLW-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from letter n-grams - internal as well as edge all treated the same - after the data string has been split into tokens.  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;S#-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitPrefixSuffixNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from prefixes and suffixes of each token, after splitting string with splitWordsRegexp.  Requires splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;S#B-&lt;i&gt;str&lt;/i&gt;, S#E-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSplitWordVectors&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;(If non-null) load word vectors from this file and add their average over all split words as real-valued features.  Requires splitWordsRegexp or splitWordsTokenizerRegexp. Note that for best results you need a close match between your tokenization and that used by the word vectors.&lt;/td&gt;&lt;td&gt;SWV-&lt;i&gt;num&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+
+ * &lt;tr&gt;&lt;td&gt; useNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from letter n-grams - internal as well as edge all treated the same.&lt;/td&gt;&lt;td&gt;#-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; usePrefixSuffixNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from prefix and suffix substrings of the string.&lt;/td&gt;&lt;td&gt;#B-&lt;i&gt;str&lt;/i&gt;, #E-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; lowercase&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make the input string lowercase so all features work uncased&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; lowercaseNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Make features from letter n-grams all lowercase (for all of useNGrams, usePrefixSuffixNGrams, useSplitNGrams, and useSplitPrefixSuffixNGrams)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; maxNGramLeng&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;If this number is positive, n-grams above this size will not be used in the model&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; minNGramLeng&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;Must be positive. n-grams below this size will not be used in the model&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; partialNGramRegexp&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If this is defined and the regexp matches, then n-grams are made only from the matching text (if no capturing groups are defined) or from the first capturing group of the regexp, if there is one.  This substring is used for both useNGrams and usePrefixSuffixNGrams.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; realValued&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Treat this column as real-valued and do not perform any transforms on the feature value.&lt;/td&gt;&lt;td&gt;Value&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; logTransform&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Treat this column as real-valued and use the log of the value as the feature value.&lt;/td&gt;&lt;td&gt;Log&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; logitTransform&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Treat this column as real-valued and use the logit of the value as the feature value.&lt;/td&gt;&lt;td&gt;Logit&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; sqrtTransform&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Treat this column as real-valued and use the square root of the value as the feature value.&lt;/td&gt;&lt;td&gt;Sqrt&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; filename&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Treat this column as a filename (path) and then use the contents of that file (assumed to be plain text) in the calculation of features according to other flag specifications.&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; wordShape&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;none&lt;/td&gt;&lt;td&gt;Either &quot;none&quot; for no wordShape use, or the name of a word shape function recognized by {@link edu.stanford.nlp.process.WordShapeClassifier#lookupShaper(String)}, such as &quot;dan1&quot; or &quot;chris4&quot;.  WordShape functions equivalence-class strings based on the pattern of letter, digit, and symbol characters that they contain.  The details depend on the particular function chosen.&lt;/td&gt;&lt;td&gt;SHAPE-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; splitWordShape&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;none&lt;/td&gt;&lt;td&gt;Either &quot;none&quot; for no wordShape or the name of a word shape function recognized by {@link WordShapeClassifier#lookupShaper(String)}.  This is applied to each &quot;word&quot; found by splitWordsRegexp or splitWordsTokenizerRegexp.&lt;/td&gt;&lt;td&gt;SSHAPE-&lt;i&gt;str&lt;/i&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; featureMinimumSupport&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;0&lt;/td&gt;&lt;td&gt;A feature, that is, an (observed,class) pair, will only be included in the model providing it is seen a minimum of this number of times in the training data.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; biasedHyperplane&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, a sequence of comma-separated pairs of &lt;i&gt;className prob&lt;/i&gt;.  An item will only be classified to a certain class &lt;i&gt;className&lt;/i&gt; if its probability of class membership exceeds the given conditional probability &lt;i&gt;prob&lt;/i&gt;; otherwise it will be assigned to a different class.  If this list of classes is exhaustive, and no condition is satisfied, then the most probable class is chosen.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printFeatures&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;Print out the features and their values for each instance to a file based on this name.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printClassifier&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;Style in which to print the classifier. One of: HighWeight, HighMagnitude, AllWeights, WeightHistogram, WeightDistribution. See LinearClassifier class for details.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; printClassifierParam&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;100&lt;/td&gt;&lt;td&gt;A parameter to the printing style, which may give, for example the number of parameters to print (for HighWeight or HighMagnitude).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; justify&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;For each test data item, print justification (weights) for active features used in classification.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; exitAfterTrainingFeaturization&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, the program exits after reading the training data (trainFile) and before building a classifier.  This is useful in conjunction with printFeatures, if one only wants to convert data to features for use with another classifier.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; verboseOptimization&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, print much more detail about classifier optimization.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; intern&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, (String) intern all of the (final) feature names.  Recommended (this saves memory, but slows down feature generation in training).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; cacheNGrams&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, record the NGram features that correspond to a String (under the current option settings and reuse rather than recalculating if the String is seen again.  &lt;b&gt;Disrecommended (speeds training but can require enormous amounts of memory).&lt;/b&gt;&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useNB&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use a Naive Bayes generative classifier (over all features) rather than a discriminative logistic regression classifier.  (Set {@code useClass} to true to get a prior term.)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useBinary&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Use the binary classifier (i.e. use LogisticClassifierFactory, rather than LinearClassifierFactory) to get classifier&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; l1reg&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;0.0&lt;/td&gt;&lt;td&gt;If set to be larger than 0, uses L1 regularization&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useAdaptL1&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, uses adaptive L1 regularization to find value of l1reg that gives the desired number of features set by limitFeatures&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; l1regmin&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;0.0&lt;/td&gt;&lt;td&gt;Minimum L1 in search&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; l1regmax&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;500.0&lt;/td&gt;&lt;td&gt;Maximum L1 in search&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; featureWeightThreshold&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;0.0&lt;/td&gt;&lt;td&gt;Threshold of model weight at which feature is kept. &quot;Unimportant&quot; low weight features are discarded. (Currently only implemented for adaptL1.)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; limitFeaturesLabels&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If set, only include features for these labels in the desired number of features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; limitFeatures&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;0&lt;/td&gt;&lt;td&gt;If set to be larger than 0, uses adaptive L1 regularization to find value of l1reg that gives the desired number of features&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;prior&lt;/td&gt;&lt;td&gt;String/int&lt;/td&gt;&lt;td&gt;quadratic&lt;/td&gt;&lt;td&gt;Type of prior (regularization penalty on weights). Possible values are null, &quot;no&quot;, &quot;quadratic&quot;, &quot;huber&quot;, &quot;quartic&quot;, &quot;cosh&quot;, or &quot;adapt&quot;. See {@link edu.stanford.nlp.classify.LogPrior LogPrior} for more information.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; useSum&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Do optimization via summed conditional likelihood, rather than the product.  (This is expensive, non-standard, and somewhat unstable, but can be quite effective: see Klein and Manning 2002 EMNLP paper.)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; tolerance&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;1e-4&lt;/td&gt;&lt;td&gt;Convergence tolerance in parameter optimization&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; sigma&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;1.0&lt;/td&gt;&lt;td&gt;A parameter to several of the smoothing (i.e., regularization) methods, usually giving a degree of smoothing as a standard deviation (with small positive values being stronger smoothing, and bigger values weaker smoothing). However, for Naive Bayes models it is the amount of add-sigma smoothing, so a bigger number is more smoothing.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt; epsilon&lt;/td&gt;&lt;td&gt;double&lt;/td&gt;&lt;td&gt;0.01&lt;/td&gt;&lt;td&gt;Used only as a parameter in the Huber loss: this is the distance from 0 at which the loss changes from quadratic to linear&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;useQN&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;true&lt;/td&gt;&lt;td&gt;Use Quasi-Newton optimization if true, otherwise use Conjugate Gradient optimization.  Recommended.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;QNsize&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;15&lt;/td&gt;&lt;td&gt;Number of previous iterations of Quasi-Newton to store (this increases memory use, but speeds convergence by letting the Quasi-Newton optimization more effectively approximate the second derivative).&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;featureFormat&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Assumes the input file isn't text strings but already featurized.  One column is treated as the class column (as defined by {@code goldAnswerColumn}, and all other columns are treated as features of the instance.  (If answers are not present, set {@code goldAnswerColumn} to a negative number.)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;trainFromSVMLight&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Assumes the trainFile is in SVMLight format (see &lt;a href=&quot;http://svmlight.joachims.org/&quot;&gt;SVMLight web page&lt;/a&gt; for more information)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;testFromSVMLight&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Assumes the testFile is in SVMLight format&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;printSVMLightFormatTo&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, print the featurized training data to an SVMLight format file (usually used with exitAfterTrainingFeaturization). This is just an option to write out data in a particular format. After that, you're on your own using some other piece of software that reads SVMlight format files.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;crossValidationFolds&lt;/td&gt;&lt;td&gt;int&lt;/td&gt;&lt;td&gt;-1&lt;/td&gt;&lt;td&gt;If positive, the training data is divided in to this many folds and cross-validation is done on the training data (prior to testing on test data, if it is also specified)&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;printCrossValidationDecisions&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;Whether to print the individual classification decisions in cross-validation training, if crossValidationFolds is positive.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;shuffleTrainingData&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, the training data is shuffled prior to training and cross-validation. This is vital in cross-validation if the training data is otherwise sorted by class.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;shuffleSeed&lt;/td&gt;&lt;td&gt;long&lt;/td&gt;&lt;td&gt;0&lt;/td&gt;&lt;td&gt;If non-zero, and the training data is being shuffled, this is used as the seed for the Random. Otherwise, System.nanoTime() is used.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;csvInput&lt;/td&gt;&lt;td&gt;boolean&lt;/td&gt;&lt;td&gt;false&lt;/td&gt;&lt;td&gt;If true, reads train and test file in csv format, with support for quoted fields.&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;inputFormat&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If &quot;header&quot; then reads file with first line treated as header; if &quot;comments&quot; treats lines starting with # as comments; else treated as &quot;plain&quot; tsv/csv file&lt;/td&gt;&lt;/tr&gt;
+ * &lt;tr&gt;&lt;td&gt;csvOutput&lt;/td&gt;&lt;td&gt;String&lt;/td&gt;&lt;td&gt;null&lt;/td&gt;&lt;td&gt;If non-null, used to format the output of the classifier. This is a printf-style format specification where %0 through %9 can print columns of the input, %c prints the assigned class and %n a newline character. This option can produce Kaggle-format output files!&lt;/td&gt;&lt;/tr&gt;
+ * &lt;/table&gt;
+ *
+ * @author Christopher Manning
+ * @author Anna Rafferty
+ * @author Angel Chang (added options for using l1reg)
+ */
+<span class="nc bnc" id="L247" title="All 2 branches missed.">public class ColumnDataClassifier  {</span>
+
+  private static final double DEFAULT_VALUE = 1.0; // default value for setting categorical, boolean features
+  private static final String DEFAULT_IGNORE_REGEXP = &quot;\\s+&quot;;
+
+  private final Flags[] flags;
+  private final Flags globalFlags; // simply points to flags[0]
+  private Classifier&lt;String,String&gt; classifier; // really only assigned once too (either in train or load in setProperties)
+  private TokenizerFactory&lt;Word&gt; ptbFactory;
+
+<span class="nc" id="L257">  private enum InputFormat { PLAIN, COMMENTS, HEADER }</span>
+
+  /** A logger for this class */
+<span class="nc" id="L260">  private static final Redwood.RedwoodChannels logger = Redwood.channels(ColumnDataClassifier.class);</span>
+
+  /**
+   * Entry point for taking a String (formatted as a line of a TSV file) and
+   * translating it into a Datum of features. If real-valued features are used,
+   * this method returns an RVFDatum; otherwise, categorical features are used.
+   *
+   * @param line Line of file
+   * @return A Datum (may be an RVFDatum; never null)
+   */
+  public Datum&lt;String,String&gt; makeDatumFromLine(String line) {
+<span class="nc" id="L271">    return makeDatumFromStrings(splitLineToFields(line));</span>
+  }
+
+
+  /**
+   * Takes a String[] of elements and translates them into a Datum of features.
+   * If real-valued features are used, this method accesses makeRVFDatumFromLine
+   * and returns an RVFDatum; otherwise, categorical features are used.
+   *
+   * @param strings The elements that features are made from (the columns of a TSV/CSV file)
+   * @return A Datum (may be an RVFDatum; never null)
+   */
+  public Datum&lt;String,String&gt; makeDatumFromStrings(String[] strings) {
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    if (globalFlags.usesRealValues) {</span>
+<span class="nc" id="L285">      return makeRVFDatumFromStrings(strings);</span>
+    }
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    if (globalFlags.featureFormat) {</span>
+<span class="nc" id="L289">      Collection&lt;String&gt; theFeatures = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">      for (int i = 0; i &lt; strings.length; i++) {</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (i != globalFlags.goldAnswerColumn) {</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">          if (globalFlags.significantColumnId) {</span>
+<span class="nc" id="L293">            theFeatures.add(String.format(&quot;%d:%s&quot;, i, strings[i]));</span>
+          } else {
+<span class="nc" id="L295">            theFeatures.add(strings[i]);</span>
+          }
+        }
+      }
+<span class="nc" id="L299">      return new BasicDatum&lt;&gt;(theFeatures, strings[globalFlags.goldAnswerColumn]);</span>
+    } else {
+      //logger.info(&quot;Read in &quot; + strings);
+<span class="nc" id="L302">      return makeDatum(strings);</span>
+    }
+  }
+
+  private static boolean isRealValued(Flags flags) {
+<span class="nc bnc" id="L307" title="All 10 branches missed.">    return flags != null &amp;&amp; (flags.isRealValued || flags.logTransform || flags.logitTransform || flags.sqrtTransform);</span>
+  }
+
+  private RVFDatum&lt;String,String&gt; makeRVFDatumFromStrings(String[] strings) {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    if (globalFlags.featureFormat) {</span>
+<span class="nc" id="L312">      ClassicCounter&lt;String&gt; theFeatures = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">      for (int i = 0; i &lt; strings.length; i++) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if (i != globalFlags.goldAnswerColumn) {</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">          if (isRealValued(flags[i])) {</span>
+<span class="nc" id="L316">            addFeatureValue(strings[i], flags[i], theFeatures);</span>
+          } else {
+<span class="nc" id="L318">            theFeatures.setCount(strings[i], 1.0);</span>
+          }
+        }
+      }
+<span class="nc" id="L322">      return new RVFDatum&lt;&gt;(theFeatures, strings[globalFlags.goldAnswerColumn]);</span>
+    } else {
+      //logger.info(&quot;Read in &quot; + strings);
+<span class="nc" id="L325">      return makeRVFDatum(strings);</span>
+    }
+  }
+
+
+  /** Read a set of training examples from a file, and return the data in a
+   *  featurized form. If feature selection is asked for, the returned
+   *  featurized form is after feature selection has been applied.
+   *
+   *  @param fileName File with supervised training examples.
+   *  @return A GeneralDataset, where the labels and features are Strings.
+   */
+  public GeneralDataset&lt;String,String&gt; readTrainingExamples(String fileName) {
+<span class="nc" id="L338">    return readAndReturnTrainingExamples(fileName).first();</span>
+  }
+
+
+  /** Read a set of training examples from a file, and return the data in a
+   *  featurized form and in String form. If feature selection is asked for, the returned
+   *  featurized form is after feature selection has been applied.
+   *  (Note that at present we sometimes need the String form, e.g., for cross-validation, and so
+   *  we always pass to readDataset that we are inTestPhase (even though we are training), so this second
+   *  element is filled in.)
+   *
+   *  @param fileName File with supervised training examples.
+   *  @return A Pair of a GeneralDataset, where the labels and features are Strings and a List of the input examples
+   */
+  public Pair&lt;GeneralDataset&lt;String,String&gt;, List&lt;String[]&gt;&gt; readAndReturnTrainingExamples(String fileName) {
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    if (globalFlags.printFeatures != null) {</span>
+<span class="nc" id="L354">      newFeaturePrinter(globalFlags.printFeatures, &quot;train&quot;, Flags.encoding);</span>
+    }
+<span class="nc" id="L356">    Pair&lt;GeneralDataset&lt;String,String&gt;, List&lt;String[]&gt;&gt; dataInfo = readDataset(fileName, true);</span>
+<span class="nc" id="L357">    GeneralDataset&lt;String,String&gt; train = dataInfo.first();</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">    if (globalFlags.featureMinimumSupport &gt; 1) {</span>
+<span class="nc" id="L359">      logger.info(&quot;Removing Features with counts &lt; &quot; + globalFlags.featureMinimumSupport);</span>
+<span class="nc" id="L360">      train.applyFeatureCountThreshold(globalFlags.featureMinimumSupport);</span>
+    }
+<span class="nc" id="L362">    train.summaryStatistics();</span>
+<span class="nc" id="L363">    return dataInfo;</span>
+  }
+
+
+  /** Read a data set from a file at test time, and return it.
+   *
+   *  @param filename The file to read the examples from.
+   *  @return A Pair. The first item of the pair is the featurized data set,
+   *     ready for passing to the classifier.  The second item of the pair
+   *     is simply each line of the file split into tab-separated columns.
+   *     This is at present necessary for the built-in evaluation, which uses
+   *     the gold class from here, and may also be helpful when wanting to
+   *     print extra output about the classification process.
+   */
+  public Pair&lt;GeneralDataset&lt;String,String&gt;,List&lt;String[]&gt;&gt; readTestExamples(String filename) {
+<span class="nc" id="L378">    return readDataset(filename, true);</span>
+  }
+
+  private static List&lt;String[]&gt; makeSVMLightLineInfos(List&lt;String&gt; lines) {
+<span class="nc" id="L382">    List&lt;String[]&gt; lineInfos = new ArrayList&lt;&gt;(lines.size());</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">    for (String line : lines) {</span>
+<span class="nc" id="L384">      line = line.replaceFirst(&quot;#.*$&quot;, &quot;&quot;); // remove any trailing comments</span>
+      // in principle, it'd be nice to save the comment, though, for possible use as a displayedColumn - make it column 1??
+<span class="nc" id="L386">      lineInfos.add(line.split(&quot;\\s+&quot;));</span>
+<span class="nc" id="L387">    }</span>
+<span class="nc" id="L388">    return lineInfos;</span>
+  }
+
+
+  /** NB: This is meant to do splitting strictly only on tabs, and to thus
+   *  work with things that are exactly TSV files.  It shouldn't split on
+   *  all whitespace, because it is useful to be able to have spaces inside
+   *  fields for short text documents, and then to be able to split them into
+   *  words with features like useSplitWords.
+   */
+<span class="nc" id="L398">  private static final Pattern tab = Pattern.compile(&quot;\\t&quot;);</span>
+
+
+  /** Read a data set from a file and convert it into a Dataset object.
+   *  In test phase, returns the {@code List&lt;String[]&gt;} with the data columns for printing purposes.
+   *  Otherwise, returns {@code null} for the second item.
+   *
+   *  @param filename Where to read data from
+   *  @param inTestPhase Whether to return the read String[] for each data item
+   *  @return A Pair of a GeneralDataSet of Datums and a List of datums in String form.
+   */
+  @SuppressWarnings(&quot;NonThreadSafeLazyInitialization&quot;)
+  private Pair&lt;GeneralDataset&lt;String,String&gt;, List&lt;String[]&gt;&gt; readDataset(String filename, boolean inTestPhase) {
+<span class="nc" id="L411">    Timing tim = new Timing();</span>
+    GeneralDataset&lt;String,String&gt; dataset;
+<span class="nc" id="L413">    List&lt;String[]&gt; lineInfos = null;</span>
+<span class="nc bnc" id="L414" title="All 8 branches missed.">    if ((inTestPhase &amp;&amp; Flags.testFromSVMLight) || (!inTestPhase &amp;&amp; Flags.trainFromSVMLight)) {</span>
+<span class="nc" id="L415">      List&lt;String&gt; lines = null;</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">      if (inTestPhase) {</span>
+<span class="nc" id="L417">        lines = new ArrayList&lt;&gt;();</span>
+      }
+<span class="nc bnc" id="L419" title="All 2 branches missed.">      if (globalFlags.usesRealValues) {</span>
+<span class="nc" id="L420">        dataset = RVFDataset.readSVMLightFormat(filename, lines);</span>
+      } else {
+<span class="nc" id="L422">        dataset = Dataset.readSVMLightFormat(filename, lines);</span>
+      }
+<span class="nc bnc" id="L424" title="All 2 branches missed.">      if (lines != null) {</span>
+<span class="nc" id="L425">        lineInfos = makeSVMLightLineInfos(lines);</span>
+      }
+<span class="nc" id="L427">    } else {</span>
+      try {
+<span class="nc bnc" id="L429" title="All 2 branches missed.">        if (inTestPhase) {</span>
+<span class="nc" id="L430">          lineInfos = new ArrayList&lt;&gt;();</span>
+        }
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        if (globalFlags.usesRealValues) {</span>
+<span class="nc" id="L433">          dataset = new RVFDataset&lt;&gt;();</span>
+        } else {
+<span class="nc" id="L435">          dataset = new Dataset&lt;&gt;();</span>
+        }
+<span class="nc" id="L437">        int lineNo = 0;</span>
+<span class="nc" id="L438">        int minColumns = Integer.MAX_VALUE;</span>
+<span class="nc" id="L439">        int maxColumns = 0;</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        for (String line : ObjectBank.getLineIterator(new File(filename), Flags.encoding)) {</span>
+<span class="nc" id="L441">          lineNo++;</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">          if (Flags.inputFormat == InputFormat.HEADER) {</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            if (lineNo == 1) {</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">              if (storedHeader == null) {</span>
+<span class="nc" id="L445">                storedHeader = line; // store it because need elements of it to print header in output</span>
+              }
+              continue;
+            }
+<span class="nc bnc" id="L449" title="All 2 branches missed.">          } else if (Flags.inputFormat == InputFormat.COMMENTS) {</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (line.matches(&quot;\\s#.*&quot;)) {</span>
+<span class="nc" id="L451">              continue;</span>
+            }
+          }
+<span class="nc" id="L454">          String[] strings = splitLineToFields(line);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">          if (strings.length &lt; 2) {</span>
+<span class="nc" id="L456">            throw new RuntimeException(&quot;Line format error at line &quot; + lineNo + &quot;: &quot; + line);</span>
+          }
+<span class="nc bnc" id="L458" title="All 2 branches missed.">          if (strings.length &lt; minColumns) {</span>
+<span class="nc" id="L459">            minColumns = strings.length;</span>
+          }
+<span class="nc bnc" id="L461" title="All 2 branches missed.">          if (strings.length &gt; maxColumns) {</span>
+<span class="nc" id="L462">            maxColumns = strings.length;</span>
+          }
+<span class="nc bnc" id="L464" title="All 2 branches missed.">          if (inTestPhase) {</span>
+<span class="nc" id="L465">            lineInfos.add(strings);</span>
+          }
+<span class="nc bnc" id="L467" title="All 2 branches missed.">          if (strings.length &lt; flags.length) {</span>
+<span class="nc" id="L468">            throw new RuntimeException(&quot;Error: Line has too few tab-separated columns (&quot; + maxColumns +</span>
+                    &quot;) for &quot; + flags.length + &quot; columns required by specified properties: &quot; + line);
+          }
+<span class="nc" id="L471">          dataset.add(makeDatumFromStrings(strings));</span>
+<span class="nc" id="L472">        }</span>
+<span class="nc bnc" id="L473" title="All 4 branches missed.">        if (lineNo &gt; 0 &amp;&amp; minColumns != maxColumns) {</span>
+<span class="nc" id="L474">          logger.info(&quot;WARNING: Number of tab-separated columns in &quot; +</span>
+                  filename + &quot; varies between &quot; + minColumns + &quot; and &quot; + maxColumns);
+        }
+<span class="nc" id="L477">      } catch (Exception e) {</span>
+<span class="nc" id="L478">        throw new RuntimeException(&quot;Dataset could not be loaded&quot;, e);</span>
+<span class="nc" id="L479">      }</span>
+    }
+<span class="nc" id="L481">    logger.info(&quot;Reading dataset from &quot; + filename + &quot; ... done [&quot; + tim.toSecondsString() + &quot;s, &quot; + dataset.size() + &quot; items].&quot;);</span>
+<span class="nc" id="L482">    return new Pair&lt;&gt;(dataset, lineInfos);</span>
+  }
+
+  /** Split according to whether we are using tsv file (default) or csv files. */
+  private String[] splitLineToFields(String line) {
+<span class="nc bnc" id="L487" title="All 2 branches missed.">    if (globalFlags.csvInput) {</span>
+<span class="nc" id="L488">      String[] strings = StringUtils.splitOnCharWithQuoting(line, ',', '&quot;', '&quot;');</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">      for (int i = 0; i &lt; strings.length; ++i) {</span>
+<span class="nc bnc" id="L490" title="All 4 branches missed.">        if (strings[i].startsWith(&quot;\&quot;&quot;) &amp;&amp; strings[i].endsWith(&quot;\&quot;&quot;))</span>
+<span class="nc" id="L491">          strings[i] = strings[i].substring(1,strings[i].length()-1);</span>
+      }
+<span class="nc" id="L493">      return strings;</span>
+    }
+    else {
+<span class="nc" id="L496">      return tab.split(line);</span>
+    }
+  }
+
+  /**
+   * Write summary statistics about a group of answers.
+   */
+  private Pair&lt;Double, Double&gt; writeResultsSummary(int num, Counter&lt;String&gt; contingency, Collection&lt;String&gt; labels) {
+<span class="nc" id="L504">    logger.info(&quot;&quot;);</span>
+<span class="nc" id="L505">    String message = &quot;&quot;;</span>
+<span class="nc" id="L506">    message += num + &quot; examples&quot;;</span>
+<span class="nc bnc" id="L507" title="All 4 branches missed.">    if (globalFlags.groupingColumn &gt;= 0 &amp;&amp; globalFlags.rankingAccuracyClass != null) {</span>
+<span class="nc" id="L508">      message += &quot; and &quot; + numGroups + &quot; ranking groups&quot;;</span>
+    }
+<span class="nc" id="L510">    logger.info(message + &quot; in test set&quot;);</span>
+<span class="nc" id="L511">    int numClasses = 0;</span>
+<span class="nc" id="L512">    double microAccuracy = 0.0;</span>
+<span class="nc" id="L513">    double macroF1 = 0.0;</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">    for (String key : labels) {</span>
+<span class="nc" id="L515">      numClasses++;</span>
+<span class="nc" id="L516">      int tp = (int) contingency.getCount(key + &quot;|TP&quot;);</span>
+<span class="nc" id="L517">      int fn = (int) contingency.getCount(key + &quot;|FN&quot;);</span>
+<span class="nc" id="L518">      int fp = (int) contingency.getCount(key + &quot;|FP&quot;);</span>
+<span class="nc" id="L519">      int tn = (int) contingency.getCount(key + &quot;|TN&quot;);</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">      double p = (tp + fp == 0) ? 1.0 : ((double) tp) / (tp + fp); // If nothing selected, then vacuous 1.0</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">      double r = (tp + fn == 0) ? 1.0 : ((double) tp) / (tp + fn); // If nothing to find, then vacuous 1.0</span>
+<span class="nc bnc" id="L522" title="All 4 branches missed.">      double f = (p == 0.0 &amp;&amp; r == 0.0) ? 0.0 : 2 * p * r / (p + r);</span>
+<span class="nc" id="L523">      double acc = ((double) tp + tn)/num;</span>
+<span class="nc" id="L524">      macroF1 += f;</span>
+<span class="nc" id="L525">      microAccuracy += tp;</span>
+<span class="nc" id="L526">      logger.info(&quot;Cls &quot; + key + &quot;: TP=&quot; + tp + &quot; FN=&quot; + fn + &quot; FP=&quot; + fp + &quot; TN=&quot; + tn + &quot;; Acc &quot; + nf.format(acc) + &quot; P &quot; + nf.format(p) + &quot; R &quot; + nf.format(r) + &quot; F1 &quot; + nf.format(f));</span>
+<span class="nc" id="L527">    }</span>
+
+<span class="nc bnc" id="L529" title="All 4 branches missed.">    if (globalFlags.groupingColumn &gt;= 0 &amp;&amp; globalFlags.rankingAccuracyClass != null) {</span>
+<span class="nc" id="L530">      double cor = (int) contingency.getCount(&quot;Ranking|Correct&quot;);</span>
+<span class="nc" id="L531">      double err = (int) contingency.getCount(&quot;Ranking|Error&quot;);</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">      double rankacc = (cor + err == 0) ? 0 : cor / (cor + err);</span>
+<span class="nc" id="L533">      logger.info(&quot;Ranking accuracy: &quot; + nf.format(rankacc));</span>
+<span class="nc" id="L534">      double cov = (int) contingency.getCount(&quot;Ranking|Covered&quot;);</span>
+<span class="nc" id="L535">      double coverr = (int) contingency.getCount(&quot;Ranking|Uncovered&quot;);</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">      double covacc = (cov + coverr == 0) ? 0 : cov / (cov + coverr);</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">      if (coverr &gt; 0.5) {</span>
+<span class="nc" id="L538">        double ce = (int) (contingency.getCount(&quot;Ranking|Error&quot;) - contingency.getCount(&quot;Ranking|Uncovered&quot;));</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        double crankacc = (cor + ce == 0) ? 0 : cor / (cor + ce);</span>
+<span class="nc" id="L540">        logger.info(&quot; (on &quot; + nf.format(covacc) + &quot; of groups with correct answer: &quot; + nf.format(crankacc) + ')');</span>
+<span class="nc" id="L541">      } else {</span>
+<span class="nc" id="L542">        logger.info(&quot;&quot;);</span>
+      }
+
+<span class="nc bnc" id="L545" title="All 2 branches missed.">      if (globalFlags.rankingScoreColumn &gt;= 0) {</span>
+<span class="nc" id="L546">        double totalSim = contingency.getCount(&quot;Ranking|Score&quot;);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">        double ranksim = (cor + err == 0) ? 0 : totalSim / (cor + err);</span>
+<span class="nc" id="L548">        logger.info(&quot;Ranking average score: &quot; + nf.format(ranksim));</span>
+      }
+    }
+<span class="nc" id="L551">    microAccuracy = microAccuracy / num;</span>
+<span class="nc" id="L552">    macroF1 = macroF1 / numClasses;</span>
+<span class="nc" id="L553">    NumberFormat nf2 = new DecimalFormat(&quot;0.00000&quot;);</span>
+<span class="nc" id="L554">    logger.info(&quot;Accuracy/micro-averaged F1: &quot; + nf2.format(microAccuracy));</span>
+<span class="nc" id="L555">    logger.info(&quot;Macro-averaged F1: &quot; + nf2.format(macroF1));</span>
+<span class="nc" id="L556">    return new Pair&lt;&gt;(microAccuracy, macroF1);</span>
+  }
+
+  // These variables are only used by the private methods used by main() for displaying
+  // performance statistics when running the command-line version. So their being
+  // static does no harm.
+<span class="nc" id="L562">  private static int numGroups = 0;</span>
+<span class="nc" id="L563">  private static String lastGroup = &quot;&quot;;</span>
+<span class="nc" id="L564">  private static int numInGroup = 0;</span>
+<span class="nc" id="L565">  private static double bestProb = 0.0;</span>
+<span class="nc" id="L566">  private static double bestSim = 0.0;</span>
+<span class="nc" id="L567">  private static boolean currentHighestProbCorrect = false;</span>
+<span class="nc" id="L568">  private static boolean foundAnswerInGroup = false;</span>
+
+  private static String storedHeader;
+
+<span class="nc" id="L572">  private static final NumberFormat nf = new DecimalFormat(&quot;0.000&quot;);</span>
+
+  /**
+   * Write out an answer, and update statistics.
+   */
+  private void writeAnswer(String[] strs, String clAnswer, Distribution&lt;String&gt; cntr) {
+<span class="nc bnc" id="L578" title="All 2 branches missed.">    String goldAnswer = globalFlags.goldAnswerColumn &lt; strs.length ? strs[globalFlags.goldAnswerColumn]: &quot;&quot;;</span>
+<span class="nc" id="L579">    String printedText = &quot;&quot;;</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">    if (globalFlags.displayedColumn &gt;= 0) {</span>
+<span class="nc" id="L581">      printedText = strs[globalFlags.displayedColumn];</span>
+    }
+    String results;
+<span class="nc bnc" id="L584" title="All 2 branches missed.">    if (globalFlags.displayAllAnswers) {</span>
+      // sort the labels by probability
+<span class="nc" id="L586">      TreeSet&lt;Pair&lt;Double,String&gt;&gt; sortedLabels = new TreeSet&lt;&gt;();</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">      for (String key : cntr.keySet()) {</span>
+<span class="nc" id="L588">        sortedLabels.add(new Pair&lt;&gt;(cntr.probabilityOf(key), key));</span>
+<span class="nc" id="L589">      }</span>
+<span class="nc" id="L590">      StringBuilder builder = new StringBuilder();</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">      for (Pair&lt;Double,String&gt; pair : sortedLabels.descendingSet()) {</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        if (builder.length() &gt; 0) {</span>
+<span class="nc" id="L593">          builder.append('\t');</span>
+        }
+<span class="nc" id="L595">        builder.append(pair.first()).append('\t').append(pair.second());</span>
+<span class="nc" id="L596">      }</span>
+<span class="nc" id="L597">      results = builder.toString();</span>
+<span class="nc" id="L598">    } else {</span>
+<span class="nc" id="L599">      results = clAnswer + '\t' + nf.format(cntr.probabilityOf(clAnswer)) + '\t' + nf.format(cntr.probabilityOf(goldAnswer));</span>
+    }
+
+    String line;
+<span class="nc bnc" id="L603" title="All 2 branches missed.">    if (printedText.isEmpty()) {</span>
+<span class="nc" id="L604">      line = goldAnswer + '\t' + results;</span>
+     } else {
+<span class="nc" id="L606">      line = printedText + '\t' + goldAnswer + '\t' + results;</span>
+    }
+<span class="nc" id="L608">    System.out.println(line);</span>
+<span class="nc" id="L609">  }</span>
+
+  private void updatePerformanceStatistics(String[] strs, String clAnswer, Distribution&lt;String&gt; cntr, Counter&lt;String&gt; contingency, Classifier&lt;String, String&gt; c, double sim) {
+<span class="nc bnc" id="L612" title="All 2 branches missed.">    String goldAnswer = globalFlags.goldAnswerColumn &lt; strs.length ? strs[globalFlags.goldAnswerColumn]: &quot;&quot;;</span>
+    // NB: This next bit judges correctness by surface String equality, not our internal indices, so strs has to be right even for svmlightFormat
+<span class="nc bnc" id="L614" title="All 2 branches missed.">    for (String next : c.labels()) {</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">      if (next.equals(goldAnswer)) {</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        if (next.equals(clAnswer)) {</span>
+<span class="nc" id="L617">          contingency.incrementCount(next + &quot;|TP&quot;);</span>
+        } else {
+<span class="nc" id="L619">          contingency.incrementCount(next + &quot;|FN&quot;);</span>
+        }
+      } else {
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (next.equals(clAnswer)) {</span>
+<span class="nc" id="L623">          contingency.incrementCount(next + &quot;|FP&quot;);</span>
+        } else {
+<span class="nc" id="L625">          contingency.incrementCount(next + &quot;|TN&quot;);</span>
+        }
+      }
+<span class="nc" id="L628">    }</span>
+<span class="nc bnc" id="L629" title="All 4 branches missed.">    if (globalFlags.groupingColumn &gt;= 0 &amp;&amp; globalFlags.rankingAccuracyClass != null) {</span>
+<span class="nc" id="L630">      String group = strs[globalFlags.groupingColumn];</span>
+      // logger.info(&quot;Group is &quot; + group);
+<span class="nc bnc" id="L632" title="All 2 branches missed.">      if (group.equals(lastGroup)) {</span>
+<span class="nc" id="L633">        numInGroup++;</span>
+<span class="nc" id="L634">        double prob = cntr.probabilityOf(globalFlags.rankingAccuracyClass);</span>
+        // logger.info(&quot;  same group; prob is &quot; + prob);
+<span class="nc bnc" id="L636" title="All 2 branches missed.">        if (prob &gt; bestProb) {</span>
+<span class="nc" id="L637">          bestProb = prob;</span>
+<span class="nc" id="L638">          bestSim = sim;</span>
+          // logger.info(&quot;  better prob than before&quot;);
+<span class="nc" id="L640">          currentHighestProbCorrect = goldAnswer.equals(globalFlags.rankingAccuracyClass);</span>
+        }
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (globalFlags.rankingAccuracyClass.equals(goldAnswer)) {</span>
+<span class="nc" id="L643">          foundAnswerInGroup = true;</span>
+        }
+<span class="nc" id="L645">      } else {</span>
+<span class="nc" id="L646">        finishRanking(contingency, bestSim);</span>
+<span class="nc" id="L647">        numGroups++;</span>
+<span class="nc" id="L648">        lastGroup = group;</span>
+<span class="nc" id="L649">        bestProb = cntr.probabilityOf(globalFlags.rankingAccuracyClass);</span>
+<span class="nc" id="L650">        bestSim = sim;</span>
+        // logger.info(&quot;  different; prob is &quot; + bestProb);
+<span class="nc" id="L652">        numInGroup = 1;</span>
+<span class="nc" id="L653">        currentHighestProbCorrect = goldAnswer.equals(globalFlags.rankingAccuracyClass);</span>
+<span class="nc" id="L654">        foundAnswerInGroup = globalFlags.rankingAccuracyClass.equals(goldAnswer);</span>
+      }
+    }
+<span class="nc" id="L657">  }</span>
+
+
+  private void finishRanking(Counter&lt;String&gt; contingency, double sim) {
+<span class="nc bnc" id="L661" title="All 2 branches missed.">    if (numInGroup &gt; 0) {</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">      if (globalFlags.justify) {</span>
+<span class="nc" id="L663">        String message = &quot;Previous group of &quot; + numInGroup + &quot;: &quot;;</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">        if (!foundAnswerInGroup) {</span>
+<span class="nc" id="L665">          message += &quot;no correct answer; &quot;;</span>
+        }
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        message += &quot;highest ranked guess was: &quot; + ((currentHighestProbCorrect ? &quot;correct&quot; : &quot;incorrect&quot;));</span>
+<span class="nc" id="L668">        logger.info(message);</span>
+<span class="nc" id="L669">        logger.info(&quot; (sim. = &quot; + nf.format(sim) + ')');</span>
+      }
+<span class="nc bnc" id="L671" title="All 2 branches missed.">      if (currentHighestProbCorrect) {</span>
+<span class="nc" id="L672">        contingency.incrementCount(&quot;Ranking|Correct&quot;);</span>
+      } else {
+<span class="nc" id="L674">        contingency.incrementCount(&quot;Ranking|Error&quot;);</span>
+      }
+<span class="nc bnc" id="L676" title="All 2 branches missed.">      if (foundAnswerInGroup) {</span>
+<span class="nc" id="L677">        contingency.incrementCount(&quot;Ranking|Covered&quot;);</span>
+      } else {
+<span class="nc" id="L679">        contingency.incrementCount(&quot;Ranking|Uncovered&quot;);</span>
+      }
+<span class="nc" id="L681">      contingency.incrementCount(&quot;Ranking|Score&quot;, sim);</span>
+    }
+<span class="nc" id="L683">  }</span>
+
+
+  /** Test and evaluate classifier on examples with their String representation and gold classification available.
+   *
+   * @param cl The classifier to test
+   * @param test The dataset to test on
+   * @param lineInfos Duplicate List of the items to be classified, each an array of Strings (like a line of a TSV file)
+   * @return A Pair consisting of the accuracy (micro-averaged F1) and macro-averaged F1 for the dataset
+   */
+  private Pair&lt;Double, Double&gt; testExamples(Classifier&lt;String, String&gt; cl, GeneralDataset&lt;String, String&gt; test, List&lt;String[]&gt; lineInfos) {
+    // usually suppress item level printing in crossvalidation
+<span class="nc bnc" id="L695" title="All 4 branches missed.">    if ( ! (globalFlags.crossValidationFolds &gt; 0 &amp;&amp; ! globalFlags.printCrossValidationDecisions)) {</span>
+<span class="nc" id="L696">      String message = &quot;&quot;;</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">      if (globalFlags.csvOutput != null) {</span>
+<span class="nc" id="L698">        message += formatCsv(globalFlags.csvOutput, storedHeader.split(&quot;\t&quot;), null);</span>
+      } else {
+<span class="nc" id="L700">        message += &quot;Output format: &quot;;</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">        if (globalFlags.displayedColumn &gt;= 0) {</span>
+<span class="nc" id="L702">          message += &quot;dataColumn&quot; + globalFlags.displayedColumn + '\t';</span>
+        }
+<span class="nc" id="L704">        message += &quot;goldAnswer\t&quot;;</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">        if (globalFlags.displayAllAnswers) {</span>
+<span class="nc" id="L706">          logger.info(message + &quot;[P(class) class]+ {sorted by probability}&quot;);</span>
+        } else {
+<span class="nc" id="L708">          logger.info(message + &quot;classifierAnswer\tP(clAnswer)\tP(goldAnswer)&quot;);</span>
+        }
+      }
+    }
+
+<span class="nc" id="L713">    Counter&lt;String&gt; contingency = new ClassicCounter&lt;&gt;();  // store tp,fp,fn,tn</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">    for (int i = 0, sz = test.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L715">      testExample(cl, test, lineInfos, contingency, i);</span>
+    }
+
+<span class="nc bnc" id="L718" title="All 4 branches missed.">    if (globalFlags.groupingColumn &gt;= 0 &amp;&amp; globalFlags.rankingAccuracyClass != null)</span>
+<span class="nc" id="L719">      finishRanking(contingency, bestSim);</span>
+
+<span class="nc" id="L721">    return writeResultsSummary(test.size(), contingency, cl.labels());</span>
+  }
+
+  private void testExample(Classifier&lt;String, String&gt; cl,
+                           GeneralDataset&lt;String, String&gt; test,
+                           List&lt;String[]&gt; lineInfos,
+                           Counter&lt;String&gt; contingency,
+                           int i) {
+<span class="nc" id="L729">    String[] example = lineInfos.get(i);</span>
+    Datum&lt;String,String&gt; d;
+<span class="nc bnc" id="L731" title="All 2 branches missed.">    if (globalFlags.usesRealValues) {</span>
+<span class="nc" id="L732">      d = test.getRVFDatum(i);</span>
+    } else {
+<span class="nc" id="L734">      d = test.getDatum(i);</span>
+    }
+<span class="nc bnc" id="L736" title="All 2 branches missed.">    if (globalFlags.justify) {</span>
+<span class="nc" id="L737">      logger.info(&quot;### Test item &quot; + i);</span>
+<span class="nc" id="L738">      logger.info(StringUtils.join(example, &quot;\t&quot;));</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">      if (cl instanceof LinearClassifier) {</span>
+<span class="nc" id="L740">        ((LinearClassifier&lt;String,String&gt;)cl).justificationOf(d);</span>
+      }
+<span class="nc" id="L742">      logger.info();</span>
+    }
+    Counter&lt;String&gt; logScores;
+<span class="nc bnc" id="L745" title="All 2 branches missed.">    if (globalFlags.usesRealValues) {</span>
+<span class="nc" id="L746">      logScores = ErasureUtils.&lt;RVFClassifier&lt;String,String&gt;&gt;uncheckedCast(cl).scoresOf((RVFDatum&lt;String,String&gt;)d);</span>
+    } else {
+<span class="nc" id="L748">      logScores = cl.scoresOf(d);</span>
+    }
+<span class="nc" id="L750">    Distribution&lt;String&gt; dist = Distribution.distributionFromLogisticCounter(logScores);</span>
+<span class="nc" id="L751">    String answer = null;</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">    if (globalFlags.biasedHyperplane != null) {</span>
+      // logger.info(&quot;Biased using counter: &quot; +
+      //         globalFlags.biasedHyperplane);
+<span class="nc" id="L755">      List&lt;String&gt; biggestKeys = new ArrayList&lt;&gt;(logScores.keySet());</span>
+<span class="nc" id="L756">      biggestKeys.sort(Counters.toComparatorDescending(logScores));</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">      for (String key : biggestKeys) {</span>
+<span class="nc" id="L758">        double prob = dist.probabilityOf(key);</span>
+<span class="nc" id="L759">        double threshold = globalFlags.biasedHyperplane.getCount(key);</span>
+        // logger.info(&quot;  Trying &quot; + key + &quot; prob is &quot; + prob +
+        //           &quot; threshold is &quot; + threshold);
+<span class="nc bnc" id="L762" title="All 2 branches missed.">        if (prob &gt; threshold) {</span>
+<span class="nc" id="L763">          answer = key;</span>
+<span class="nc" id="L764">          break;</span>
+        }
+<span class="nc" id="L766">      }</span>
+    }
+<span class="nc bnc" id="L768" title="All 2 branches missed.">    if (answer == null) {</span>
+<span class="nc bnc" id="L769" title="All 2 branches missed.">      if (globalFlags.usesRealValues) {</span>
+<span class="nc" id="L770">        answer = ErasureUtils.&lt;RVFClassifier&lt;String,String&gt;&gt;uncheckedCast(cl).classOf((RVFDatum&lt;String,String&gt;) d);</span>
+      } else {
+<span class="nc" id="L772">        answer = cl.classOf(d);</span>
+      }
+    }
+<span class="nc" id="L775">    double sim = 0.0;</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">    if (globalFlags.rankingScoreColumn &gt;= 0) {</span>
+      try {
+<span class="nc" id="L778">        sim = Double.parseDouble(example[globalFlags.rankingScoreColumn]);</span>
+<span class="nc" id="L779">      } catch (NumberFormatException nfe) {</span>
+        // just don't print it
+<span class="nc" id="L781">      }</span>
+    }
+<span class="nc bnc" id="L783" title="All 4 branches missed.">    if ( ! (globalFlags.crossValidationFolds &gt; 0 &amp;&amp; ! globalFlags.printCrossValidationDecisions)) {</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">      if (globalFlags.csvOutput != null) {</span>
+<span class="nc" id="L785">        System.out.print(formatCsv(globalFlags.csvOutput, example, answer));</span>
+      } else {
+<span class="nc" id="L787">        writeAnswer(example, answer, dist);</span>
+      }
+    }
+<span class="nc" id="L790">    updatePerformanceStatistics(example, answer, dist, contingency, cl, sim);</span>
+<span class="nc" id="L791">  }</span>
+
+  private String formatCsv(String format, String[] fields, String answer) {
+<span class="nc" id="L794">    StringBuilder out = new StringBuilder();</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">    for (int i = 0, len = format.length(); i &lt; len; i++) {</span>
+<span class="nc" id="L796">      char ch = format.charAt(i);</span>
+<span class="nc bnc" id="L797" title="All 4 branches missed.">      if (ch == '%' &amp;&amp; i + 1 &lt; len) {</span>
+<span class="nc" id="L798">        char ch2 = format.charAt(i + 1);</span>
+<span class="nc bnc" id="L799" title="All 4 branches missed.">        if (ch2 &gt;= '0' &amp;&amp; ch2 &lt;= '9') {</span>
+<span class="nc" id="L800">          int field = ch2 - '0';</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">          if (field &lt; fields.length) {</span>
+<span class="nc" id="L802">            out.append(fields[field]);</span>
+          } else {
+<span class="nc" id="L804">            throw new IllegalArgumentException(&quot;Not enough columns for format &quot; + format);</span>
+          }
+<span class="nc bnc" id="L806" title="All 2 branches missed.">        } else if (ch2 == 'c') {</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">          if (answer != null) {</span>
+<span class="nc" id="L808">            out.append(answer);</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">          } else if (globalFlags.goldAnswerColumn &lt; fields.length) {</span>
+<span class="nc" id="L810">            out.append(fields[globalFlags.goldAnswerColumn]);</span>
+          } else {
+<span class="nc" id="L812">            out.append(&quot;Class&quot;);</span>
+          }
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        } else if (ch2 == 'n') {</span>
+<span class="nc" id="L815">          out.append('\n');</span>
+        } else {
+<span class="nc" id="L817">          throw new IllegalArgumentException(&quot;Unrecognized format specification in &quot; + format);</span>
+        }
+<span class="nc" id="L819">        i++; // have also dealt with next character giving format</span>
+<span class="nc" id="L820">      } else {</span>
+<span class="nc" id="L821">        out.append(ch);</span>
+      }
+    }
+<span class="nc" id="L824">    return out.toString();</span>
+  }
+
+
+  /**
+   * Extracts all the features from a certain input datum.
+   *
+   * @param strs The data String[] to extract features from
+   * @return The constructed Datum
+   */
+  private Datum&lt;String,String&gt; makeDatum(String[] strs) {
+<span class="nc bnc" id="L835" title="All 2 branches missed.">    String goldAnswer = globalFlags.goldAnswerColumn &lt; strs.length ? strs[globalFlags.goldAnswerColumn]: &quot;&quot;;</span>
+<span class="nc" id="L836">    List&lt;String&gt; theFeatures = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L837">    Collection&lt;String&gt; globalFeatures = Generics.newHashSet();</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">    if (globalFlags.useClassFeature) {</span>
+<span class="nc" id="L839">      globalFeatures.add(&quot;CLASS&quot;);</span>
+    }
+<span class="nc" id="L841">    addAllInterningAndPrefixing(theFeatures, globalFeatures, &quot;&quot;);</span>
+
+<span class="nc bnc" id="L843" title="All 2 branches missed.">    for (int i = 0; i &lt; flags.length; i++) {</span>
+<span class="nc" id="L844">      Collection&lt;String&gt; featuresC = Generics.newHashSet();//important that this is a hash set to prevent same feature from being added multiple times</span>
+<span class="nc" id="L845">      makeDatum(strs[i], flags[i], featuresC, goldAnswer);</span>
+<span class="nc" id="L846">      addAllInterningAndPrefixing(theFeatures, featuresC, i + &quot;-&quot;);</span>
+    }
+
+<span class="nc bnc" id="L849" title="All 2 branches missed.">    if (globalFlags.printFeatures != null) {</span>
+<span class="nc" id="L850">      printFeatures(strs, theFeatures);</span>
+    }
+    //System.out.println(&quot;Features are: &quot; + theFeatures);
+<span class="nc" id="L853">    return new BasicDatum&lt;&gt;(theFeatures, goldAnswer);</span>
+  }
+
+  /**
+   * Extracts all the features from a certain input array and makes
+   * a real valued feature datum; those features that are not real valued
+   * are given value 1.0.
+   *
+   * @param strs The data String[] to extract features from
+   * @return The constructed RVFDatum
+   */
+  private RVFDatum&lt;String,String&gt; makeRVFDatum(String[] strs) {
+<span class="nc bnc" id="L865" title="All 2 branches missed.">    String goldAnswer = globalFlags.goldAnswerColumn &lt; strs.length ? strs[globalFlags.goldAnswerColumn]: &quot;&quot;;</span>
+<span class="nc" id="L866">    ClassicCounter&lt;String&gt; theFeatures = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L867">    ClassicCounter&lt;String&gt; globalFeatures = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L868" title="All 2 branches missed.">    if (globalFlags.useClassFeature) {</span>
+<span class="nc" id="L869">      globalFeatures.setCount(&quot;CLASS&quot;, 1.0);</span>
+    }
+<span class="nc" id="L871">    addAllInterningAndPrefixingRVF(theFeatures, globalFeatures, &quot;&quot;);</span>
+
+<span class="nc bnc" id="L873" title="All 2 branches missed.">    for (int i = 0; i &lt; flags.length; i++) {</span>
+<span class="nc" id="L874">      ClassicCounter&lt;String&gt; featuresC = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L875">      makeDatum(strs[i], flags[i], featuresC, goldAnswer);</span>
+<span class="nc" id="L876">      addAllInterningAndPrefixingRVF(theFeatures, featuresC, i + &quot;-&quot;);</span>
+    }
+
+<span class="nc bnc" id="L879" title="All 2 branches missed.">    if (globalFlags.printFeatures != null) {</span>
+<span class="nc" id="L880">      printFeatures(strs, theFeatures);</span>
+    }
+    //System.out.println(&quot;Features are: &quot; + theFeatures);
+<span class="nc" id="L883">    return new RVFDatum&lt;&gt;(theFeatures, goldAnswer);</span>
+  }
+
+  private void addAllInterningAndPrefixingRVF(ClassicCounter&lt;String&gt; accumulator, ClassicCounter&lt;String&gt; addend, String prefix) {
+<span class="nc bnc" id="L887" title="All 4 branches missed.">    assert prefix != null;</span>
+<span class="nc bnc" id="L888" title="All 2 branches missed.">    for (String protoFeat : addend.keySet()) {</span>
+<span class="nc" id="L889">      double count = addend.getCount(protoFeat);</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">      if ( ! prefix.isEmpty()) {</span>
+<span class="nc" id="L891">        protoFeat = prefix + protoFeat;</span>
+      }
+<span class="nc bnc" id="L893" title="All 2 branches missed.">      if (globalFlags.intern) {</span>
+<span class="nc" id="L894">        protoFeat = protoFeat.intern();</span>
+      }
+<span class="nc" id="L896">      accumulator.incrementCount(protoFeat, count);</span>
+<span class="nc" id="L897">    }</span>
+<span class="nc" id="L898">  }</span>
+
+  private void addAllInterningAndPrefixing(Collection&lt;String&gt; accumulator, Collection&lt;String&gt; addend, String prefix) {
+<span class="nc bnc" id="L901" title="All 4 branches missed.">    assert prefix != null;</span>
+<span class="nc bnc" id="L902" title="All 2 branches missed.">    for (String protoFeat : addend) {</span>
+<span class="nc bnc" id="L903" title="All 2 branches missed.">      if ( ! prefix.isEmpty()) {</span>
+<span class="nc" id="L904">        protoFeat = prefix + protoFeat;</span>
+      }
+<span class="nc bnc" id="L906" title="All 2 branches missed.">      if (globalFlags.intern) {</span>
+<span class="nc" id="L907">        protoFeat = protoFeat.intern();</span>
+      }
+<span class="nc" id="L909">      accumulator.add(protoFeat);</span>
+<span class="nc" id="L910">    }</span>
+<span class="nc" id="L911">  }</span>
+
+  /**
+   * This method takes care of adding features to the collection-ish object features when
+   * the value of the feature must be parsed as a real number, including performing
+   * math transforms.
+   */
+  private static void addFeatureValue(String cWord, Flags flags, Object featuresC) {
+<span class="nc" id="L919">    double value = Double.valueOf(cWord);</span>
+<span class="nc bnc" id="L920" title="All 2 branches missed.">    if (flags.logTransform) {</span>
+<span class="nc" id="L921">      double log = Math.log(value);</span>
+<span class="nc bnc" id="L922" title="All 4 branches missed.">      if(Double.isInfinite(log) || Double.isNaN(log)) {</span>
+<span class="nc" id="L923">        logger.info(&quot;WARNING: Log transform attempted on out of range value; feature ignored&quot;);</span>
+      } else
+<span class="nc" id="L925">        addFeature(featuresC, &quot;Log&quot;, log);</span>
+<span class="nc bnc" id="L926" title="All 2 branches missed.">    } else if(flags.logitTransform) {</span>
+<span class="nc" id="L927">      double logit = Math.log(value/(1-value));</span>
+<span class="nc bnc" id="L928" title="All 4 branches missed.">      if(Double.isInfinite(logit) || Double.isNaN(logit)) {</span>
+<span class="nc" id="L929">        logger.info(&quot;WARNING: Logit transform attempted on out of range value; feature ignored&quot;);</span>
+      } else {
+<span class="nc" id="L931">        addFeature(featuresC, &quot;Logit&quot;, logit);</span>
+      }
+<span class="nc bnc" id="L933" title="All 2 branches missed.">    } else if(flags.sqrtTransform) {</span>
+<span class="nc" id="L934">      double sqrt = Math.sqrt(value);</span>
+<span class="nc" id="L935">      addFeature(featuresC, &quot;Sqrt&quot;, sqrt);</span>
+<span class="nc" id="L936">    } else {</span>
+<span class="nc" id="L937">      addFeature(featuresC, Flags.realValuedFeaturePrefix, value);</span>
+    }
+<span class="nc" id="L939">  }</span>
+
+  /**
+   * This method takes care of adding features to the collection-ish object features via
+   * instanceof checks.  Features must be a type of collection or a counter, and value is used
+   * iff it is a counter
+   */
+    private static &lt;F&gt; void addFeature(Object features, F newFeature, double value) {
+<span class="nc bnc" id="L947" title="All 2 branches missed.">      if (features instanceof Counter&lt;?&gt;) {</span>
+<span class="nc" id="L948">        ErasureUtils.&lt;Counter&lt;F&gt;&gt;uncheckedCast(features).setCount(newFeature, value);</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">      } else if(features instanceof Collection&lt;?&gt;) {</span>
+<span class="nc" id="L950">        ErasureUtils.&lt;Collection&lt;F&gt;&gt;uncheckedCast(features).add(newFeature);</span>
+      } else {
+<span class="nc" id="L952">        throw new RuntimeException(&quot;addFeature was called with a features object that is neither a counter nor a collection!&quot;);</span>
+      }
+<span class="nc" id="L954">    }</span>
+
+    /**
+     * Extracts all the features from a certain input column.
+     *
+     * @param cWord The String to extract data from
+     * @param flags Flags specifying which features to extract
+     * @param featuresC Some kind of Collection or Counter to put features into
+     * @param goldAns The goldAnswer for this whole datum or emptyString if none.
+     *                    This is used only for filling in the binned lengths histogram counters
+     */
+    private void makeDatum(String cWord, Flags flags, Object featuresC, String goldAns) {
+
+      //logger.info(&quot;Making features for &quot; + cWord + &quot; flags &quot; + flags);
+<span class="nc bnc" id="L968" title="All 2 branches missed.">      if (flags == null) {</span>
+        // no features for this column
+<span class="nc" id="L970">        return;</span>
+      }
+<span class="nc bnc" id="L972" title="All 2 branches missed.">      if (flags.filename) {</span>
+<span class="nc" id="L973">        cWord = IOUtils.slurpFileNoExceptions(cWord);</span>
+      }
+<span class="nc bnc" id="L975" title="All 2 branches missed.">      if (flags.lowercase) {</span>
+<span class="nc" id="L976">        cWord = cWord.toLowerCase(Locale.ENGLISH);</span>
+      }
+
+<span class="nc bnc" id="L979" title="All 2 branches missed.">      if (flags.useString) {</span>
+<span class="nc" id="L980">        addFeature(featuresC,&quot;S-&quot;+cWord,DEFAULT_VALUE);</span>
+      }
+<span class="nc bnc" id="L982" title="All 2 branches missed.">      if (flags.binnedLengths != null) {</span>
+<span class="nc" id="L983">        int len = cWord.length();</span>
+<span class="nc" id="L984">        String featureName = null;</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">        for (int i = 0; i &lt;= flags.binnedLengths.length; i++) {</span>
+<span class="nc bnc" id="L986" title="All 4 branches missed.">          if (i == flags.binnedLengths.length || len &lt;= flags.binnedLengths[i]) {</span>
+<span class="nc bnc" id="L987" title="All 4 branches missed.">            featureName = &quot;Len-&quot; + ((i == 0) ? 0 : (flags.binnedLengths[i - 1] + 1)) + '-' + ((i == flags.binnedLengths.length) ? &quot;Inf&quot; : Integer.toString(flags.binnedLengths[i]));</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">            if (flags.binnedLengthsCounter != null) {</span>
+<span class="nc" id="L989">              flags.binnedLengthsCounter.incrementCount(featureName, goldAns);</span>
+            }
+            break;
+          }
+        }
+<span class="nc" id="L994">        addFeature(featuresC,featureName,DEFAULT_VALUE);</span>
+      }
+<span class="nc bnc" id="L996" title="All 2 branches missed.">      if (flags.binnedValues != null) {</span>
+<span class="nc" id="L997">        double val = flags.binnedValuesNaN;</span>
+        try {
+<span class="nc" id="L999">          val = Double.parseDouble(cWord);</span>
+<span class="nc" id="L1000">        } catch (NumberFormatException nfe) {</span>
+          // do nothing -- keeps value of flags.binnedValuesNaN
+<span class="nc" id="L1002">        }</span>
+<span class="nc" id="L1003">        String featureName = null;</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">        for (int i = 0; i &lt;= flags.binnedValues.length; i++) {</span>
+<span class="nc bnc" id="L1005" title="All 4 branches missed.">          if (i == flags.binnedValues.length || val &lt;= flags.binnedValues[i]) {</span>
+<span class="nc bnc" id="L1006" title="All 4 branches missed.">            featureName = &quot;Val-(&quot; + ((i == 0) ? &quot;-Inf&quot; : Double.toString(flags.binnedValues[i - 1])) + ',' + ((i == flags.binnedValues.length) ? &quot;Inf&quot; : Double.toString(flags.binnedValues[i])) + ']';</span>
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">            if (flags.binnedValuesCounter != null) {</span>
+<span class="nc" id="L1008">              flags.binnedValuesCounter.incrementCount(featureName, goldAns);</span>
+            }
+            break;
+          }
+        }
+<span class="nc" id="L1013">        addFeature(featuresC,featureName,DEFAULT_VALUE);</span>
+      }
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">      if (flags.countChars != null) {</span>
+<span class="nc" id="L1016">        int[] cnts = new int[flags.countChars.length];</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">        for (int i = 0; i &lt; cnts.length; i++) {</span>
+<span class="nc" id="L1018">          cnts[i] = 0;</span>
+        }
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">        for (int i = 0, len = cWord.length(); i &lt; len; i++) {</span>
+<span class="nc" id="L1021">          char ch = cWord.charAt(i);</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">          for (int j = 0; j &lt; cnts.length; j++) {</span>
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">            if (ch == flags.countChars[j]) {</span>
+<span class="nc" id="L1024">              cnts[j]++;</span>
+            }
+          }
+        }
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">        for (int j = 0; j &lt; cnts.length; j++) {</span>
+<span class="nc" id="L1029">          String featureName = null;</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">          for (int i = 0; i &lt;= flags.countCharsBins.length; i++) {</span>
+<span class="nc bnc" id="L1031" title="All 4 branches missed.">            if (i == flags.countCharsBins.length || cnts[j] &lt;= flags.countCharsBins[i]) {</span>
+<span class="nc bnc" id="L1032" title="All 4 branches missed.">              featureName = &quot;Char-&quot; + flags.countChars[j] + '-' + ((i == 0) ? 0 : (flags.countCharsBins[i - 1] + 1)) + '-' + ((i == flags.countCharsBins.length) ? &quot;Inf&quot; : Integer.toString(flags.countCharsBins[i]));</span>
+<span class="nc" id="L1033">              break;</span>
+            }
+          }
+<span class="nc" id="L1036">          addFeature(featuresC,featureName,DEFAULT_VALUE);</span>
+        }
+      }
+<span class="nc bnc" id="L1039" title="All 6 branches missed.">      if (flags.splitWordsPattern != null || flags.splitWordsTokenizerPattern != null ||</span>
+              flags.splitWordsWithPTBTokenizer) {
+        String[] bits;
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">        if (flags.splitWordsTokenizerPattern != null) {</span>
+<span class="nc" id="L1043">          bits = regexpTokenize(flags.splitWordsTokenizerPattern, flags.splitWordsIgnorePattern, cWord);</span>
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">        } else if (flags.splitWordsPattern != null) {</span>
+<span class="nc" id="L1045">          bits = splitTokenize(flags.splitWordsPattern, flags.splitWordsIgnorePattern, cWord);</span>
+        } else { //PTB tokenizer
+<span class="nc" id="L1047">          bits = ptbTokenize(cWord);</span>
+        }
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (flags.showTokenization) {</span>
+<span class="nc" id="L1050">          logger.info(&quot;Tokenization: &quot; + Arrays.toString(bits));</span>
+        }
+
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">        if (flags.splitWordCount) {</span>
+<span class="nc" id="L1054">          addFeature(featuresC, &quot;SWNUM&quot;, bits.length);</span>
+        }
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">        if (flags.logSplitWordCount) {</span>
+<span class="nc" id="L1057">          addFeature(featuresC, &quot;LSWNUM&quot;, Math.log(bits.length));</span>
+        }
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">        if (flags.binnedSplitWordCounts != null) {</span>
+<span class="nc" id="L1060">          String featureName = null;</span>
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">          for (int i = 0; i &lt;= flags.binnedSplitWordCounts.length; i++) {</span>
+<span class="nc bnc" id="L1062" title="All 4 branches missed.">            if (i == flags.binnedSplitWordCounts.length || bits.length &lt;= flags.binnedSplitWordCounts[i]) {</span>
+<span class="nc bnc" id="L1063" title="All 4 branches missed.">              featureName = &quot;SWNUMBIN-&quot; + ((i == 0) ? 0 : (flags.binnedSplitWordCounts[i - 1] + 1)) + '-' + ((i == flags.binnedSplitWordCounts.length) ? &quot;Inf&quot; : Integer.toString(flags.binnedSplitWordCounts[i]));</span>
+<span class="nc" id="L1064">              break;</span>
+            }
+          }
+<span class="nc" id="L1067">          addFeature(featuresC, featureName, DEFAULT_VALUE);</span>
+        }
+        // add features over splitWords
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">        for (int i = 0; i &lt; bits.length; i++) {</span>
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">          if (flags.useSplitWords) {</span>
+<span class="nc" id="L1072">            addFeature(featuresC, &quot;SW-&quot; + bits[i], DEFAULT_VALUE);</span>
+          }
+<span class="nc bnc" id="L1074" title="All 2 branches missed.">          if (flags.useLowercaseSplitWords) {</span>
+<span class="nc" id="L1075">            addFeature(featuresC, &quot;LSW-&quot; + bits[i].toLowerCase(), DEFAULT_VALUE);</span>
+          }
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">          if (flags.useSplitWordPairs) {</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">            if (i + 1 &lt; bits.length) {</span>
+<span class="nc" id="L1079">              addFeature(featuresC, &quot;SWP-&quot; + bits[i] + '-' + bits[i + 1], DEFAULT_VALUE);</span>
+            }
+          }
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">          if (flags.useLowercaseSplitWordPairs) {</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">            if (i + 1 &lt; bits.length) {</span>
+<span class="nc" id="L1084">              addFeature(featuresC, &quot;LSWP-&quot; + bits[i].toLowerCase() + '-' + bits[i + 1].toLowerCase(), DEFAULT_VALUE);</span>
+            }
+          }
+<span class="nc bnc" id="L1087" title="All 2 branches missed.">          if (flags.useAllSplitWordPairs) {</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">            for (int j = i + 1; j &lt; bits.length; j++) {</span>
+              // sort lexicographically
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">              if (bits[i].compareTo(bits[j]) &lt; 0) {</span>
+<span class="nc" id="L1091">                addFeature(featuresC, &quot;ASWP-&quot; + bits[i] + '-' + bits[j], DEFAULT_VALUE);</span>
+              } else {
+<span class="nc" id="L1093">                addFeature(featuresC, &quot;ASWP-&quot; + bits[j] + '-' + bits[i], DEFAULT_VALUE);</span>
+              }
+            }
+          }
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">          if (flags.useAllSplitWordTriples) {</span>
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">            for (int j = i + 1; j &lt; bits.length; j++) {</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">              for (int k = j + 1; k &lt; bits.length; k++) {</span>
+                // sort lexicographically
+<span class="nc" id="L1101">                String[] triple = new String[3];</span>
+<span class="nc" id="L1102">                triple[0] = bits[i];</span>
+<span class="nc" id="L1103">                triple[1] = bits[j];</span>
+<span class="nc" id="L1104">                triple[2] = bits[k];</span>
+<span class="nc" id="L1105">                Arrays.sort(triple);</span>
+<span class="nc" id="L1106">                addFeature(featuresC, &quot;ASWT-&quot; + triple[0] + '-' + triple[1] + '-' + triple[2], DEFAULT_VALUE);</span>
+              }
+            }
+          }
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">          if (flags.useSplitWordNGrams) {</span>
+<span class="nc" id="L1111">            StringBuilder sb = new StringBuilder(&quot;SW#&quot;);</span>
+<span class="nc bnc" id="L1112" title="All 4 branches missed.">            for (int j = i; j &lt; i+flags.minWordNGramLeng-1 &amp;&amp; j &lt; bits.length; j++) {</span>
+<span class="nc" id="L1113">              sb.append('-');</span>
+<span class="nc" id="L1114">              sb.append(bits[j]);</span>
+            }
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">            int maxIndex = (flags.maxWordNGramLeng &gt; 0)? Math.min(bits.length, i + flags.maxWordNGramLeng): bits.length;</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">            for (int j = i + flags.minWordNGramLeng-1; j &lt; maxIndex; j++) {</span>
+<span class="nc bnc" id="L1118" title="All 2 branches missed.">              if (flags.wordNGramBoundaryRegexp != null) {</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">                if (flags.wordNGramBoundaryPattern.matcher(bits[j]).matches()) {</span>
+<span class="nc" id="L1120">                  break;</span>
+                }
+              }
+<span class="nc" id="L1123">              sb.append('-');</span>
+<span class="nc" id="L1124">              sb.append(bits[j]);</span>
+<span class="nc" id="L1125">              addFeature(featuresC, sb.toString(), DEFAULT_VALUE);</span>
+            }
+          }
+          // this is equivalent to having boundary tokens in splitWordPairs -- they get a special feature
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">          if (flags.useSplitFirstLastWords) {</span>
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">            if (i == 0) {</span>
+<span class="nc" id="L1131">              addFeature(featuresC,&quot;SFW-&quot; + bits[i], DEFAULT_VALUE);</span>
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">            } else if (i == bits.length - 1) {</span>
+<span class="nc" id="L1133">              addFeature(featuresC,&quot;SLW-&quot; + bits[i], DEFAULT_VALUE);</span>
+            }
+          }
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">          if (flags.useLowercaseSplitFirstLastWords) {</span>
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">            if (i == 0) {</span>
+<span class="nc" id="L1138">              addFeature(featuresC,&quot;LSFW-&quot; + bits[i].toLowerCase(), DEFAULT_VALUE);</span>
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">            } else if (i == bits.length - 1) {</span>
+<span class="nc" id="L1140">              addFeature(featuresC,&quot;SLW-&quot; + bits[i].toLowerCase(), DEFAULT_VALUE);</span>
+            }
+          }
+<span class="nc bnc" id="L1143" title="All 4 branches missed.">          if (flags.useSplitNGrams || flags.useSplitPrefixSuffixNGrams) {</span>
+<span class="nc" id="L1144">            Collection&lt;String&gt; featureNames = makeNGramFeatures(bits[i], flags, true, &quot;S#&quot;);</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">            for(String featureName : featureNames)</span>
+<span class="nc" id="L1146">              addFeature(featuresC, featureName, DEFAULT_VALUE);</span>
+          }
+<span class="nc bnc" id="L1148" title="All 2 branches missed.">          if (flags.splitWordShape &gt; edu.stanford.nlp.process.WordShapeClassifier.NOWORDSHAPE) {</span>
+<span class="nc" id="L1149">            String shape = edu.stanford.nlp.process.WordShapeClassifier.wordShape(bits[i], flags.splitWordShape);</span>
+            // logger.info(&quot;Shaper is &quot; + flags.splitWordShape + &quot; word len &quot; + bits[i].length() + &quot; shape is &quot; + shape);
+<span class="nc" id="L1151">            addFeature(featuresC,&quot;SSHAPE-&quot; + shape,DEFAULT_VALUE);</span>
+          }
+        } // for bits
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">        if (flags.wordVectors != null) {</span>
+<span class="nc" id="L1155">          double[] averages = null;</span>
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">          for (String bit : bits) {</span>
+<span class="nc" id="L1157">            float[] wv = flags.wordVectors.get(bit);</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">            if (wv != null) {</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">              if (averages == null) {</span>
+<span class="nc" id="L1160">                averages = new double[wv.length];</span>
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">                for (int j = 0; j &lt; wv.length; j++) {</span>
+<span class="nc" id="L1162">                  averages[j] += wv[j];</span>
+                }
+              }
+            }
+          }
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">          if (averages != null) {</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">            for (int j = 0; j &lt; averages.length; j++) {</span>
+<span class="nc" id="L1169">              averages[j] /= bits.length;</span>
+<span class="nc" id="L1170">              addFeature(featuresC, &quot;SWV-&quot; + j, averages[j]);</span>
+            }
+          // } else {
+          //   logger.info(&quot;No word vectors found for words in |&quot; + cWord + '|');
+          }
+        } // end if wordVectors
+      } // end if uses some split words features
+
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">      if (flags.wordShape &gt; WordShapeClassifier.NOWORDSHAPE) {</span>
+<span class="nc" id="L1179">        String shape = edu.stanford.nlp.process.WordShapeClassifier.wordShape(cWord, flags.wordShape);</span>
+<span class="nc" id="L1180">        addFeature(featuresC, &quot;SHAPE-&quot; + shape, DEFAULT_VALUE);</span>
+      }
+<span class="nc bnc" id="L1182" title="All 4 branches missed.">      if (flags.useNGrams || flags.usePrefixSuffixNGrams) {</span>
+<span class="nc" id="L1183">        Collection&lt;String&gt; featureNames = makeNGramFeatures(cWord, flags, false, &quot;#&quot;);</span>
+<span class="nc bnc" id="L1184" title="All 2 branches missed.">        for(String featureName : featureNames)</span>
+<span class="nc" id="L1185">          addFeature(featuresC,featureName,DEFAULT_VALUE);</span>
+      }
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">      if (isRealValued(flags)) {</span>
+<span class="nc" id="L1188">        addFeatureValue(cWord, flags, featuresC);</span>
+      }
+       //logger.info(&quot;Made featuresC &quot; + featuresC);
+<span class="nc" id="L1191">    }  //end makeDatum</span>
+
+  /** Return the tokens using PTB tokenizer.
+   *
+   *  @param str String to tokenize
+   *  @return List of tokens
+   */
+  // todo [cdm 2017]: Someday should generalize this to allow use of other tokenizers
+  private String[] ptbTokenize(String str) {
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">    if (ptbFactory==null) {</span>
+<span class="nc" id="L1201">      ptbFactory = PTBTokenizer.factory();</span>
+    }
+<span class="nc" id="L1203">    Tokenizer&lt;Word&gt; tokenizer = ptbFactory.getTokenizer(new StringReader(str));</span>
+<span class="nc" id="L1204">    List&lt;Word&gt; words = tokenizer.tokenize();</span>
+<span class="nc" id="L1205">    String[] res = new String[words.size()];</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">    for (int i = 0, sz = words.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L1207">      res[i] = words.get(i).word();</span>
+    }
+<span class="nc" id="L1209">    return res;</span>
+  }
+
+  /**
+   * Caches a hash of word to all substring features.  Uses a &lt;i&gt;lot&lt;/i&gt; of memory!
+   * If the String space is large, you shouldn't turn this on.
+   */
+<span class="nc" id="L1216">  private static final Map&lt;String,Collection&lt;String&gt;&gt; wordToSubstrings = new ConcurrentHashMap&lt;&gt;();</span>
+
+
+  private String intern(String s) {
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">    if (globalFlags.intern) {</span>
+<span class="nc" id="L1221">      return s.intern();</span>
+    }
+<span class="nc" id="L1223">    return s;</span>
+  }
+
+  /**
+   * Return a Collection of NGrams from the input String.
+   */
+  private Collection&lt;String&gt; makeNGramFeatures(final String input, Flags flags, boolean useSplit, String featPrefix) {
+<span class="nc" id="L1230">    String toNGrams = input;</span>
+    boolean internalNGrams;
+    boolean prefixSuffixNGrams;
+<span class="nc bnc" id="L1233" title="All 2 branches missed.">    if (useSplit) {</span>
+<span class="nc" id="L1234">      internalNGrams = flags.useSplitNGrams;</span>
+<span class="nc" id="L1235">      prefixSuffixNGrams = flags.useSplitPrefixSuffixNGrams;</span>
+    } else {
+<span class="nc" id="L1237">      internalNGrams = flags.useNGrams;</span>
+<span class="nc" id="L1238">      prefixSuffixNGrams = flags.usePrefixSuffixNGrams;</span>
+    }
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">    if (flags.lowercaseNGrams) {</span>
+<span class="nc" id="L1241">      toNGrams = toNGrams.toLowerCase(Locale.ENGLISH);</span>
+    }
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">    if (flags.partialNGramRegexp != null) {</span>
+<span class="nc" id="L1244">      Matcher m = flags.partialNGramPattern.matcher(toNGrams);</span>
+      // log.info(&quot;Matching |&quot; + flags.partialNGramRegexp +
+      //                &quot;| against |&quot; + toNGrams + &quot;|&quot;);
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">      if (m.find()) {</span>
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">        if (m.groupCount() &gt; 0) {</span>
+<span class="nc" id="L1249">          toNGrams = m.group(1);</span>
+        } else {
+<span class="nc" id="L1251">          toNGrams = m.group();</span>
+        }
+        // log.info(&quot; Matched |&quot; + toNGrams + &quot;|&quot;);
+      }
+      // logger.info();
+    }
+<span class="nc" id="L1257">    Collection&lt;String&gt; subs = null;</span>
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">    if (flags.cacheNGrams) {</span>
+<span class="nc" id="L1259">      subs = wordToSubstrings.get(toNGrams);</span>
+    }
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">    if (subs == null) {</span>
+<span class="nc" id="L1262">      subs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1263">      String strN = featPrefix + '-';</span>
+<span class="nc" id="L1264">      String strB = featPrefix + &quot;B-&quot;;</span>
+<span class="nc" id="L1265">      String strE = featPrefix + &quot;E-&quot;;</span>
+<span class="nc" id="L1266">      int wleng = toNGrams.length();</span>
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">      for (int i = 0; i &lt; wleng; i++) {</span>
+<span class="nc bnc" id="L1268" title="All 2 branches missed.">        for (int j = i + flags.minNGramLeng, min = Math.min(wleng, i + flags.maxNGramLeng); j &lt;= min; j++) {</span>
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">          if (prefixSuffixNGrams) {</span>
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">            if (i == 0) {</span>
+<span class="nc" id="L1271">              subs.add(intern(strB + toNGrams.substring(i, j)));</span>
+            }
+<span class="nc bnc" id="L1273" title="All 2 branches missed.">            if (j == wleng) {</span>
+<span class="nc" id="L1274">              subs.add(intern(strE + toNGrams.substring(i, j)));</span>
+            }
+          }
+<span class="nc bnc" id="L1277" title="All 2 branches missed.">          if (internalNGrams) {</span>
+<span class="nc" id="L1278">            subs.add(intern(strN + toNGrams.substring(i, j)));</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">      if (flags.cacheNGrams) {</span>
+<span class="nc" id="L1283">        wordToSubstrings.put(toNGrams, subs);</span>
+      }
+    }
+<span class="nc" id="L1286">    return subs;</span>
+  }
+
+
+  private static PrintWriter cliqueWriter;
+
+  private static void newFeaturePrinter(String prefix, String suffix, String encoding) {
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">    if (cliqueWriter != null) {</span>
+<span class="nc" id="L1294">      closeFeaturePrinter();</span>
+    }
+    try {
+<span class="nc" id="L1297">      cliqueWriter = IOUtils.getPrintWriter(prefix + '.' + suffix, encoding);</span>
+<span class="nc" id="L1298">    } catch (IOException ioe) {</span>
+<span class="nc" id="L1299">      cliqueWriter = null;</span>
+<span class="nc" id="L1300">    }</span>
+<span class="nc" id="L1301">  }</span>
+
+  private static void closeFeaturePrinter() {
+<span class="nc" id="L1304">    cliqueWriter.close();</span>
+<span class="nc" id="L1305">    cliqueWriter = null;</span>
+<span class="nc" id="L1306">  }</span>
+
+  private static void printFeatures(String[] wi, ClassicCounter&lt;String&gt; features) {
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">    if (cliqueWriter != null) {</span>
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">      for (int i = 0; i &lt; wi.length; i++) {</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">        if (i &gt; 0) {</span>
+<span class="nc" id="L1312">          cliqueWriter.print(&quot;\t&quot;);</span>
+        }
+<span class="nc" id="L1314">        cliqueWriter.print(wi[i]);</span>
+      }
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">      for (String feat : features.keySet()) {</span>
+<span class="nc" id="L1317">        cliqueWriter.print(&quot;\t&quot;);</span>
+<span class="nc" id="L1318">        cliqueWriter.print(feat);</span>
+<span class="nc" id="L1319">        cliqueWriter.print(&quot;\t&quot;);</span>
+<span class="nc" id="L1320">        cliqueWriter.print(features.getCount(feat));</span>
+<span class="nc" id="L1321">      }</span>
+<span class="nc" id="L1322">      cliqueWriter.println();</span>
+    }
+<span class="nc" id="L1324">  }</span>
+
+  private static void printFeatures(String[] wi, List&lt;String&gt; features) {
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">    if (cliqueWriter != null) {</span>
+<span class="nc bnc" id="L1328" title="All 2 branches missed.">      for (int i = 0; i &lt; wi.length; i++) {</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">        if (i &gt; 0) {</span>
+<span class="nc" id="L1330">          cliqueWriter.print(&quot;\t&quot;);</span>
+        }
+<span class="nc" id="L1332">        cliqueWriter.print(wi[i]);</span>
+      }
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">      for (String feat : features) {</span>
+<span class="nc" id="L1335">        cliqueWriter.print(&quot;\t&quot;);</span>
+<span class="nc" id="L1336">        cliqueWriter.print(feat);</span>
+<span class="nc" id="L1337">      }</span>
+<span class="nc" id="L1338">      cliqueWriter.println();</span>
+    }
+<span class="nc" id="L1340">  }</span>
+
+  /**
+   * Creates a classifier from training data.  A specialized training regimen.
+   * It searches for an appropriate l1reg parameter to use to get specified number of features.
+   * This is called from makeClassifier() when certain properties are set.
+   *
+   * @param train training data
+   * @return trained classifier
+   */
+  private Classifier&lt;String,String&gt; makeClassifierAdaptL1(GeneralDataset&lt;String,String&gt; train) {
+<span class="nc bnc" id="L1351" title="All 6 branches missed.">    assert(globalFlags.useAdaptL1 &amp;&amp; globalFlags.limitFeatures &gt; 0);</span>
+<span class="nc" id="L1352">    Classifier&lt;String, String&gt; lc = null;</span>
+<span class="nc" id="L1353">    double l1reg = globalFlags.l1reg;</span>
+<span class="nc" id="L1354">    double l1regmax = globalFlags.l1regmax;</span>
+<span class="nc" id="L1355">    double l1regmin = globalFlags.l1regmin;</span>
+<span class="nc bnc" id="L1356" title="All 2 branches missed.">    if (globalFlags.l1reg &lt;= 0.0)  {</span>
+<span class="nc" id="L1357">      logger.info(&quot;WARNING: useAdaptL1 set and limitFeatures to &quot; + globalFlags.limitFeatures</span>
+              + &quot;, but invalid value of l1reg=&quot; + globalFlags.l1reg + &quot;, defaulting to &quot; + globalFlags.l1regmax);
+<span class="nc" id="L1359">      l1reg = l1regmax;</span>
+    } else {
+<span class="nc" id="L1361">      logger.info(&quot;TRAIN: useAdaptL1 set and limitFeatures to &quot; + globalFlags.limitFeatures</span>
+              + &quot;, l1reg=&quot; + globalFlags.l1reg + &quot;, l1regmax=&quot; + globalFlags.l1regmax + &quot;, l1regmin=&quot; + globalFlags.l1regmin);
+
+    }
+<span class="nc" id="L1365">    Set&lt;String&gt; limitFeatureLabels = null;</span>
+<span class="nc bnc" id="L1366" title="All 2 branches missed.">    if (globalFlags.limitFeaturesLabels != null) {</span>
+<span class="nc" id="L1367">      String[] labels = globalFlags.limitFeaturesLabels.split(&quot;,&quot;);</span>
+<span class="nc" id="L1368">      limitFeatureLabels = Generics.newHashSet();</span>
+<span class="nc bnc" id="L1369" title="All 2 branches missed.">      for (String label:labels) {</span>
+<span class="nc" id="L1370">        limitFeatureLabels.add(label.trim());</span>
+      }
+    }
+    // Do binary search starting with specified l1reg to find reasonable value of l1reg that gives desired number of features
+<span class="nc" id="L1374">    double l1regtop = l1regmax;</span>
+<span class="nc" id="L1375">    double l1regbottom = l1regmin;</span>
+<span class="nc" id="L1376">    int limitFeatureTol = 5;</span>
+<span class="nc" id="L1377">    double l1regminchange = 0.05;</span>
+    while (true) {
+<span class="nc" id="L1379">      logger.info(&quot;Training: l1reg=&quot; + l1reg + &quot;, threshold=&quot; + globalFlags.featureWeightThreshold</span>
+              + &quot;, target=&quot; + globalFlags.limitFeatures);
+      LinearClassifierFactory&lt;String,String&gt; lcf;
+<span class="nc" id="L1382">      Minimizer&lt;DiffFunction&gt; minim = ReflectionLoading.loadByReflection(&quot;edu.stanford.nlp.optimization.OWLQNMinimizer&quot;, l1reg);</span>
+<span class="nc" id="L1383">      lcf = new LinearClassifierFactory&lt;&gt;(minim, globalFlags.tolerance, globalFlags.useSum, globalFlags.prior, globalFlags.sigma, globalFlags.epsilon);</span>
+<span class="nc" id="L1384">      int featureCount = -1;</span>
+      try {
+<span class="nc" id="L1386">        LinearClassifier&lt;String,String&gt; c = lcf.trainClassifier(train);</span>
+<span class="nc" id="L1387">        lc = c;</span>
+<span class="nc" id="L1388">        featureCount = c.getFeatureCount(limitFeatureLabels, globalFlags.featureWeightThreshold, false /*useMagnitude*/);</span>
+
+<span class="nc" id="L1390">        logger.info(&quot;Training Done: l1reg=&quot; + l1reg + &quot;, threshold=&quot; + globalFlags.featureWeightThreshold</span>
+                + &quot;, features=&quot; + featureCount + &quot;, target=&quot; + globalFlags.limitFeatures);
+        //         String classifierDesc = c.toString(globalFlags.printClassifier, globalFlags.printClassifierParam);
+<span class="nc" id="L1393">        List&lt;Triple&lt;String,String,Double&gt;&gt; topFeatures = c.getTopFeatures(</span>
+                limitFeatureLabels, globalFlags.featureWeightThreshold, false /*useMagnitude*/,
+                globalFlags.limitFeatures, true /*descending order*/);
+<span class="nc" id="L1396">        String classifierDesc = c.topFeaturesToString(topFeatures);</span>
+<span class="nc" id="L1397">        logger.info(&quot;Printing top &quot; + globalFlags.limitFeatures + &quot; features with weights above &quot;</span>
+                + globalFlags.featureWeightThreshold);
+<span class="nc bnc" id="L1399" title="All 2 branches missed.">        if (globalFlags.limitFeaturesLabels != null) {</span>
+<span class="nc" id="L1400">          logger.info(&quot;  Limited to labels: &quot; + globalFlags.limitFeaturesLabels);</span>
+        }
+<span class="nc" id="L1402">        logger.info(classifierDesc);</span>
+<span class="nc" id="L1403">      } catch (RuntimeException ex) {</span>
+<span class="nc bnc" id="L1404" title="All 4 branches missed.">        if (ex.getMessage() != null &amp;&amp; ex.getMessage().startsWith(&quot;L-BFGS chose a non-descent direction&quot;)) {</span>
+<span class="nc" id="L1405">          logger.info(&quot;Error in optimization, will try again with different l1reg&quot;);</span>
+<span class="nc" id="L1406">          ex.printStackTrace(System.err);</span>
+        } else {
+<span class="nc" id="L1408">          throw ex;</span>
+        }
+<span class="nc" id="L1410">      }</span>
+<span class="nc bnc" id="L1411" title="All 4 branches missed.">      if (featureCount &lt; 0 || featureCount &lt; globalFlags.limitFeatures - limitFeatureTol) {</span>
+        // Too few features or some other bad thing happened =&gt; decrease l1reg
+<span class="nc" id="L1413">        l1regtop = l1reg;</span>
+<span class="nc" id="L1414">        l1reg = 0.5*(l1reg + l1regbottom);</span>
+<span class="nc bnc" id="L1415" title="All 2 branches missed.">        if (l1regtop - l1reg &lt; l1regminchange) {</span>
+<span class="nc" id="L1416">          logger.info(&quot;Stopping: old l1reg  &quot; + l1regtop + &quot;- new l1reg &quot; + l1reg</span>
+                  + &quot;, difference less than &quot; + l1regminchange);
+<span class="nc" id="L1418">          break;</span>
+        }
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">      } else if (featureCount &gt; globalFlags.limitFeatures + limitFeatureTol) {</span>
+        // Too many features =&gt; increase l1reg
+<span class="nc" id="L1422">        l1regbottom = l1reg;</span>
+<span class="nc" id="L1423">        l1reg = 0.5*(l1reg + l1regtop);</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">        if (l1reg - l1regbottom &lt; l1regminchange) {</span>
+<span class="nc" id="L1425">          logger.info(&quot;Stopping: new l1reg  &quot; + l1reg + &quot;- old l1reg &quot; + l1regbottom</span>
+                  + &quot;, difference less than &quot; + l1regminchange);
+<span class="nc" id="L1427">          break;</span>
+        }
+      } else {
+<span class="nc" id="L1430">        logger.info(&quot;Stopping: # of features within &quot; + limitFeatureTol + &quot; of target&quot;);</span>
+<span class="nc" id="L1431">        break;</span>
+      }
+<span class="nc" id="L1433">    }</span>
+    // Update flags for later serialization
+<span class="nc" id="L1435">    globalFlags.l1reg = l1reg;</span>
+<span class="nc" id="L1436">    return lc;</span>
+  }
+
+  /**
+   * Creates a classifier from training data.
+   *
+   * @param train training data
+   * @return trained classifier
+   */
+  public Classifier&lt;String,String&gt; makeClassifier(GeneralDataset&lt;String,String&gt; train) {
+    Classifier&lt;String, String&gt; lc;
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">    if (globalFlags.useClassifierFactory != null) {</span>
+      ClassifierFactory&lt;String, String, Classifier&lt;String,String&gt;&gt; cf;
+<span class="nc bnc" id="L1449" title="All 2 branches missed.">      if (globalFlags.classifierFactoryArgs != null) {</span>
+<span class="nc" id="L1450">        cf = ReflectionLoading.loadByReflection(globalFlags.useClassifierFactory, globalFlags.classifierFactoryArgs);</span>
+      } else {
+<span class="nc" id="L1452">        cf = ReflectionLoading.loadByReflection(globalFlags.useClassifierFactory);</span>
+      }
+<span class="nc" id="L1454">      lc = cf.trainClassifier(train);</span>
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">    } else if (globalFlags.useNB) {</span>
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">      double sigma = (globalFlags.prior == 0) ? 0.0 : globalFlags.sigma;</span>
+<span class="nc" id="L1457">      lc = new NBLinearClassifierFactory&lt;String,String&gt;(sigma, globalFlags.useClassFeature).trainClassifier(train);</span>
+<span class="nc bnc" id="L1458" title="All 2 branches missed.">    } else if (globalFlags.useBinary) {</span>
+<span class="nc" id="L1459">      LogisticClassifierFactory&lt;String,String&gt; lcf = new LogisticClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L1460">      LogPrior prior = new LogPrior(globalFlags.prior, globalFlags.sigma, globalFlags.epsilon);</span>
+<span class="nc" id="L1461">      lc = lcf.trainClassifier(train, globalFlags.l1reg, globalFlags.tolerance, prior, globalFlags.biased);</span>
+<span class="nc bnc" id="L1462" title="All 2 branches missed.">    } else if (globalFlags.biased) {</span>
+<span class="nc" id="L1463">      LogisticClassifierFactory&lt;String,String&gt; lcf = new LogisticClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L1464">      LogPrior prior = new LogPrior(globalFlags.prior, globalFlags.sigma, globalFlags.epsilon);</span>
+<span class="nc" id="L1465">      lc = lcf.trainClassifier(train, prior, true);</span>
+<span class="nc bnc" id="L1466" title="All 4 branches missed.">    } else if (globalFlags.useAdaptL1 &amp;&amp; globalFlags.limitFeatures &gt; 0) {</span>
+<span class="nc" id="L1467">      lc = makeClassifierAdaptL1(train);</span>
+    } else {
+      LinearClassifierFactory&lt;String,String&gt; lcf;
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">      if (globalFlags.l1reg &gt; 0.0) {</span>
+<span class="nc" id="L1471">        Minimizer&lt;DiffFunction&gt; minim = ReflectionLoading.loadByReflection(&quot;edu.stanford.nlp.optimization.OWLQNMinimizer&quot;, globalFlags.l1reg);</span>
+<span class="nc" id="L1472">        lcf = new LinearClassifierFactory&lt;&gt;(minim, globalFlags.tolerance, globalFlags.useSum, globalFlags.prior, globalFlags.sigma, globalFlags.epsilon);</span>
+<span class="nc" id="L1473">      } else {</span>
+<span class="nc" id="L1474">        lcf  = new LinearClassifierFactory&lt;&gt;(globalFlags.tolerance, globalFlags.useSum, globalFlags.prior, globalFlags.sigma, globalFlags.epsilon, globalFlags.QNsize);</span>
+      }
+<span class="nc" id="L1476">      lcf.setVerbose(globalFlags.verboseOptimization);</span>
+<span class="nc bnc" id="L1477" title="All 2 branches missed.">      if ( ! globalFlags.useQN) {</span>
+<span class="nc" id="L1478">        lcf.useConjugateGradientAscent();</span>
+      }
+
+<span class="nc" id="L1481">      lc = lcf.trainClassifier(train);</span>
+    }
+<span class="nc" id="L1483">    return lc;</span>
+  }
+
+
+  private static String[] regexpTokenize(Pattern tokenizerRegexp, Pattern ignoreRegexp, String inWord) {
+<span class="nc" id="L1488">    List&lt;String&gt; al = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1489">    String word = inWord;</span>
+<span class="nc bnc" id="L1490" title="All 2 branches missed.">    while ( ! word.isEmpty()) {</span>
+      // logger.info(&quot;String to match on is &quot; + word);
+<span class="nc" id="L1492">      Matcher mig = null;</span>
+<span class="nc bnc" id="L1493" title="All 2 branches missed.">      if (ignoreRegexp != null) {</span>
+<span class="nc" id="L1494">        mig = ignoreRegexp.matcher(word);</span>
+      }
+<span class="nc bnc" id="L1496" title="All 4 branches missed.">      if (mig != null &amp;&amp; mig.lookingAt()) {</span>
+<span class="nc" id="L1497">        word = word.substring(mig.end());</span>
+      } else {
+<span class="nc" id="L1499">        Matcher m = tokenizerRegexp.matcher(word);</span>
+<span class="nc bnc" id="L1500" title="All 2 branches missed.">        if (m.lookingAt()) {</span>
+          // Logging.logger(ColumnDataClassifier.class).info(&quot;Matched &quot; + m.end() + &quot; chars: &quot; +
+          //		       word.substring(0, m.end()));
+<span class="nc" id="L1503">          al.add(word.substring(0, m.end()));</span>
+<span class="nc" id="L1504">          word = word.substring(m.end());</span>
+        } else {
+<span class="nc" id="L1506">          logger.info(&quot;Warning: regexpTokenize pattern &quot; + tokenizerRegexp + &quot; didn't match on |&quot; +</span>
+<span class="nc" id="L1507">                  word.substring(0, 1) + &quot;| of |&quot; + word + '|');</span>
+          // logger.info(&quot;Default matched 1 char: &quot; +
+          //		       word.substring(0, 1));
+<span class="nc" id="L1510">          al.add(word.substring(0, 1));</span>
+<span class="nc" id="L1511">          word = word.substring(1);</span>
+        }
+      }
+<span class="nc" id="L1514">    }</span>
+<span class="nc" id="L1515">    String[] bits = al.toArray(new String[al.size()]);</span>
+<span class="nc" id="L1516">    return bits;</span>
+  }
+
+  private static String[] splitTokenize(Pattern splitRegexp, Pattern ignoreRegexp, String cWord) {
+<span class="nc" id="L1520">    String[] bits = splitRegexp.split(cWord);</span>
+<span class="nc bnc" id="L1521" title="All 2 branches missed.">    if (ignoreRegexp != null) {</span>
+<span class="nc" id="L1522">      List&lt;String&gt; keepBits = new ArrayList&lt;&gt;(bits.length);</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">      for (String bit : bits) {</span>
+<span class="nc bnc" id="L1524" title="All 2 branches missed.">        if ( ! ignoreRegexp.matcher(bit).matches()) {</span>
+<span class="nc" id="L1525">          keepBits.add(bit);</span>
+        }
+      }
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">      if (keepBits.size() != bits.length) {</span>
+<span class="nc" id="L1529">        bits = new String[keepBits.size()];</span>
+<span class="nc" id="L1530">        keepBits.toArray(bits);</span>
+      }
+    }
+<span class="nc" id="L1533">    return bits;</span>
+  }
+
+  private static Map&lt;String, float[]&gt; loadWordVectors(String filename) {
+<span class="nc" id="L1537">    Timing timing = new Timing();</span>
+<span class="nc" id="L1538">    Map&lt;String,float[]&gt; map = new HashMap&lt;&gt;(10000); // presumably they'll load a fair-sized vocab!?</span>
+<span class="nc" id="L1539">    BufferedReader br = null;</span>
+    try {
+<span class="nc" id="L1541">      br = IOUtils.readerFromString(filename);</span>
+<span class="nc" id="L1542">      int numDimensions = -1;</span>
+<span class="nc" id="L1543">      boolean warned = false;</span>
+<span class="nc bnc" id="L1544" title="All 2 branches missed.">      for (String line; (line = br.readLine()) != null; ) {</span>
+<span class="nc" id="L1545">        String[] fields = line.split(&quot;\\s+&quot;);</span>
+<span class="nc bnc" id="L1546" title="All 2 branches missed.">        if (numDimensions &lt; 0) {</span>
+<span class="nc" id="L1547">          numDimensions = fields.length - 1;</span>
+        } else {
+<span class="nc bnc" id="L1549" title="All 4 branches missed.">          if (numDimensions != fields.length -1 &amp;&amp; ! warned) {</span>
+<span class="nc" id="L1550">            logger.info(&quot;loadWordVectors: Inconsistent vector size: &quot; + numDimensions +</span>
+                    &quot; vs. &quot; + (fields.length - 1));
+<span class="nc" id="L1552">            warned = true;</span>
+          }
+        }
+<span class="nc" id="L1555">        float[] vector = new float[fields.length - 1];</span>
+<span class="nc bnc" id="L1556" title="All 2 branches missed.">        for (int i = 1; i &lt; fields.length; i++) {</span>
+<span class="nc" id="L1557">          vector[i-1] = Float.parseFloat(fields[i]);</span>
+        }
+<span class="nc" id="L1559">        map.put(fields[0], vector);</span>
+<span class="nc" id="L1560">      }</span>
+<span class="nc" id="L1561">    } catch (IOException ioe) {</span>
+<span class="nc" id="L1562">      throw new RuntimeIOException(&quot;Couldn't load word vectors&quot;, ioe);</span>
+    } finally {
+<span class="nc" id="L1564">      IOUtils.closeIgnoringExceptions(br);</span>
+<span class="nc" id="L1565">    }</span>
+<span class="nc" id="L1566">    timing.done(&quot;Loading word vectors from &quot; + filename + &quot; ... &quot;);</span>
+<span class="nc" id="L1567">    return map;</span>
+  }
+
+
+  /**
+   * Initialize using values in Properties file.
+   *
+   * @param props Properties, with the special format of column.flag used in ColumnDataClassifier
+   * @return An array of flags for each data column, with additional global flags in element [0]
+   */
+  private static Pair&lt;Flags[], Classifier&lt;String,String&gt;&gt; setProperties(Properties props) {
+    Flags[] myFlags;
+<span class="nc" id="L1579">    Classifier&lt;String,String&gt; classifier = null;</span>
+<span class="nc" id="L1580">    boolean myUsesRealValues = false;</span>
+
+    Pattern prefix;
+    try {
+<span class="nc" id="L1584">      prefix = Pattern.compile(&quot;([0-9]+)\\.(.*)&quot;);</span>
+<span class="nc" id="L1585">    } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L1586">      throw new RuntimeException(pse);</span>
+<span class="nc" id="L1587">    }</span>
+
+    // if we are loading a classifier then we have to load it before we do anything
+    // else and have its Properties be the defaults that can then be overridden by
+    // other command-line arguments
+<span class="nc" id="L1592">    String loadPath = props.getProperty(&quot;loadClassifier&quot;);</span>
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">    if (loadPath != null) {</span>
+<span class="nc" id="L1594">      Pair&lt;Flags[],Classifier&lt;String,String&gt;&gt; pair = loadClassifier(loadPath);</span>
+<span class="nc" id="L1595">      myFlags = pair.first();</span>
+<span class="nc" id="L1596">      classifier = pair.second();</span>
+<span class="nc" id="L1597">    } else {</span>
+<span class="nc" id="L1598">      myFlags = new Flags[1];</span>
+<span class="nc" id="L1599">      myFlags[0] = new Flags();  // initialize zero column flags used for global flags; it can't be null</span>
+    }
+
+<span class="nc" id="L1602">    logger.info(&quot;Setting ColumnDataClassifier properties&quot;);</span>
+<span class="nc bnc" id="L1603" title="All 2 branches missed.">    for (String key : props.stringPropertyNames()) {</span>
+<span class="nc" id="L1604">      String val = props.getProperty(key);</span>
+<span class="nc" id="L1605">      logger.info(key + &quot; = &quot; + val);</span>
+
+<span class="nc" id="L1607">      int col = 0;  // the default (first after class)</span>
+<span class="nc" id="L1608">      Matcher matcher = prefix.matcher(key);</span>
+<span class="nc bnc" id="L1609" title="All 2 branches missed.">      if (matcher.matches()) {</span>
+<span class="nc" id="L1610">        col = Integer.parseInt(matcher.group(1));</span>
+<span class="nc" id="L1611">        key = matcher.group(2);</span>
+      }
+<span class="nc bnc" id="L1613" title="All 2 branches missed.">      if (col &gt;= myFlags.length) {</span>
+<span class="nc" id="L1614">        myFlags = Arrays.copyOf(myFlags, col + 1);</span>
+      }
+<span class="nc bnc" id="L1616" title="All 2 branches missed.">      if (myFlags[col] == null) {</span>
+<span class="nc" id="L1617">        myFlags[col] = new Flags();</span>
+      }
+
+<span class="nc bnc" id="L1620" title="All 2 branches missed.">      if (key.equals(&quot;useString&quot;)) {</span>
+<span class="nc" id="L1621">        myFlags[col].useString = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">      } else if (key.equals(&quot;binnedLengths&quot;)) {</span>
+<span class="nc bnc" id="L1623" title="All 2 branches missed.">        if (val != null) {</span>
+<span class="nc" id="L1624">          String[] binnedLengthStrs = val.split(&quot;[, ]+&quot;);</span>
+<span class="nc" id="L1625">          myFlags[col].binnedLengths = new int[binnedLengthStrs.length];</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">          for (int i = 0; i &lt; myFlags[col].binnedLengths.length; i++) {</span>
+<span class="nc" id="L1627">            myFlags[col].binnedLengths[i] = Integer.parseInt(binnedLengthStrs[i]);</span>
+          }
+<span class="nc" id="L1629">        }</span>
+<span class="nc bnc" id="L1630" title="All 2 branches missed.">      } else if (key.equals(&quot;binnedLengthsStatistics&quot;)) {</span>
+<span class="nc bnc" id="L1631" title="All 2 branches missed.">        if (Boolean.parseBoolean(val)) {</span>
+<span class="nc" id="L1632">          myFlags[col].binnedLengthsCounter = new TwoDimensionalCounter&lt;&gt;();</span>
+        }
+<span class="nc bnc" id="L1634" title="All 2 branches missed.">      } else if (key.equals(&quot;splitWordCount&quot;)) {</span>
+<span class="nc" id="L1635">        myFlags[col].splitWordCount = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">      } else if (key.equals(&quot;logSplitWordCount&quot;)) {</span>
+<span class="nc" id="L1637">        myFlags[col].logSplitWordCount = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1638" title="All 2 branches missed.">      } else if (key.equals(&quot;binnedSplitWordCounts&quot;)) {</span>
+<span class="nc bnc" id="L1639" title="All 2 branches missed.">        if (val != null) {</span>
+<span class="nc" id="L1640">          String[] binnedSplitWordCountStrs = val.split(&quot;[, ]+&quot;);</span>
+<span class="nc" id="L1641">          myFlags[col].binnedSplitWordCounts = new int[binnedSplitWordCountStrs.length];</span>
+<span class="nc bnc" id="L1642" title="All 2 branches missed.">          for (int i = 0; i &lt; myFlags[col].binnedSplitWordCounts.length; i++) {</span>
+<span class="nc" id="L1643">            myFlags[col].binnedSplitWordCounts[i] = Integer.parseInt(binnedSplitWordCountStrs[i]);</span>
+          }
+<span class="nc" id="L1645">        }</span>
+<span class="nc bnc" id="L1646" title="All 2 branches missed.">      } else if (key.equals(&quot;countChars&quot;)) {</span>
+<span class="nc" id="L1647">        myFlags[col].countChars = val.toCharArray();</span>
+<span class="nc bnc" id="L1648" title="All 2 branches missed.">      } else if (key.equals(&quot;countCharsBins&quot;)) {</span>
+<span class="nc bnc" id="L1649" title="All 2 branches missed.">        if (val != null) {</span>
+<span class="nc" id="L1650">          String[] binnedCountStrs = val.split(&quot;[, ]+&quot;);</span>
+<span class="nc" id="L1651">          myFlags[col].countCharsBins = new int[binnedCountStrs.length];</span>
+<span class="nc bnc" id="L1652" title="All 2 branches missed.">          for (int i = 0; i &lt; binnedCountStrs.length; i++) {</span>
+<span class="nc" id="L1653">            myFlags[col].countCharsBins[i] = Integer.parseInt(binnedCountStrs[i]);</span>
+          }
+<span class="nc" id="L1655">        }</span>
+<span class="nc bnc" id="L1656" title="All 2 branches missed.">      } else if (key.equals(&quot;binnedValues&quot;)) {</span>
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">        if (val != null) {</span>
+<span class="nc" id="L1658">          String[] binnedValuesStrs = val.split(&quot;[, ]+&quot;);</span>
+<span class="nc" id="L1659">          myFlags[col].binnedValues = new double[binnedValuesStrs.length];</span>
+<span class="nc bnc" id="L1660" title="All 2 branches missed.">          for (int i = 0; i &lt; myFlags[col].binnedValues.length; i++) {</span>
+<span class="nc" id="L1661">            myFlags[col].binnedValues[i] = Double.parseDouble(binnedValuesStrs[i]);</span>
+          }
+<span class="nc" id="L1663">        }</span>
+<span class="nc bnc" id="L1664" title="All 2 branches missed.">      } else if (key.equals(&quot;binnedValuesNaN&quot;)) {</span>
+<span class="nc" id="L1665">        myFlags[col].binnedValuesNaN = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1666" title="All 2 branches missed.">      } else if (key.equals(&quot;binnedValuesStatistics&quot;)) {</span>
+<span class="nc bnc" id="L1667" title="All 2 branches missed.">        if (Boolean.parseBoolean(val)) {</span>
+<span class="nc" id="L1668">          myFlags[col].binnedValuesCounter = new TwoDimensionalCounter&lt;&gt;();</span>
+        }
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">      } else if (key.equals(&quot;useNGrams&quot;)) {</span>
+<span class="nc" id="L1671">        myFlags[col].useNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">      } else if (key.equals(&quot;usePrefixSuffixNGrams&quot;)) {</span>
+<span class="nc" id="L1673">        myFlags[col].usePrefixSuffixNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1674" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitNGrams&quot;)) {</span>
+<span class="nc" id="L1675">        myFlags[col].useSplitNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1676" title="All 2 branches missed.">      } else if (key.equals(&quot;wordShape&quot;)) {</span>
+<span class="nc" id="L1677">        myFlags[col].wordShape = WordShapeClassifier.lookupShaper(val);</span>
+<span class="nc bnc" id="L1678" title="All 2 branches missed.">      } else if (key.equals(&quot;splitWordShape&quot;)) {</span>
+<span class="nc" id="L1679">        myFlags[col].splitWordShape = WordShapeClassifier.lookupShaper(val);</span>
+<span class="nc bnc" id="L1680" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitPrefixSuffixNGrams&quot;)) {</span>
+<span class="nc" id="L1681">        myFlags[col].useSplitPrefixSuffixNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1682" title="All 2 branches missed.">      } else if (key.equals(&quot;lowercaseNGrams&quot;)) {</span>
+<span class="nc" id="L1683">        myFlags[col].lowercaseNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1684" title="All 2 branches missed.">      } else if (key.equals(&quot;lowercase&quot;)) {</span>
+<span class="nc" id="L1685">        myFlags[col].lowercase = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1686" title="All 2 branches missed.">      } else if (key.equals(&quot;useLowercaseSplitWords&quot;)) {</span>
+<span class="nc" id="L1687">        myFlags[col].useLowercaseSplitWords = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">      } else if (key.equals(&quot;useSum&quot;)) {</span>
+<span class="nc" id="L1689">        myFlags[col].useSum = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1690" title="All 2 branches missed.">      } else if (key.equals(&quot;tolerance&quot;)) {</span>
+<span class="nc" id="L1691">        myFlags[col].tolerance = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1692" title="All 2 branches missed.">      } else if (key.equals(&quot;printFeatures&quot;)) {</span>
+<span class="nc" id="L1693">        myFlags[col].printFeatures = val;</span>
+<span class="nc bnc" id="L1694" title="All 2 branches missed.">      } else if (key.equals(&quot;printClassifier&quot;)) {</span>
+<span class="nc" id="L1695">        myFlags[col].printClassifier = val;</span>
+<span class="nc bnc" id="L1696" title="All 2 branches missed.">      } else if (key.equals(&quot;printClassifierParam&quot;)) {</span>
+<span class="nc" id="L1697">        myFlags[col].printClassifierParam = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1698" title="All 2 branches missed.">      } else if (key.equals(&quot;exitAfterTrainingFeaturization&quot;)) {</span>
+<span class="nc" id="L1699">        myFlags[col].exitAfterTrainingFeaturization = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1700" title="All 4 branches missed.">      } else if (key.equals(&quot;intern&quot;) || key.equals(&quot;intern2&quot;)) {</span>
+<span class="nc" id="L1701">        myFlags[col].intern = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1702" title="All 2 branches missed.">      } else if (key.equals(&quot;cacheNGrams&quot;)) {</span>
+<span class="nc" id="L1703">        myFlags[col].cacheNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1704" title="All 2 branches missed.">      } else if (key.equals(&quot;useClassifierFactory&quot;)) {</span>
+<span class="nc" id="L1705">        myFlags[col].useClassifierFactory = val;</span>
+<span class="nc bnc" id="L1706" title="All 2 branches missed.">      } else if (key.equals(&quot;classifierFactoryArgs&quot;)) {</span>
+<span class="nc" id="L1707">        myFlags[col].classifierFactoryArgs = val;</span>
+<span class="nc bnc" id="L1708" title="All 2 branches missed.">      } else if (key.equals(&quot;useNB&quot;)) {</span>
+<span class="nc" id="L1709">        myFlags[col].useNB = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1710" title="All 2 branches missed.">      } else if (key.equals(&quot;useBinary&quot;)) {</span>
+<span class="nc" id="L1711">        myFlags[col].useBinary = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1712" title="All 2 branches missed.">      } else if (key.equals(&quot;l1reg&quot;)) {</span>
+<span class="nc" id="L1713">        myFlags[col].l1reg = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1714" title="All 2 branches missed.">      } else if (key.equals(&quot;useAdaptL1&quot;)) {</span>
+<span class="nc" id="L1715">        myFlags[col].useAdaptL1 = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1716" title="All 2 branches missed.">      } else if (key.equals(&quot;limitFeatures&quot;)) {</span>
+<span class="nc" id="L1717">        myFlags[col].limitFeatures = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1718" title="All 2 branches missed.">      } else if (key.equals(&quot;l1regmin&quot;)) {</span>
+<span class="nc" id="L1719">        myFlags[col].l1regmin = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1720" title="All 2 branches missed.">      } else if (key.equals(&quot;l1regmax&quot;)) {</span>
+<span class="nc" id="L1721">        myFlags[col].l1regmax = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1722" title="All 2 branches missed.">      } else if (key.equals(&quot;limitFeaturesLabels&quot;)) {</span>
+<span class="nc" id="L1723">        myFlags[col].limitFeaturesLabels = val;</span>
+<span class="nc bnc" id="L1724" title="All 2 branches missed.">      } else if (key.equals(&quot;featureWeightThreshold&quot;)) {</span>
+<span class="nc" id="L1725">        myFlags[col].featureWeightThreshold = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1726" title="All 2 branches missed.">      } else if (key.equals(&quot;useClassFeature&quot;)) {</span>
+<span class="nc" id="L1727">        myFlags[col].useClassFeature = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1728" title="All 2 branches missed.">      } else if (key.equals(&quot;featureMinimumSupport&quot;)) {</span>
+<span class="nc" id="L1729">        myFlags[col].featureMinimumSupport = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1730" title="All 2 branches missed.">      } else if (key.equals(&quot;prior&quot;)) {</span>
+<span class="nc bnc" id="L1731" title="All 2 branches missed.">        if (val.equalsIgnoreCase(&quot;no&quot;)) {</span>
+<span class="nc" id="L1732">          myFlags[col].prior = LogPrior.LogPriorType.NULL.ordinal();</span>
+<span class="nc bnc" id="L1733" title="All 2 branches missed.">        } else if (val.equalsIgnoreCase(&quot;huber&quot;)) {</span>
+<span class="nc" id="L1734">          myFlags[col].prior = LogPrior.LogPriorType.HUBER.ordinal();</span>
+<span class="nc bnc" id="L1735" title="All 2 branches missed.">        } else if (val.equalsIgnoreCase(&quot;quadratic&quot;)) {</span>
+<span class="nc" id="L1736">          myFlags[col].prior = LogPrior.LogPriorType.QUADRATIC.ordinal();</span>
+<span class="nc bnc" id="L1737" title="All 2 branches missed.">        } else if (val.equalsIgnoreCase(&quot;quartic&quot;)) {</span>
+<span class="nc" id="L1738">          myFlags[col].prior = LogPrior.LogPriorType.QUARTIC.ordinal();</span>
+        } else {
+          try {
+<span class="nc" id="L1741">            myFlags[col].prior = Integer.parseInt(val);</span>
+<span class="nc" id="L1742">          } catch (NumberFormatException nfe) {</span>
+<span class="nc" id="L1743">            logger.info(&quot;Unknown prior &quot; + val + &quot;; using none.&quot;);</span>
+<span class="nc" id="L1744">          }</span>
+        }
+<span class="nc bnc" id="L1746" title="All 2 branches missed.">      } else if (key.equals(&quot;sigma&quot;)) {</span>
+<span class="nc" id="L1747">        myFlags[col].sigma = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1748" title="All 2 branches missed.">      } else if (key.equals(&quot;epsilon&quot;)) {</span>
+<span class="nc" id="L1749">        myFlags[col].epsilon = Double.parseDouble(val);</span>
+<span class="nc bnc" id="L1750" title="All 2 branches missed.">      } else if (key.equals(&quot;maxNGramLeng&quot;)) {</span>
+<span class="nc" id="L1751">        myFlags[col].maxNGramLeng = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1752" title="All 2 branches missed.">      } else if (key.equals(&quot;minNGramLeng&quot;)) {</span>
+<span class="nc" id="L1753">        myFlags[col].minNGramLeng = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1754" title="All 2 branches missed.">      } else if (key.equals(&quot;partialNGramRegexp&quot;)) {</span>
+<span class="nc" id="L1755">        myFlags[col].partialNGramRegexp = val;</span>
+        try {
+<span class="nc" id="L1757">          myFlags[col].partialNGramPattern = Pattern.compile(myFlags[col].partialNGramRegexp);</span>
+<span class="nc" id="L1758">        } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L1759">          logger.info(&quot;Ill-formed partialNGramPattern: &quot; + myFlags[col].partialNGramPattern);</span>
+<span class="nc" id="L1760">          myFlags[col].partialNGramRegexp = null;</span>
+<span class="nc" id="L1761">        }</span>
+<span class="nc bnc" id="L1762" title="All 2 branches missed.">      } else if (key.equals(&quot;splitWordsRegexp&quot;)) {</span>
+        try {
+<span class="nc" id="L1764">          myFlags[col].splitWordsPattern = Pattern.compile(val);</span>
+<span class="nc" id="L1765">        } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L1766">          logger.info(&quot;Ill-formed splitWordsRegexp: &quot; + val);</span>
+<span class="nc" id="L1767">        }</span>
+<span class="nc bnc" id="L1768" title="All 2 branches missed.">      } else if (key.equals(&quot;splitWordsTokenizerRegexp&quot;)) {</span>
+        try {
+<span class="nc" id="L1770">          myFlags[col].splitWordsTokenizerPattern = Pattern.compile(val);</span>
+<span class="nc" id="L1771">        } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L1772">          logger.info(&quot;Ill-formed splitWordsTokenizerRegexp: &quot; + val);</span>
+<span class="nc" id="L1773">        }</span>
+<span class="nc bnc" id="L1774" title="All 2 branches missed.">      } else if (key.equals(&quot;splitWordsIgnoreRegexp&quot;)) {</span>
+<span class="nc" id="L1775">        String trimVal = val.trim();</span>
+<span class="nc bnc" id="L1776" title="All 2 branches missed.">        if (trimVal.isEmpty()) {</span>
+<span class="nc" id="L1777">          myFlags[col].splitWordsIgnorePattern = null;</span>
+        } else {
+          try {
+<span class="nc" id="L1780">            myFlags[col].splitWordsIgnorePattern = Pattern.compile(trimVal);</span>
+<span class="nc" id="L1781">          } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L1782">            logger.info(&quot;Ill-formed splitWordsIgnoreRegexp: &quot; + trimVal);</span>
+<span class="nc" id="L1783">          }</span>
+        }
+<span class="nc bnc" id="L1785" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitWords&quot;)) {</span>
+<span class="nc" id="L1786">        myFlags[col].useSplitWords = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1787" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitWordPairs&quot;)) {</span>
+<span class="nc" id="L1788">        myFlags[col].useSplitWordPairs = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1789" title="All 2 branches missed.">      } else if (key.equals(&quot;useLowercaseSplitWordPairs&quot;)) {</span>
+<span class="nc" id="L1790">        myFlags[col].useLowercaseSplitWordPairs = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1791" title="All 2 branches missed.">      } else if (key.equals(&quot;useAllSplitWordPairs&quot;)) {</span>
+<span class="nc" id="L1792">        myFlags[col].useAllSplitWordPairs = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1793" title="All 2 branches missed.">      } else if (key.equals(&quot;useAllSplitWordTriples&quot;)) {</span>
+<span class="nc" id="L1794">        myFlags[col].useAllSplitWordTriples = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1795" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitWordNGrams&quot;)) {</span>
+<span class="nc" id="L1796">        myFlags[col].useSplitWordNGrams = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1797" title="All 2 branches missed.">      } else if (key.equals(&quot;maxWordNGramLeng&quot;)) {</span>
+<span class="nc" id="L1798">        myFlags[col].maxWordNGramLeng = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1799" title="All 2 branches missed.">      } else if (key.equals(&quot;minWordNGramLeng&quot;)) {</span>
+<span class="nc" id="L1800">        myFlags[col].minWordNGramLeng = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1801" title="All 2 branches missed.">        if (myFlags[col].minWordNGramLeng &lt; 1) {</span>
+<span class="nc" id="L1802">          logger.info(&quot;minWordNGramLeng set to &quot; + myFlags[col].minWordNGramLeng + &quot;, resetting to 1&quot;);</span>
+<span class="nc" id="L1803">          myFlags[col].minWordNGramLeng = 1;</span>
+        }
+<span class="nc bnc" id="L1805" title="All 2 branches missed.">      } else if (key.equals(&quot;wordNGramBoundaryRegexp&quot;)) {</span>
+<span class="nc" id="L1806">        myFlags[col].wordNGramBoundaryRegexp = val;</span>
+        try {
+<span class="nc" id="L1808">          myFlags[col].wordNGramBoundaryPattern = Pattern.compile(myFlags[col].wordNGramBoundaryRegexp);</span>
+<span class="nc" id="L1809">        } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L1810">          logger.info(&quot;Ill-formed wordNGramBoundary regexp: &quot; + myFlags[col].wordNGramBoundaryRegexp);</span>
+<span class="nc" id="L1811">          myFlags[col].wordNGramBoundaryRegexp = null;</span>
+<span class="nc" id="L1812">        }</span>
+<span class="nc bnc" id="L1813" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitFirstLastWords&quot;)) {</span>
+<span class="nc" id="L1814">        myFlags[col].useSplitFirstLastWords = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1815" title="All 2 branches missed.">      } else if (key.equals(&quot;useLowercaseSplitFirstLastWords&quot;)) {</span>
+<span class="nc" id="L1816">        myFlags[col].useLowercaseSplitFirstLastWords = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1817" title="All 2 branches missed.">      } else if (key.equals(&quot;loadClassifier&quot;)) {</span>
+<span class="nc" id="L1818">        myFlags[col].loadClassifier = val;</span>
+<span class="nc bnc" id="L1819" title="All 2 branches missed.">      } else if (key.equals(&quot;serializeTo&quot;)) {</span>
+<span class="nc" id="L1820">        Flags.serializeTo = val;</span>
+<span class="nc bnc" id="L1821" title="All 2 branches missed.">      } else if (key.equals(&quot;printTo&quot;)) {</span>
+<span class="nc" id="L1822">        Flags.printTo = val;</span>
+<span class="nc bnc" id="L1823" title="All 2 branches missed.">      } else if (key.equals(&quot;trainFile&quot;)) {</span>
+<span class="nc" id="L1824">        Flags.trainFile = val;</span>
+<span class="nc bnc" id="L1825" title="All 2 branches missed.">      } else if (key.equals(&quot;displayAllAnswers&quot;)) {</span>
+<span class="nc" id="L1826">        Flags.displayAllAnswers = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1827" title="All 2 branches missed.">      } else if (key.equals(&quot;testFile&quot;)) {</span>
+<span class="nc" id="L1828">        myFlags[col].testFile = val;</span>
+<span class="nc bnc" id="L1829" title="All 2 branches missed.">      } else if (key.equals(&quot;trainFromSVMLight&quot;)) {</span>
+<span class="nc" id="L1830">        Flags.trainFromSVMLight = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1831" title="All 2 branches missed.">      } else if (key.equals(&quot;testFromSVMLight&quot;)) {</span>
+<span class="nc" id="L1832">        Flags.testFromSVMLight = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1833" title="All 2 branches missed.">      } else if (key.equals(&quot;encoding&quot;)) {</span>
+<span class="nc" id="L1834">        Flags.encoding = val;</span>
+<span class="nc bnc" id="L1835" title="All 2 branches missed.">      } else if (key.equals(&quot;printSVMLightFormatTo&quot;)) {</span>
+<span class="nc" id="L1836">        Flags.printSVMLightFormatTo = val;</span>
+<span class="nc bnc" id="L1837" title="All 2 branches missed.">      } else if (key.equals(&quot;displayedColumn&quot;)) {</span>
+<span class="nc" id="L1838">        myFlags[col].displayedColumn = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1839" title="All 2 branches missed.">      } else if (key.equals(&quot;groupingColumn&quot;)) {</span>
+<span class="nc" id="L1840">        myFlags[col].groupingColumn = Integer.parseInt(val);</span>
+        // logger.info(&quot;Grouping column is &quot; + (myFlags[col].groupingColumn));
+<span class="nc bnc" id="L1842" title="All 2 branches missed.">      } else if (key.equals(&quot;rankingScoreColumn&quot;)) {</span>
+<span class="nc" id="L1843">        myFlags[col].rankingScoreColumn = Integer.parseInt(val);</span>
+        // logger.info(&quot;Ranking score column is &quot; + (myFlags[col].rankingScoreColumn));
+<span class="nc bnc" id="L1845" title="All 2 branches missed.">      } else if (key.equals(&quot;rankingAccuracyClass&quot;)) {</span>
+<span class="nc" id="L1846">        myFlags[col].rankingAccuracyClass = val;</span>
+<span class="nc bnc" id="L1847" title="All 2 branches missed.">      } else if (key.equals(&quot;goldAnswerColumn&quot;)) {</span>
+<span class="nc" id="L1848">        myFlags[col].goldAnswerColumn = Integer.parseInt(val);</span>
+        // logger.info(&quot;Gold answer column is &quot; + (myFlags[col].goldAnswerColumn));  // it's a nuisance to print this when used programmatically
+<span class="nc bnc" id="L1850" title="All 2 branches missed.">      } else if (key.equals(&quot;useQN&quot;)) {</span>
+<span class="nc" id="L1851">        myFlags[col].useQN = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1852" title="All 2 branches missed.">      } else if (key.equals(&quot;QNsize&quot;)) {</span>
+<span class="nc" id="L1853">        myFlags[col].QNsize = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1854" title="All 2 branches missed.">      } else if (key.equals(&quot;featureFormat&quot;)) {</span>
+<span class="nc" id="L1855">        myFlags[col].featureFormat = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1856" title="All 2 branches missed.">      } else if (key.equals(&quot;significantColumnId&quot;)) {</span>
+<span class="nc" id="L1857">        myFlags[col].significantColumnId = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1858" title="All 2 branches missed.">      } else if (key.equals(&quot;justify&quot;)) {</span>
+<span class="nc" id="L1859">        myFlags[col].justify = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1860" title="All 2 branches missed.">      } else if (key.equals(&quot;verboseOptimization&quot;)) {</span>
+<span class="nc" id="L1861">        myFlags[col].verboseOptimization = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1862" title="All 2 branches missed.">      }  else if (key.equals(&quot;realValued&quot;)) {</span>
+<span class="nc" id="L1863">        myFlags[col].isRealValued = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1864" title="All 4 branches missed.">        myUsesRealValues = myUsesRealValues || myFlags[col].isRealValued;</span>
+<span class="nc bnc" id="L1865" title="All 2 branches missed.">      } else if (key.equals(&quot;logTransform&quot;)) {</span>
+<span class="nc" id="L1866">        myFlags[col].logTransform = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1867" title="All 4 branches missed.">        myUsesRealValues = myUsesRealValues || myFlags[col].logTransform;</span>
+<span class="nc bnc" id="L1868" title="All 2 branches missed.">      } else if (key.equals(&quot;logitTransform&quot;)) {</span>
+<span class="nc" id="L1869">        myFlags[col].logitTransform = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1870" title="All 4 branches missed.">        myUsesRealValues = myUsesRealValues || myFlags[col].logitTransform;</span>
+<span class="nc bnc" id="L1871" title="All 2 branches missed.">      } else if (key.equals(&quot;sqrtTransform&quot;)) {</span>
+<span class="nc" id="L1872">        myFlags[col].sqrtTransform = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1873" title="All 4 branches missed.">        myUsesRealValues = myUsesRealValues || myFlags[col].sqrtTransform;</span>
+<span class="nc bnc" id="L1874" title="All 2 branches missed.">      } else if (key.equals(&quot;filename&quot;)) {</span>
+<span class="nc" id="L1875">        myFlags[col].filename = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1876" title="All 2 branches missed.">      } else if (key.equals(&quot;biased&quot;)) {</span>
+<span class="nc" id="L1877">        myFlags[col].biased = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1878" title="All 2 branches missed.">      } else if (key.equals(&quot;biasedHyperplane&quot;)) {</span>
+        // logger.info(&quot;Constraints is &quot; + constraints);
+<span class="nc bnc" id="L1880" title="All 4 branches missed.">        if (val != null &amp;&amp; val.trim().length() &gt; 0) {</span>
+<span class="nc" id="L1881">          String[] bits = val.split(&quot;[, ]+&quot;);</span>
+<span class="nc" id="L1882">          myFlags[col].biasedHyperplane = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L1883" title="All 2 branches missed.">          for (int i = 0; i &lt; bits.length; i += 2) {</span>
+<span class="nc" id="L1884">            myFlags[col].biasedHyperplane.setCount(bits[i], Double.parseDouble(bits[i + 1]));</span>
+          }
+<span class="nc" id="L1886">        }</span>
+        // logger.info(&quot;Biased Hyperplane is &quot; + biasedHyperplane);
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">      } else if (key.equals(&quot;crossValidationFolds&quot;)) {</span>
+<span class="nc" id="L1889">        myFlags[col].crossValidationFolds = Integer.parseInt(val);</span>
+<span class="nc bnc" id="L1890" title="All 2 branches missed.">      } else if (key.equals(&quot;printCrossValidationDecisions&quot;)) {</span>
+<span class="nc" id="L1891">        myFlags[col].printCrossValidationDecisions = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1892" title="All 2 branches missed.">      } else if (key.equals(&quot;shuffleTrainingData&quot;)) {</span>
+<span class="nc" id="L1893">        myFlags[col].shuffleTrainingData = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1894" title="All 2 branches missed.">      } else if (key.equals(&quot;shuffleSeed&quot;)) {</span>
+<span class="nc" id="L1895">        myFlags[col].shuffleSeed = Long.parseLong(val);</span>
+<span class="nc bnc" id="L1896" title="All 2 branches missed.">      } else if (key.equals(&quot;csvInput&quot;)) {</span>
+<span class="nc" id="L1897">        myFlags[col].csvInput = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1898" title="All 2 branches missed.">      } else if (key.equals(&quot;inputFormat&quot;)) {</span>
+<span class="nc bnc" id="L1899" title="All 2 branches missed.">        if (val.equalsIgnoreCase(&quot;header&quot;)) {</span>
+<span class="nc" id="L1900">          myFlags[col].inputFormat = InputFormat.HEADER;</span>
+<span class="nc bnc" id="L1901" title="All 2 branches missed.">        } else if (val.equalsIgnoreCase(&quot;comments&quot;)) {</span>
+<span class="nc" id="L1902">          myFlags[col].inputFormat = InputFormat.COMMENTS;</span>
+<span class="nc bnc" id="L1903" title="All 2 branches missed.">        } else if (val.equalsIgnoreCase(&quot;plain&quot;)) {</span>
+<span class="nc" id="L1904">          myFlags[col].inputFormat = InputFormat.PLAIN;</span>
+        } else {
+<span class="nc" id="L1906">          logger.info(&quot;Unknown inputFormat: &quot; + val);</span>
+        }
+<span class="nc bnc" id="L1908" title="All 2 branches missed.">      } else if (key.equals(&quot;splitWordsWithPTBTokenizer&quot;)) {</span>
+        // System.out.println(&quot;splitting with ptb tokenizer&quot;);
+<span class="nc" id="L1910">        myFlags[col].splitWordsWithPTBTokenizer = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1911" title="All 2 branches missed.">      } else if (key.equals(&quot;useSplitWordVectors&quot;)) {</span>
+<span class="nc" id="L1912">        myFlags[col].wordVectors = loadWordVectors(val);</span>
+<span class="nc" id="L1913">        myUsesRealValues = true;</span>
+<span class="nc bnc" id="L1914" title="All 2 branches missed.">      } else if (key.equals(&quot;showTokenization&quot;)) {</span>
+<span class="nc" id="L1915">        myFlags[col].showTokenization = Boolean.parseBoolean(val);</span>
+<span class="nc bnc" id="L1916" title="All 2 branches missed.">      } else if (key.equals(&quot;csvOutput&quot;)) {</span>
+<span class="nc" id="L1917">        myFlags[col].csvOutput = val;</span>
+<span class="nc bnc" id="L1918" title="All 4 branches missed.">      } else if ( ! key.isEmpty() &amp;&amp; ! key.equals(&quot;prop&quot;)) {</span>
+<span class="nc" id="L1919">        logger.info(&quot;Unknown property: |&quot; + key + '|');</span>
+      }
+<span class="nc" id="L1921">    }</span>
+<span class="nc" id="L1922">    myFlags[0].usesRealValues = myUsesRealValues;</span>
+<span class="nc" id="L1923">    return new Pair&lt;&gt;(myFlags,classifier);</span>
+  }
+
+
+  /** Construct a ColumnDataClassifier.
+   *
+   *  @param filename The file with properties which specifies all aspects of behavior.
+   *               See the class documentation for details of the properties.
+   */
+  public ColumnDataClassifier(String filename) {
+<span class="nc" id="L1933">    this(StringUtils.propFileToProperties(filename));</span>
+<span class="nc" id="L1934">  }</span>
+
+  /** Construct a ColumnDataClassifier.
+   *
+   *  @param props The properties object specifies all aspects of its behavior.
+   *               See the class documentation for details of the properties.
+   */
+  public ColumnDataClassifier(Properties props) {
+<span class="nc" id="L1942">    this(setProperties(props));</span>
+<span class="nc" id="L1943">  }</span>
+
+  /** Construct a ColumnDataClassifier.
+   *
+   *  @param flagsClassifierPair A Pair of a Flags object array specifies all aspects of featurization
+   *                             and other behavior and a Classifier that will be used.
+   */
+<span class="nc" id="L1950">  public ColumnDataClassifier(Pair&lt;Flags[],Classifier&lt;String,String&gt;&gt; flagsClassifierPair) {</span>
+<span class="nc" id="L1951">    flags = flagsClassifierPair.first();</span>
+<span class="nc" id="L1952">    globalFlags = flags[0];</span>
+<span class="nc" id="L1953">    classifier = flagsClassifierPair.second();</span>
+<span class="nc" id="L1954">  }</span>
+
+
+  private static Pair&lt;Flags[],Classifier&lt;String,String&gt;&gt; loadClassifier(String path) {
+<span class="nc" id="L1958">    Timing t = new Timing();</span>
+<span class="nc" id="L1959">    try (ObjectInputStream ois = IOUtils.readStreamFromString(path)) {</span>
+<span class="nc" id="L1960">      Pair&lt;Flags[],Classifier&lt;String,String&gt;&gt; pair = loadClassifier(ois);</span>
+<span class="nc" id="L1961">      t.done(logger, &quot;Loading classifier from &quot; + path);</span>
+<span class="nc" id="L1962">      return pair;</span>
+<span class="nc bnc" id="L1963" title="All 8 branches missed.">    } catch (IOException | ClassNotFoundException e) {</span>
+<span class="nc" id="L1964">      throw new RuntimeIOException(&quot;Error loading classifier from &quot; + path, e);</span>
+    }
+  }
+
+  private static Pair&lt;Flags[],Classifier&lt;String,String&gt;&gt; loadClassifier(ObjectInputStream ois)
+          throws IOException, ClassNotFoundException {
+    // load the classifier
+<span class="nc" id="L1971">    Classifier&lt;String,String&gt; classifier = ErasureUtils.&lt;LinearClassifier&lt;String,String&gt;&gt;uncheckedCast(ois.readObject());</span>
+<span class="nc" id="L1972">    Flags[] myFlags = (Flags[]) ois.readObject();</span>
+<span class="nc bnc" id="L1973" title="All 4 branches missed.">    assert myFlags.length &gt; 0;</span>
+<span class="nc" id="L1974">    return new Pair&lt;&gt;(myFlags, classifier);</span>
+  }
+
+  /** Return a new ColumnDataClassifier object based on a serialized object.
+   *  The serialized object stores both a Flags[] that specifies feature extraction and
+   *  other properties of the classifier and a Classifier object.
+   *
+   *  @param path A classpath resource, URL, or file system path
+   *  @return The ColumnDataClassifier
+   */
+  public static ColumnDataClassifier getClassifier(String path) {
+<span class="nc" id="L1985">    return new ColumnDataClassifier(loadClassifier(path));</span>
+  }
+
+  /** Return a new ColumnDataClassifier object based on a serialized object.
+   *  The serialized stream stores both a Flags[] that specifies feature extraction and
+   *  other properties of the classifier and a Classifier object.
+   *
+   *  @param ois Where to read a serialized classifier from
+   *  @return The ColumnDataClassifier
+   */
+  public static ColumnDataClassifier getClassifier(ObjectInputStream ois)
+          throws IOException, ClassNotFoundException {
+<span class="nc" id="L1997">    return new ColumnDataClassifier(loadClassifier(ois));</span>
+  }
+
+
+  /**
+   * Runs the ColumnDataClassifier from the command-line.  Usage:
+   *
+   * {@code java edu.stanford.nlp.classify.ColumnDataClassifier -trainFile trainFile
+   * -testFile testFile [-useNGrams|-useString|-sigma sigma|...] }
+   *
+   * or
+   *
+   * {@code java ColumnDataClassifier -prop propFile }
+   *
+   * @param args Command line arguments, as described in the class documentation
+   * @throws IOException If IO problems
+   */
+  public static void main(String[] args) throws IOException {
+<span class="nc" id="L2015">    StringUtils.logInvocationString(logger, args);</span>
+    // the constructor will load a classifier if one is specified with loadClassifier
+<span class="nc" id="L2017">    ColumnDataClassifier cdc = new ColumnDataClassifier(StringUtils.argsToProperties(args));</span>
+<span class="nc" id="L2018">    String testFile = cdc.globalFlags.testFile;</span>
+
+    // check that we have roughly sensible options or else warn and exit
+<span class="nc bnc" id="L2021" title="All 10 branches missed.">    if ((testFile == null &amp;&amp; Flags.serializeTo == null &amp;&amp; cdc.globalFlags.crossValidationFolds &lt; 2) ||</span>
+            (Flags.trainFile == null &amp;&amp; cdc.globalFlags.loadClassifier == null)) {
+<span class="nc" id="L2023">      logger.info(&quot;usage: java edu.stanford.nlp.classify.ColumnDataClassifier -prop propFile&quot;);</span>
+<span class="nc" id="L2024">      logger.info(&quot;  and/or: -trainFile trainFile -testFile testFile|-serializeTo modelFile [-useNGrams|-sigma sigma|...]&quot;);</span>
+<span class="nc" id="L2025">      return; // ENDS PROCESSING</span>
+    }
+
+<span class="nc bnc" id="L2028" title="All 2 branches missed.">    if (cdc.globalFlags.loadClassifier == null) {</span>
+      // Otherwise we attempt to train one and exit if we don't succeed
+<span class="nc bnc" id="L2030" title="All 2 branches missed.">      if ( ! cdc.trainClassifier(Flags.trainFile)) {</span>
+<span class="nc" id="L2031">        return;</span>
+      }
+    }
+
+<span class="nc bnc" id="L2035" title="All 2 branches missed.">    if (testFile != null) {</span>
+<span class="nc" id="L2036">      cdc.testClassifier(testFile);</span>
+    }
+<span class="nc" id="L2038">  } // end main()</span>
+
+
+  public boolean trainClassifier(String path) throws IOException {
+    // build dataset of training data featurized
+<span class="nc" id="L2043">    Pair&lt;GeneralDataset&lt;String,String&gt;, List&lt;String[]&gt;&gt; dataInfo = readAndReturnTrainingExamples(path);</span>
+<span class="nc" id="L2044">    GeneralDataset&lt;String,String&gt; train = dataInfo.first();</span>
+<span class="nc" id="L2045">    List&lt;String[]&gt; lineInfos = dataInfo.second();</span>
+
+    // For things like cross validation, we may well need to sort data!  Data sets are often ordered by class.
+<span class="nc bnc" id="L2048" title="All 2 branches missed.">    if (globalFlags.shuffleTrainingData) {</span>
+      long seed;
+<span class="nc bnc" id="L2050" title="All 2 branches missed.">      if (globalFlags.shuffleSeed != 0) {</span>
+<span class="nc" id="L2051">        seed = globalFlags.shuffleSeed;</span>
+      } else {
+<span class="nc" id="L2053">        seed = System.nanoTime();</span>
+      }
+<span class="nc" id="L2055">      train.shuffleWithSideInformation(seed, lineInfos);</span>
+    }
+
+    // print any binned value histograms
+<span class="nc bnc" id="L2059" title="All 2 branches missed.">    for (int i = 0; i &lt; flags.length; i++) {</span>
+<span class="nc bnc" id="L2060" title="All 4 branches missed.">      if (flags[i] != null &amp;&amp; flags[i].binnedValuesCounter != null) {</span>
+<span class="nc" id="L2061">        logger.info(&quot;BinnedValuesStatistics for column &quot; + i);</span>
+<span class="nc" id="L2062">        logger.info(flags[i].binnedValuesCounter.toString());</span>
+      }
+    }
+    // print any binned length histograms
+<span class="nc bnc" id="L2066" title="All 2 branches missed.">    for (int i = 0; i &lt; flags.length; i++) {</span>
+<span class="nc bnc" id="L2067" title="All 4 branches missed.">      if (flags[i] != null &amp;&amp; flags[i].binnedLengthsCounter != null) {</span>
+<span class="nc" id="L2068">        logger.info(&quot;BinnedLengthsStatistics for column &quot; + i);</span>
+<span class="nc" id="L2069">        logger.info(flags[i].binnedLengthsCounter.toString());</span>
+      }
+    }
+    // print the training data in SVMlight format if desired
+<span class="nc bnc" id="L2073" title="All 2 branches missed.">    if (Flags.printSVMLightFormatTo != null) {</span>
+<span class="nc" id="L2074">      PrintWriter pw = IOUtils.getPrintWriter(Flags.printSVMLightFormatTo, Flags.encoding);</span>
+<span class="nc" id="L2075">      train.printSVMLightFormat(pw);</span>
+<span class="nc" id="L2076">      IOUtils.closeIgnoringExceptions(pw);</span>
+<span class="nc" id="L2077">      train.featureIndex().saveToFilename(Flags.printSVMLightFormatTo + &quot;.featureIndex&quot;);</span>
+<span class="nc" id="L2078">      train.labelIndex().saveToFilename(Flags.printSVMLightFormatTo + &quot;.labelIndex&quot;);</span>
+    }
+
+<span class="nc bnc" id="L2081" title="All 2 branches missed.">    if (globalFlags.crossValidationFolds &gt; 1) {</span>
+<span class="nc" id="L2082">      crossValidate(train, lineInfos);</span>
+    }
+
+<span class="nc bnc" id="L2085" title="All 2 branches missed.">    if (globalFlags.exitAfterTrainingFeaturization) {</span>
+<span class="nc" id="L2086">      return false; // ENDS PROCESSING</span>
+    }
+
+    // build the classifier
+<span class="nc" id="L2090">    classifier = makeClassifier(train);</span>
+<span class="nc" id="L2091">    printClassifier(classifier);</span>
+
+    // serialize the classifier
+<span class="nc" id="L2094">    String serializeTo = Flags.serializeTo;</span>
+<span class="nc bnc" id="L2095" title="All 2 branches missed.">    if (serializeTo != null) {</span>
+<span class="nc" id="L2096">      serializeClassifier(serializeTo);</span>
+    }
+<span class="nc" id="L2098">    return true;</span>
+  }
+
+  /** Serialize a classifier to a file. This writes to the file both a LinearClassifier and the
+   *  Flags[] object from a ColumnDataClassifier. The latter captures all the information about
+   *  how the ColumnDataClassifier is extracting features from data items for the classifier.
+   *
+   *  @param serializeTo Filename to serialize the classifier to
+   *  @throws IOException If any IO error
+   */
+  public void serializeClassifier(String serializeTo) throws IOException {
+<span class="nc" id="L2109">    logger.info(&quot;Serializing classifier to &quot; + serializeTo + &quot;...&quot;);</span>
+<span class="nc" id="L2110">    ObjectOutputStream oos = IOUtils.writeStreamFromString(serializeTo);</span>
+<span class="nc" id="L2111">    serializeClassifier(oos);</span>
+<span class="nc" id="L2112">    oos.close();</span>
+<span class="nc" id="L2113">    logger.info(&quot;Done.&quot;);</span>
+<span class="nc" id="L2114">  }</span>
+
+  /** Serialize a classifier to an ObjectOutputStream. This writes to the file both a LinearClassifier and the
+   *  Flags[] object from a ColumnDataClassifier. The latter captures all the information about
+   *  how the ColumnDataClassifier is extracting features from data items for the classifier.
+   *
+   *  @param oos ObjectOutputStream to serialize the classifier to
+   *  @throws IOException If any IO error
+   */
+  public void serializeClassifier(ObjectOutputStream oos) throws IOException {
+<span class="nc" id="L2124">    oos.writeObject(classifier);</span>
+    // Fiddle: Don't write a testFile to the serialized classifier.  It makes no sense and confuses people
+<span class="nc" id="L2126">    String testFile = globalFlags.testFile;</span>
+<span class="nc" id="L2127">    globalFlags.testFile = null;</span>
+<span class="nc" id="L2128">    oos.writeObject(flags);</span>
+<span class="nc" id="L2129">    globalFlags.testFile = testFile;</span>
+<span class="nc" id="L2130">  }</span>
+
+  private void printClassifier(Classifier classifier) {
+    String classString;
+<span class="nc bnc" id="L2134" title="All 2 branches missed.">    if (classifier instanceof LinearClassifier&lt;?,?&gt;) {</span>
+<span class="nc" id="L2135">      classString = ((LinearClassifier&lt;?,?&gt;)classifier).toString(globalFlags.printClassifier, globalFlags.printClassifierParam);</span>
+    } else {
+<span class="nc" id="L2137">      classString = classifier.toString();</span>
+    }
+<span class="nc bnc" id="L2139" title="All 2 branches missed.">    if (Flags.printTo != null) {</span>
+<span class="nc" id="L2140">      PrintWriter fw = null;</span>
+      try {
+<span class="nc" id="L2142">        fw = IOUtils.getPrintWriter(Flags.printTo, Flags.encoding);</span>
+<span class="nc" id="L2143">        fw.write(classString);</span>
+<span class="nc" id="L2144">        fw.println();</span>
+<span class="nc" id="L2145">      } catch (IOException ioe) {</span>
+<span class="nc" id="L2146">        logger.warn(ioe);</span>
+      } finally {
+<span class="nc" id="L2148">        IOUtils.closeIgnoringExceptions(fw);</span>
+<span class="nc" id="L2149">      }</span>
+<span class="nc" id="L2150">      logger.info(&quot;Built classifier described in file &quot; + Flags.printTo);</span>
+<span class="nc" id="L2151">    } else {</span>
+<span class="nc" id="L2152">      logger.info(&quot;Built this classifier: &quot; + classString);</span>
+    }
+<span class="nc" id="L2154">  }</span>
+
+  /** Test and evaluate classifier on examples available in a file (or URL, classpath resource, etc.)
+   *
+   * @param testFile The path, classpath resource or URL to load TSV data from
+   * @return A Pair consisting of the accuracy (micro-averaged F1) and macro-averaged F1 for the dataset
+   */
+  public Pair&lt;Double, Double&gt; testClassifier(String testFile) {
+<span class="nc bnc" id="L2162" title="All 2 branches missed.">    if (globalFlags.printFeatures != null) {</span>
+<span class="nc" id="L2163">      newFeaturePrinter(globalFlags.printFeatures, &quot;test&quot;, Flags.encoding);</span>
+    }
+
+<span class="nc" id="L2166">    Pair&lt;GeneralDataset&lt;String,String&gt;,List&lt;String[]&gt;&gt; testInfo = readTestExamples(testFile);</span>
+<span class="nc" id="L2167">    GeneralDataset&lt;String,String&gt; test = testInfo.first();</span>
+<span class="nc" id="L2168">    List&lt;String[]&gt; lineInfos = testInfo.second();</span>
+
+<span class="nc" id="L2170">    Pair&lt;Double, Double&gt; pair = testExamples(classifier, test, lineInfos);</span>
+    // ((LinearClassifier) classifier).dumpSorted();
+<span class="nc bnc" id="L2172" title="All 2 branches missed.">    if (globalFlags.printFeatures != null) {</span>
+<span class="nc" id="L2173">      closeFeaturePrinter();</span>
+    }
+<span class="nc" id="L2175">    return pair;</span>
+  }
+
+  /** Run cross-validation on a dataset, and return accuracy and macro-F1 scores.
+   *  The number of folds is given by the crossValidationFolds property.
+   *
+   *  @param dataset The dataset of examples to cross-validate on.
+   *  @param lineInfos The String form of the items in the dataset. (Must be present.)
+   *  @return Accuracy and macro F1
+   */
+  public Pair&lt;Double,Double&gt; crossValidate(GeneralDataset&lt;String,String&gt; dataset, List&lt;String[]&gt; lineInfos) {
+<span class="nc" id="L2186">    final int numFolds = globalFlags.crossValidationFolds;</span>
+<span class="nc" id="L2187">    double accuracySum = 0.0;</span>
+<span class="nc" id="L2188">    double macroF1Sum = 0.0;</span>
+<span class="nc bnc" id="L2189" title="All 2 branches missed.">    for (int fold = 0; fold &lt; numFolds; fold++) {</span>
+<span class="nc" id="L2190">      logger.info(&quot;&quot;);</span>
+<span class="nc" id="L2191">      logger.info(&quot;### Fold &quot; + fold);</span>
+<span class="nc" id="L2192">      Pair&lt;GeneralDataset&lt;String,String&gt;,GeneralDataset&lt;String,String&gt;&gt; split =</span>
+<span class="nc" id="L2193">              dataset.splitOutFold(fold, numFolds);</span>
+<span class="nc" id="L2194">      GeneralDataset&lt;String,String&gt; devTrain = split.first();</span>
+<span class="nc" id="L2195">      GeneralDataset&lt;String,String&gt; devTest = split.second();</span>
+
+<span class="nc" id="L2197">      Classifier&lt;String,String&gt; cl = makeClassifier(devTrain);</span>
+<span class="nc" id="L2198">      printClassifier(cl);</span>
+
+<span class="nc" id="L2200">      int normalFoldSize = lineInfos.size()/numFolds;</span>
+<span class="nc" id="L2201">      int start = normalFoldSize * fold;</span>
+<span class="nc" id="L2202">      int end = start + normalFoldSize;</span>
+<span class="nc bnc" id="L2203" title="All 2 branches missed.">      if (fold == (numFolds - 1)) {</span>
+<span class="nc" id="L2204">        end = lineInfos.size();</span>
+      }
+
+<span class="nc" id="L2207">      List&lt;String[]&gt; devTestLineInfos = lineInfos.subList(start, end);</span>
+<span class="nc" id="L2208">      Pair&lt;Double,Double&gt; accuracies = testExamples(cl, devTest, devTestLineInfos);</span>
+<span class="nc" id="L2209">      accuracySum += accuracies.first();</span>
+<span class="nc" id="L2210">      macroF1Sum += accuracies.second();</span>
+    }
+<span class="nc" id="L2212">    double averageAccuracy = accuracySum / numFolds;</span>
+<span class="nc" id="L2213">    double averageMacroF1 = macroF1Sum / numFolds;</span>
+<span class="nc" id="L2214">    NumberFormat nf2 = new DecimalFormat(&quot;0.00000&quot;);</span>
+<span class="nc" id="L2215">    logger.info(&quot;Average accuracy/micro-averaged F1: &quot; + nf2.format(averageAccuracy));</span>
+<span class="nc" id="L2216">    logger.info(&quot;Average macro-averaged F1: &quot; + nf2.format(averageMacroF1));</span>
+<span class="nc" id="L2217">    logger.info(&quot;&quot;);</span>
+<span class="nc" id="L2218">    return new Pair&lt;&gt;(averageAccuracy, averageMacroF1);</span>
+  }
+
+  public String classOf(Datum&lt;String,String&gt; example) {
+<span class="nc bnc" id="L2222" title="All 2 branches missed.">    if (classifier == null) {</span>
+<span class="nc" id="L2223">      throw new RuntimeException(&quot;Classifier is not initialized&quot;);</span>
+    }
+<span class="nc" id="L2225">    return classifier.classOf(example);</span>
+  }
+
+  public Counter&lt;String&gt; scoresOf(Datum&lt;String,String&gt; example) {
+<span class="nc bnc" id="L2229" title="All 2 branches missed.">    if (classifier == null) {</span>
+<span class="nc" id="L2230">      throw new RuntimeException(&quot;Classifier is not initialized&quot;);</span>
+    }
+<span class="nc" id="L2232">    return classifier.scoresOf(example);</span>
+  }
+
+  public Classifier&lt;String,String&gt; getClassifier() {
+<span class="nc bnc" id="L2236" title="All 2 branches missed.">    if (classifier == null) {</span>
+<span class="nc" id="L2237">      throw new RuntimeException(&quot;Classifier is not initialized&quot;);</span>
+    }
+<span class="nc" id="L2239">    return classifier;</span>
+  }
+
+
+<span class="nc" id="L2243">  static class Flags implements Serializable {</span>
+
+    // PLEASE ADD NEW FLAGS AT THE END OF THIS CLASS (SO AS TO NOT UNNECESSARILY BREAK SERIALIZED CLASSIFIERS)
+
+    private static final long serialVersionUID = -7076671761070232566L;
+
+<span class="nc" id="L2249">    boolean useNGrams = false;</span>
+<span class="nc" id="L2250">    boolean usePrefixSuffixNGrams = false;</span>
+<span class="nc" id="L2251">    boolean lowercaseNGrams = false;</span>
+    boolean lowercase;
+
+<span class="nc" id="L2254">    boolean useSplitNGrams = false;</span>
+<span class="nc" id="L2255">    boolean useSplitPrefixSuffixNGrams = false;</span>
+
+<span class="nc" id="L2257">    boolean cacheNGrams = false;</span>
+<span class="nc" id="L2258">    int maxNGramLeng = -1;</span>
+<span class="nc" id="L2259">    int minNGramLeng = 2;</span>
+<span class="nc" id="L2260">    String partialNGramRegexp = null;</span>
+<span class="nc" id="L2261">    Pattern partialNGramPattern = null;</span>
+
+<span class="nc" id="L2263">    boolean useSum = false;</span>
+<span class="nc" id="L2264">    double tolerance = 1e-4;</span>
+<span class="nc" id="L2265">    String printFeatures = null;</span>
+<span class="nc" id="L2266">    String printClassifier = null;</span>
+<span class="nc" id="L2267">    int printClassifierParam = 100;</span>
+
+<span class="nc" id="L2269">    boolean exitAfterTrainingFeaturization = false;</span>
+
+<span class="nc" id="L2271">    boolean intern = false;</span>
+
+<span class="nc" id="L2273">    Pattern splitWordsPattern = null;</span>
+<span class="nc" id="L2274">    Pattern splitWordsTokenizerPattern = null;</span>
+<span class="nc" id="L2275">    Pattern splitWordsIgnorePattern = Pattern.compile(DEFAULT_IGNORE_REGEXP);</span>
+<span class="nc" id="L2276">    boolean useSplitWords = false;</span>
+<span class="nc" id="L2277">    boolean useSplitWordPairs = false;</span>
+<span class="nc" id="L2278">    boolean useLowercaseSplitWordPairs = false;</span>
+<span class="nc" id="L2279">    boolean useSplitFirstLastWords = false;</span>
+<span class="nc" id="L2280">    boolean useLowercaseSplitWords = false;</span>
+<span class="nc" id="L2281">    boolean useLowercaseSplitFirstLastWords = false;</span>
+
+<span class="nc" id="L2283">    int wordShape = edu.stanford.nlp.process.WordShapeClassifier.NOWORDSHAPE;</span>
+<span class="nc" id="L2284">    int splitWordShape = WordShapeClassifier.NOWORDSHAPE;</span>
+
+<span class="nc" id="L2286">    boolean useString = false;</span>
+<span class="nc" id="L2287">    boolean useClassFeature = false;</span>
+
+<span class="nc" id="L2289">    int[] binnedLengths = null;</span>
+<span class="nc" id="L2290">    TwoDimensionalCounter&lt;String,String&gt; binnedLengthsCounter = null;</span>
+<span class="nc" id="L2291">    double[] binnedValues = null;</span>
+<span class="nc" id="L2292">    TwoDimensionalCounter&lt;String,String&gt; binnedValuesCounter = null;</span>
+<span class="nc" id="L2293">    double binnedValuesNaN = -1.0;</span>
+
+    //true iff this feature is real valued
+<span class="nc" id="L2296">    boolean isRealValued = false;</span>
+    public static final String realValuedFeaturePrefix = &quot;Value&quot;; //prefix to add before column number for denoting real valued features
+<span class="nc" id="L2298">    boolean logitTransform = false;</span>
+<span class="nc" id="L2299">    boolean logTransform = false;</span>
+<span class="nc" id="L2300">    boolean sqrtTransform = false;</span>
+
+<span class="nc" id="L2302">    char[] countChars = null;</span>
+<span class="nc" id="L2303">    int[] countCharsBins = {0, 1};</span>
+
+<span class="nc" id="L2305">    ClassicCounter&lt;String&gt; biasedHyperplane = null;</span>
+
+<span class="nc" id="L2307">    boolean justify = false;</span>
+
+<span class="nc" id="L2309">    boolean featureFormat = false;</span>
+<span class="nc" id="L2310">    boolean significantColumnId = false;</span>
+
+    String  useClassifierFactory;
+    String  classifierFactoryArgs;
+
+<span class="nc" id="L2315">    boolean useNB = false;</span>
+<span class="nc" id="L2316">    boolean useQN = true;</span>
+<span class="nc" id="L2317">    int QNsize = 15;</span>
+
+<span class="nc" id="L2319">    int prior = LogPrior.LogPriorType.QUADRATIC.ordinal();</span>
+<span class="nc" id="L2320">    double sigma = 1.0;</span>
+<span class="nc" id="L2321">    double epsilon = 0.01;</span>
+
+<span class="nc" id="L2323">    int featureMinimumSupport = 0;</span>
+
+<span class="nc" id="L2325">    int displayedColumn = 1;  // = 2nd column of data file! (Because we count from 0.)</span>
+<span class="nc" id="L2326">    int groupingColumn = -1;</span>
+<span class="nc" id="L2327">    int rankingScoreColumn = -1;</span>
+<span class="nc" id="L2328">    String rankingAccuracyClass = null;</span>
+
+<span class="nc" id="L2330">    int goldAnswerColumn = 0;</span>
+
+    boolean biased;
+
+<span class="nc" id="L2334">    boolean useSplitWordNGrams = false;</span>
+<span class="nc" id="L2335">    int maxWordNGramLeng = -1;</span>
+<span class="nc" id="L2336">    int minWordNGramLeng = 1;</span>
+<span class="nc" id="L2337">    boolean useBinary = false;</span>
+<span class="nc" id="L2338">    double l1reg = 0.0;</span>
+    String wordNGramBoundaryRegexp;
+    Pattern wordNGramBoundaryPattern;
+
+<span class="nc" id="L2342">    boolean useAdaptL1 = false;</span>
+<span class="nc" id="L2343">    int limitFeatures = 0;</span>
+<span class="nc" id="L2344">    String limitFeaturesLabels = null;</span>
+<span class="nc" id="L2345">    double l1regmin = 0.0;</span>
+<span class="nc" id="L2346">    double l1regmax = 500.0;</span>
+<span class="nc" id="L2347">    double featureWeightThreshold = 0;</span>
+
+<span class="nc" id="L2349">    String testFile = null;  // this one would be better off static (we avoid serializing it)</span>
+<span class="nc" id="L2350">    String loadClassifier = null;   // this one could also be static</span>
+
+    // these are static because we don't want them serialized
+<span class="nc" id="L2353">    static String trainFile = null;</span>
+<span class="nc" id="L2354">    static String serializeTo = null;</span>
+<span class="nc" id="L2355">    static String printTo = null;</span>
+<span class="nc" id="L2356">    static boolean trainFromSVMLight = false; //train file is in SVMLight format</span>
+<span class="nc" id="L2357">    static boolean testFromSVMLight = false; //test file is in SVMLight format</span>
+<span class="nc" id="L2358">    static String encoding = null;</span>
+    static String printSVMLightFormatTo;
+
+<span class="nc" id="L2361">    static boolean displayAllAnswers = false;</span>
+
+    // Distinguishes whether this file has real valued features or if the more efficient non-RVF representation can be used.
+    // This is set as a summary flag in globalFeatures based on whether anything uses real values.
+    boolean usesRealValues;
+    boolean filename;
+
+    boolean useAllSplitWordPairs;
+    boolean useAllSplitWordTriples;
+
+<span class="nc" id="L2371">    boolean showTokenization = false;</span>
+
+<span class="nc" id="L2373">    int crossValidationFolds = -1;</span>
+<span class="nc" id="L2374">    boolean shuffleTrainingData = false;</span>
+<span class="nc" id="L2375">    long shuffleSeed = 0;</span>
+
+<span class="nc" id="L2377">    static boolean csvInput = false; //train and test files are in csv format</span>
+<span class="nc" id="L2378">    static InputFormat inputFormat = InputFormat.PLAIN;</span>
+<span class="nc" id="L2379">    boolean splitWordsWithPTBTokenizer = false;</span>
+
+    boolean splitWordCount;
+    boolean logSplitWordCount;
+    int[] binnedSplitWordCounts;
+    Map&lt;String, float[]&gt; wordVectors;
+
+<span class="nc" id="L2386">    static String csvOutput = null;</span>
+<span class="nc" id="L2387">    boolean printCrossValidationDecisions = false;</span>
+
+<span class="nc" id="L2389">    boolean verboseOptimization = false;</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L2393">      return &quot;Flags[&quot; +</span>
+        &quot;goldAnswerColumn = &quot; + goldAnswerColumn +
+        &quot;, useString = &quot; + useString +
+        &quot;, useNGrams = &quot; + useNGrams +
+        &quot;, usePrefixSuffixNGrams = &quot; + usePrefixSuffixNGrams +
+        ']';
+    }
+
+  } // end class Flags
+
+} // end class ColumnDataClassifier
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

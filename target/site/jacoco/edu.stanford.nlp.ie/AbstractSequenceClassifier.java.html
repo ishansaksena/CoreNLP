@@ -1,0 +1,1667 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractSequenceClassifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">AbstractSequenceClassifier.java</span></div><h1>AbstractSequenceClassifier.java</h1><pre class="source lang-java linenums">// AbstractSequenceClassifier -- a framework for probabilistic sequence models.
+// Copyright (c) 2002-2008 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    Support/Questions: java-nlp-user@lists.stanford.edu
+//    Licensing: java-nlp-support@lists.stanford.edu
+//    http://nlp.stanford.edu/downloads/crf-classifier.shtml
+
+package edu.stanford.nlp.ie;
+
+import edu.stanford.nlp.fsm.DFSA;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RegExFileFilter;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.objectbank.ResettableReaderIteratorFactory;
+import edu.stanford.nlp.process.CoreLabelTokenFactory;
+import edu.stanford.nlp.process.CoreTokenFactory;
+import edu.stanford.nlp.sequences.*;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.Sampler;
+import edu.stanford.nlp.stats.TwoDimensionalCounter;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.concurrent.*;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+import java.util.zip.GZIPInputStream;
+
+/**
+ * This class provides common functionality for (probabilistic) sequence models.
+ * It is a superclass of our CMM and CRF sequence classifiers, and is even used
+ * in the (deterministic) NumberSequenceClassifier. See implementing classes for
+ * more information.
+ * &lt;p&gt;
+ * An implementation must implement these 5 abstract methods: &lt;br&gt;
+ * {@code List&lt;IN&gt; classify(List&lt;IN&gt; document); } &lt;br&gt;
+ * {@code List&lt;IN&gt; classifyWithGlobalInformation(List&lt;IN&gt; tokenSequence, final CoreMap document, final CoreMap sentence); } &lt;br&gt;
+ * {@code void train(Collection&lt;List&lt;IN&gt;&gt; docs, DocumentReaderAndWriter&lt;IN&gt; readerAndWriter); } &lt;br&gt;
+ * {@code void serializeClassifier(String serializePath); } &lt;br&gt;
+ * {@code void loadClassifier(ObjectInputStream in, Properties props) throws IOException,
+ * ClassCastException, ClassNotFoundException; } &lt;br&gt;
+ * but a runtime (or rule-based) implementation can usefully implement just the first,
+ * and throw UnsupportedOperationException for the rest. Additionally, this method throws
+ * UnsupportedOperationException by default, but is implemented for some classifiers: &lt;br&gt;
+ * {@code Pair&lt;Counter&lt;Integer&gt;, TwoDimensionalCounter&lt;Integer,String&gt;&gt; printProbsDocument(List&lt;CoreLabel&gt; document); } &lt;br&gt;
+ *
+ * @author Jenny Finkel
+ * @author Dan Klein
+ * @author Christopher Manning
+ * @author Dan Cer
+ * @author sonalg (made the class generic)
+ */
+<span class="pc bpc" id="L85" title="1 of 2 branches missed.">public abstract class AbstractSequenceClassifier&lt;IN extends CoreMap&gt; implements Function&lt;String, String&gt;  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L88">  private static Redwood.RedwoodChannels log = Redwood.channels(AbstractSequenceClassifier.class);</span>
+
+  public SeqClassifierFlags flags;
+  public Index&lt;String&gt; classIndex; // = null;
+
+  // Thang Sep13: multiple feature factories (NERFeatureFactory, EmbeddingFeatureFactory)
+  public List&lt;FeatureFactory&lt;IN&gt;&gt; featureFactories;
+
+  protected IN pad;
+  private CoreTokenFactory&lt;IN&gt; tokenFactory;
+  public int windowSize;
+
+  /** Different threads can add or query knownLCWords at the same time,
+   *  so we need a concurrent data structure.  Created in reinit().
+   */
+  protected MaxSizeConcurrentHashSet&lt;String&gt; knownLCWords; // = null;
+
+  private DocumentReaderAndWriter&lt;IN&gt; defaultReaderAndWriter;
+
+  /** This is the DocumentReaderAndWriter used for reading training and testing files.
+   *  It is the DocumentReaderAndWriter specified by the readerAndWriter flag and
+   *  defaults to {@code edu.stanford.nlp.sequences.ColumnDocumentReaderAndWriter} which
+   *  is suitable for reading CoNLL-style TSV files.
+   *
+   *  @return The default DocumentReaderAndWriter
+   */
+  public DocumentReaderAndWriter&lt;IN&gt; defaultReaderAndWriter() {
+<span class="nc" id="L115">    return defaultReaderAndWriter;</span>
+  }
+
+  private DocumentReaderAndWriter&lt;IN&gt; plainTextReaderAndWriter;
+
+  /** This is the default DocumentReaderAndWriter used for reading text files for runtime
+   *  classification. It is the DocumentReaderAndWriter specified by the plainTextDocumentReaderAndWriter
+   *  flag and defaults to {@code edu.stanford.nlp.sequences.PlainTextDocumentReaderAndWriter} which
+   *  is suitable for reading plain text files, in languages with a Tokenizer available.
+   *
+   *  @return The default plain text DocumentReaderAndWriter
+   */
+  public DocumentReaderAndWriter&lt;IN&gt; plainTextReaderAndWriter() {
+<span class="nc" id="L128">    return plainTextReaderAndWriter;</span>
+  }
+
+
+  /**
+   * Construct a SeqClassifierFlags object based on the passed in properties,
+   * and then call the other constructor.
+   *
+   * @param props See SeqClassifierFlags for known properties.
+   */
+  public AbstractSequenceClassifier(Properties props) {
+<span class="fc" id="L139">    this(new SeqClassifierFlags(props));</span>
+<span class="fc" id="L140">  }</span>
+
+  /**
+   * Initialize the featureFactory and other variables based on the passed in
+   * flags.
+   *
+   * @param flags A specification of the AbstractSequenceClassifier to construct.
+   */
+<span class="fc" id="L148">  public AbstractSequenceClassifier(SeqClassifierFlags flags) {</span>
+<span class="fc" id="L149">    this.flags = flags;</span>
+
+    // Thang Sep13: allow for multiple feature factories.
+<span class="fc" id="L152">    this.featureFactories = Generics.newArrayList();</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">    if (flags.featureFactory != null) {</span>
+<span class="fc" id="L154">      FeatureFactory&lt;IN&gt; factory = new MetaClass(flags.featureFactory).createInstance(flags.featureFactoryArgs); // for compatibility</span>
+<span class="fc" id="L155">      featureFactories.add(factory);</span>
+    }
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">    if (flags.featureFactories != null) {</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">      for (int i = 0; i &lt; flags.featureFactories.length; i++) {</span>
+<span class="nc" id="L159">        FeatureFactory&lt;IN&gt; indFeatureFactory = new MetaClass(flags.featureFactories[i]).</span>
+<span class="nc" id="L160">            createInstance(flags.featureFactoriesArgs.get(i));</span>
+<span class="nc" id="L161">        this.featureFactories.add(indFeatureFactory);</span>
+      }
+    }
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">    if (flags.tokenFactory == null) {</span>
+<span class="nc" id="L165">      tokenFactory = (CoreTokenFactory&lt;IN&gt;) new CoreLabelTokenFactory();</span>
+    } else {
+<span class="fc" id="L167">      this.tokenFactory = new MetaClass(flags.tokenFactory).createInstance(flags.tokenFactoryArgs);</span>
+    }
+<span class="fc" id="L169">    pad = tokenFactory.makeToken();</span>
+<span class="fc" id="L170">    windowSize = flags.maxLeft + 1;</span>
+<span class="fc" id="L171">    reinit();</span>
+<span class="fc" id="L172">  }</span>
+
+  /**
+   * This method should be called after there have been changes to the flags
+   * (SeqClassifierFlags) variable, such as after deserializing a classifier. It
+   * is called inside the loadClassifier methods. It assumes that the flags
+   * variable and the pad variable exist, but reinitializes things like the pad
+   * variable, featureFactory and readerAndWriter based on the flags.
+   * &lt;p&gt;
+   * &lt;i&gt;Implementation note:&lt;/i&gt; At the moment this variable doesn't set
+   * windowSize or featureFactory, since they are being serialized separately in
+   * the file, but we should probably stop serializing them and just
+   * reinitialize them from the flags?
+   */
+  protected final void reinit() {
+<span class="fc" id="L187">    pad.set(CoreAnnotations.AnswerAnnotation.class, flags.backgroundSymbol);</span>
+<span class="fc" id="L188">    pad.set(CoreAnnotations.GoldAnswerAnnotation.class, flags.backgroundSymbol);</span>
+
+<span class="fc bfc" id="L190" title="All 2 branches covered.">    for (FeatureFactory featureFactory : featureFactories) {</span>
+<span class="fc" id="L191">      featureFactory.init(flags);</span>
+<span class="fc" id="L192">    }</span>
+
+<span class="fc" id="L194">    defaultReaderAndWriter = makeReaderAndWriter();</span>
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">    if (flags.readerAndWriter != null &amp;&amp;</span>
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">        flags.readerAndWriter.equals(flags.plainTextDocumentReaderAndWriter)) {</span>
+<span class="nc" id="L197">      plainTextReaderAndWriter = defaultReaderAndWriter;</span>
+    } else {
+<span class="fc" id="L199">      plainTextReaderAndWriter = makePlainTextReaderAndWriter();</span>
+    }
+
+<span class="pc bpc" id="L202" title="3 of 4 branches missed.">    if (knownLCWords == null || knownLCWords.isEmpty()) {</span>
+      // reinit limits max (additional) size. We temporarily loosen this during training
+<span class="fc" id="L204">      knownLCWords = new MaxSizeConcurrentHashSet&lt;&gt;(flags.maxAdditionalKnownLCWords);</span>
+    } else {
+<span class="nc" id="L206">      knownLCWords.setMaxSize(knownLCWords.size() + flags.maxAdditionalKnownLCWords);</span>
+    }
+<span class="fc" id="L208">  }</span>
+
+  public Set&lt;String&gt; getKnownLCWords() {
+<span class="nc" id="L211">    return knownLCWords;</span>
+  }
+
+  /**
+   * Makes a DocumentReaderAndWriter based on the flags the CRFClassifier
+   * was constructed with.  Will create an instance of the class specified in
+   * the property flags.readerAndWriter and
+   * initialize it with the CRFClassifier's flags.
+   *
+   * @return The appropriate ReaderAndWriter for training/testing this classifier
+   */
+  public DocumentReaderAndWriter&lt;IN&gt; makeReaderAndWriter() {
+    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter;
+    try {
+<span class="fc" id="L225">      readerAndWriter = ReflectionLoading.loadByReflection(flags.readerAndWriter);</span>
+<span class="nc" id="L226">    } catch (Exception e) {</span>
+<span class="nc" id="L227">      throw new RuntimeException(String.format(&quot;Error loading flags.readerAndWriter: '%s'&quot;, flags.readerAndWriter), e);</span>
+<span class="fc" id="L228">    }</span>
+<span class="fc" id="L229">    readerAndWriter.init(flags);</span>
+<span class="fc" id="L230">    return readerAndWriter;</span>
+  }
+
+  /**
+   * Makes a DocumentReaderAndWriter based on
+   * flags.plainTextReaderAndWriter.  Useful for reading in
+   * untokenized text documents or reading plain text from the command
+   * line.  An example of a way to use this would be to return a
+   * edu.stanford.nlp.wordseg.Sighan2005DocumentReaderAndWriter for
+   * the Chinese Segmenter.
+   */
+  public DocumentReaderAndWriter&lt;IN&gt; makePlainTextReaderAndWriter() {
+<span class="fc" id="L242">    String readerClassName = flags.plainTextDocumentReaderAndWriter;</span>
+    // We set this default here if needed because there may be models
+    // which don't have the reader flag set
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">    if (readerClassName == null) {</span>
+<span class="nc" id="L246">      readerClassName = SeqClassifierFlags.DEFAULT_PLAIN_TEXT_READER;</span>
+    }
+    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter;
+    try {
+<span class="fc" id="L250">      readerAndWriter = ReflectionLoading.loadByReflection(readerClassName);</span>
+<span class="nc" id="L251">    } catch (Exception e) {</span>
+<span class="nc" id="L252">      throw new RuntimeException(String.format(&quot;Error loading flags.plainTextDocumentReaderAndWriter: '%s'&quot;, flags.plainTextDocumentReaderAndWriter), e);</span>
+<span class="fc" id="L253">    }</span>
+<span class="fc" id="L254">    readerAndWriter.init(flags);</span>
+<span class="fc" id="L255">    return readerAndWriter;</span>
+  }
+
+  /**
+   * Returns the background class for the classifier.
+   *
+   * @return The background class name
+   */
+  public String backgroundSymbol() {
+<span class="nc" id="L264">    return flags.backgroundSymbol;</span>
+  }
+
+  public Set&lt;String&gt; labels() {
+<span class="nc" id="L268">    return Generics.newHashSet(classIndex.objectsList());</span>
+  }
+
+  /**
+   * Classify a List of IN. This method returns a new list of tokens, not
+   * the list of tokens passed in, and runs the new tokens through
+   * ObjectBankWrapper.  (Both these behaviors are different from that of the
+   * classify(List) method.
+   *
+   * @param tokenSequence The List of IN to be classified.
+   * @return The classified List of IN, where the classifier output for
+   *         each token is stored in its
+   *         {@link edu.stanford.nlp.ling.CoreAnnotations.AnswerAnnotation}
+   *         field.
+   */
+  public List&lt;IN&gt; classifySentence(List&lt;? extends HasWord&gt; tokenSequence) {
+<span class="nc" id="L284">    List&lt;IN&gt; document = preprocessTokens(tokenSequence);</span>
+<span class="nc" id="L285">    classify(document);</span>
+<span class="nc" id="L286">    return document;</span>
+  }
+
+  private List&lt;IN&gt; preprocessTokens(List&lt;? extends HasWord&gt; tokenSequence) {
+    // log.info(&quot;knownLCWords.size is &quot; + knownLCWords.size() + &quot;; knownLCWords.maxSize is &quot; + knownLCWords.getMaxSize() +
+    //                   &quot;, prior to NER for &quot; + getClass().toString());
+<span class="nc" id="L292">    List&lt;IN&gt; document = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L293">    int i = 0;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">    for (HasWord word : tokenSequence) {</span>
+      IN wi; // initialized below
+<span class="nc bnc" id="L296" title="All 2 branches missed.">      if (word instanceof CoreMap) {</span>
+        // copy all annotations! some are required later in
+        // AbstractSequenceClassifier.classifyWithInlineXML
+        // wi = (IN) new ArrayCoreMap((ArrayCoreMap) word);
+<span class="nc" id="L300">        wi = tokenFactory.makeToken((IN) word);</span>
+      } else {
+<span class="nc" id="L302">        wi = tokenFactory.makeToken();</span>
+<span class="nc" id="L303">        wi.set(CoreAnnotations.TextAnnotation.class, word.word());</span>
+        // wi.setWord(word.word());
+      }
+<span class="nc" id="L306">      wi.set(CoreAnnotations.PositionAnnotation.class, Integer.toString(i));</span>
+<span class="nc" id="L307">      wi.set(CoreAnnotations.AnswerAnnotation.class, backgroundSymbol());</span>
+<span class="nc" id="L308">      document.add(wi);</span>
+<span class="nc" id="L309">      i++;</span>
+<span class="nc" id="L310">    }</span>
+
+    // TODO get rid of ObjectBankWrapper
+<span class="nc" id="L313">    ObjectBankWrapper&lt;IN&gt; wrapper = new ObjectBankWrapper&lt;&gt;(flags, null, knownLCWords);</span>
+<span class="nc" id="L314">    wrapper.processDocument(document);</span>
+    // log.info(&quot;Size of knownLCWords is &quot; + knownLCWords.size() + &quot;, after NER for &quot; + getClass().toString());
+<span class="nc" id="L316">    return document;</span>
+  }
+
+  /**
+   * Classify a List of IN using whatever additional information is passed in globalInfo.
+   * Used by SUTime (NumberSequenceClassifier), which requires the doc date to resolve relative dates.
+   *
+   * @param tokenSequence The List of IN to be classified.
+   * @return The classified List of IN, where the classifier output for
+   *         each token is stored in its &quot;answer&quot; field.
+   */
+  public List&lt;IN&gt; classifySentenceWithGlobalInformation(List&lt;? extends HasWord&gt; tokenSequence, final CoreMap doc, final CoreMap sentence) {
+<span class="nc" id="L328">    List&lt;IN&gt; document = preprocessTokens(tokenSequence);</span>
+<span class="nc" id="L329">    classifyWithGlobalInformation(document, doc, sentence);</span>
+<span class="nc" id="L330">    return document;</span>
+  }
+
+  public SequenceModel getSequenceModel(List&lt;IN&gt; doc) {
+<span class="nc" id="L334">    throw new UnsupportedOperationException();</span>
+  }
+
+  public Sampler&lt;List&lt;IN&gt;&gt; getSampler(final List&lt;IN&gt; input) {
+<span class="nc" id="L338">    return new Sampler&lt;List&lt;IN&gt;&gt;() {</span>
+<span class="nc" id="L339">      SequenceModel model = getSequenceModel(input);</span>
+<span class="nc" id="L340">      SequenceSampler sampler = new SequenceSampler();</span>
+
+      @Override
+      public List&lt;IN&gt; drawSample() {
+<span class="nc" id="L344">        int[] sampleArray = sampler.bestSequence(model);</span>
+<span class="nc" id="L345">        List&lt;IN&gt; sample = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L346">        int i = 0;</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        for (IN word : input) {</span>
+
+<span class="nc" id="L349">          IN newWord = tokenFactory.makeToken(word);</span>
+<span class="nc" id="L350">          newWord.set(CoreAnnotations.AnswerAnnotation.class, classIndex.get(sampleArray[i++]));</span>
+<span class="nc" id="L351">          sample.add(newWord);</span>
+<span class="nc" id="L352">        }</span>
+<span class="nc" id="L353">        return sample;</span>
+      }
+    };
+  }
+
+  /** Takes a list of tokens and provides the K best sequence labelings of these tokens with their scores.
+   *
+   *  @param doc The List of tokens
+   *  @param answerField The key for each token into which the label for the token will be written
+   *  @param k The number of best sequence labelings to generate
+   *  @return A Counter where each key is a List of tokens with labels written in the answerField and its value
+   *          is the score (conditional probability) assigned to this labeling of the sequence.
+   */
+  public Counter&lt;List&lt;IN&gt;&gt; classifyKBest(List&lt;IN&gt; doc, Class&lt;? extends CoreAnnotation&lt;String&gt;&gt; answerField, int k) {
+
+<span class="nc bnc" id="L368" title="All 2 branches missed.">    if (doc.isEmpty()) {</span>
+<span class="nc" id="L369">      return new ClassicCounter&lt;&gt;();</span>
+    }
+
+    // TODO get rid of ObjectBankWrapper
+    // i'm sorry that this is so hideous - JRF
+<span class="nc" id="L374">    ObjectBankWrapper&lt;IN&gt; obw = new ObjectBankWrapper&lt;&gt;(flags, null, knownLCWords);</span>
+<span class="nc" id="L375">    doc = obw.processDocument(doc);</span>
+
+<span class="nc" id="L377">    SequenceModel model = getSequenceModel(doc);</span>
+
+<span class="nc" id="L379">    KBestSequenceFinder tagInference = new KBestSequenceFinder();</span>
+<span class="nc" id="L380">    Counter&lt;int[]&gt; bestSequences = tagInference.kBestSequences(model, k);</span>
+
+<span class="nc" id="L382">    Counter&lt;List&lt;IN&gt;&gt; kBest = new ClassicCounter&lt;&gt;();</span>
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">    for (int[] seq : bestSequences.keySet()) {</span>
+<span class="nc" id="L385">      List&lt;IN&gt; kth = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L386">      int pos = model.leftWindow();</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">      for (IN fi : doc) {</span>
+<span class="nc" id="L388">        IN newFL = tokenFactory.makeToken(fi);</span>
+<span class="nc" id="L389">        String guess = classIndex.get(seq[pos]);</span>
+<span class="nc" id="L390">        fi.remove(CoreAnnotations.AnswerAnnotation.class); // because fake answers will get</span>
+                                           // added during testing
+<span class="nc" id="L392">        newFL.set(answerField, guess);</span>
+<span class="nc" id="L393">        pos++;</span>
+<span class="nc" id="L394">        kth.add(newFL);</span>
+<span class="nc" id="L395">      }</span>
+<span class="nc" id="L396">      kBest.setCount(kth, bestSequences.getCount(seq));</span>
+<span class="nc" id="L397">    }</span>
+
+<span class="nc" id="L399">    return kBest;</span>
+  }
+
+  private DFSA&lt;String, Integer&gt; getViterbiSearchGraph(List&lt;IN&gt; doc, Class&lt;? extends CoreAnnotation&lt;String&gt;&gt; answerField) {
+<span class="nc bnc" id="L403" title="All 2 branches missed.">    if (doc.isEmpty()) {</span>
+<span class="nc" id="L404">      return new DFSA&lt;&gt;(null);</span>
+    }
+    // TODO get rid of ObjectBankWrapper
+<span class="nc" id="L407">    ObjectBankWrapper&lt;IN&gt; obw = new ObjectBankWrapper&lt;&gt;(flags, null, knownLCWords);</span>
+<span class="nc" id="L408">    doc = obw.processDocument(doc);</span>
+<span class="nc" id="L409">    SequenceModel model = getSequenceModel(doc);</span>
+<span class="nc" id="L410">    return ViterbiSearchGraphBuilder.getGraph(model, classIndex);</span>
+  }
+
+  /**
+   * Classify the tokens in a String. Each sentence becomes a separate document.
+   *
+   * @param str A String with tokens in one or more sentences of text to be
+   *          classified.
+   * @return {@link List} of classified sentences (each a List of something that
+   *         extends {@link CoreMap}).
+   */
+  public List&lt;List&lt;IN&gt;&gt; classify(String str) {
+<span class="nc" id="L422">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L423">      makeObjectBankFromString(str, plainTextReaderAndWriter);</span>
+<span class="nc" id="L424">    return classifyObjectBank(documents);</span>
+  }
+  /**
+   * Classify the tokens in a String. Each sentence becomes a separate document.
+   * Doesn't override default readerAndWriter.
+   *
+   * @param str A String with tokens in one or more sentences of text to be classified.
+   * @return {@link List} of classified sentences (each a List of something that
+   *         extends {@link CoreMap}).
+   */
+  public List&lt;List&lt;IN&gt;&gt; classifyRaw(String str,
+                                    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc" id="L436">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L437">      makeObjectBankFromString(str, readerAndWriter);</span>
+<span class="nc" id="L438">    return classifyObjectBank(documents);</span>
+  }
+
+  /**
+   * Classify the contents of a file.
+   *
+   * @param filename Contains the sentence(s) to be classified.
+   * @return {@link List} of classified List of IN.
+   */
+  public List&lt;List&lt;IN&gt;&gt; classifyFile(String filename) {
+<span class="nc" id="L448">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L449">      makeObjectBankFromFile(filename, plainTextReaderAndWriter);</span>
+<span class="nc" id="L450">    return classifyObjectBank(documents);</span>
+  }
+
+
+  /**
+   * Classify the tokens in an ObjectBank.
+   *
+   * @param documents The documents in an ObjectBank to classify.
+   * @return {@link List} of classified sentences (each a List of something that
+   *         extends {@link CoreMap}).
+   */
+  private List&lt;List&lt;IN&gt;&gt; classifyObjectBank(ObjectBank&lt;List&lt;IN&gt;&gt; documents) {
+<span class="nc" id="L462">    List&lt;List&lt;IN&gt;&gt; result = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">    for (List&lt;IN&gt; document : documents) {</span>
+<span class="nc" id="L465">      classify(document);</span>
+
+<span class="nc" id="L467">      List&lt;IN&gt; sentence = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">      for (IN wi : document) {</span>
+        // TaggedWord word = new TaggedWord(wi.word(), wi.answer());
+        // sentence.add(word);
+<span class="nc" id="L471">        sentence.add(wi);</span>
+<span class="nc" id="L472">      }</span>
+<span class="nc" id="L473">      result.add(sentence);</span>
+<span class="nc" id="L474">    }</span>
+<span class="nc" id="L475">    return result;</span>
+  }
+
+  /**
+   * Maps a String input to an XML-formatted rendition of applying NER to the
+   * String. Implements the Function interface. Calls
+   * classifyWithInlineXML(String) [q.v.].
+   */
+  @Override
+  public String apply(String in) {
+<span class="nc" id="L485">    return classifyWithInlineXML(in);</span>
+  }
+
+  /**
+   * Classify the contents of a {@link String} to one of several String
+   * representations that shows the classes. Plain text or XML input is expected
+   * and the {@link PlainTextDocumentReaderAndWriter} is used. The classifier
+   * will tokenize the text and treat each sentence as a separate document. The
+   * output can be specified to be in a choice of three formats: slashTags
+   * (e.g., Bill/PERSON Smith/PERSON died/O ./O), inlineXML (e.g.,
+   * &amp;lt;PERSON&amp;gt;Bill Smith&amp;lt;/PERSON&amp;gt; went to
+   * &amp;lt;LOCATION&amp;gt;Paris&amp;lt;/LOCATION&amp;gt; .), or xml, for stand-off XML (e.g.,
+   * &amp;lt;wi num=&quot;0&quot; entity=&quot;PERSON&quot;&amp;gt;Sue&amp;lt;/wi&amp;gt; &amp;lt;wi num=&quot;1&quot;
+   * entity=&quot;O&quot;&amp;gt;shouted&amp;lt;/wi&amp;gt; ). There is also a binary choice as to
+   * whether the spacing between tokens of the original is preserved or whether
+   * the (tagged) tokens are printed with a single space (for inlineXML or
+   * slashTags) or a single newline (for xml) between each one.
+   * &lt;p&gt;
+   * &lt;i&gt;Fine points:&lt;/i&gt; The slashTags and xml formats show tokens as
+   * transformed by any normalization processes inside the tokenizer, while
+   * inlineXML shows the tokens exactly as they appeared in the source text.
+   * When a period counts as both part of an abbreviation and as an end of
+   * sentence marker, it is included twice in the output String for slashTags or
+   * xml, but only once for inlineXML, where it is not counted as part of the
+   * abbreviation (or any named entity it is part of). For slashTags with
+   * preserveSpacing=true, there will be two successive periods such as &quot;Jr..&quot;
+   * The tokenized (preserveSpacing=false) output will have a space or a newline
+   * after the last token.
+   *
+   * @param sentences
+   *          The String to be classified. It will be tokenized and
+   *          divided into documents according to (heuristically
+   *          determined) sentence boundaries.
+   * @param outputFormat
+   *          The format to put the output in: one of &quot;slashTags&quot;, &quot;xml&quot;,
+   *          &quot;inlineXML&quot;, &quot;tsv&quot;, or &quot;tabbedEntities&quot;
+   * @param preserveSpacing
+   *          Whether to preserve the input spacing between tokens, which may
+   *          sometimes be none (true) or whether to tokenize the text and print
+   *          it with one space between each token (false)
+   * @return A {@link String} with annotated with classification information.
+   */
+  public String classifyToString(String sentences, String outputFormat, boolean preserveSpacing) {
+<span class="nc" id="L528">    PlainTextDocumentReaderAndWriter.OutputStyle outFormat =</span>
+<span class="nc" id="L529">      PlainTextDocumentReaderAndWriter.OutputStyle.fromShortName(outputFormat);</span>
+
+
+<span class="nc" id="L532">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L533">      makeObjectBankFromString(sentences, plainTextReaderAndWriter);</span>
+
+<span class="nc" id="L535">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : documents) {</span>
+<span class="nc" id="L537">      List&lt;IN&gt; docOutput = classify(doc);</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">      if (plainTextReaderAndWriter instanceof PlainTextDocumentReaderAndWriter) {</span>
+        // TODO: implement this particular method and its options in
+        // the other documentReaderAndWriters
+<span class="nc" id="L541">        sb.append(((PlainTextDocumentReaderAndWriter&lt;IN&gt;) plainTextReaderAndWriter).getAnswers(docOutput, outFormat, preserveSpacing));</span>
+      } else {
+<span class="nc" id="L543">        StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L544">        PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc" id="L545">        plainTextReaderAndWriter.printAnswers(docOutput, pw);</span>
+<span class="nc" id="L546">        pw.flush();</span>
+<span class="nc" id="L547">        sb.append(sw);</span>
+<span class="nc" id="L548">        sb.append('\n');</span>
+      }
+<span class="nc" id="L550">    }</span>
+<span class="nc" id="L551">    return sb.toString();</span>
+  }
+
+  /**
+   * Classify the contents of a {@link String}. Plain text or XML is expected
+   * and the {@link PlainTextDocumentReaderAndWriter} is used by default.
+   * The classifier
+   * will treat each sentence as a separate document. The output can be
+   * specified to be in a choice of formats: Output is in inline XML format
+   * (e.g. &amp;lt;PERSON&amp;gt;Bill Smith&amp;lt;/PERSON&amp;gt; went to
+   * &amp;lt;LOCATION&amp;gt;Paris&amp;lt;/LOCATION&amp;gt; .)
+   *
+   * @param sentences
+   *          The string to be classified
+   * @return A {@link String} with annotated with classification information.
+   */
+  public String classifyWithInlineXML(String sentences) {
+<span class="nc" id="L568">    return classifyToString(sentences, &quot;inlineXML&quot;, true);</span>
+  }
+
+  /**
+   * Classify the contents of a String to a tagged word/class String. Plain text
+   * or XML input is expected and the {@link PlainTextDocumentReaderAndWriter}
+   * is used by default.
+   * Output looks like: My/O name/O is/O Bill/PERSON Smith/PERSON ./O
+   *
+   * @param sentences
+   *          The String to be classified
+   * @return A String annotated with classification information.
+   */
+  public String classifyToString(String sentences) {
+<span class="nc" id="L582">    return classifyToString(sentences, &quot;slashTags&quot;, true);</span>
+  }
+
+  /**
+   * Classify the contents of a {@link String} to classified character offset
+   * spans. Plain text or XML input text is expected and the
+   * {@link PlainTextDocumentReaderAndWriter} is used by default.
+   * Output is a (possibly
+   * empty, but not {@code null}) List of Triples. Each Triple is an entity
+   * name, followed by beginning and ending character offsets in the original
+   * String. Character offsets can be thought of as fenceposts between the
+   * characters, or, like certain methods in the Java String class, as character
+   * positions, numbered starting from 0, with the end index pointing to the
+   * position AFTER the entity ends. That is, end - start is the length of the
+   * entity in characters.
+   * &lt;p&gt;
+   * &lt;i&gt;Fine points:&lt;/i&gt; Token offsets are true wrt the source text, even though
+   * the tokenizer may internally normalize certain tokens to String
+   * representations of different lengths (e.g., &quot; becoming `` or ''). When a
+   * period counts as both part of an abbreviation and as an end of sentence
+   * marker, and that abbreviation is part of a named entity, the reported
+   * entity string excludes the period.
+   *
+   * @param sentences The string to be classified
+   * @return A {@link List} of {@link Triple}s, each of which gives an entity
+   *         type and the beginning and ending character offsets.
+   */
+  public List&lt;Triple&lt;String, Integer, Integer&gt;&gt; classifyToCharacterOffsets(String sentences) {
+<span class="nc" id="L610">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L611">      makeObjectBankFromString(sentences, plainTextReaderAndWriter);</span>
+
+<span class="nc" id="L613">    List&lt;Triple&lt;String, Integer, Integer&gt;&gt; entities = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : documents) {</span>
+<span class="nc" id="L615">      String prevEntityType = flags.backgroundSymbol;</span>
+<span class="nc" id="L616">      Triple&lt;String, Integer, Integer&gt; prevEntity = null;</span>
+
+<span class="nc" id="L618">      classify(doc);</span>
+
+<span class="nc bnc" id="L620" title="All 2 branches missed.">      for (IN fl : doc) {</span>
+<span class="nc" id="L621">        String guessedAnswer = fl.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (guessedAnswer.equals(flags.backgroundSymbol)) {</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">          if (prevEntity != null) {</span>
+<span class="nc" id="L624">            entities.add(prevEntity);</span>
+<span class="nc" id="L625">            prevEntity = null;</span>
+          }
+        } else {
+<span class="nc bnc" id="L628" title="All 2 branches missed.">          if (!guessedAnswer.equals(prevEntityType)) {</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">            if (prevEntity != null) {</span>
+<span class="nc" id="L630">              entities.add(prevEntity);</span>
+            }
+<span class="nc" id="L632">            prevEntity = new Triple&lt;&gt;(guessedAnswer,</span>
+<span class="nc" id="L633">                    fl.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class),</span>
+<span class="nc" id="L634">                    fl.get(CoreAnnotations.CharacterOffsetEndAnnotation.class));</span>
+          } else {
+<span class="nc bnc" id="L636" title="All 4 branches missed.">            assert prevEntity != null; // if you read the code carefully, this</span>
+                                       // should always be true!
+<span class="nc" id="L638">            prevEntity.setThird(fl.get(CoreAnnotations.CharacterOffsetEndAnnotation.class));</span>
+          }
+        }
+<span class="nc" id="L641">        prevEntityType = guessedAnswer;</span>
+<span class="nc" id="L642">      }</span>
+
+      // include any entity at end of doc
+<span class="nc bnc" id="L645" title="All 2 branches missed.">      if (prevEntity != null) {</span>
+<span class="nc" id="L646">        entities.add(prevEntity);</span>
+      }
+
+<span class="nc" id="L649">    }</span>
+<span class="nc" id="L650">    return entities;</span>
+  }
+
+  /**
+   * Have a word segmenter segment a String into a list of words.
+   * ONLY USE IF YOU LOADED A CHINESE WORD SEGMENTER!!!!!
+   *
+   * @param sentence The string to be classified
+   * @return List of words
+   */
+  // todo: This method is currently [2016] only called in a very small number of places:
+  // the parser's jsp webapp, ChineseSegmenterAnnotator, and SegDemo.
+  // Maybe we could eliminate it?
+  // It also seems like it should be using the plainTextReaderAndWriter, not default?
+  public List&lt;String&gt; segmentString(String sentence) {
+<span class="nc" id="L665">    return segmentString(sentence, defaultReaderAndWriter);</span>
+  }
+
+  public List&lt;String&gt; segmentString(String sentence, DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc" id="L669">    ObjectBank&lt;List&lt;IN&gt;&gt; docs = makeObjectBankFromString(sentence, readerAndWriter);</span>
+
+<span class="nc" id="L671">    StringWriter stringWriter = new StringWriter();</span>
+<span class="nc" id="L672">    PrintWriter stringPrintWriter = new PrintWriter(stringWriter);</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : docs) {</span>
+<span class="nc" id="L674">      classify(doc);</span>
+<span class="nc" id="L675">      readerAndWriter.printAnswers(doc, stringPrintWriter);</span>
+<span class="nc" id="L676">      stringPrintWriter.println();</span>
+<span class="nc" id="L677">    }</span>
+<span class="nc" id="L678">    stringPrintWriter.close();</span>
+<span class="nc" id="L679">    String segmented = stringWriter.toString();</span>
+
+<span class="nc" id="L681">    return Arrays.asList(segmented.split(&quot;\\s&quot;));</span>
+  }
+
+  /*
+   * Classify the contents of {@link SeqClassifierFlags scf.testFile}. The file
+   * should be in the format expected based on {@link SeqClassifierFlags
+   * scf.documentReader}.
+   *
+   * @return A {@link List} of {@link List}s of classified something that
+   *         extends {@link CoreMap} where each {@link List} refers to a
+   *         document/sentence.
+   */
+  // public ObjectBank&lt;List&lt;IN&gt;&gt; test() {
+  // return test(flags.testFile);
+  // }
+
+  /**
+   * Classify a {@link List} of something that extends{@link CoreMap}.
+   * The classifications are added in place to the items of the document,
+   * which is also returned by this method
+   *
+   * @param document A {@link List} of something that extends {@link CoreMap}.
+   * @return The same {@link List}, but with the elements annotated with their
+   *         answers (stored under the
+   *         {@link edu.stanford.nlp.ling.CoreAnnotations.AnswerAnnotation}
+   *         key). The answers will be the class labels defined by the CRF
+   *         Classifier. They might be things like entity labels (in BIO
+   *         notation or not) or something like &quot;1&quot; vs. &quot;0&quot; on whether to
+   *         begin a new token here or not (in word segmentation).
+   */
+  public abstract List&lt;IN&gt; classify(List&lt;IN&gt; document);
+
+  /**
+   * Classify a {@link List} of something that extends {@link CoreMap} using as
+   * additional information whatever is stored in the document and sentence.
+   * This is needed for SUTime (NumberSequenceClassifier), which requires
+   * the document date to resolve relative dates.
+   *
+   * @param tokenSequence
+   * @param document
+   * @param sentence
+   * @return Classified version of the input tokenSequence
+   */
+  public abstract List&lt;IN&gt; classifyWithGlobalInformation(List&lt;IN&gt; tokenSequence, final CoreMap document, final CoreMap sentence);
+
+  /**
+   * Classification is finished for the document.
+   * Do any cleanup (if information was stored as part of the document for global classification)
+   * @param document
+   */
+  public void finalizeClassification(final CoreMap document) {
+<span class="nc" id="L732">  }</span>
+
+  /**
+   * Train the classifier based on values in flags. It will use the first of
+   * these variables that is defined: trainFiles (and baseTrainDir),
+   * trainFileList, trainFile.
+   */
+  public void train() {
+<span class="nc bnc" id="L740" title="All 2 branches missed.">    if (flags.trainFiles != null) {</span>
+<span class="nc" id="L741">      train(flags.baseTrainDir, flags.trainFiles, defaultReaderAndWriter);</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">    } else if (flags.trainFileList != null) {</span>
+<span class="nc" id="L743">      String[] files = flags.trainFileList.split(&quot;,&quot;);</span>
+<span class="nc" id="L744">      train(files, defaultReaderAndWriter);</span>
+<span class="nc" id="L745">    } else {</span>
+<span class="nc" id="L746">      train(flags.trainFile, defaultReaderAndWriter);</span>
+    }
+<span class="nc" id="L748">  }</span>
+
+  public void train(String filename) {
+<span class="nc" id="L751">    train(filename, defaultReaderAndWriter);</span>
+<span class="nc" id="L752">  }</span>
+
+  public void train(String filename,
+                    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+    // only for the OCR data does this matter
+<span class="nc" id="L757">    flags.ocrTrain = true;</span>
+<span class="nc" id="L758">    train(makeObjectBankFromFile(filename, readerAndWriter), readerAndWriter);</span>
+<span class="nc" id="L759">  }</span>
+
+  public void train(String baseTrainDir, String trainFiles,
+                    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+    // only for the OCR data does this matter
+<span class="nc" id="L764">    flags.ocrTrain = true;</span>
+<span class="nc" id="L765">    train(makeObjectBankFromFiles(baseTrainDir, trainFiles, readerAndWriter),</span>
+          readerAndWriter);
+<span class="nc" id="L767">  }</span>
+
+  public void train(String[] trainFileList,
+                    DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+    // only for the OCR data does this matter
+<span class="nc" id="L772">    flags.ocrTrain = true;</span>
+<span class="nc" id="L773">    train(makeObjectBankFromFiles(trainFileList, readerAndWriter),</span>
+          readerAndWriter);
+<span class="nc" id="L775">  }</span>
+
+  /**
+   * Trains a classifier from a Collection of sequences.
+   * Note that the Collection can be (and usually is) an ObjectBank.
+   *
+   * @param docs An ObjectBank or a collection of sequences of IN
+   */
+  public void train(Collection&lt;List&lt;IN&gt;&gt; docs) {
+<span class="nc" id="L784">    train(docs, defaultReaderAndWriter);</span>
+<span class="nc" id="L785">  }</span>
+
+  /**
+   * Trains a classifier from a Collection of sequences.
+   * Note that the Collection can be (and usually is) an ObjectBank.
+   *
+   * @param docs An ObjectBank or a collection of sequences of IN
+   * @param readerAndWriter A DocumentReaderAndWriter to use when loading test files
+   */
+  public abstract void train(Collection&lt;List&lt;IN&gt;&gt; docs,
+                             DocumentReaderAndWriter&lt;IN&gt; readerAndWriter);
+
+  /**
+   * Reads a String into an ObjectBank object. NOTE: that the current
+   * implementation of ReaderIteratorFactory will first try to interpret each
+   * string as a filename, so this method will yield unwanted results if it
+   * applies to a string that is at the same time a filename. It prints out a
+   * warning, at least.
+   *
+   * @param string The String which will be the content of the ObjectBank
+   * @return The ObjectBank
+   */
+  public ObjectBank&lt;List&lt;IN&gt;&gt;
+    makeObjectBankFromString(String string,
+                             DocumentReaderAndWriter&lt;IN&gt; readerAndWriter)
+  {
+<span class="nc bnc" id="L811" title="All 2 branches missed.">    if (flags.announceObjectBankEntries) {</span>
+<span class="nc" id="L812">      log.info(&quot;Reading data using &quot; + readerAndWriter.getClass());</span>
+
+<span class="nc bnc" id="L814" title="All 2 branches missed.">      if (flags.inputEncoding == null) {</span>
+<span class="nc" id="L815">        log.info(&quot;Getting data from &quot; + string + &quot; (default encoding)&quot;);</span>
+      } else {
+<span class="nc" id="L817">        log.info(&quot;Getting data from &quot; + string + &quot; (&quot; + flags.inputEncoding + &quot; encoding)&quot;);</span>
+      }
+    }
+    // return new ObjectBank&lt;List&lt;IN&gt;&gt;(new
+    // ResettableReaderIteratorFactory(string), readerAndWriter);
+    // TODO
+<span class="nc" id="L823">    return new ObjectBankWrapper&lt;&gt;(flags, new ObjectBank&lt;&gt;(new ResettableReaderIteratorFactory(string),</span>
+            readerAndWriter), knownLCWords);
+  }
+
+  public ObjectBank&lt;List&lt;IN&gt;&gt; makeObjectBankFromFile(String filename) {
+<span class="nc" id="L828">    return makeObjectBankFromFile(filename, defaultReaderAndWriter);</span>
+  }
+
+  public ObjectBank&lt;List&lt;IN&gt;&gt; makeObjectBankFromFile(String filename,
+                                                     DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc" id="L833">    String[] fileAsArray = { filename };</span>
+<span class="nc" id="L834">    return makeObjectBankFromFiles(fileAsArray, readerAndWriter);</span>
+  }
+
+  public ObjectBank&lt;List&lt;IN&gt;&gt; makeObjectBankFromFiles(String[] trainFileList,
+                                                      DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+    // try{
+<span class="nc" id="L840">    Collection&lt;File&gt; files = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">    for (String trainFile : trainFileList) {</span>
+<span class="nc" id="L842">      File f = new File(trainFile);</span>
+<span class="nc" id="L843">      files.add(f);</span>
+    }
+    // System.err.printf(&quot;trainFileList contains %d file%s in encoding %s.%n&quot;, files.size(), files.size() == 1 ? &quot;&quot;: &quot;s&quot;, flags.inputEncoding);
+    // TODO get rid of ObjectBankWrapper
+    // return new ObjectBank&lt;List&lt;IN&gt;&gt;(new
+    // ResettableReaderIteratorFactory(files), readerAndWriter);
+<span class="nc" id="L849">    return new ObjectBankWrapper&lt;&gt;(flags, new ObjectBank&lt;&gt;(new ResettableReaderIteratorFactory(files, flags.inputEncoding),</span>
+            readerAndWriter), knownLCWords);
+    // } catch (IOException e) {
+    // throw new RuntimeException(e);
+    // }
+  }
+
+  public ObjectBank&lt;List&lt;IN&gt;&gt; makeObjectBankFromFiles(String baseDir, String filePattern,
+                                                      DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+
+<span class="nc" id="L859">    File path = new File(baseDir);</span>
+<span class="nc" id="L860">    FileFilter filter = new RegExFileFilter(Pattern.compile(filePattern));</span>
+<span class="nc" id="L861">    File[] origFiles = path.listFiles(filter);</span>
+<span class="nc" id="L862">    Collection&lt;File&gt; files = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L863" title="All 2 branches missed.">    for (File file : origFiles) {</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">      if (file.isFile()) {</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">        if (flags.announceObjectBankEntries) {</span>
+<span class="nc" id="L866">          log.info(&quot;Getting data from &quot; + file + &quot; (&quot; + flags.inputEncoding + &quot; encoding)&quot;);</span>
+        }
+<span class="nc" id="L868">        files.add(file);</span>
+      }
+    }
+
+<span class="nc bnc" id="L872" title="All 2 branches missed.">    if (files.isEmpty()) {</span>
+<span class="nc" id="L873">      throw new RuntimeException(&quot;No matching files: &quot; + baseDir + '\t' + filePattern);</span>
+    }
+    // return new ObjectBank&lt;List&lt;IN&gt;&gt;(new
+    // ResettableReaderIteratorFactory(files, flags.inputEncoding),
+    // readerAndWriter);
+    // TODO get rid of ObjectBankWrapper
+<span class="nc" id="L879">    return new ObjectBankWrapper&lt;&gt;(flags, new ObjectBank&lt;&gt;(new ResettableReaderIteratorFactory(files,</span>
+            flags.inputEncoding), readerAndWriter), knownLCWords);
+  }
+
+  public ObjectBank&lt;List&lt;IN&gt;&gt; makeObjectBankFromFiles(Collection&lt;File&gt; files,
+                                                      DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc bnc" id="L885" title="All 2 branches missed.">    if (files.isEmpty()) {</span>
+<span class="nc" id="L886">      throw new RuntimeException(&quot;Attempt to make ObjectBank with empty file list&quot;);</span>
+    }
+    // return new ObjectBank&lt;List&lt;IN&gt;&gt;(new
+    // ResettableReaderIteratorFactory(files, flags.inputEncoding),
+    // readerAndWriter);
+    // TODO get rid of ObjectBankWrapper
+<span class="nc" id="L892">    return new ObjectBankWrapper&lt;&gt;(flags, new ObjectBank&lt;&gt;(new ResettableReaderIteratorFactory(files,</span>
+            flags.inputEncoding), readerAndWriter), knownLCWords);
+  }
+
+  /**
+   * Set up an ObjectBank that will allow one to iterate over a collection of
+   * documents obtained from the passed in Reader. Each document will be
+   * represented as a list of IN. If the ObjectBank iterator() is called until
+   * hasNext() returns false, then the Reader will be read till end of file, but
+   * no reading is done at the time of this call. Reading is done using the
+   * reading method specified in {@code flags.documentReader}, and for some
+   * reader choices, the column mapping given in {@code flags.map}.
+   *
+   * @param in
+   *          Input data addNEWLCWords do we add new lowercase words from this
+   *          data to the word shape classifier
+   * @return The list of documents
+   */
+  public ObjectBank&lt;List&lt;IN&gt;&gt; makeObjectBankFromReader(BufferedReader in,
+                                                       DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+<span class="nc bnc" id="L912" title="All 2 branches missed.">    if (flags.announceObjectBankEntries) {</span>
+<span class="nc" id="L913">      log.info(&quot;Reading data using &quot; + readerAndWriter.getClass());</span>
+    }
+    // TODO get rid of ObjectBankWrapper
+    // return new ObjectBank&lt;List&lt;IN&gt;&gt;(new ResettableReaderIteratorFactory(in),
+    // readerAndWriter);
+<span class="nc" id="L918">    return new ObjectBankWrapper&lt;&gt;(flags, new ObjectBank&lt;&gt;(new ResettableReaderIteratorFactory(in),</span>
+            readerAndWriter), knownLCWords);
+  }
+
+  /**
+   * Takes the file, reads it in, and prints out the likelihood of each possible
+   * label at each point.
+   *
+   * @param filename The path to the specified file
+   */
+  public void printProbs(String filename,
+                         DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) {
+    // only for the OCR data does this matter
+<span class="nc" id="L931">    flags.ocrTrain = false;</span>
+
+<span class="nc" id="L933">    ObjectBank&lt;List&lt;IN&gt;&gt; docs =</span>
+<span class="nc" id="L934">      makeObjectBankFromFile(filename, readerAndWriter);</span>
+<span class="nc" id="L935">    printProbsDocuments(docs);</span>
+<span class="nc" id="L936">  }</span>
+
+  /**
+   * Takes the files, reads them in, and prints out the likelihood of each possible
+   * label at each point.
+   *
+   * @param testFiles A Collection of files
+   */
+  public void printProbs(Collection&lt;File&gt; testFiles,
+                         DocumentReaderAndWriter&lt;IN&gt; readerWriter) {
+
+<span class="nc" id="L947">    ObjectBank&lt;List&lt;IN&gt;&gt; documents = makeObjectBankFromFiles(testFiles, readerWriter);</span>
+<span class="nc" id="L948">    printProbsDocuments(documents);</span>
+<span class="nc" id="L949">  }</span>
+
+
+  /**
+   * Takes a {@link List} of documents and prints the likelihood of each
+   * possible label at each point.
+   *
+   * @param documents A {@link List} of {@link List} of something that extends
+   *          {@link CoreMap}.
+   */
+  public void printProbsDocuments(ObjectBank&lt;List&lt;IN&gt;&gt; documents) {
+<span class="nc" id="L960">    Counter&lt;Integer&gt; calibration = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L961">    Counter&lt;Integer&gt; correctByBin = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L962">    TwoDimensionalCounter&lt;Integer,String&gt; calibratedTokens = new TwoDimensionalCounter&lt;&gt;();</span>
+
+<span class="nc bnc" id="L964" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : documents) {</span>
+<span class="nc" id="L965">      Triple&lt;Counter&lt;Integer&gt;, Counter&lt;Integer&gt;, TwoDimensionalCounter&lt;Integer,String&gt;&gt; triple = printProbsDocument(doc);</span>
+<span class="nc bnc" id="L966" title="All 2 branches missed.">      if (triple != null) {</span>
+<span class="nc" id="L967">        Counters.addInPlace(calibration, triple.first());</span>
+<span class="nc" id="L968">        Counters.addInPlace(correctByBin, triple.second());</span>
+<span class="nc" id="L969">        calibratedTokens.addAll(triple.third());</span>
+      }
+<span class="nc" id="L971">      System.out.println();</span>
+<span class="nc" id="L972">    }</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">    if (calibration.size() &gt; 0) {</span>
+      // we stored stuff, so print it out
+<span class="nc" id="L975">      PrintWriter pw = new PrintWriter(System.err);</span>
+<span class="nc" id="L976">      outputCalibrationInfo(pw, calibration, correctByBin, calibratedTokens);</span>
+<span class="nc" id="L977">      pw.flush();</span>
+    }
+<span class="nc" id="L979">  }</span>
+
+  private static void outputCalibrationInfo(PrintWriter pw,
+                                            Counter&lt;Integer&gt; calibration,
+                                            Counter&lt;Integer&gt; correctByBin,
+                                            TwoDimensionalCounter&lt;Integer, String&gt; calibratedTokens) {
+<span class="nc" id="L985">    final int numBins = 10;</span>
+<span class="nc" id="L986">    pw.println(); // in practice may well be in middle of line when called</span>
+<span class="nc" id="L987">    pw.println(&quot;----------------------------------------&quot;);</span>
+<span class="nc" id="L988">    pw.println(&quot;Probability distribution given to tokens (Counts for all class-token pairs; accuracy for this bin; examples are gold entity tokens in bin)&quot;);</span>
+<span class="nc" id="L989">    pw.println(&quot;----------------------------------------&quot;);</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">    for (int i = 0; i &lt; numBins; i++) {</span>
+<span class="nc" id="L991">      pw.printf(&quot;[%.1f-%.1f%c: %.0f  %.2f%n&quot;,</span>
+<span class="nc" id="L992">              ((double) i) / numBins,</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">              ((double) (i+1)) / numBins,</span>
+<span class="nc" id="L994">              i == (numBins - 1) ? ']': ')',</span>
+<span class="nc" id="L995">              calibration.getCount(i),</span>
+<span class="nc" id="L996">              correctByBin.getCount(i) / calibration.getCount(i));</span>
+    }
+<span class="nc" id="L998">    pw.println(&quot;----------------------------------------&quot;);</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">    for (int i = 0; i &lt; numBins; i++) {</span>
+<span class="nc" id="L1000">      pw.printf(&quot;[%.1f-%.1f%c: %s%n&quot;,</span>
+<span class="nc" id="L1001">              ((double) i) / numBins,</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">              ((double) (i+1)) / numBins,</span>
+<span class="nc" id="L1003">              i == (numBins - 1) ? ']': ')',</span>
+<span class="nc" id="L1004">              Counters.toSortedString(calibratedTokens.getCounter(i), 20, &quot;%s=%.0f&quot;, &quot;, &quot;, &quot;[%s]&quot;));</span>
+    }
+<span class="nc" id="L1006">    pw.println(&quot;----------------------------------------&quot;);</span>
+<span class="nc" id="L1007">  }</span>
+
+  public void classifyStdin() throws IOException {
+<span class="nc" id="L1010">    classifyStdin(plainTextReaderAndWriter);</span>
+<span class="nc" id="L1011">  }</span>
+
+  public void classifyStdin(DocumentReaderAndWriter&lt;IN&gt; readerWriter) throws IOException {
+<span class="nc" id="L1014">    BufferedReader is = IOUtils.readerFromStdin(flags.inputEncoding);</span>
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">    for (String line; (line = is.readLine()) != null; ) {</span>
+<span class="nc" id="L1016">      Collection&lt;List&lt;IN&gt;&gt; documents = makeObjectBankFromString(line, readerWriter);</span>
+<span class="nc bnc" id="L1017" title="All 4 branches missed.">      if (flags.keepEmptySentences &amp;&amp; documents.isEmpty()) {</span>
+<span class="nc" id="L1018">        documents = Collections.&lt;List&lt;IN&gt;&gt;singletonList(Collections.&lt;IN&gt;emptyList());</span>
+      }
+<span class="nc" id="L1020">      classifyAndWriteAnswers(documents, readerWriter, false);</span>
+<span class="nc" id="L1021">    }</span>
+<span class="nc" id="L1022">  }</span>
+
+  public Triple&lt;Counter&lt;Integer&gt;, Counter&lt;Integer&gt;, TwoDimensionalCounter&lt;Integer,String&gt;&gt; printProbsDocument(List&lt;IN&gt; document) {
+<span class="nc" id="L1025">    throw new UnsupportedOperationException(&quot;Not implemented for this class.&quot;);</span>
+  }
+
+  /** Does nothing by default.  Subclasses can override if necessary. */
+<span class="nc" id="L1029">  public void dumpFeatures(Collection&lt;List&lt;IN&gt;&gt; documents) {}</span>
+
+  /**
+   * Load a text file, run the classifier on it, and then print the answers to
+   * stdout (with timing to stderr). This uses the value of flags.plainTextDocumentReaderAndWriter
+   * to determine how to read the textFile format. By default this gives
+   * edu.stanford.nlp.sequences.PlainTextDocumentReaderAndWriter.
+   * &lt;i&gt;Note:&lt;/i&gt; This means that it works right for
+   * a plain textFile (and not a tab-separated columns test file).
+   *
+   * @param textFile The file to test on.
+   */
+  public void classifyAndWriteAnswers(String textFile)
+          throws IOException {
+<span class="nc" id="L1043">    classifyAndWriteAnswers(textFile, plainTextReaderAndWriter(), false);</span>
+<span class="nc" id="L1044">  }</span>
+
+  /**
+   * Load a test file, run the classifier on it, and then print the answers to
+   * stdout (with timing to stderr). This uses the value of flags.documentReader
+   * to determine testFile format. By default, this means that it is set up to
+   * read a tab-separated columns test file
+   *
+   * @param testFile The file to test on.
+   * @param outputScores Whether to calculate and then log performance scores (P/R/F1)
+   * @return A Triple of P/R/F1 if outputScores is true, else null
+   */
+  public Triple&lt;Double,Double,Double&gt; classifyAndWriteAnswers(String testFile, boolean outputScores)
+          throws IOException {
+<span class="nc" id="L1058">    return classifyAndWriteAnswers(testFile, defaultReaderAndWriter(), outputScores);</span>
+  }
+
+  /**
+   * Load a test file, run the classifier on it, and then print the answers to
+   * stdout (with timing to stderr).
+   *
+   * @param testFile The file to test on.
+   * @param readerWriter A reader and writer to use for the output
+   * @param outputScores Whether to calculate and then log performance scores (P/R/F1)
+   * @return A Triple of P/R/F1 if outputScores is true, else null
+   */
+  public Triple&lt;Double,Double,Double&gt; classifyAndWriteAnswers(String testFile,
+                                                              DocumentReaderAndWriter&lt;IN&gt; readerWriter,
+                                                              boolean outputScores)
+          throws IOException {
+<span class="nc" id="L1074">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L1075">            makeObjectBankFromFile(testFile, readerWriter);</span>
+<span class="nc" id="L1076">    return classifyAndWriteAnswers(documents, readerWriter, outputScores);</span>
+  }
+
+  /** If the flag
+   *  {@code outputEncoding} is defined, the output is written in that
+   *  character encoding, otherwise in the system default character encoding.
+   */
+  public Triple&lt;Double,Double,Double&gt; classifyAndWriteAnswers(String testFile, OutputStream outStream,
+                                      DocumentReaderAndWriter&lt;IN&gt; readerWriter, boolean outputScores)
+          throws IOException {
+<span class="nc" id="L1086">    ObjectBank&lt;List&lt;IN&gt;&gt; documents = makeObjectBankFromFile(testFile, readerWriter);</span>
+<span class="nc" id="L1087">    PrintWriter pw = IOUtils.encodedOutputStreamPrintWriter(outStream, flags.outputEncoding, true);</span>
+<span class="nc" id="L1088">    return classifyAndWriteAnswers(documents, pw, readerWriter, outputScores);</span>
+  }
+
+  public Triple&lt;Double,Double,Double&gt; classifyAndWriteAnswers(String baseDir, String filePattern,
+                                      DocumentReaderAndWriter&lt;IN&gt; readerWriter,
+                                      boolean outputScores)
+          throws IOException {
+<span class="nc" id="L1095">    ObjectBank&lt;List&lt;IN&gt;&gt; documents = makeObjectBankFromFiles(baseDir, filePattern, readerWriter);</span>
+<span class="nc" id="L1096">    return classifyAndWriteAnswers(documents, readerWriter, outputScores);</span>
+  }
+
+  /** Run the classifier on a collection of text files.
+   *  Uses the plainTextReaderAndWriter to process them.
+   *
+   *  @param textFiles A File Collection to process.
+   *  @throws IOException For any IO error
+   */
+  public void classifyFilesAndWriteAnswers(Collection&lt;File&gt; textFiles)
+          throws IOException {
+<span class="nc" id="L1107">    classifyFilesAndWriteAnswers(textFiles, plainTextReaderAndWriter, false);</span>
+<span class="nc" id="L1108">  }</span>
+
+  public void classifyFilesAndWriteAnswers(Collection&lt;File&gt; testFiles,
+                                           DocumentReaderAndWriter&lt;IN&gt; readerWriter, boolean outputScores)
+          throws IOException {
+<span class="nc" id="L1113">    ObjectBank&lt;List&lt;IN&gt;&gt; documents =</span>
+<span class="nc" id="L1114">      makeObjectBankFromFiles(testFiles, readerWriter);</span>
+<span class="nc" id="L1115">    classifyAndWriteAnswers(documents, readerWriter, outputScores);</span>
+<span class="nc" id="L1116">  }</span>
+
+  public Triple&lt;Double,Double,Double&gt; classifyAndWriteAnswers(Collection&lt;List&lt;IN&gt;&gt; documents,
+                                                              DocumentReaderAndWriter&lt;IN&gt; readerWriter,
+                                                              boolean outputScores)
+          throws IOException {
+<span class="nc" id="L1122">    return classifyAndWriteAnswers(documents,</span>
+<span class="nc" id="L1123">                                   IOUtils.encodedOutputStreamPrintWriter(System.out, flags.outputEncoding, true),</span>
+                                   readerWriter, outputScores);
+  }
+
+  /**
+   *
+   * @param documents
+   * @param printWriter
+   * @param readerWriter
+   * @param outputScores Whether to calculate and output the performance scores (P/R/F1) of the classifier
+   * @return A Triple of overall P/R/F1, if outputScores is true, else {@code null}. The scores are done
+   *         on a 0-100 scale like percentages.
+   * @throws IOException
+   */
+  public Triple&lt;Double,Double,Double&gt; classifyAndWriteAnswers(Collection&lt;List&lt;IN&gt;&gt; documents,
+                                                              PrintWriter printWriter,
+                                                              DocumentReaderAndWriter&lt;IN&gt; readerWriter,
+                                                              boolean outputScores)
+          throws IOException {
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">    if (flags.exportFeatures != null) {</span>
+<span class="nc" id="L1143">      dumpFeatures(documents);</span>
+    }
+
+<span class="nc" id="L1146">    Timing timer = new Timing();</span>
+
+<span class="nc" id="L1148">    Counter&lt;String&gt; entityTP = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1149">    Counter&lt;String&gt; entityFP = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1150">    Counter&lt;String&gt; entityFN = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L1151">    boolean resultsCounted = outputScores;</span>
+<span class="nc" id="L1152">    int numWords = 0;</span>
+<span class="nc" id="L1153">    int numDocs = 0;</span>
+
+<span class="nc" id="L1155">    final AtomicInteger threadCompletionCounter = new AtomicInteger(0);</span>
+
+<span class="nc" id="L1157">    ThreadsafeProcessor&lt;List&lt;IN&gt;, List&lt;IN&gt;&gt; threadProcessor =</span>
+<span class="nc" id="L1158">        new ThreadsafeProcessor&lt;List&lt;IN&gt;, List&lt;IN&gt;&gt;() {</span>
+      @Override
+      public List&lt;IN&gt; process(List&lt;IN&gt; doc) {
+<span class="nc" id="L1161">        doc = classify(doc);</span>
+
+<span class="nc" id="L1163">        int completedNo = threadCompletionCounter.incrementAndGet();</span>
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">        if (flags.verboseMode) log.info(completedNo + &quot; examples completed&quot;);</span>
+<span class="nc" id="L1165">        return doc;</span>
+      }
+      @Override
+      public ThreadsafeProcessor&lt;List&lt;IN&gt;, List&lt;IN&gt;&gt; newInstance() {
+<span class="nc" id="L1169">        return this;</span>
+      }
+    };
+
+<span class="nc" id="L1173">    MulticoreWrapper&lt;List&lt;IN&gt;, List&lt;IN&gt;&gt; wrapper = null;</span>
+<span class="nc bnc" id="L1174" title="All 2 branches missed.">    if (flags.multiThreadClassifier != 0) {</span>
+<span class="nc" id="L1175">      wrapper = new MulticoreWrapper&lt;&gt;(flags.multiThreadClassifier, threadProcessor);</span>
+    }
+
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">    for (List&lt;IN&gt; doc: documents) {</span>
+<span class="nc" id="L1179">      numWords += doc.size();</span>
+<span class="nc" id="L1180">      numDocs++;</span>
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">      if (wrapper != null) {</span>
+<span class="nc" id="L1182">        wrapper.put(doc);</span>
+<span class="nc bnc" id="L1183" title="All 2 branches missed.">        while (wrapper.peek()) {</span>
+<span class="nc" id="L1184">          List&lt;IN&gt; results = wrapper.poll();</span>
+<span class="nc" id="L1185">          writeAnswers(results, printWriter, readerWriter);</span>
+<span class="nc bnc" id="L1186" title="All 4 branches missed.">          resultsCounted = resultsCounted &amp;&amp; countResults(results, entityTP, entityFP, entityFN);</span>
+<span class="nc" id="L1187">        }</span>
+      } else {
+<span class="nc" id="L1189">        List&lt;IN&gt; results = threadProcessor.process(doc);</span>
+<span class="nc" id="L1190">        writeAnswers(results, printWriter, readerWriter);</span>
+<span class="nc bnc" id="L1191" title="All 4 branches missed.">        resultsCounted = resultsCounted &amp;&amp; countResults(results, entityTP, entityFP, entityFN);</span>
+      }
+<span class="nc" id="L1193">    }</span>
+<span class="nc bnc" id="L1194" title="All 2 branches missed.">    if (wrapper != null) {</span>
+<span class="nc" id="L1195">      wrapper.join();</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">      while (wrapper.peek()) {</span>
+<span class="nc" id="L1197">        List&lt;IN&gt; results = wrapper.poll();</span>
+<span class="nc" id="L1198">        writeAnswers(results, printWriter, readerWriter);</span>
+<span class="nc bnc" id="L1199" title="All 4 branches missed.">        resultsCounted = resultsCounted &amp;&amp; countResults(results, entityTP, entityFP, entityFN);</span>
+<span class="nc" id="L1200">      }</span>
+    }
+
+<span class="nc" id="L1203">    long millis = timer.stop();</span>
+<span class="nc" id="L1204">    double wordspersec = numWords / (((double) millis) / 1000);</span>
+<span class="nc" id="L1205">    NumberFormat nf = new DecimalFormat(&quot;0.00&quot;); // easier way!</span>
+<span class="nc" id="L1206">    log.info(StringUtils.getShortClassName(this) +</span>
+                       &quot; tagged &quot; + numWords + &quot; words in &quot; + numDocs +
+<span class="nc" id="L1208">                       &quot; documents at &quot; + nf.format(wordspersec) +</span>
+                       &quot; words per second.&quot;);
+<span class="nc bnc" id="L1210" title="All 2 branches missed.">    if (outputScores) {</span>
+<span class="nc" id="L1211">      return printResults(entityTP, entityFP, entityFN);</span>
+    } else {
+<span class="nc" id="L1213">      return null;</span>
+    }
+  }
+
+  /**
+   * Load a test file, run the classifier on it, and then print the answers to
+   * stdout (with timing to stderr). This uses the value of flags.documentReader
+   * to determine testFile format.
+   *
+   * @param testFile The name of the file to test on.
+   * @param k How many best to print
+   * @param readerAndWriter Class to be used for printing answers
+   */
+  public void classifyAndWriteAnswersKBest(String testFile, int k,
+                                       DocumentReaderAndWriter&lt;IN&gt; readerAndWriter)
+    throws IOException {
+<span class="nc" id="L1229">    ObjectBank&lt;List&lt;IN&gt;&gt; documents = makeObjectBankFromFile(testFile, readerAndWriter);</span>
+<span class="nc" id="L1230">    PrintWriter pw = IOUtils.encodedOutputStreamPrintWriter(System.out, flags.outputEncoding, true);</span>
+<span class="nc" id="L1231">    classifyAndWriteAnswersKBest(documents, k, pw, readerAndWriter);</span>
+<span class="nc" id="L1232">    pw.flush();</span>
+<span class="nc" id="L1233">  }</span>
+
+  /**
+   * Run the classifier on the documents in an ObjectBank, and print the
+   * answers to a given PrintWriter (with timing to stderr). The value of
+   * flags.documentReader is used to determine testFile format.
+   *
+   * @param documents The ObjectBank to test on.
+   */
+  public void classifyAndWriteAnswersKBest(ObjectBank&lt;List&lt;IN&gt;&gt; documents, int k, PrintWriter printWriter,
+                                           DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) throws IOException {
+<span class="nc" id="L1244">    Timing timer = new Timing();</span>
+<span class="nc" id="L1245">    int numWords = 0;</span>
+<span class="nc" id="L1246">    int numSentences = 0;</span>
+
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : documents) {</span>
+<span class="nc" id="L1249">      Counter&lt;List&lt;IN&gt;&gt; kBest = classifyKBest(doc, CoreAnnotations.AnswerAnnotation.class, k);</span>
+<span class="nc" id="L1250">      numWords += doc.size();</span>
+<span class="nc" id="L1251">      List&lt;List&lt;IN&gt;&gt; sorted = Counters.toSortedList(kBest);</span>
+<span class="nc" id="L1252">      int n = 1;</span>
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">      for (List&lt;IN&gt; l : sorted) {</span>
+<span class="nc" id="L1254">        printWriter.println(&quot;&lt;sentence id=&quot; + numSentences + &quot; k=&quot; + n + &quot; logProb=&quot; + kBest.getCount(l) + &quot; prob=&quot;</span>
+<span class="nc" id="L1255">            + Math.exp(kBest.getCount(l)) + '&gt;');</span>
+<span class="nc" id="L1256">        writeAnswers(l, printWriter, readerAndWriter);</span>
+<span class="nc" id="L1257">        printWriter.println(&quot;&lt;/sentence&gt;&quot;);</span>
+<span class="nc" id="L1258">        n++;</span>
+<span class="nc" id="L1259">      }</span>
+<span class="nc" id="L1260">      numSentences++;</span>
+<span class="nc" id="L1261">    }</span>
+
+<span class="nc" id="L1263">    long millis = timer.stop();</span>
+<span class="nc" id="L1264">    double wordspersec = numWords / (((double) millis) / 1000);</span>
+<span class="nc" id="L1265">    NumberFormat nf = new DecimalFormat(&quot;0.00&quot;); // easier way!</span>
+<span class="nc" id="L1266">    log.info(this.getClass().getName() + &quot; tagged &quot; + numWords + &quot; words in &quot; + numSentences</span>
+<span class="nc" id="L1267">        + &quot; documents at &quot; + nf.format(wordspersec) + &quot; words per second.&quot;);</span>
+<span class="nc" id="L1268">  }</span>
+
+  /**
+   * Load a test file, run the classifier on it, and then write a Viterbi search
+   * graph for each sequence.
+   *
+   * @param testFile The file to test on.
+   */
+  public void classifyAndWriteViterbiSearchGraph(String testFile, String searchGraphPrefix, DocumentReaderAndWriter&lt;IN&gt; readerAndWriter) throws IOException {
+<span class="nc" id="L1277">    Timing timer = new Timing();</span>
+<span class="nc" id="L1278">    ObjectBank&lt;List&lt;IN&gt;&gt; documents = makeObjectBankFromFile(testFile, readerAndWriter);</span>
+<span class="nc" id="L1279">    int numWords = 0;</span>
+<span class="nc" id="L1280">    int numSentences = 0;</span>
+
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">    for (List&lt;IN&gt; doc : documents) {</span>
+<span class="nc" id="L1283">      DFSA&lt;String, Integer&gt; tagLattice = getViterbiSearchGraph(doc, CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1284">      numWords += doc.size();</span>
+<span class="nc" id="L1285">      PrintWriter latticeWriter = new PrintWriter(new FileOutputStream(searchGraphPrefix + '.' + numSentences</span>
+          + &quot;.wlattice&quot;));
+<span class="nc" id="L1287">      PrintWriter vsgWriter = new PrintWriter(new FileOutputStream(searchGraphPrefix + '.' + numSentences + &quot;.lattice&quot;));</span>
+<span class="nc bnc" id="L1288" title="All 2 branches missed.">      if (readerAndWriter instanceof LatticeWriter) {</span>
+<span class="nc" id="L1289">        ((LatticeWriter&lt;IN, String, Integer&gt;) readerAndWriter).printLattice(tagLattice, doc, latticeWriter);</span>
+      }
+<span class="nc" id="L1291">      tagLattice.printAttFsmFormat(vsgWriter);</span>
+<span class="nc" id="L1292">      latticeWriter.close();</span>
+<span class="nc" id="L1293">      vsgWriter.close();</span>
+<span class="nc" id="L1294">      numSentences++;</span>
+<span class="nc" id="L1295">    }</span>
+
+<span class="nc" id="L1297">    long millis = timer.stop();</span>
+<span class="nc" id="L1298">    double wordspersec = numWords / (((double) millis) / 1000);</span>
+<span class="nc" id="L1299">    NumberFormat nf = new DecimalFormat(&quot;0.00&quot;); // easier way!</span>
+<span class="nc" id="L1300">    log.info(this.getClass().getName() + &quot; tagged &quot; + numWords + &quot; words in &quot; + numSentences</span>
+<span class="nc" id="L1301">        + &quot; documents at &quot; + nf.format(wordspersec) + &quot; words per second.&quot;);</span>
+<span class="nc" id="L1302">  }</span>
+
+  /**
+   * Write the classifications of the Sequence classifier to a writer in a
+   * format determined by the DocumentReaderAndWriter used.
+   *
+   * @param doc Documents to write out
+   * @param printWriter Writer to use for output
+   * @throws IOException If an IO problem
+   */
+  public void writeAnswers(List&lt;IN&gt; doc, PrintWriter printWriter,
+                           DocumentReaderAndWriter&lt;IN&gt; readerAndWriter)
+          throws IOException {
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">    if (flags.lowerNewgeneThreshold) {</span>
+<span class="nc" id="L1316">      return;</span>
+    }
+<span class="nc bnc" id="L1318" title="All 2 branches missed.">    if (flags.numRuns &lt;= 1) {</span>
+<span class="nc" id="L1319">      readerAndWriter.printAnswers(doc, printWriter);</span>
+      // out.println();
+<span class="nc" id="L1321">      printWriter.flush();</span>
+    }
+<span class="nc" id="L1323">  }</span>
+
+  /**
+   * Count results using a method appropriate for the tag scheme being used.
+   */
+  public boolean countResults(List&lt;IN&gt; doc,
+                              Counter&lt;String&gt; entityTP,
+                              Counter&lt;String&gt; entityFP,
+                              Counter&lt;String&gt; entityFN) {
+<span class="nc bnc" id="L1332" title="All 2 branches missed.">    String bg = (flags.evaluateBackground ? null : flags.backgroundSymbol);</span>
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">    if (flags.sighanPostProcessing) {</span>
+      // TODO: this is extremely indicative of being a Chinese Segmenter,
+      // but it would still be better to have something more concrete
+<span class="nc" id="L1336">      return countResultsSegmenter(doc, entityTP, entityFP, entityFN);</span>
+    }
+<span class="nc" id="L1338">    return IOBUtils.countEntityResults(doc, entityTP, entityFP, entityFN, bg);</span>
+  }
+
+  // TODO: could make this a parameter for the model
+  private static final String CUT_LABEL = &quot;Cut&quot;;
+
+  public static boolean countResultsSegmenter(List&lt;? extends CoreMap&gt; doc,
+                                              Counter&lt;String&gt; entityTP,
+                                              Counter&lt;String&gt; entityFP,
+                                              Counter&lt;String&gt; entityFN) {
+    // count from 1 because each label represents cutting or
+    // not cutting at a word, so we don't count the first word
+<span class="nc bnc" id="L1350" title="All 2 branches missed.">    for (int i = 1; i &lt; doc.size(); ++i) {</span>
+<span class="nc" id="L1351">      CoreMap word = doc.get(i);</span>
+<span class="nc" id="L1352">      String gold = word.get(CoreAnnotations.GoldAnswerAnnotation.class);</span>
+<span class="nc" id="L1353">      String guess = word.get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc bnc" id="L1354" title="All 4 branches missed.">      if (gold == null || guess == null) {</span>
+<span class="nc" id="L1355">        return false;</span>
+      }
+<span class="nc bnc" id="L1357" title="All 4 branches missed.">      if (gold.equals(&quot;1&quot;) &amp;&amp; guess.equals(&quot;1&quot;)) {</span>
+<span class="nc" id="L1358">        entityTP.incrementCount(CUT_LABEL, 1.0);</span>
+<span class="nc bnc" id="L1359" title="All 4 branches missed.">      } else if (gold.equals(&quot;0&quot;) &amp;&amp; guess.equals(&quot;1&quot;)) {</span>
+<span class="nc" id="L1360">        entityFP.incrementCount(CUT_LABEL, 1.0);</span>
+<span class="nc bnc" id="L1361" title="All 4 branches missed.">      } else if (gold.equals(&quot;1&quot;) &amp;&amp; guess.equals(&quot;0&quot;)) {</span>
+<span class="nc" id="L1362">        entityFN.incrementCount(CUT_LABEL, 1.0);</span>
+      }
+    }
+<span class="nc" id="L1365">    return true;</span>
+  }
+
+
+  /**
+   * Given counters of true positives, false positives, and false
+   * negatives, prints out precision, recall, and f1 for each key.
+   */
+  public static Triple&lt;Double,Double,Double&gt; printResults(Counter&lt;String&gt; entityTP, Counter&lt;String&gt; entityFP,
+                           Counter&lt;String&gt; entityFN) {
+<span class="nc" id="L1375">    Set&lt;String&gt; entities = new TreeSet&lt;&gt;();</span>
+<span class="nc" id="L1376">    entities.addAll(entityTP.keySet());</span>
+<span class="nc" id="L1377">    entities.addAll(entityFP.keySet());</span>
+<span class="nc" id="L1378">    entities.addAll(entityFN.keySet());</span>
+<span class="nc" id="L1379">    log.info(&quot;         Entity\tP\tR\tF1\tTP\tFP\tFN&quot;);</span>
+<span class="nc bnc" id="L1380" title="All 2 branches missed.">    for (String entity : entities) {</span>
+<span class="nc" id="L1381">      double tp = entityTP.getCount(entity);</span>
+<span class="nc" id="L1382">      double fp = entityFP.getCount(entity);</span>
+<span class="nc" id="L1383">      double fn = entityFN.getCount(entity);</span>
+<span class="nc" id="L1384">      printPRLine(entity, tp, fp, fn);</span>
+<span class="nc" id="L1385">    }</span>
+<span class="nc" id="L1386">    double tp = entityTP.totalCount();</span>
+<span class="nc" id="L1387">    double fp = entityFP.totalCount();</span>
+<span class="nc" id="L1388">    double fn = entityFN.totalCount();</span>
+<span class="nc" id="L1389">    return printPRLine(&quot;Totals&quot;, tp, fp, fn);</span>
+  }
+
+  /**
+   * Print a line of precision, recall, and f1 scores, titled by entity.
+   *
+   * @return A Triple of the P/R/F, done on a 0-100 scale like percentages
+   */
+  private static Triple&lt;Double,Double,Double&gt; printPRLine(String entity, double tp, double fp, double fn) {
+<span class="nc bnc" id="L1398" title="All 4 branches missed.">    double precision = (tp == 0.0 &amp;&amp; fp == 0.0) ? 0.0 : tp / (tp + fp);</span>
+<span class="nc bnc" id="L1399" title="All 4 branches missed.">    double recall = (tp == 0.0 &amp;&amp; fn == 0.0) ? 1.0 : tp / (tp + fn);</span>
+<span class="nc bnc" id="L1400" title="All 4 branches missed.">    double f1 = ((precision == 0.0 || recall == 0.0) ?</span>
+                 0.0 : 2.0 / (1.0 / precision + 1.0 / recall));
+<span class="nc" id="L1402">    log.info(String.format(&quot;%15s\t%.4f\t%.4f\t%.4f\t%.0f\t%.0f\t%.0f%n&quot;,</span>
+<span class="nc" id="L1403">                      entity, precision, recall, f1, tp, fp, fn));</span>
+<span class="nc" id="L1404">    return new Triple&lt;&gt;(precision * 100, recall * 100, f1 * 100);</span>
+  }
+
+  /**
+   * Serialize a sequence classifier to a file on the given path.
+   *
+   * @param serializePath The path/filename to write the classifier to.
+   */
+  public abstract void serializeClassifier(String serializePath);
+
+  /** Serialize a sequence classifier to an object output stream **/
+  public abstract void serializeClassifier(ObjectOutputStream oos);
+
+  /**
+   * Loads a classifier from the given input stream.
+   * Any exceptions are rethrown as unchecked exceptions.
+   * This method does not close the InputStream.
+   *
+   * @param in The InputStream to read from
+   */
+  public void loadClassifierNoExceptions(InputStream in, Properties props) {
+    // load the classifier
+    try {
+<span class="nc" id="L1427">      loadClassifier(in, props);</span>
+<span class="nc" id="L1428">    } catch (IOException e) {</span>
+<span class="nc" id="L1429">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1430">    } catch (ClassNotFoundException cnfe) {</span>
+<span class="nc" id="L1431">      throw new RuntimeException(cnfe);</span>
+<span class="nc" id="L1432">    }</span>
+<span class="nc" id="L1433">  }</span>
+
+  /**
+   * Load a classifier from the specified InputStream. No extra properties are
+   * supplied. This does not close the InputStream.
+   *
+   * @param in The InputStream to load the serialized classifier from
+   * @throws IOException If there are problems accessing the input stream
+   * @throws ClassCastException If there are problems interpreting the serialized data
+   * @throws ClassNotFoundException If there are problems interpreting the serialized data
+   */
+  public void loadClassifier(InputStream in) throws IOException, ClassCastException, ClassNotFoundException {
+<span class="nc" id="L1445">    loadClassifier(in, null);</span>
+<span class="nc" id="L1446">  }</span>
+
+  /**
+   * Load a classifier from the specified InputStream. The classifier is
+   * reinitialized from the flags serialized in the classifier. This does not
+   * close the InputStream.
+   *
+   * @param in The InputStream to load the serialized classifier from
+   * @param props This Properties object will be used to update the
+   *          SeqClassifierFlags which are read from the serialized classifier
+   * @throws IOException If there are problems accessing the input stream
+   * @throws ClassCastException If there are problems interpreting the serialized data
+   * @throws ClassNotFoundException If there are problems interpreting the serialized data
+   */
+  public void loadClassifier(InputStream in, Properties props) throws IOException, ClassCastException,
+      ClassNotFoundException {
+<span class="nc" id="L1462">    loadClassifier(new ObjectInputStream(in), props);</span>
+<span class="nc" id="L1463">  }</span>
+
+  /**
+   * Load a classifier from the specified input stream. The classifier is
+   * reinitialized from the flags serialized in the classifier.
+   *
+   * @param in The InputStream to load the serialized classifier from
+   * @param props This Properties object will be used to update the
+   *          SeqClassifierFlags which are read from the serialized classifier
+   * @throws IOException If there are problems accessing the input stream
+   * @throws ClassCastException If there are problems interpreting the serialized data
+   * @throws ClassNotFoundException If there are problems interpreting the serialized data
+   */
+  public abstract void loadClassifier(ObjectInputStream in, Properties props) throws IOException, ClassCastException,
+      ClassNotFoundException;
+
+  /**
+   * Loads a classifier from the file specified by loadPath. If loadPath ends in
+   * .gz, uses a GZIPInputStream, else uses a regular FileInputStream.
+   */
+  public void loadClassifier(String loadPath) throws ClassCastException, IOException, ClassNotFoundException {
+<span class="nc" id="L1484">    loadClassifier(loadPath, null);</span>
+<span class="nc" id="L1485">  }</span>
+
+  /**
+   * Loads a classifier from the file, classpath resource, or URL specified by loadPath. If loadPath ends in
+   * .gz, uses a GZIPInputStream.
+   */
+  public void loadClassifier(String loadPath, Properties props) throws ClassCastException, IOException, ClassNotFoundException {
+<span class="nc" id="L1492">    InputStream is = IOUtils.getInputStreamFromURLOrClasspathOrFileSystem(loadPath);</span>
+<span class="nc" id="L1493">    Timing t = new Timing();</span>
+<span class="nc" id="L1494">    loadClassifier(is, props);</span>
+<span class="nc" id="L1495">    is.close();</span>
+<span class="nc" id="L1496">    t.done(log, &quot;Loading classifier from &quot; + loadPath);</span>
+<span class="nc" id="L1497">  }</span>
+
+  public void loadClassifierNoExceptions(String loadPath) {
+<span class="nc" id="L1500">    loadClassifierNoExceptions(loadPath, null);</span>
+<span class="nc" id="L1501">  }</span>
+
+  public void loadClassifierNoExceptions(String loadPath, Properties props) {
+    try {
+<span class="nc" id="L1505">      loadClassifier(loadPath, props);</span>
+<span class="nc" id="L1506">    } catch (IOException e) {</span>
+<span class="nc" id="L1507">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1508">    } catch (ClassCastException|ClassNotFoundException e) {</span>
+<span class="nc" id="L1509">      throw new RuntimeException(e);</span>
+<span class="nc" id="L1510">    }</span>
+<span class="nc" id="L1511">  }</span>
+
+  public void loadClassifier(File file) throws ClassCastException, IOException, ClassNotFoundException {
+<span class="nc" id="L1514">    loadClassifier(file, null);</span>
+<span class="nc" id="L1515">  }</span>
+
+  /**
+   * Loads a classifier from the file specified. If the file's name ends in .gz,
+   * uses a GZIPInputStream, else uses a regular FileInputStream. This method
+   * closes the File when done.
+   *
+   * @param file Loads a classifier from this file.
+   * @param props Properties in this object will be used to overwrite those
+   *          specified in the serialized classifier
+   *
+   * @throws IOException If there are problems accessing the input stream
+   * @throws ClassCastException If there are problems interpreting the serialized data
+   * @throws ClassNotFoundException If there are problems interpreting the serialized data
+   */
+  public void loadClassifier(File file, Properties props) throws ClassCastException, IOException,
+      ClassNotFoundException {
+<span class="nc" id="L1532">    Timing t = new Timing();</span>
+    BufferedInputStream bis;
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">    if (file.getName().endsWith(&quot;.gz&quot;)) {</span>
+<span class="nc" id="L1535">      bis = new BufferedInputStream(new GZIPInputStream(new FileInputStream(file)));</span>
+    } else {
+<span class="nc" id="L1537">      bis = new BufferedInputStream(new FileInputStream(file));</span>
+    }
+<span class="nc" id="L1539">    loadClassifier(bis, props);</span>
+<span class="nc" id="L1540">    bis.close();</span>
+<span class="nc" id="L1541">    t.done(log, &quot;Loading classifier from &quot; + file.getAbsolutePath());</span>
+<span class="nc" id="L1542">  }</span>
+
+  public void loadClassifierNoExceptions(File file) {
+<span class="nc" id="L1545">    loadClassifierNoExceptions(file, null);</span>
+<span class="nc" id="L1546">  }</span>
+
+  public void loadClassifierNoExceptions(File file, Properties props) {
+    try {
+<span class="nc" id="L1550">      loadClassifier(file, props);</span>
+<span class="nc" id="L1551">    } catch (Exception e) {</span>
+<span class="nc" id="L1552">      log.info(&quot;Error deserializing &quot; + file.getAbsolutePath());</span>
+<span class="nc" id="L1553">      throw new RuntimeException(e);</span>
+<span class="nc" id="L1554">    }</span>
+<span class="nc" id="L1555">  }</span>
+
+  /**
+   * This function will load a classifier that is stored inside a jar file (if
+   * it is so stored). The classifier should be specified as its full path
+   * in a jar. If the classifier is not stored in the jar file or this is not run
+   * from inside a jar file, then this function will throw a RuntimeException.
+   *
+   * @param modelName
+   *          The name of the model file. Iff it ends in .gz, then it is assumed
+   *          to be gzip compressed.
+   * @param props
+   *          A Properties object which can override certain properties in the
+   *          serialized file, such as the DocumentReaderAndWriter. You can pass
+   *          in {@code null} to override nothing.
+   */
+  // todo [john bauer 2015]: This method may not be necessary.  Perhaps use the IOUtils equivalents
+  public void loadJarClassifier(String modelName, Properties props) {
+<span class="nc" id="L1573">    Timing t = new Timing();</span>
+    try {
+<span class="nc" id="L1575">      InputStream is = getClass().getResourceAsStream(modelName);</span>
+<span class="nc bnc" id="L1576" title="All 2 branches missed.">      if (modelName.endsWith(&quot;.gz&quot;)) {</span>
+<span class="nc" id="L1577">        is = new GZIPInputStream(is);</span>
+      }
+<span class="nc" id="L1579">      is = new BufferedInputStream(is);</span>
+<span class="nc" id="L1580">      loadClassifier(is, props);</span>
+<span class="nc" id="L1581">      is.close();</span>
+<span class="nc" id="L1582">      t.done(log, &quot;Loading CLASSPATH classifier &quot; + modelName);</span>
+<span class="nc" id="L1583">    } catch (Exception e) {</span>
+<span class="nc" id="L1584">      String msg = &quot;Error loading classifier from jar file (most likely you are not running this code from a jar file or the named classifier is not stored in the jar file)&quot;;</span>
+<span class="nc" id="L1585">      throw new RuntimeException(msg, e);</span>
+<span class="nc" id="L1586">    }</span>
+<span class="nc" id="L1587">  }</span>
+
+  private transient PrintWriter cliqueWriter;
+  private transient int writtenNum; // = 0;
+
+  /** Print the String features generated from a IN */
+  protected void printFeatures(IN wi, Collection&lt;String&gt; features) {
+<span class="nc bnc" id="L1594" title="All 4 branches missed.">    if (flags.printFeatures == null || writtenNum &gt;= flags.printFeaturesUpto) {</span>
+<span class="nc" id="L1595">      return;</span>
+    }
+<span class="nc bnc" id="L1597" title="All 2 branches missed.">    if (cliqueWriter == null) {</span>
+<span class="nc" id="L1598">      cliqueWriter = IOUtils.getPrintWriterOrDie(&quot;features-&quot; + flags.printFeatures + &quot;.txt&quot;);</span>
+<span class="nc" id="L1599">      writtenNum = 0;</span>
+    }
+<span class="nc bnc" id="L1601" title="All 2 branches missed.">    if (wi instanceof CoreLabel) {</span>
+<span class="nc" id="L1602">      cliqueWriter.print(wi.get(CoreAnnotations.TextAnnotation.class) + ' ' + wi.get(CoreAnnotations.PartOfSpeechAnnotation.class) + ' '</span>
+<span class="nc" id="L1603">          + wi.get(CoreAnnotations.GoldAnswerAnnotation.class) + '\t');</span>
+    } else {
+<span class="nc" id="L1605">      cliqueWriter.print(wi.get(CoreAnnotations.TextAnnotation.class)</span>
+<span class="nc" id="L1606">          + wi.get(CoreAnnotations.GoldAnswerAnnotation.class) + '\t');</span>
+    }
+<span class="nc" id="L1608">    boolean first = true;</span>
+<span class="nc" id="L1609">    List&lt;String&gt; featsList = new ArrayList&lt;&gt;(features);</span>
+<span class="nc" id="L1610">    Collections.sort(featsList);</span>
+<span class="nc bnc" id="L1611" title="All 2 branches missed.">    for (String feat : featsList) {</span>
+<span class="nc bnc" id="L1612" title="All 2 branches missed.">      if (first) {</span>
+<span class="nc" id="L1613">        first = false;</span>
+      } else {
+<span class="nc" id="L1615">        cliqueWriter.print(&quot; &quot;);</span>
+      }
+<span class="nc" id="L1617">      cliqueWriter.print(feat);</span>
+<span class="nc" id="L1618">    }</span>
+<span class="nc" id="L1619">    cliqueWriter.println();</span>
+<span class="nc" id="L1620">    writtenNum++;</span>
+<span class="nc" id="L1621">  }</span>
+
+  /** Print the String features generated from a token. */
+  protected void printFeatureLists(IN wi, Collection&lt;List&lt;String&gt;&gt; features) {
+<span class="nc bnc" id="L1625" title="All 4 branches missed.">    if (flags.printFeatures == null || writtenNum &gt;= flags.printFeaturesUpto) {</span>
+<span class="nc" id="L1626">      return;</span>
+    }
+<span class="nc" id="L1628">    printFeatureListsHelper(wi, features);</span>
+<span class="nc" id="L1629">  }</span>
+
+  // Separating this method out lets printFeatureLists be inlined, which is good since it is usually a no-op.
+  private void printFeatureListsHelper(IN wi, Collection&lt;List&lt;String&gt;&gt; features) {
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">    if (cliqueWriter == null) {</span>
+<span class="nc" id="L1634">      cliqueWriter = IOUtils.getPrintWriterOrDie(&quot;features-&quot; + flags.printFeatures + &quot;.txt&quot;);</span>
+<span class="nc" id="L1635">      writtenNum = 0;</span>
+    }
+<span class="nc bnc" id="L1637" title="All 2 branches missed.">    if (wi instanceof CoreLabel) {</span>
+<span class="nc" id="L1638">      cliqueWriter.print(wi.get(CoreAnnotations.TextAnnotation.class) + ' ' + wi.get(CoreAnnotations.PartOfSpeechAnnotation.class) + ' '</span>
+<span class="nc" id="L1639">          + wi.get(CoreAnnotations.GoldAnswerAnnotation.class) + '\t');</span>
+    } else {
+<span class="nc" id="L1641">      cliqueWriter.print(wi.get(CoreAnnotations.TextAnnotation.class)</span>
+<span class="nc" id="L1642">          + wi.get(CoreAnnotations.GoldAnswerAnnotation.class) + '\t');</span>
+    }
+<span class="nc" id="L1644">    boolean first = true;</span>
+<span class="nc bnc" id="L1645" title="All 2 branches missed.">    for (List&lt;String&gt; featList : features) {</span>
+<span class="nc" id="L1646">      List&lt;String&gt; sortedFeatList = new ArrayList&lt;&gt;(featList);</span>
+<span class="nc" id="L1647">      Collections.sort(sortedFeatList);</span>
+<span class="nc bnc" id="L1648" title="All 2 branches missed.">      for (String feat : sortedFeatList) {</span>
+<span class="nc bnc" id="L1649" title="All 2 branches missed.">        if (first) {</span>
+<span class="nc" id="L1650">          first = false;</span>
+        } else {
+<span class="nc" id="L1652">          cliqueWriter.print(&quot; &quot;);</span>
+        }
+<span class="nc" id="L1654">        cliqueWriter.print(feat);</span>
+<span class="nc" id="L1655">      }</span>
+<span class="nc" id="L1656">      cliqueWriter.print(&quot;  &quot;);</span>
+<span class="nc" id="L1657">    }</span>
+<span class="nc" id="L1658">    cliqueWriter.println();</span>
+<span class="nc" id="L1659">    writtenNum++;</span>
+<span class="nc" id="L1660">  }</span>
+
+  public int windowSize() {
+<span class="nc" id="L1663">    return windowSize;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

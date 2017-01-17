@@ -1,0 +1,1189 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogConditionalObjectiveFunction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.classify</a> &gt; <span class="el_source">LogConditionalObjectiveFunction.java</span></div><h1>LogConditionalObjectiveFunction.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.classify;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.lang.reflect.Array;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.concurrent.CountDownLatch;
+
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.math.ADMath;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.math.DoubleAD;
+import edu.stanford.nlp.optimization.AbstractStochasticCachingDiffUpdateFunction;
+import edu.stanford.nlp.optimization.StochasticCalculateMethods;
+import edu.stanford.nlp.util.ArgumentParser;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+
+
+/**
+ * Maximizes the conditional likelihood with a given prior.
+ *
+ * @author Dan Klein
+ * @author Galen Andrew
+ * @author Chris Cox (merged w/ SumConditionalObjectiveFunction, 2/16/05)
+ * @author Sarah Spikes (Templatization, allowing an {@code Iterable&lt;Datum&lt;L, F&gt;&gt;} to be passed in instead of a {@code GeneralDataset&lt;L, F&gt;})
+ * @author Angel Chang (support in place SGD - extend AbstractStochasticCachingDiffUpdateFunction)
+ * @author Christopher Manning (cleaned out the cruft and sped it up in 2014)
+ * @author Keenon Werling added some multithreading to the batch evaluations
+ */
+
+public class LogConditionalObjectiveFunction&lt;L, F&gt; extends AbstractStochasticCachingDiffUpdateFunction  {
+
+  /** A logger for this class */
+<span class="fc" id="L35">  private static Redwood.RedwoodChannels log = Redwood.channels(LogConditionalObjectiveFunction.class);</span>
+
+  protected final LogPrior prior;
+
+  protected final int numFeatures;
+  protected final int numClasses;
+
+  /** Normally, this contains the data. The first index is the datum number,
+   *  and then there is an array of feature indices for each datum.
+   */
+  protected final int[][] data;
+  /** Alternatively, the data may be available from an Iterable in not yet
+   *  indexed form.  (In 2014, it's not clear any code actually uses this option.)
+   *  And then you need an index for both.
+   */
+  protected final Iterable&lt;Datum&lt;L, F&gt;&gt; dataIterable;
+  protected final Index&lt;L&gt; labelIndex;
+  protected final Index&lt;F&gt; featureIndex;
+
+  /** Same size as data if the features have values; null if the features are binary. */
+  protected final double[][] values;
+  /** The label of each data index. */
+  protected final int[] labels;
+
+  protected final float[] dataWeights;
+
+  protected final boolean useSummedConditionalLikelihood; //whether to use sumConditional or logConditional
+
+  /** This is used to cache the numerator in batch methods. */
+<span class="pc" id="L64">  protected double[] derivativeNumerator = null;</span>
+
+  /** The only reason this is around is because the Prior Functions don't handle stochastic calculations yet. */
+<span class="pc" id="L67">  protected double [] priorDerivative = null;</span>
+
+  /** The flag to tell the gradient computations to multithread over the data.
+   * keenon (june 2015): On my machine,
+   * */
+<span class="pc" id="L72">  protected boolean parallelGradientCalculation = true;</span>
+
+  /** Multithreading gradient calculations is a bit cheaper if you reuse the threads. */
+<span class="pc" id="L75">  protected int threads = ArgumentParser.threads;</span>
+
+  @Override
+  public int domainDimension() {
+<span class="fc" id="L79">    return numFeatures * numClasses;</span>
+  }
+
+  @Override
+  public int dataDimension(){
+<span class="nc" id="L84">    return data.length;</span>
+  }
+
+  private int classOf(int index) {
+<span class="nc" id="L88">    return index % numClasses;</span>
+  }
+
+  private int featureOf(int index) {
+<span class="nc" id="L92">    return index / numClasses;</span>
+  }
+
+  /** Converts a Phi feature number and class index into an f(x,y) feature index. */
+  // [cdm2014: Tried inline this; no big gains.]
+  protected int indexOf(int f, int c) {
+<span class="fc" id="L98">    return f * numClasses + c;</span>
+  }
+
+  public double[][] to2D(double[] x) {
+<span class="fc" id="L102">    double[][] x2 = new double[numFeatures][numClasses];</span>
+<span class="fc bfc" id="L103" title="All 2 branches covered.">    for (int i = 0; i &lt; numFeatures; i++) {</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">      for (int j = 0; j &lt; numClasses; j++) {</span>
+<span class="fc" id="L105">        x2[i][j] = x[indexOf(i, j)];</span>
+      }
+    }
+<span class="fc" id="L108">    return x2;</span>
+  }
+
+  /**
+   * Calculate the conditional likelihood.
+   * If {@code useSummedConditionalLikelihood} is {@code false} (the default),
+   * this calculates standard(product) CL, otherwise this calculates summed CL.
+   * What's the difference?  See Klein and Manning's 2002 EMNLP paper.
+   */
+  @Override
+  protected void calculate(double[] x) {
+    //If the batchSize is 0 then use the regular calculate methods
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">    if (useSummedConditionalLikelihood) {</span>
+<span class="nc" id="L121">      calculateSCL(x);</span>
+    } else {
+<span class="fc" id="L123">      calculateCL(x);</span>
+    }
+<span class="fc" id="L125">  }</span>
+
+
+  /**
+   * This function is used to come up with an estimate of the value / gradient based on only a small
+   * portion of the data (referred to as the batchSize for lack of a better term.  In this case batch does
+   * not mean All!!  It should be thought of in the sense of &quot;a small batch of the data&quot;.
+   */
+  @Override
+  public void calculateStochastic(double[] x, double[] v, int[] batch) {
+
+<span class="nc bnc" id="L136" title="All 4 branches missed.">    if(method.calculatesHessianVectorProduct() &amp;&amp; v != null){</span>
+      //  This is used for Stochastic Methods that involve second order information (SMD for example)
+<span class="nc bnc" id="L138" title="All 2 branches missed.">      if(method.equals(StochasticCalculateMethods.AlgorithmicDifferentiation)){</span>
+<span class="nc" id="L139">        calculateStochasticAlgorithmicDifferentiation(x,v,batch);</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">      }else if(method.equals(StochasticCalculateMethods.IncorporatedFiniteDifference)){</span>
+<span class="nc" id="L141">        calculateStochasticFiniteDifference(x,v,finiteDifferenceStepSize,batch);</span>
+      }
+    } else{
+      //This is used for Stochastic Methods that don't need anything but the gradient (SGD)
+<span class="nc" id="L145">      calculateStochasticGradientLocal(x,batch);</span>
+    }
+
+<span class="nc" id="L148">  }</span>
+
+
+  /**
+   * Calculate the summed conditional likelihood of this data by summing
+   * conditional estimates.
+   *
+   */
+  private void calculateSCL(double[] x) {
+    //System.out.println(&quot;Checking at: &quot;+x[0]+&quot; &quot;+x[1]+&quot; &quot;+x[2]);
+<span class="nc" id="L158">    value = 0.0;</span>
+<span class="nc" id="L159">    Arrays.fill(derivative, 0.0);</span>
+<span class="nc" id="L160">    double[] sums = new double[numClasses];</span>
+<span class="nc" id="L161">    double[] probs = new double[numClasses];</span>
+    // double[] counts = new double[numClasses];
+    // Arrays.fill(counts, 0.0); // not needed; Java arrays zero initialized
+<span class="nc bnc" id="L164" title="All 2 branches missed.">    for (int d = 0; d &lt; data.length; d++) {</span>
+<span class="nc" id="L165">      int[] features = data[d];</span>
+      // activation
+<span class="nc" id="L167">      Arrays.fill(sums, 0.0);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L170">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L171">          sums[c] += x[i];</span>
+        }
+      }
+      // expectation (slower routine replaced by fast way)
+      // double total = Double.NEGATIVE_INFINITY;
+      // for (int c=0; c&lt;numClasses; c++) {
+      //   total = SloppyMath.logAdd(total, sums[c]);
+      // }
+<span class="nc" id="L179">      double total = ArrayMath.logSum(sums);</span>
+<span class="nc" id="L180">      int ld = labels[d];</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L182">        probs[c] = Math.exp(sums[c] - total);</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L184">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L185">          derivative[i] += probs[ld] * probs[c];</span>
+        }
+      }
+      // observed
+<span class="nc bnc" id="L189" title="All 2 branches missed.">      for (int feature : features) {</span>
+<span class="nc" id="L190">        int i = indexOf(feature, labels[d]);</span>
+<span class="nc" id="L191">        derivative[i] -= probs[ld];</span>
+      }
+<span class="nc" id="L193">      value -= probs[ld];</span>
+    }
+    // priors
+    if (true) {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L198">        double k = 1.0;</span>
+<span class="nc" id="L199">        double w = x[i];</span>
+<span class="nc" id="L200">        value += k * w * w / 2.0;</span>
+<span class="nc" id="L201">        derivative[i] += k * w;</span>
+      }
+    }
+<span class="nc" id="L204">  }</span>
+
+  /**
+   * Calculate the conditional likelihood of this data by multiplying
+   * conditional estimates. Full dataset batch estimation.
+   */
+  private void calculateCL(double[] x) {
+<span class="pc bpc" id="L211" title="1 of 2 branches missed.">    if (values != null) {</span>
+<span class="nc" id="L212">      rvfcalculate(x);</span>
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">    } else if (dataIterable != null) {</span>
+<span class="nc" id="L214">      calculateCLiterable(x);</span>
+    } else {
+<span class="fc" id="L216">      calculateCLbatch(x);</span>
+    }
+<span class="fc" id="L218">  }</span>
+
+  private class CLBatchDerivativeCalculation implements Runnable {
+    int numThreads;
+    int threadIdx;
+<span class="fc" id="L223">    double localValue = 0.0;</span>
+    double[] x;
+    int[] batch;
+    double[] localDerivative;
+    CountDownLatch latch;
+
+<span class="fc" id="L229">    public CLBatchDerivativeCalculation(int numThreads, int threadIdx, int[] batch, double[] x, int derivativeSize, CountDownLatch latch) {</span>
+<span class="fc" id="L230">      this.numThreads = numThreads;</span>
+<span class="fc" id="L231">      this.threadIdx = threadIdx;</span>
+<span class="fc" id="L232">      this.x = x;</span>
+<span class="fc" id="L233">      this.batch = batch;</span>
+<span class="fc" id="L234">      this.localDerivative = new double[derivativeSize];</span>
+<span class="fc" id="L235">      this.latch = latch;</span>
+<span class="fc" id="L236">    }</span>
+
+    @Override
+    public void run() {
+<span class="fc" id="L240">      double[] sums = new double[numClasses];</span>
+<span class="fc" id="L241">      double[] probs = new double[numClasses];</span>
+
+      // TODO: could probably get slightly better speedup if threads took linear subsequences, for cacheing
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">      int batchSize = batch == null ? data.length : batch.length;</span>
+<span class="fc bfc" id="L245" title="All 2 branches covered.">      for (int m = threadIdx; m &lt; batchSize; m += numThreads) {</span>
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">        int d = batch == null ? m : batch[m];</span>
+
+        // activation
+<span class="fc" id="L249">        Arrays.fill(sums, 0.0);</span>
+
+<span class="fc" id="L251">        int[] featuresArr = data[d];</span>
+
+<span class="fc bfc" id="L253" title="All 2 branches covered.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">          for (int feature : featuresArr) {</span>
+<span class="fc" id="L255">            int i = indexOf(feature, c);</span>
+<span class="fc" id="L256">            sums[c] += x[i];</span>
+          }
+        }
+        // expectation (slower routine replaced by fast way)
+        // double total = Double.NEGATIVE_INFINITY;
+        // for (int c=0; c&lt;numClasses; c++) {
+        //   total = SloppyMath.logAdd(total, sums[c]);
+        // }
+<span class="fc" id="L264">        double total = ArrayMath.logSum(sums);</span>
+<span class="fc bfc" id="L265" title="All 2 branches covered.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="fc" id="L266">          probs[c] = Math.exp(sums[c] - total);</span>
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">          if (dataWeights != null) {</span>
+<span class="nc" id="L268">            probs[c] *= dataWeights[d];</span>
+          }
+        }
+
+<span class="fc bfc" id="L272" title="All 2 branches covered.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="fc bfc" id="L273" title="All 2 branches covered.">          for (int feature : featuresArr) {</span>
+<span class="fc" id="L274">            int i = indexOf(feature, c);</span>
+<span class="fc" id="L275">            localDerivative[i] += probs[c];</span>
+          }
+        }
+
+<span class="fc" id="L279">        int labelindex = labels[d];</span>
+<span class="fc" id="L280">        double dV = sums[labelindex] - total;</span>
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L282">          dV *= dataWeights[d];</span>
+        }
+<span class="fc" id="L284">        localValue -= dV;</span>
+      }
+
+<span class="fc" id="L287">      latch.countDown();</span>
+<span class="fc" id="L288">    }</span>
+  }
+
+  private void calculateCLbatch(double[] x) {
+    //System.out.println(&quot;Checking at: &quot;+x[0]+&quot; &quot;+x[1]+&quot; &quot;+x[2]);
+<span class="fc" id="L293">    value = 0.0;</span>
+    // [cdm Mar 2014] This next bit seems unnecessary: derivative is allocated by ensure() in AbstractCachingDiffFunction
+    // before calculate() is called; and after the next block, derivativeNumerator is copied into it.
+    // if (derivative == null) {
+    //   derivative = new double[x.length];
+    // } else {
+    //   Arrays.fill(derivative, 0.0);
+    // }
+
+<span class="fc bfc" id="L302" title="All 2 branches covered.">    if (derivativeNumerator == null) {</span>
+<span class="fc" id="L303">      derivativeNumerator = new double[x.length];</span>
+<span class="fc bfc" id="L304" title="All 2 branches covered.">      for (int d = 0; d &lt; data.length; d++) {</span>
+<span class="fc" id="L305">        int[] features = data[d];</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">        for (int feature : features) {</span>
+<span class="fc" id="L307">          int i = indexOf(feature, labels[d]);</span>
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">          if (dataWeights == null) {</span>
+<span class="fc" id="L309">            derivativeNumerator[i] -= 1;</span>
+          } else {
+<span class="nc" id="L311">            derivativeNumerator[i] -= dataWeights[d];</span>
+          }
+        }
+      }
+    }
+
+<span class="fc" id="L317">    copy(derivative, derivativeNumerator);</span>
+    //    Arrays.fill(derivative, 0.0);
+    //    double[] counts = new double[numClasses];
+    //    Arrays.fill(counts, 0.0);
+
+<span class="pc bpc" id="L322" title="2 of 4 branches missed.">    if (parallelGradientCalculation &amp;&amp; threads &gt; 1) {</span>
+      // Launch several threads (reused out of our fixed pool) to handle the computation
+      @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L325">      CLBatchDerivativeCalculation[] runnables = (CLBatchDerivativeCalculation[])Array.newInstance(CLBatchDerivativeCalculation.class, threads);</span>
+<span class="fc" id="L326">      CountDownLatch latch = new CountDownLatch(threads);</span>
+<span class="fc bfc" id="L327" title="All 2 branches covered.">      for (int i = 0; i &lt; threads; i++) {</span>
+<span class="fc" id="L328">        runnables[i] = new CLBatchDerivativeCalculation(threads, i, null, x, derivative.length, latch);</span>
+<span class="fc" id="L329">        new Thread(runnables[i]).start();</span>
+      }
+      try {
+<span class="fc" id="L332">        latch.await();</span>
+<span class="nc" id="L333">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L334">        throw new RuntimeInterruptedException(e);</span>
+<span class="fc" id="L335">      }</span>
+
+<span class="fc bfc" id="L337" title="All 2 branches covered.">      for (int i = 0; i &lt; threads; i++) {</span>
+<span class="fc" id="L338">        value += runnables[i].localValue;</span>
+<span class="fc bfc" id="L339" title="All 2 branches covered.">        for (int j = 0; j &lt; derivative.length; j++) {</span>
+<span class="fc" id="L340">          derivative[j] += runnables[i].localDerivative[j];</span>
+        }
+      }
+<span class="fc" id="L343">    }</span>
+    else {
+<span class="nc" id="L345">      double[] sums = new double[numClasses];</span>
+<span class="nc" id="L346">      double[] probs = new double[numClasses];</span>
+
+<span class="nc bnc" id="L348" title="All 2 branches missed.">      for (int d = 0; d &lt; data.length; d++) {</span>
+        // activation
+<span class="nc" id="L350">        Arrays.fill(sums, 0.0);</span>
+
+<span class="nc" id="L352">        int[] featuresArr = data[d];</span>
+
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        for (int feature : featuresArr) {</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">          for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L356">            int i = indexOf(feature, c);</span>
+<span class="nc" id="L357">            sums[c] += x[i];</span>
+          }
+        }
+        // expectation (slower routine replaced by fast way)
+        // double total = Double.NEGATIVE_INFINITY;
+        // for (int c=0; c&lt;numClasses; c++) {
+        //   total = SloppyMath.logAdd(total, sums[c]);
+        // }
+<span class="nc" id="L365">        double total = ArrayMath.logSum(sums);</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L367">          probs[c] = Math.exp(sums[c] - total);</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">          if (dataWeights != null) {</span>
+<span class="nc" id="L369">            probs[c] *= dataWeights[d];</span>
+          }
+        }
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        for (int feature : featuresArr) {</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">          for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L375">            int i = indexOf(feature, c);</span>
+<span class="nc" id="L376">            derivative[i] += probs[c];</span>
+          }
+        }
+
+<span class="nc" id="L380">        int labelindex = labels[d];</span>
+<span class="nc" id="L381">        double dV = sums[labelindex] - total;</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L383">          dV *= dataWeights[d];</span>
+        }
+<span class="nc" id="L385">        value -= dV;</span>
+      }
+    }
+
+<span class="fc" id="L389">    value += prior.compute(x, derivative);</span>
+<span class="fc" id="L390">  }</span>
+
+
+  private void calculateCLiterable(double[] x) {
+    //System.out.println(&quot;Checking at: &quot;+x[0]+&quot; &quot;+x[1]+&quot; &quot;+x[2]);
+<span class="nc" id="L395">    value = 0.0;</span>
+    // [cdm Mar 2014] This next bit seems unnecessary: derivative is allocated by ensure() in AbstractCachingDiffFunction
+    // before calculate() is called; and after the next block, derivativeNumerator is copied into it.
+    // if (derivative == null) {
+    //   derivative = new double[x.length];
+    // } else {
+    //   Arrays.fill(derivative, 0.0);
+    // }
+
+<span class="nc bnc" id="L404" title="All 2 branches missed.">    if (derivativeNumerator == null) {</span>
+<span class="nc" id="L405">      derivativeNumerator = new double[x.length];</span>
+      //use dataIterable if data is null &amp; vice versa
+      //TODO: Make sure this work as expected!!
+      //int index = 0;
+<span class="nc bnc" id="L409" title="All 2 branches missed.">      for (Datum&lt;L, F&gt; datum : dataIterable) {</span>
+<span class="nc" id="L410">        Collection&lt;F&gt; features = datum.asFeatures();</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        for (F feature : features) {</span>
+<span class="nc" id="L412">          int i = indexOf(featureIndex.indexOf(feature), labelIndex.indexOf(datum.label()));</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">          if (dataWeights == null) {</span>
+<span class="nc" id="L414">            derivativeNumerator[i] -= 1;</span>
+          } /*else {
+              derivativeNumerator[i] -= dataWeights[index];
+            }*/
+<span class="nc" id="L418">        }</span>
+<span class="nc" id="L419">      }</span>
+    }
+
+<span class="nc" id="L422">    copy(derivative, derivativeNumerator);</span>
+    //    Arrays.fill(derivative, 0.0);
+<span class="nc" id="L424">    double[] sums = new double[numClasses];</span>
+<span class="nc" id="L425">    double[] probs = new double[numClasses];</span>
+    //    double[] counts = new double[numClasses];
+    //    Arrays.fill(counts, 0.0);
+
+<span class="nc bnc" id="L429" title="All 2 branches missed.">    for (Datum&lt;L, F&gt; datum : dataIterable) {</span>
+      // activation
+<span class="nc" id="L431">      Arrays.fill(sums, 0.0);</span>
+<span class="nc" id="L432">      Collection&lt;F&gt; features = datum.asFeatures();</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">      for (F feature : features) {</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L435">          int i = indexOf(featureIndex.indexOf(feature), c);</span>
+<span class="nc" id="L436">          sums[c] += x[i];</span>
+        }
+<span class="nc" id="L438">      }</span>
+      // expectation (slower routine replaced by fast way)
+      // double total = Double.NEGATIVE_INFINITY;
+      // for (int c=0; c&lt;numClasses; c++) {
+      //   total = SloppyMath.logAdd(total, sums[c]);
+      // }
+<span class="nc" id="L444">      double total = ArrayMath.logSum(sums);</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L446">        probs[c] = Math.exp(sums[c] - total);</span>
+      }
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">      for (F feature : features) {</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L451">          int i = indexOf(featureIndex.indexOf(feature), c);</span>
+<span class="nc" id="L452">          derivative[i] += probs[c];</span>
+        }
+<span class="nc" id="L454">      }</span>
+
+<span class="nc" id="L456">      int label = this.labelIndex.indexOf(datum.label());</span>
+<span class="nc" id="L457">      double dV = sums[label] - total;</span>
+<span class="nc" id="L458">      value -= dV;</span>
+<span class="nc" id="L459">    }</span>
+
+<span class="nc" id="L461">    value += prior.compute(x, derivative);</span>
+<span class="nc" id="L462">  }</span>
+
+
+  public void calculateStochasticFiniteDifference(double[] x,double[] v, double h, int[] batch){
+    //  THOUGHTS:
+    //  does applying the renormalization (g(x+hv)-g(x)) / h at each step along the way
+    //  introduce too much error to makes this method numerically accurate?
+    //  akleeman Feb 23 2007
+
+    //  Answer to my own question:     Feb 25th
+    //      Doesn't look like it!!  With h = 1e-4 it seems like the Finite Difference makes almost
+    //     exactly the same step as the exact hessian vector product calculated through AD.
+    //     That said it's probably (in the case of the Log Conditional Objective function) logical
+    //     to only use finite difference.  Unless of course the function is somehow nearly singular,
+    //     in which case finite difference could turn what is a convex problem into a singular proble... NOT GOOD.
+
+<span class="nc bnc" id="L478" title="All 2 branches missed.">    if (values != null) {</span>
+<span class="nc" id="L479">      rvfcalculate(x);</span>
+<span class="nc" id="L480">      return;</span>
+    }
+
+<span class="nc" id="L483">    value = 0.0;</span>
+
+<span class="nc bnc" id="L485" title="All 2 branches missed.">    if (priorDerivative == null) {</span>
+<span class="nc" id="L486">      priorDerivative = new double[x.length];</span>
+    }
+
+<span class="nc" id="L489">    double priorFactor = batch.length/(data.length*prior.getSigma()*prior.getSigma());</span>
+
+<span class="nc" id="L491">    derivative = ArrayMath.multiply(x,priorFactor);</span>
+<span class="nc" id="L492">    HdotV = ArrayMath.multiply(v,priorFactor);</span>
+
+    //Arrays.fill(derivative, 0.0);
+<span class="nc" id="L495">    double[] sums = new double[numClasses];</span>
+<span class="nc" id="L496">    double[] sumsV = new double[numClasses];</span>
+<span class="nc" id="L497">    double[] probs = new double[numClasses];</span>
+<span class="nc" id="L498">    double[] probsV = new double[numClasses];</span>
+
+<span class="nc bnc" id="L500" title="All 2 branches missed.">    for (int m : batch) {</span>
+
+      //Sets the index based on the current batch
+<span class="nc" id="L503">      int[] features = data[m];</span>
+      // activation
+
+<span class="nc" id="L506">      Arrays.fill(sums, 0.0);</span>
+<span class="nc" id="L507">      Arrays.fill(sumsV, 0.0);</span>
+
+<span class="nc bnc" id="L509" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L511">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L512">          sums[c] += x[i];</span>
+<span class="nc" id="L513">          sumsV[c] += x[i] + h * v[i];</span>
+        }
+      }
+
+<span class="nc" id="L517">      double total = ArrayMath.logSum(sums);</span>
+<span class="nc" id="L518">      double totalV = ArrayMath.logSum(sumsV);</span>
+
+<span class="nc bnc" id="L520" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L521">        probs[c] = Math.exp(sums[c] - total);</span>
+<span class="nc" id="L522">        probsV[c] = Math.exp(sumsV[c] - totalV);</span>
+
+<span class="nc bnc" id="L524" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L525">          probs[c] *= dataWeights[m];</span>
+<span class="nc" id="L526">          probsV[c] *= dataWeights[m];</span>
+        }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L529">          int i = indexOf(feature, c);</span>
+          //derivative[i] += (-1);
+<span class="nc" id="L531">          derivative[i] += probs[c];</span>
+<span class="nc" id="L532">          HdotV[i] += (probsV[c] - probs[c]) / h;</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">          if (c == labels[m]) {</span>
+<span class="nc" id="L534">            derivative[i] -= 1;</span>
+          }
+
+        }
+      }
+
+<span class="nc" id="L540">      double dV = sums[labels[m]] - total;</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">      if (dataWeights != null) {</span>
+<span class="nc" id="L542">        dV *= dataWeights[m];</span>
+      }
+<span class="nc" id="L544">      value -= dV;</span>
+    }
+
+    //Why was this being copied?  -akleeman
+    //double[] tmpDeriv = new double[derivative.length];
+    //System.arraycopy(derivative,0,tmpDeriv,0,derivative.length);
+<span class="nc" id="L550">    value += ((double) batch.length)/((double) data.length)*prior.compute(x,priorDerivative);</span>
+<span class="nc" id="L551">  }</span>
+
+
+
+
+  public void calculateStochasticGradientLocal(double[] x, int[] batch) {
+<span class="nc bnc" id="L557" title="All 2 branches missed.">    if (values != null) {</span>
+<span class="nc" id="L558">      rvfcalculate(x);</span>
+<span class="nc" id="L559">      return;</span>
+    }
+
+<span class="nc" id="L562">    value = 0.0;</span>
+
+<span class="nc" id="L564">    int batchSize = batch.length;</span>
+
+<span class="nc bnc" id="L566" title="All 2 branches missed.">    if (priorDerivative == null) {</span>
+<span class="nc" id="L567">      priorDerivative = new double[x.length];</span>
+    }
+
+<span class="nc" id="L570">    double priorFactor = batchSize/(data.length*prior.getSigma()*prior.getSigma());</span>
+
+<span class="nc" id="L572">    derivative = ArrayMath.multiply(x,priorFactor);</span>
+
+    //Arrays.fill(derivative, 0.0);
+<span class="nc" id="L575">    double[] sums = new double[numClasses];</span>
+    //double[] sumsV = new double[numClasses];
+<span class="nc" id="L577">    double[] probs = new double[numClasses];</span>
+    //double[] probsV = new double[numClasses];
+
+<span class="nc bnc" id="L580" title="All 2 branches missed.">    for (int m : batch) {</span>
+
+      //Sets the index based on the current batch
+<span class="nc" id="L583">      int[] features = data[m];</span>
+      // activation
+
+<span class="nc" id="L586">      Arrays.fill(sums, 0.0);</span>
+      //Arrays.fill(sumsV,0.0);
+
+<span class="nc bnc" id="L589" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L591">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L592">          sums[c] += x[i];</span>
+        }
+      }
+
+<span class="nc" id="L596">      double total = ArrayMath.logSum(sums);</span>
+      //double totalV = ArrayMath.logSum(sumsV);
+
+<span class="nc bnc" id="L599" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L600">        probs[c] = Math.exp(sums[c] - total);</span>
+        //probsV[c] = Math.exp(sumsV[c]- totalV);
+
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L604">          probs[c] *= dataWeights[m];</span>
+          //probsV[c] *= dataWeights[m];
+        }
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L608">          int i = indexOf(feature, c);</span>
+          //derivative[i] += (-1);
+<span class="nc" id="L610">          derivative[i] += probs[c];</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">          if (c == labels[m]) {</span>
+<span class="nc" id="L612">            derivative[i] -= 1;</span>
+          }
+
+        }
+      }
+
+<span class="nc" id="L618">      double dV = sums[labels[m]] - total;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">      if (dataWeights != null) {</span>
+<span class="nc" id="L620">        dV *= dataWeights[m];</span>
+      }
+<span class="nc" id="L622">      value -= dV;</span>
+    }
+
+<span class="nc" id="L625">    value += ((double) batchSize)/((double) data.length)*prior.compute(x,priorDerivative);</span>
+<span class="nc" id="L626">  }</span>
+
+  @Override
+  public double valueAt(double[] x, double xscale, int[] batch) {
+<span class="nc" id="L630">    value = 0.0;</span>
+<span class="nc" id="L631">    double[] sums = new double[numClasses];</span>
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">    for (int m : batch) {</span>
+      //Sets the index based on the current batch
+<span class="nc" id="L635">      int[] features = data[m];</span>
+<span class="nc" id="L636">      Arrays.fill(sums, 0.0);</span>
+
+<span class="nc bnc" id="L638" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L640">          int i = indexOf(features[f], c);</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">          if (values != null) {</span>
+<span class="nc" id="L642">            sums[c] += x[i] * xscale * values[m][f];</span>
+          } else {
+<span class="nc" id="L644">            sums[c] += x[i] * xscale;</span>
+          }
+        }
+      }
+
+<span class="nc" id="L649">      double total = ArrayMath.logSum(sums);</span>
+<span class="nc" id="L650">      double dV = sums[labels[m]] - total;</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">      if (dataWeights != null) {</span>
+<span class="nc" id="L652">        dV *= dataWeights[m];</span>
+      }
+<span class="nc" id="L654">      value -= dV;</span>
+    }
+<span class="nc" id="L656">    return value;</span>
+  }
+
+  @Override
+  public double calculateStochasticUpdate(double[] x, double xscale, int[] batch, double gain) {
+<span class="nc" id="L661">    value = 0.0;</span>
+
+    // Double check that we don't have a mismatch between parallel and batch size settings
+
+<span class="nc bnc" id="L665" title="All 4 branches missed.">    if (parallelGradientCalculation &amp;&amp; threads &gt; 1) {</span>
+<span class="nc" id="L666">      int examplesPerProcessor = 50;</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">      if (batch.length &lt;= Runtime.getRuntime().availableProcessors() * examplesPerProcessor) {</span>
+<span class="nc" id="L668">        log.info(&quot;\n\n***************&quot;);</span>
+<span class="nc" id="L669">        log.info(&quot;CONFIGURATION ERROR: YOUR BATCH SIZE DOESN'T MEET PARALLEL MINIMUM SIZE FOR PERFORMANCE&quot;);</span>
+<span class="nc" id="L670">        log.info(&quot;Batch size: &quot; + batch.length);</span>
+<span class="nc" id="L671">        log.info(&quot;CPUS: &quot; + Runtime.getRuntime().availableProcessors());</span>
+<span class="nc" id="L672">        log.info(&quot;Minimum batch size per CPU: &quot; + examplesPerProcessor);</span>
+<span class="nc" id="L673">        log.info(&quot;MINIMIM BATCH SIZE ON THIS MACHINE: &quot; + (Runtime.getRuntime().availableProcessors() * examplesPerProcessor));</span>
+<span class="nc" id="L674">        log.info(&quot;TURNING OFF PARALLEL GRADIENT COMPUTATION&quot;);</span>
+<span class="nc" id="L675">        log.info(&quot;***************\n&quot;);</span>
+<span class="nc" id="L676">        parallelGradientCalculation = false;</span>
+      }
+    }
+
+<span class="nc bnc" id="L680" title="All 4 branches missed.">    if (parallelGradientCalculation &amp;&amp; threads &gt; 1) {</span>
+      // Launch several threads (reused out of our fixed pool) to handle the computation
+      @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L683">      CLBatchDerivativeCalculation[] runnables = (CLBatchDerivativeCalculation[])Array.newInstance(CLBatchDerivativeCalculation.class, threads);</span>
+<span class="nc" id="L684">      CountDownLatch latch = new CountDownLatch(threads);</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">      for (int i = 0; i &lt; threads; i++) {</span>
+<span class="nc" id="L686">        runnables[i] = new CLBatchDerivativeCalculation(threads, i, batch, x, x.length, latch);</span>
+<span class="nc" id="L687">        new Thread(runnables[i]).start();</span>
+      }
+      try {
+<span class="nc" id="L690">        latch.await();</span>
+<span class="nc" id="L691">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L692">        throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L693">      }</span>
+
+<span class="nc bnc" id="L695" title="All 2 branches missed.">      for (int i = 0; i &lt; threads; i++) {</span>
+<span class="nc" id="L696">        value += runnables[i].localValue;</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">        for (int j = 0; j &lt; x.length; j++) {</span>
+<span class="nc" id="L698">          x[j] += runnables[i].localDerivative[j] * xscale * gain;</span>
+        }
+      }
+<span class="nc" id="L701">    }</span>
+    else {
+<span class="nc" id="L703">      double[] sums = new double[numClasses];</span>
+<span class="nc" id="L704">      double[] probs = new double[numClasses];</span>
+
+<span class="nc bnc" id="L706" title="All 2 branches missed.">      for (int m : batch) {</span>
+
+        // Sets the index based on the current batch
+<span class="nc" id="L709">        int[] features = data[m];</span>
+        // activation
+
+<span class="nc" id="L712">        Arrays.fill(sums, 0.0);</span>
+
+<span class="nc bnc" id="L714" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">          for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L716">            int i = indexOf(features[f], c);</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">            if (values != null) {</span>
+<span class="nc" id="L718">              sums[c] += x[i] * xscale * values[m][f];</span>
+            } else {
+<span class="nc" id="L720">              sums[c] += x[i] * xscale;</span>
+            }
+          }
+        }
+
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L726">          int i = indexOf(features[f], labels[m]);</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">          double v = (values != null) ? values[m][f] : 1;</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">          double delta = (dataWeights != null) ? dataWeights[m] * v : v;</span>
+<span class="nc" id="L729">          x[i] += delta * gain;</span>
+        }
+
+<span class="nc" id="L732">        double total = ArrayMath.logSum(sums);</span>
+
+<span class="nc bnc" id="L734" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L735">          probs[c] = Math.exp(sums[c] - total);</span>
+
+<span class="nc bnc" id="L737" title="All 2 branches missed.">          if (dataWeights != null) {</span>
+<span class="nc" id="L738">            probs[c] *= dataWeights[m];</span>
+          }
+<span class="nc bnc" id="L740" title="All 2 branches missed.">          for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L741">            int i = indexOf(features[f], c);</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            double v = (values != null) ? values[m][f] : 1;</span>
+<span class="nc" id="L743">            double delta = probs[c] * v;</span>
+<span class="nc" id="L744">            x[i] -= delta * gain;</span>
+          }
+        }
+
+<span class="nc" id="L748">        double dV = sums[labels[m]] - total;</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L750">          dV *= dataWeights[m];</span>
+        }
+<span class="nc" id="L752">        value -= dV;</span>
+      }
+    }
+<span class="nc" id="L755">    return value;</span>
+  }
+
+  @Override
+  public void calculateStochasticGradient(double[] x, int[] batch) {
+<span class="nc bnc" id="L760" title="All 2 branches missed.">    if (derivative == null) {</span>
+<span class="nc" id="L761">      derivative = new double[domainDimension()];</span>
+    }
+<span class="nc" id="L763">    Arrays.fill(derivative, 0.0);</span>
+<span class="nc" id="L764">    double[] sums = new double[numClasses];</span>
+<span class="nc" id="L765">    double[] probs = new double[numClasses];</span>
+    //double[] counts = new double[numClasses];
+    // Arrays.fill(counts, 0.0); // not needed; Java arrays zero initialized
+<span class="nc bnc" id="L768" title="All 2 branches missed.">    for (int d : batch) {</span>
+
+      //Sets the index based on the current batch
+<span class="nc" id="L771">      int[] features = data[d];</span>
+      // activation
+<span class="nc" id="L773">      Arrays.fill(sums, 0.0);</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L776">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L777">          sums[c] += x[i];</span>
+        }
+      }
+      // expectation (slower routine replaced by fast way)
+      // double total = Double.NEGATIVE_INFINITY;
+      // for (int c=0; c&lt;numClasses; c++) {
+      //   total = SloppyMath.logAdd(total, sums[c]);
+      // }
+<span class="nc" id="L785">      double total = ArrayMath.logSum(sums);</span>
+<span class="nc" id="L786">      int ld = labels[d];</span>
+<span class="nc bnc" id="L787" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L788">        probs[c] = Math.exp(sums[c] - total);</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L790">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L791">          derivative[i] += probs[ld] * probs[c];</span>
+        }
+      }
+      // observed
+<span class="nc bnc" id="L795" title="All 2 branches missed.">      for (int feature : features) {</span>
+<span class="nc" id="L796">        int i = indexOf(feature, labels[d]);</span>
+<span class="nc" id="L797">        derivative[i] -= probs[ld];</span>
+      }
+    }
+<span class="nc" id="L800">  }</span>
+
+
+  protected void calculateStochasticAlgorithmicDifferentiation(double[] x, double[] v, int[] batch) {
+
+<span class="nc" id="L805">    log.info(&quot;*&quot;);</span>
+
+    //Initialize
+<span class="nc" id="L808">    value = 0.0;</span>
+
+    //initialize any variables
+<span class="nc" id="L811">    DoubleAD[] derivativeAD = new DoubleAD[x.length];</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">    for (int i = 0; i &lt; x.length;i++) {</span>
+<span class="nc" id="L813">      derivativeAD[i] = new DoubleAD(0.0,0.0);</span>
+    }
+
+<span class="nc" id="L816">    DoubleAD[] xAD = new DoubleAD[x.length];</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">    for (int i = 0; i &lt; x.length;i++){</span>
+<span class="nc" id="L818">      xAD[i] = new DoubleAD(x[i],v[i]);</span>
+    }
+
+    // Initialize the sums
+<span class="nc" id="L822">    DoubleAD[] sums = new DoubleAD[numClasses];</span>
+<span class="nc bnc" id="L823" title="All 2 branches missed.">    for (int c = 0; c&lt;numClasses;c++){</span>
+<span class="nc" id="L824">      sums[c] = new DoubleAD(0,0);</span>
+    }
+
+<span class="nc" id="L827">    DoubleAD[] probs = new DoubleAD[numClasses];</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">    for (int c = 0; c&lt;numClasses;c++) {</span>
+<span class="nc" id="L829">      probs[c] = new DoubleAD(0,0);</span>
+    }
+
+    //long curTime = System.currentTimeMillis();
+    // Copy the Derivative numerator, and set up the vector V to be used for Hess*V
+<span class="nc bnc" id="L834" title="All 2 branches missed.">    for (int i = 0; i &lt; x.length;i++){</span>
+<span class="nc" id="L835">      xAD[i].set(x[i],v[i]);</span>
+<span class="nc" id="L836">      derivativeAD[i].set(0.0,0.0);</span>
+    }
+
+    //log.info(System.currentTimeMillis() - curTime + &quot; - &quot;);
+    //curTime = System.currentTimeMillis();
+
+<span class="nc bnc" id="L842" title="All 2 branches missed.">    for (int d = 0; d &lt;batch.length ; d++) {</span>
+
+      //Sets the index based on the current batch
+<span class="nc" id="L845">      int m = (curElement + d) % data.length;</span>
+
+<span class="nc" id="L847">      int[] features = data[m];</span>
+
+<span class="nc bnc" id="L849" title="All 2 branches missed.">      for (int c = 0; c&lt;numClasses;c++){</span>
+<span class="nc" id="L850">        sums[c].set(0.0,0.0);</span>
+      }
+
+
+<span class="nc bnc" id="L854" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L855" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L856">          int i = indexOf(feature, c);</span>
+<span class="nc" id="L857">          sums[c] = ADMath.plus(sums[c], xAD[i]);</span>
+        }
+      }
+
+<span class="nc" id="L861">      DoubleAD total = ADMath.logSum(sums);</span>
+
+<span class="nc bnc" id="L863" title="All 2 branches missed.">      for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L864">        probs[c] = ADMath.exp( ADMath.minus(sums[c], total) );</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L866">          probs[c] = ADMath.multConst(probs[c], dataWeights[d]);</span>
+        }
+<span class="nc bnc" id="L868" title="All 2 branches missed.">        for (int feature : features) {</span>
+<span class="nc" id="L869">          int i = indexOf(feature, c);</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">          if (c == labels[m]) {</span>
+<span class="nc" id="L871">            derivativeAD[i].plusEqualsConst(-1.0);</span>
+          }
+<span class="nc" id="L873">          derivativeAD[i].plusEquals(probs[c]);</span>
+        }
+      }
+
+<span class="nc" id="L877">      double dV = sums[labels[m]].getval() - total.getval();</span>
+<span class="nc bnc" id="L878" title="All 2 branches missed.">      if (dataWeights != null) {</span>
+<span class="nc" id="L879">        dV *= dataWeights[d];</span>
+      }
+<span class="nc" id="L881">      value -= dV;</span>
+    }
+
+    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    // DANGEROUS!!!!!!! Divide by Zero possible!!!!!!!!!!
+    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    // Need to modify the prior class to handle AD  -akleeman
+
+    //log.info(System.currentTimeMillis() - curTime + &quot; - &quot;);
+    //curTime = System.currentTimeMillis();
+
+<span class="nc" id="L892">    double[] tmp = new double[x.length];</span>
+<span class="nc bnc" id="L893" title="All 2 branches missed.">    for(int i = 0; i &lt; x.length; i++){</span>
+<span class="nc" id="L894">      tmp[i] = derivativeAD[i].getval();</span>
+<span class="nc" id="L895">      derivativeAD[i].plusEquals(ADMath.multConst(xAD[i], batch.length/(data.length * prior.getSigma()*prior.getSigma())));</span>
+<span class="nc" id="L896">      derivative[i] = derivativeAD[i].getval();</span>
+<span class="nc" id="L897">      HdotV[i] = derivativeAD[i].getdot();</span>
+    }
+<span class="nc" id="L899">    value += ((double) batch.length)/((double) data.length)*prior.compute(x, tmp);</span>
+
+    //log.info(System.currentTimeMillis() - curTime + &quot; - &quot;);
+    //log.info(&quot;&quot;);
+<span class="nc" id="L903">  }</span>
+
+  private class RVFDerivativeCalculation implements Runnable {
+    int numThreads;
+    int threadIdx;
+<span class="nc" id="L908">    double localValue = 0.0;</span>
+    double[] x;
+    double[] localDerivative;
+    CountDownLatch latch;
+
+<span class="nc" id="L913">    public RVFDerivativeCalculation(int numThreads, int threadIdx, double[] x, int derivativeSize, CountDownLatch latch) {</span>
+<span class="nc" id="L914">      this.numThreads = numThreads;</span>
+<span class="nc" id="L915">      this.threadIdx = threadIdx;</span>
+<span class="nc" id="L916">      this.x = x;</span>
+<span class="nc" id="L917">      this.localDerivative = new double[derivativeSize];</span>
+<span class="nc" id="L918">      this.latch = latch;</span>
+<span class="nc" id="L919">    }</span>
+
+    @Override
+    public void run() {
+<span class="nc" id="L923">      double[] sums = new double[numClasses];</span>
+<span class="nc" id="L924">      double[] probs = new double[numClasses];</span>
+
+<span class="nc bnc" id="L926" title="All 2 branches missed.">      for (int d = threadIdx; d &lt; data.length; d += numThreads) {</span>
+<span class="nc" id="L927">        final int[] features = data[d];</span>
+<span class="nc" id="L928">        final double[] vals = values[d];</span>
+        // activation
+<span class="nc" id="L930">        Arrays.fill(sums, 0.0);</span>
+
+<span class="nc bnc" id="L932" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">          for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L934">            final int feature = features[f];</span>
+<span class="nc" id="L935">            final double val = vals[f];</span>
+<span class="nc" id="L936">            int i = indexOf(feature, c);</span>
+<span class="nc" id="L937">            sums[c] += x[i] * val;</span>
+          }
+        }
+        // expectation (slower routine replaced by fast way)
+        // double total = Double.NEGATIVE_INFINITY;
+        // for (int c=0; c&lt;numClasses; c++) {
+        //   total = SloppyMath.logAdd(total, sums[c]);
+        // }
+        // it is faster to split these two loops. More striding
+<span class="nc" id="L946">        double total = ArrayMath.logSum(sums);</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L948">          probs[c] = Math.exp(sums[c] - total);</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">          if (dataWeights != null) {</span>
+<span class="nc" id="L950">            probs[c] *= dataWeights[d];</span>
+          }
+        }
+
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L955" title="All 2 branches missed.">          for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L956">            final int feature = features[f];</span>
+<span class="nc" id="L957">            final double val = vals[f];</span>
+<span class="nc" id="L958">            int i = indexOf(feature, c);</span>
+<span class="nc" id="L959">            localDerivative[i] += probs[c] * val;</span>
+          }
+        }
+
+<span class="nc" id="L963">        double dV = sums[labels[d]] - total;</span>
+<span class="nc bnc" id="L964" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L965">          dV *= dataWeights[d];</span>
+        }
+<span class="nc" id="L967">        localValue -= dV;</span>
+      }
+<span class="nc" id="L969">      latch.countDown();</span>
+<span class="nc" id="L970">    }</span>
+  }
+
+  /**
+   * Calculate conditional likelihood for datasets with real-valued features.
+   * Currently this can calculate CL only (no support for SCL).
+   * TODO: sum-conditional obj. fun. with RVFs.
+   */
+  protected void rvfcalculate(double[] x) {
+<span class="nc" id="L979">    value = 0.0;</span>
+    // This is only calculated once per training run, not worth the effort to multi-thread properly
+<span class="nc bnc" id="L981" title="All 2 branches missed.">    if (derivativeNumerator == null) {</span>
+<span class="nc" id="L982">      derivativeNumerator = new double[x.length];</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">      for (int d = 0; d &lt; data.length; d++) {</span>
+<span class="nc" id="L984">        final int[] features = data[d];</span>
+<span class="nc" id="L985">        final double[] vals = values[d];</span>
+<span class="nc bnc" id="L986" title="All 2 branches missed.">        for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L987">          int i = indexOf(features[f], labels[d]);</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">          if (dataWeights == null) {</span>
+<span class="nc" id="L989">            derivativeNumerator[i] -= vals[f];</span>
+          } else {
+<span class="nc" id="L991">            derivativeNumerator[i] -= dataWeights[d] * vals[f];</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L996">    copy(derivative, derivativeNumerator);</span>
+    //    Arrays.fill(derivative, 0.0);
+    //    double[] counts = new double[numClasses];
+    //    Arrays.fill(counts, 0.0);
+
+<span class="nc bnc" id="L1001" title="All 4 branches missed.">    if (parallelGradientCalculation &amp;&amp; threads &gt; 1) {</span>
+      // Launch several threads (reused out of our fixed pool) to handle the computation
+      @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L1004">      RVFDerivativeCalculation[] runnables = (RVFDerivativeCalculation[])Array.newInstance(RVFDerivativeCalculation.class, threads);</span>
+<span class="nc" id="L1005">      CountDownLatch latch = new CountDownLatch(threads);</span>
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">      for (int i = 0; i &lt; threads; i++) {</span>
+<span class="nc" id="L1007">        runnables[i] = new RVFDerivativeCalculation(threads, i, x, derivative.length, latch);</span>
+<span class="nc" id="L1008">        new Thread(runnables[i]).start();</span>
+      }
+      try {
+<span class="nc" id="L1011">        latch.await();</span>
+<span class="nc" id="L1012">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L1013">        throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L1014">      }</span>
+
+<span class="nc bnc" id="L1016" title="All 2 branches missed.">      for (int i = 0; i &lt; threads; i++) {</span>
+<span class="nc" id="L1017">        value += runnables[i].localValue;</span>
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">        for (int j = 0; j &lt; derivative.length; j++) {</span>
+<span class="nc" id="L1019">          derivative[j] += runnables[i].localDerivative[j];</span>
+        }
+      }
+<span class="nc" id="L1022">    }</span>
+    else {
+      // Do the calculation locally on this thread
+<span class="nc" id="L1025">      double[] sums = new double[numClasses];</span>
+<span class="nc" id="L1026">      double[] probs = new double[numClasses];</span>
+
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">      for (int d = 0; d &lt; data.length; d++) {</span>
+<span class="nc" id="L1029">        final int[] features = data[d];</span>
+<span class="nc" id="L1030">        final double[] vals = values[d];</span>
+        // activation
+<span class="nc" id="L1032">        Arrays.fill(sums, 0.0);</span>
+
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">        for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L1035">          final int feature = features[f];</span>
+<span class="nc" id="L1036">          final double val = vals[f];</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">          for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L1038">            int i = indexOf(feature, c);</span>
+<span class="nc" id="L1039">            sums[c] += x[i] * val;</span>
+          }
+        }
+        // expectation (slower routine replaced by fast way)
+        // double total = Double.NEGATIVE_INFINITY;
+        // for (int c=0; c&lt;numClasses; c++) {
+        //   total = SloppyMath.logAdd(total, sums[c]);
+        // }
+        // it is faster to split these two loops. More striding
+<span class="nc" id="L1048">        double total = ArrayMath.logSum(sums);</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L1050">          probs[c] = Math.exp(sums[c] - total);</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">          if (dataWeights != null) {</span>
+<span class="nc" id="L1052">            probs[c] *= dataWeights[d];</span>
+          }
+        }
+
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">        for (int f = 0; f &lt; features.length; f++) {</span>
+<span class="nc" id="L1057">          final int feature = features[f];</span>
+<span class="nc" id="L1058">          final double val = vals[f];</span>
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">          for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc" id="L1060">            int i = indexOf(feature, c);</span>
+<span class="nc" id="L1061">            derivative[i] += probs[c] * val;</span>
+          }
+        }
+
+<span class="nc" id="L1065">        double dV = sums[labels[d]] - total;</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">        if (dataWeights != null) {</span>
+<span class="nc" id="L1067">          dV *= dataWeights[d];</span>
+        }
+<span class="nc" id="L1069">        value -= dV;</span>
+      }
+    }
+<span class="nc" id="L1072">    value += prior.compute(x, derivative);</span>
+<span class="nc" id="L1073">  }</span>
+
+
+  public LogConditionalObjectiveFunction(GeneralDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L1077">    this(dataset, new LogPrior(LogPrior.LogPriorType.QUADRATIC));</span>
+<span class="nc" id="L1078">  }</span>
+
+  public LogConditionalObjectiveFunction(GeneralDataset&lt;L, F&gt; dataset, LogPrior prior) {
+<span class="fc" id="L1081">    this(dataset, prior, false);</span>
+<span class="fc" id="L1082">  }</span>
+
+  public LogConditionalObjectiveFunction(GeneralDataset&lt;L, F&gt; dataset, float[] dataWeights, LogPrior prior) {
+<span class="nc" id="L1085">    this(dataset, prior, false, dataWeights);</span>
+<span class="nc" id="L1086">  }</span>
+
+  public LogConditionalObjectiveFunction(GeneralDataset&lt;L, F&gt; dataset, LogPrior prior, boolean useSumCondObjFun) {
+<span class="fc" id="L1089">    this(dataset, prior, useSumCondObjFun, null);</span>
+<span class="fc" id="L1090">  }</span>
+
+  /** Version passing in a GeneralDataset, which may be binary or real-valued features. */
+  public LogConditionalObjectiveFunction(GeneralDataset&lt;L, F&gt; dataset, LogPrior prior, boolean useSumCondObjFun,
+<span class="fc" id="L1094">                                         float[] dataWeights) {</span>
+<span class="fc" id="L1095">    this.prior = prior;</span>
+<span class="fc" id="L1096">    this.useSummedConditionalLikelihood = useSumCondObjFun;</span>
+<span class="fc" id="L1097">    this.numFeatures = dataset.numFeatures();</span>
+<span class="fc" id="L1098">    this.numClasses = dataset.numClasses();</span>
+<span class="fc" id="L1099">    this.data = dataset.getDataArray();</span>
+<span class="fc" id="L1100">    this.labels = dataset.getLabelsArray();</span>
+<span class="fc" id="L1101">    this.values = dataset.getValuesArray();</span>
+<span class="pc bpc" id="L1102" title="1 of 2 branches missed.">    if (dataWeights != null) {</span>
+<span class="nc" id="L1103">      this.dataWeights = dataWeights;</span>
+<span class="pc bpc" id="L1104" title="1 of 2 branches missed.">    } else if (dataset instanceof WeightedDataset&lt;?,?&gt;) {</span>
+<span class="nc" id="L1105">      this.dataWeights = ((WeightedDataset&lt;L, F&gt;)dataset).getWeights();</span>
+<span class="pc bpc" id="L1106" title="1 of 2 branches missed.">    } else if (dataset instanceof WeightedRVFDataset&lt;?,?&gt;) {</span>
+<span class="nc" id="L1107">      this.dataWeights = ((WeightedRVFDataset&lt;L, F&gt;)dataset).getWeights();</span>
+    } else {
+<span class="fc" id="L1109">      this.dataWeights = null;</span>
+    }
+<span class="fc" id="L1111">    this.labelIndex = null;</span>
+<span class="fc" id="L1112">    this.featureIndex = null;</span>
+<span class="fc" id="L1113">    this.dataIterable = null;</span>
+<span class="fc" id="L1114">  }</span>
+
+  //TODO: test this [none of our code actually even uses it].
+  /** Version where an Iterable is passed in for the data. Doesn't support dataWeights. */
+<span class="nc" id="L1118">  public LogConditionalObjectiveFunction(Iterable&lt;Datum&lt;L, F&gt;&gt; dataIterable, LogPrior logPrior, Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex) {</span>
+<span class="nc" id="L1119">    this.prior = logPrior;</span>
+<span class="nc" id="L1120">    this.useSummedConditionalLikelihood = false;</span>
+<span class="nc" id="L1121">    this.numFeatures = featureIndex.size();</span>
+<span class="nc" id="L1122">    this.numClasses = labelIndex.size();</span>
+<span class="nc" id="L1123">    this.data = null;</span>
+<span class="nc" id="L1124">    this.dataIterable = dataIterable;</span>
+
+<span class="nc" id="L1126">    this.labelIndex = labelIndex;</span>
+<span class="nc" id="L1127">    this.featureIndex = featureIndex;</span>
+<span class="nc" id="L1128">    this.labels = null;//dataset.getLabelsArray();</span>
+<span class="nc" id="L1129">    this.values = null;//dataset.getValuesArray();</span>
+<span class="nc" id="L1130">    this.dataWeights = null;</span>
+<span class="nc" id="L1131">  }</span>
+
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels, boolean useSumCondObjFun) {
+<span class="nc" id="L1134">    this(numFeatures, numClasses, data, labels, null, new LogPrior(LogPrior.LogPriorType.QUADRATIC), useSumCondObjFun);</span>
+<span class="nc" id="L1135">  }</span>
+
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels) {
+<span class="nc" id="L1138">    this(numFeatures, numClasses, data, labels, new LogPrior(LogPrior.LogPriorType.QUADRATIC));</span>
+<span class="nc" id="L1139">  }</span>
+
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels, LogPrior prior) {
+<span class="nc" id="L1142">    this(numFeatures, numClasses, data, labels, null, prior);</span>
+<span class="nc" id="L1143">  }</span>
+
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels, float[] dataWeights) {
+<span class="nc" id="L1146">    this(numFeatures, numClasses, data, labels, dataWeights, new LogPrior(LogPrior.LogPriorType.QUADRATIC));</span>
+<span class="nc" id="L1147">  }</span>
+
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels, float[] dataWeights, LogPrior prior) {
+<span class="nc" id="L1150">    this(numFeatures, numClasses, data, labels, dataWeights, prior, false);</span>
+<span class="nc" id="L1151">  }</span>
+
+  /* For binary features. Supports dataWeights. */
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels,
+<span class="nc" id="L1155">                                         float[] dataWeights, LogPrior prior, boolean useSummedConditionalLikelihood) {</span>
+<span class="nc" id="L1156">    this.numFeatures = numFeatures;</span>
+<span class="nc" id="L1157">    this.numClasses = numClasses;</span>
+<span class="nc" id="L1158">    this.data = data;</span>
+<span class="nc" id="L1159">    this.values = null;</span>
+<span class="nc" id="L1160">    this.labels = labels;</span>
+<span class="nc" id="L1161">    this.prior = prior;</span>
+<span class="nc" id="L1162">    this.dataWeights = dataWeights;</span>
+<span class="nc" id="L1163">    this.labelIndex = null;</span>
+<span class="nc" id="L1164">    this.featureIndex = null;</span>
+<span class="nc" id="L1165">    this.dataIterable = null;</span>
+<span class="nc" id="L1166">    this.useSummedConditionalLikelihood = useSummedConditionalLikelihood;</span>
+<span class="nc" id="L1167">  }</span>
+
+  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, int[] labels, int intPrior, double sigma, double epsilon) {
+<span class="nc" id="L1170">    this(numFeatures, numClasses, data, null, labels, intPrior, sigma, epsilon);</span>
+<span class="nc" id="L1171">  }</span>
+
+  /** For real-valued features. Passing in processed data set. */
+<span class="nc" id="L1174">  public LogConditionalObjectiveFunction(int numFeatures, int numClasses, int[][] data, double[][] values, int[] labels, int intPrior, double sigma, double epsilon) {</span>
+<span class="nc" id="L1175">    this.numFeatures = numFeatures;</span>
+<span class="nc" id="L1176">    this.numClasses = numClasses;</span>
+<span class="nc" id="L1177">    this.data = data;</span>
+<span class="nc" id="L1178">    this.values = values;</span>
+<span class="nc" id="L1179">    this.labels = labels;</span>
+<span class="nc" id="L1180">    this.prior = new LogPrior(intPrior, sigma, epsilon);</span>
+<span class="nc" id="L1181">    this.labelIndex = null;</span>
+<span class="nc" id="L1182">    this.featureIndex = null;</span>
+<span class="nc" id="L1183">    this.dataIterable = null;</span>
+<span class="nc" id="L1184">    this.useSummedConditionalLikelihood = false;</span>
+<span class="nc" id="L1185">    this.dataWeights = null;</span>
+<span class="nc" id="L1186">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

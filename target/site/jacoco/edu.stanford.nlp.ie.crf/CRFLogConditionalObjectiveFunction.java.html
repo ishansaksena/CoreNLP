@@ -1,0 +1,918 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CRFLogConditionalObjectiveFunction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.crf</a> &gt; <span class="el_source">CRFLogConditionalObjectiveFunction.java</span></div><h1>CRFLogConditionalObjectiveFunction.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.crf;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.optimization.AbstractStochasticCachingDiffUpdateFunction;
+import edu.stanford.nlp.optimization.HasFeatureGrouping;
+import edu.stanford.nlp.util.concurrent.*;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+/**
+ * @author Jenny Finkel
+ *         Mengqiu Wang
+ */
+
+public class CRFLogConditionalObjectiveFunction extends AbstractStochasticCachingDiffUpdateFunction implements HasCliquePotentialFunction, HasFeatureGrouping  {
+
+  /** A logger for this class */
+<span class="nc" id="L25">  private static final Redwood.RedwoodChannels log = Redwood.channels(CRFLogConditionalObjectiveFunction.class);</span>
+
+  public static final int NO_PRIOR = 0;
+  public static final int QUADRATIC_PRIOR = 1;
+  /* Use a Huber robust regression penalty (L1 except very near 0) not L2 */
+  public static final int HUBER_PRIOR = 2;
+  public static final int QUARTIC_PRIOR = 3;
+  public static final int DROPOUT_PRIOR = 4;
+
+  // public static final boolean DEBUG2 = true;
+  public static final boolean DEBUG2 = false;
+  public static final boolean DEBUG3 = false;
+  public static final boolean TIMED = false;
+  // public static final boolean TIMED = true;
+  public static final boolean CONDENSE = true;
+  // public static final boolean CONDENSE = false;
+<span class="nc" id="L41">  public static boolean VERBOSE = false;</span>
+
+  protected final int prior;
+  protected final double sigma;
+<span class="nc" id="L45">  protected final double epsilon = 0.1; // You can't actually set this at present</span>
+  /** label indices - for all possible label sequences - for each feature */
+  protected final List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices;
+  protected final Index&lt;String&gt; classIndex;  // didn't have &lt;String&gt; before. Added since that's what is assumed everywhere.
+  protected final double[][] Ehat; // empirical counts of all the features [feature][class]
+  protected final double[][] E;
+  protected double[][][] parallelE;
+  protected double[][][] parallelEhat;
+
+  protected final int window;
+  protected final int numClasses;
+  // public static Index&lt;String&gt; featureIndex;  // no idea why this was here [cdm 2013]
+  protected final int[] map;
+  protected int[][][][] data;  // data[docIndex][tokenIndex][][]
+  protected double[][][][] featureVal;  // featureVal[docIndex][tokenIndex][][]
+  protected int[][] labels;    // labels[docIndex][tokenIndex]
+  protected final int domainDimension;
+  // protected double[][] eHat4Update, e4Update;
+
+  protected int[][] weightIndices;
+  protected final String backgroundSymbol;
+
+<span class="nc" id="L67">  protected int[][] featureGrouping = null;</span>
+
+  protected static final double smallConst = 1e-6;
+  // protected static final double largeConst = 5;
+
+<span class="nc" id="L72">  protected Random rand = new Random(2147483647L);</span>
+
+  protected final int multiThreadGrad;
+  // need to ensure the following two objects are only read during multi-threading
+  // to ensure thread-safety. It should only be modified in calculate() via setWeights()
+  protected double[][] weights;
+  protected CliquePotentialFunction cliquePotentialFunc;
+
+  @Override
+  public double[] initial() {
+<span class="nc" id="L82">    return initial(rand);</span>
+  }
+  public double[] initial(boolean useRandomSeed) {
+<span class="nc bnc" id="L85" title="All 2 branches missed.">    Random randToUse = useRandomSeed ? new Random() : rand;</span>
+<span class="nc" id="L86">    return initial(rand);</span>
+  }
+
+  public double[] initial(Random randGen) {
+<span class="nc" id="L90">    double[] initial = new double[domainDimension()];</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">    for (int i = 0; i &lt; initial.length; i++) {</span>
+<span class="nc" id="L92">      initial[i] = randGen.nextDouble() + smallConst;</span>
+      // initial[i] = generator.nextDouble() * largeConst;
+      // initial[i] = -1+2*(i);
+      // initial[i] = (i == 0 ? 1 : 0);
+    }
+<span class="nc" id="L97">    return initial;</span>
+  }
+
+  public static int getPriorType(String priorTypeStr) {
+<span class="nc bnc" id="L101" title="All 2 branches missed.">    if (priorTypeStr == null) return QUADRATIC_PRIOR;  // default</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">    if (&quot;QUADRATIC&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L103">      return QUADRATIC_PRIOR;</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    } else if (&quot;HUBER&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L105">      return HUBER_PRIOR;</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">    } else if (&quot;QUARTIC&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L107">      return QUARTIC_PRIOR;</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">    } else if (&quot;DROPOUT&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L109">      return DROPOUT_PRIOR;</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">    } else if (&quot;NONE&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L111">      return NO_PRIOR;</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">    } else if (priorTypeStr.equalsIgnoreCase(&quot;lasso&quot;) ||</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">               priorTypeStr.equalsIgnoreCase(&quot;ridge&quot;) ||</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">               priorTypeStr.equalsIgnoreCase(&quot;gaussian&quot;) ||</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">               priorTypeStr.equalsIgnoreCase(&quot;ae-lasso&quot;) ||</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">               priorTypeStr.equalsIgnoreCase(&quot;sg-lasso&quot;) ||</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">               priorTypeStr.equalsIgnoreCase(&quot;g-lasso&quot;) ) {</span>
+<span class="nc" id="L118">      return NO_PRIOR;</span>
+    } else {
+<span class="nc" id="L120">      throw new IllegalArgumentException(&quot;Unknown prior type: &quot; + priorTypeStr);</span>
+    }
+  }
+
+  CRFLogConditionalObjectiveFunction(int[][][][] data, int[][] labels, int window, Index&lt;String&gt; classIndex, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, String priorType, String backgroundSymbol, double sigma, double[][][][] featureVal, int multiThreadGrad) {
+<span class="nc" id="L125">    this(data, labels, window, classIndex, labelIndices, map, priorType, backgroundSymbol, sigma, featureVal, multiThreadGrad, true);</span>
+<span class="nc" id="L126">  }</span>
+
+<span class="nc" id="L128">  CRFLogConditionalObjectiveFunction(int[][][][] data, int[][] labels, int window, Index&lt;String&gt; classIndex, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, String priorType, String backgroundSymbol, double sigma, double[][][][] featureVal, int multiThreadGrad, boolean calcEmpirical) {</span>
+<span class="nc" id="L129">    this.window = window;</span>
+<span class="nc" id="L130">    this.classIndex = classIndex;</span>
+<span class="nc" id="L131">    this.numClasses = classIndex.size();</span>
+<span class="nc" id="L132">    this.labelIndices = labelIndices;</span>
+<span class="nc" id="L133">    this.map = map;</span>
+<span class="nc" id="L134">    this.data = data;</span>
+<span class="nc" id="L135">    this.featureVal = featureVal;</span>
+<span class="nc" id="L136">    this.labels = labels;</span>
+<span class="nc" id="L137">    this.prior = getPriorType(priorType);</span>
+<span class="nc" id="L138">    this.backgroundSymbol = backgroundSymbol;</span>
+<span class="nc" id="L139">    this.sigma = sigma;</span>
+<span class="nc" id="L140">    this.multiThreadGrad = multiThreadGrad;</span>
+    // takes docIndex, returns Triple&lt;prob, E, dropoutGrad&gt;
+<span class="nc" id="L142">    Ehat = empty2D();</span>
+<span class="nc" id="L143">    E = empty2D();</span>
+<span class="nc" id="L144">    weights = empty2D();</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">    if (calcEmpirical)</span>
+<span class="nc" id="L146">      empiricalCounts(Ehat);</span>
+<span class="nc" id="L147">    int myDomainDimension = 0;</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">    for (int dim : map) {</span>
+<span class="nc" id="L149">      myDomainDimension += labelIndices.get(dim).size();</span>
+    }
+<span class="nc" id="L151">    domainDimension = myDomainDimension;</span>
+<span class="nc" id="L152">  }</span>
+
+  protected void empiricalCounts(double[][] eHat) {
+<span class="nc bnc" id="L155" title="All 2 branches missed.">    for (int m = 0; m &lt; data.length; m++) {</span>
+<span class="nc" id="L156">      empiricalCountsForADoc(eHat, m);</span>
+    }
+<span class="nc" id="L158">  }</span>
+
+  protected void empiricalCountsForADoc(double[][] eHat, int docIndex) {
+<span class="nc" id="L161">    int[][][] docData = data[docIndex];</span>
+<span class="nc" id="L162">    int[] docLabels = labels[docIndex];</span>
+<span class="nc" id="L163">    int[] windowLabels = new int[window];</span>
+<span class="nc" id="L164">    Arrays.fill(windowLabels, classIndex.indexOf(backgroundSymbol));</span>
+<span class="nc" id="L165">    double[][][] featureValArr = null;</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">    if (featureVal != null)</span>
+<span class="nc" id="L167">      featureValArr = featureVal[docIndex];</span>
+
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    if (docLabels.length&gt;docData.length) { // only true for self-training</span>
+      // fill the windowLabel array with the extra docLabels
+<span class="nc" id="L171">      System.arraycopy(docLabels, 0, windowLabels, 0, windowLabels.length);</span>
+      // shift the docLabels array left
+<span class="nc" id="L173">      int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L174">      System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L175">      docLabels = newDocLabels;</span>
+    }
+<span class="nc bnc" id="L177" title="All 2 branches missed.">    for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L178">      System.arraycopy(windowLabels, 1, windowLabels, 0, window - 1);</span>
+<span class="nc" id="L179">      windowLabels[window - 1] = docLabels[i];</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">      for (int j = 0; j &lt; docData[i].length; j++) {</span>
+<span class="nc" id="L181">        int[] cliqueLabel = new int[j + 1];</span>
+<span class="nc" id="L182">        System.arraycopy(windowLabels, window - 1 - j, cliqueLabel, 0, j + 1);</span>
+<span class="nc" id="L183">        CRFLabel crfLabel = new CRFLabel(cliqueLabel);</span>
+<span class="nc" id="L184">        int labelIndex = labelIndices.get(j).indexOf(crfLabel);</span>
+        //log.info(crfLabel + &quot; &quot; + labelIndex);
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        for (int n = 0; n &lt; docData[i][j].length; n++) {</span>
+<span class="nc" id="L187">          double fVal = 1.0;</span>
+<span class="nc bnc" id="L188" title="All 4 branches missed.">          if (featureValArr != null &amp;&amp; j == 0) // j == 0 because only node features gets feature values</span>
+<span class="nc" id="L189">            fVal = featureValArr[i][j][n];</span>
+<span class="nc" id="L190">          eHat[docData[i][j][n]][labelIndex] += fVal;</span>
+        }
+      }
+    }
+<span class="nc" id="L194">  }</span>
+
+  @Override
+  public CliquePotentialFunction getCliquePotentialFunction(double[] x) {
+<span class="nc" id="L198">    to2D(x, weights);</span>
+<span class="nc" id="L199">    return new LinearCliquePotentialFunction(weights);</span>
+  }
+
+  protected double expectedAndEmpiricalCountsAndValueForADoc(double[][] E, double[][] Ehat, int docIndex) {
+<span class="nc" id="L203">    empiricalCountsForADoc(Ehat, docIndex);</span>
+<span class="nc" id="L204">    return expectedCountsAndValueForADoc(E, docIndex);</span>
+  }
+
+  public double valueForADoc(int docIndex) {
+<span class="nc" id="L208">    return expectedCountsAndValueForADoc(null, docIndex, false, true);</span>
+  }
+
+  protected double expectedCountsAndValueForADoc(double[][] E, int docIndex) {
+<span class="nc" id="L212">    return expectedCountsAndValueForADoc(E, docIndex, true, true);</span>
+  }
+
+  protected double expectedCountsForADoc(double[][] E, int docIndex) {
+<span class="nc" id="L216">    return expectedCountsAndValueForADoc(E, docIndex, true, false);</span>
+  }
+
+  protected double expectedCountsAndValueForADoc(double[][] E, int docIndex, boolean doExpectedCountCalc, boolean doValueCalc) {
+<span class="nc" id="L220">    int[][][] docData = data[docIndex];</span>
+<span class="nc" id="L221">    double[][][] featureVal3DArr = null;</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">    if (featureVal != null) {</span>
+<span class="nc" id="L223">      featureVal3DArr = featureVal[docIndex];</span>
+    }
+    // make a clique tree for this document
+<span class="nc" id="L226">    CRFCliqueTree cliqueTree = CRFCliqueTree.getCalibratedCliqueTree(docData, labelIndices, numClasses, classIndex, backgroundSymbol, cliquePotentialFunc, featureVal3DArr);</span>
+
+<span class="nc" id="L228">    double prob = 0.0;</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">    if (doValueCalc) {</span>
+<span class="nc" id="L230">      prob = documentLogProbability(docData, docIndex, cliqueTree);</span>
+    }
+
+<span class="nc bnc" id="L233" title="All 2 branches missed.">    if (doExpectedCountCalc) {</span>
+<span class="nc" id="L234">      documentExpectedCounts(E, docData, featureVal3DArr, cliqueTree);</span>
+    }
+
+<span class="nc" id="L237">    return prob;</span>
+  }
+
+  /** Compute the expected counts for this document, which we will need to compute the derivative. */
+  protected void documentExpectedCounts(double[][] E, int[][][] docData, double[][][] featureVal3DArr, CRFCliqueTree cliqueTree) {
+    // iterate over the positions in this document
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    for (int i = 0; i &lt; docData.length; i++) {</span>
+      // for each possible clique at this position
+<span class="nc bnc" id="L245" title="All 2 branches missed.">      for (int j = 0; j &lt; docData[i].length; j++) {</span>
+<span class="nc" id="L246">        Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+        // for each possible labeling for that clique
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        for (int k = 0, liSize = labelIndex.size(); k &lt; liSize; k++) {</span>
+<span class="nc" id="L249">          int[] label = labelIndex.get(k).getLabel();</span>
+<span class="nc" id="L250">          double p = cliqueTree.prob(i, label); // probability of these labels occurring in this clique with these features</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">          for (int n = 0; n &lt; docData[i][j].length; n++) {</span>
+<span class="nc" id="L252">            double fVal = 1.0;</span>
+<span class="nc bnc" id="L253" title="All 4 branches missed.">            if (j == 0 &amp;&amp; featureVal3DArr != null) { // j == 0 because only node features gets feature values</span>
+<span class="nc" id="L254">              fVal = featureVal3DArr[i][j][n];</span>
+            }
+<span class="nc" id="L256">            E[docData[i][j][n]][k] += p * fVal;</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L261">  }</span>
+
+  /** Compute the log probability of the document given the model with the parameters x. */
+  private double documentLogProbability(int[][][] docData, int docIndex, CRFCliqueTree cliqueTree) {
+<span class="nc" id="L265">    int[] docLabels = labels[docIndex];</span>
+<span class="nc" id="L266">    int[] given = new int[window - 1];</span>
+<span class="nc" id="L267">    Arrays.fill(given, classIndex.indexOf(backgroundSymbol));</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">    if (docLabels.length&gt;docData.length) { // only true for self-training</span>
+      // fill the given array with the extra docLabels
+<span class="nc" id="L270">      System.arraycopy(docLabels, 0, given, 0, given.length);</span>
+      // shift the docLabels array left
+<span class="nc" id="L272">      int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L273">      System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L274">      docLabels = newDocLabels;</span>
+    }
+
+<span class="nc" id="L277">    double startPosLogProb = cliqueTree.logProbStartPos();</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L279">      System.err.printf(&quot;P_-1(Background) = % 5.3f%n&quot;, startPosLogProb);</span>
+    }
+<span class="nc" id="L281">    double prob = startPosLogProb;</span>
+
+    // iterate over the positions in this document
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L285">      int label = docLabels[i];</span>
+<span class="nc" id="L286">      double p = cliqueTree.condLogProbGivenPrevious(i, label, given);</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L288">        log.info(&quot;P(&quot; + label + &quot;|&quot; + ArrayMath.toString(given) + &quot;)=&quot; + p);</span>
+      }
+<span class="nc" id="L290">      prob += p;</span>
+<span class="nc" id="L291">      System.arraycopy(given, 1, given, 0, given.length - 1);</span>
+<span class="nc" id="L292">      given[given.length - 1] = label;</span>
+    }
+<span class="nc" id="L294">    return prob;</span>
+  }
+
+<span class="nc" id="L297">  private ThreadsafeProcessor&lt;Pair&lt;Integer, List&lt;Integer&gt;&gt;, Pair&lt;Integer, Double&gt;&gt; expectedThreadProcessor = new ExpectationThreadsafeProcessor();</span>
+<span class="nc" id="L298">  private ThreadsafeProcessor&lt;Pair&lt;Integer, List&lt;Integer&gt;&gt;, Pair&lt;Integer, Double&gt;&gt; expectedAndEmpiricalThreadProcessor = new ExpectationThreadsafeProcessor(true);</span>
+
+  class ExpectationThreadsafeProcessor implements ThreadsafeProcessor&lt;Pair&lt;Integer, List&lt;Integer&gt;&gt;, Pair&lt;Integer, Double&gt;&gt; {
+<span class="nc" id="L301">    boolean calculateEmpirical = false;</span>
+<span class="nc" id="L302">    public ExpectationThreadsafeProcessor() {</span>
+<span class="nc" id="L303">    }</span>
+
+<span class="nc" id="L305">    public ExpectationThreadsafeProcessor(boolean calculateEmpirical) {</span>
+<span class="nc" id="L306">      this.calculateEmpirical = calculateEmpirical;</span>
+<span class="nc" id="L307">    }</span>
+
+    @Override
+    public Pair&lt;Integer, Double&gt; process(Pair&lt;Integer, List&lt;Integer&gt;&gt; threadIDAndDocIndices) {
+<span class="nc" id="L311">      int tID = threadIDAndDocIndices.first();</span>
+<span class="nc bnc" id="L312" title="All 4 branches missed.">      if (tID &lt; 0 || tID &gt;= multiThreadGrad) throw new IllegalArgumentException(&quot;threadID must be with in range 0 &lt;= tID &lt; multiThreadGrad(=&quot;+multiThreadGrad+&quot;)&quot;);</span>
+<span class="nc" id="L313">      List&lt;Integer&gt; docIDs = threadIDAndDocIndices.second();</span>
+      double[][] partE; // initialized below
+<span class="nc" id="L315">      double[][] partEhat = null; // initialized below</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">      if (multiThreadGrad == 1) {</span>
+<span class="nc" id="L317">        partE = E;</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">        if (calculateEmpirical)</span>
+<span class="nc" id="L319">          partEhat = Ehat;</span>
+      } else {
+<span class="nc" id="L321">        partE = parallelE[tID];</span>
+        // TODO: if we put this on the heap, this clearing will be unnecessary
+<span class="nc" id="L323">        clear2D(partE);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if (calculateEmpirical) {</span>
+<span class="nc" id="L325">          partEhat = parallelEhat[tID];</span>
+<span class="nc" id="L326">          clear2D(partEhat);</span>
+        }
+      }
+<span class="nc" id="L329">      double probSum = 0;</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">      for (int docIndex: docIDs) {</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (calculateEmpirical)</span>
+<span class="nc" id="L332">          probSum += expectedAndEmpiricalCountsAndValueForADoc(partE, partEhat, docIndex);</span>
+        else
+<span class="nc" id="L334">          probSum += expectedCountsAndValueForADoc(partE, docIndex);</span>
+<span class="nc" id="L335">      }</span>
+<span class="nc" id="L336">      return new Pair&lt;&gt;(tID, probSum);</span>
+    }
+
+    @Override
+    public ThreadsafeProcessor&lt;Pair&lt;Integer, List&lt;Integer&gt;&gt;, Pair&lt;Integer, Double&gt;&gt; newInstance() {
+<span class="nc" id="L341">      return this;</span>
+    }
+  }
+
+  public void setWeights(double[][] weights) {
+<span class="nc" id="L346">    this.weights = weights;</span>
+<span class="nc" id="L347">    cliquePotentialFunc = new LinearCliquePotentialFunction(weights);</span>
+<span class="nc" id="L348">  }</span>
+
+
+  protected double regularGradientAndValue() {
+<span class="nc" id="L352">    int totalLen = data.length;</span>
+<span class="nc" id="L353">    List&lt;Integer&gt; docIDs = new ArrayList&lt;&gt;(totalLen);</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">    for (int m=0; m &lt; totalLen; m++) docIDs.add(m);</span>
+
+<span class="nc" id="L356">    return multiThreadGradient(docIDs, false);</span>
+  }
+
+  protected double multiThreadGradient(List&lt;Integer&gt; docIDs, boolean calculateEmpirical) {
+<span class="nc" id="L360">    double objective = 0.0;</span>
+    // TODO: This is a bunch of unnecessary heap traffic, should all be on the stack
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    if (multiThreadGrad &gt; 1) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">      if (parallelE == null) {</span>
+<span class="nc" id="L364">        parallelE = new double[multiThreadGrad][][];</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        for (int i=0; i&lt;multiThreadGrad; i++)</span>
+<span class="nc" id="L366">          parallelE[i] = empty2D();</span>
+      }
+<span class="nc bnc" id="L368" title="All 2 branches missed.">      if (calculateEmpirical) {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (parallelEhat == null) {</span>
+<span class="nc" id="L370">          parallelEhat = new double[multiThreadGrad][][];</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">          for (int i=0; i&lt;multiThreadGrad; i++)</span>
+<span class="nc" id="L372">            parallelEhat[i] = empty2D();</span>
+        }
+      }
+    }
+
+    // TODO: this is a huge amount of machinery for no discernible reason
+<span class="nc bnc" id="L378" title="All 2 branches missed.">    MulticoreWrapper&lt;Pair&lt;Integer, List&lt;Integer&gt;&gt;, Pair&lt;Integer, Double&gt;&gt; wrapper =</span>
+            new MulticoreWrapper&lt;&gt;(multiThreadGrad, (calculateEmpirical ? expectedAndEmpiricalThreadProcessor : expectedThreadProcessor));
+
+<span class="nc" id="L381">    int totalLen = docIDs.size();</span>
+<span class="nc" id="L382">    int partLen = totalLen / multiThreadGrad;</span>
+<span class="nc" id="L383">    int currIndex = 0;</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">    for (int part=0; part &lt; multiThreadGrad; part++) {</span>
+<span class="nc" id="L385">      int endIndex = currIndex + partLen;</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">      if (part == multiThreadGrad-1)</span>
+<span class="nc" id="L387">        endIndex = totalLen;</span>
+      // TODO: let's not construct a sub-list of DocIDs, unnecessary object creation, can calculate directly from ThreadID
+<span class="nc" id="L389">      List&lt;Integer&gt; subList = docIDs.subList(currIndex, endIndex);</span>
+<span class="nc" id="L390">      wrapper.put(new Pair&lt;&gt;(part, subList));</span>
+<span class="nc" id="L391">      currIndex = endIndex;</span>
+    }
+<span class="nc" id="L393">    wrapper.join();</span>
+    // This all seems fine. May want to start running this after the joins, in case we have different end-times
+<span class="nc bnc" id="L395" title="All 2 branches missed.">    while (wrapper.peek()) {</span>
+<span class="nc" id="L396">      Pair&lt;Integer, Double&gt; result = wrapper.poll();</span>
+<span class="nc" id="L397">      int tID = result.first();</span>
+<span class="nc" id="L398">      objective += result.second();</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">      if (multiThreadGrad &gt; 1) {</span>
+<span class="nc" id="L400">        combine2DArr(E, parallelE[tID]);</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (calculateEmpirical)</span>
+<span class="nc" id="L402">          combine2DArr(Ehat, parallelEhat[tID]);</span>
+      }
+<span class="nc" id="L404">    }</span>
+
+<span class="nc" id="L406">    return objective;</span>
+  }
+
+  /**
+   * Calculates both value and partial derivatives at the point x, and save them internally.
+   */
+  @Override
+  public void calculate(double[] x) {
+
+    // final double[][] weights = to2D(x);
+<span class="nc" id="L416">    to2D(x, weights);</span>
+<span class="nc" id="L417">    setWeights(weights);</span>
+
+    // the expectations over counts
+    // first index is feature index, second index is of possible labeling
+    // double[][] E = empty2D();
+<span class="nc" id="L422">    clear2D(E);</span>
+
+<span class="nc" id="L424">    double prob = regularGradientAndValue(); // the log prob of the sequence given the model, which is the negation of value at this point</span>
+
+<span class="nc bnc" id="L426" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L427">      throw new RuntimeException(&quot;Got NaN for prob in CRFLogConditionalObjectiveFunction.calculate()&quot; +</span>
+              &quot; - this may well indicate numeric underflow due to overly long documents.&quot;);
+    }
+
+    // because we minimize -L(\theta)
+<span class="nc" id="L432">    value = -prob;</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L434">      log.info(&quot;value is &quot; + Math.exp(-value));</span>
+    }
+
+    // compute the partial derivative for each feature by comparing expected counts to empirical counts
+<span class="nc" id="L438">    int index = 0;</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">    for (int i = 0; i &lt; E.length; i++) {</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">      for (int j = 0; j &lt; E[i].length; j++) {</span>
+        // because we minimize -L(\theta)
+<span class="nc" id="L442">        derivative[index] = (E[i][j] - Ehat[i][j]);</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L444">          log.info(&quot;deriv(&quot; + i + &quot;,&quot; + j + &quot;) = &quot; + E[i][j] + &quot; - &quot; + Ehat[i][j] + &quot; = &quot; + derivative[index]);</span>
+        }
+<span class="nc" id="L446">        index++;</span>
+      }
+    }
+
+<span class="nc" id="L450">    applyPrior(x, 1.0);</span>
+
+    // log.info(&quot;\nfuncVal: &quot; + value);
+<span class="nc" id="L453">  }</span>
+
+  @Override
+  public int dataDimension() {
+<span class="nc" id="L457">    return data.length;</span>
+  }
+
+  @Override
+  public void calculateStochastic(double[] x, double [] v, int[] batch) {
+<span class="nc" id="L462">    to2D(x, weights);</span>
+<span class="nc" id="L463">    setWeights(weights);</span>
+
+<span class="nc" id="L465">    double batchScale = ((double) batch.length)/((double) this.dataDimension());</span>
+
+    // the expectations over counts
+    // first index is feature index, second index is of possible labeling
+    // double[][] E = empty2D();
+
+    // iterate over all the documents
+<span class="nc" id="L472">    List&lt;Integer&gt; docIDs = new ArrayList&lt;&gt;(batch.length);</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">    for (int item : batch) {</span>
+<span class="nc" id="L474">      docIDs.add(item);</span>
+    }
+<span class="nc" id="L476">    double prob = multiThreadGradient(docIDs, false);  // the log prob of the sequence given the model, which is the negation of value at this point</span>
+
+<span class="nc bnc" id="L478" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L479">      throw new RuntimeException(&quot;Got NaN for prob in CRFLogConditionalObjectiveFunction.calculate()&quot;);</span>
+    }
+
+<span class="nc" id="L482">    value = -prob;</span>
+
+    // compute the partial derivative for each feature by comparing expected counts to empirical counts
+<span class="nc" id="L485">    int index = 0;</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">    for (int i = 0; i &lt; E.length; i++) {</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">      for (int j = 0; j &lt; E[i].length; j++) {</span>
+        // real gradient should be empirical-expected;
+        // but since we minimize -L(\theta), the gradient is -(empirical-expected)
+<span class="nc" id="L490">        derivative[index++] = (E[i][j] - batchScale*Ehat[i][j]);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L492">          log.info(&quot;deriv(&quot; + i + &quot;,&quot; + j + &quot;) = &quot; + E[i][j] + &quot; - &quot; + Ehat[i][j] + &quot; = &quot; + derivative[index - 1]);</span>
+        }
+      }
+    }
+
+<span class="nc" id="L497">    applyPrior(x, batchScale);</span>
+<span class="nc" id="L498">  }</span>
+
+  // re-initialization is faster than Arrays.fill(arr, 0)
+  // private void clearUpdateEs() {
+  //   for (int i = 0; i &lt; eHat4Update.length; i++)
+  //     eHat4Update[i] = new double[eHat4Update[i].length];
+  //   for (int i = 0; i &lt; e4Update.length; i++)
+  //     e4Update[i] = new double[e4Update[i].length];
+  // }
+
+  /**
+   * Performs stochastic update of weights x (scaled by xScale) based
+   * on samples indexed by batch.
+   * NOTE: This function does not do regularization (regularization is done by the minimizer).
+   *
+   * @param x - unscaled weights
+   * @param xScale - how much to scale x by when performing calculations
+   * @param batch - indices of which samples to compute function over
+   * @param gScale - how much to scale adjustments to x
+   * @return value of function at specified x (scaled by xScale) for samples
+   */
+  @Override
+  public double calculateStochasticUpdate(double[] x, double xScale, int[] batch, double gScale) {
+    // int[][] wis = getWeightIndices();
+<span class="nc" id="L522">    to2D(x, xScale, weights);</span>
+<span class="nc" id="L523">    setWeights(weights);</span>
+
+    // if (eHat4Update == null) {
+    //   eHat4Update = empty2D();
+    //   e4Update = new double[eHat4Update.length][];
+    //   for (int i = 0; i &lt; e4Update.length; i++)
+    //     e4Update[i] = new double[eHat4Update[i].length];
+    // } else {
+    //   clearUpdateEs();
+    // }
+
+    // Adjust weight by -gScale*gradient
+    // gradient is expected count - empirical count
+    // so we adjust by + gScale(empirical count - expected count)
+
+    // iterate over all the documents
+<span class="nc" id="L539">    List&lt;Integer&gt; docIDs = new ArrayList&lt;&gt;(batch.length);</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">    for (int item : batch) {</span>
+<span class="nc" id="L541">      docIDs.add(item);</span>
+    }
+<span class="nc" id="L543">    double prob = multiThreadGradient(docIDs, true); // the log prob of the sequence given the model, which is the negation of value at this point</span>
+
+<span class="nc bnc" id="L545" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L546">      throw new RuntimeException(&quot;Got NaN for prob in CRFLogConditionalObjectiveFunction.calculate()&quot;);</span>
+    }
+
+<span class="nc" id="L549">    value = -prob;</span>
+
+<span class="nc" id="L551">    int index = 0;</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">    for (int i = 0; i &lt; E.length; i++) {</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">      for (int j = 0; j &lt; E[i].length; j++) {</span>
+<span class="nc" id="L554">        x[index++] += (Ehat[i][j] - E[i][j]) * gScale;</span>
+      }
+    }
+
+<span class="nc" id="L558">    return value;</span>
+  }
+
+  /**
+   * Performs stochastic gradient update based
+   * on samples indexed by batch, but does not apply regularization.
+   *
+   * @param x - unscaled weights
+   * @param batch - indices of which samples to compute function over
+   */
+  @Override
+  public void calculateStochasticGradient(double[] x, int[] batch) {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">    if (derivative == null) {</span>
+<span class="nc" id="L571">      derivative = new double[domainDimension()];</span>
+    }
+    // int[][] wis = getWeightIndices();
+    // was: double[][] weights = to2D(x, 1.0); // but 1.0 should be the same as omitting 2nd parameter....
+<span class="nc" id="L575">    to2D(x, weights);</span>
+<span class="nc" id="L576">    setWeights(weights);</span>
+
+    // iterate over all the documents
+<span class="nc" id="L579">    List&lt;Integer&gt; docIDs = new ArrayList&lt;&gt;(batch.length);</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">    for (int item : batch) {</span>
+<span class="nc" id="L581">      docIDs.add(item);</span>
+    }
+<span class="nc" id="L583">    multiThreadGradient(docIDs, true);</span>
+
+<span class="nc" id="L585">    int index = 0;</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">    for (int i = 0; i &lt; E.length; i++) {</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">      for (int j = 0; j &lt; E[i].length; j++) {</span>
+        // real gradient should be empirical-expected;
+        // but since we minimize -L(\theta), the gradient is -(empirical-expected)
+<span class="nc" id="L590">        derivative[index++] = (E[i][j]-Ehat[i][j]);</span>
+      }
+    }
+<span class="nc" id="L593">  }</span>
+
+  /**
+   * Computes value of function for specified value of x (scaled by xScale)
+   * only over samples indexed by batch.
+   * NOTE: This function does not do regularization (regularization is done by the minimizer).
+   *
+   * @param x - unscaled weights
+   * @param xScale - how much to scale x by when performing calculations
+   * @param batch - indices of which samples to compute function over
+   * @return value of function at specified x (scaled by xScale) for samples
+   */
+  @Override
+  public double valueAt(double[] x, double xScale, int[] batch) {
+<span class="nc" id="L607">    double prob = 0.0; // the log prob of the sequence given the model, which is the negation of value at this point</span>
+    // int[][] wis = getWeightIndices();
+<span class="nc" id="L609">    to2D(x, xScale, weights);</span>
+<span class="nc" id="L610">    setWeights(weights);</span>
+
+    // iterate over all the documents
+<span class="nc bnc" id="L613" title="All 2 branches missed.">    for (int ind : batch) {</span>
+<span class="nc" id="L614">      prob += valueForADoc(ind);</span>
+    }
+
+<span class="nc bnc" id="L617" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L618">      throw new RuntimeException(&quot;Got NaN for prob in CRFLogConditionalObjectiveFunction.calculate()&quot;);</span>
+    }
+
+<span class="nc" id="L621">    value = -prob;</span>
+<span class="nc" id="L622">    return value;</span>
+  }
+
+  @Override
+  public int[][] getFeatureGrouping() {
+<span class="nc bnc" id="L627" title="All 2 branches missed.">    if (featureGrouping != null)</span>
+<span class="nc" id="L628">      return featureGrouping;</span>
+    else {
+<span class="nc" id="L630">      int[][] fg = new int[1][];</span>
+<span class="nc" id="L631">      fg[0] = ArrayMath.range(0, domainDimension());</span>
+<span class="nc" id="L632">      return fg;</span>
+    }
+  }
+
+  public void setFeatureGrouping(int[][] fg) {
+<span class="nc" id="L637">    this.featureGrouping = fg;</span>
+<span class="nc" id="L638">  }</span>
+
+  protected void applyPrior(double[] x, double batchScale) {
+    // incorporate priors
+<span class="nc bnc" id="L642" title="All 2 branches missed.">    if (prior == QUADRATIC_PRIOR) {</span>
+<span class="nc" id="L643">      double lambda = 1 / (sigma * sigma);</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L645">        double w = x[i];</span>
+<span class="nc" id="L646">        value += batchScale * w * w * lambda * 0.5;</span>
+<span class="nc" id="L647">        derivative[i] += batchScale * w * lambda;</span>
+      }
+<span class="nc bnc" id="L649" title="All 2 branches missed.">    } else if (prior == HUBER_PRIOR) {</span>
+<span class="nc" id="L650">      double sigmaSq = sigma * sigma;</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L652">        double w = x[i];</span>
+<span class="nc" id="L653">        double wabs = Math.abs(w);</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">        if (wabs &lt; epsilon) {</span>
+<span class="nc" id="L655">          value += batchScale*w * w / 2.0 / epsilon / sigmaSq;</span>
+<span class="nc" id="L656">          derivative[i] += batchScale*w / epsilon / sigmaSq;</span>
+        } else {
+<span class="nc" id="L658">          value += batchScale*(wabs - epsilon / 2) / sigmaSq;</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">          derivative[i] += batchScale*((w &lt; 0.0) ? -1.0 : 1.0) / sigmaSq;</span>
+        }
+      }
+<span class="nc bnc" id="L662" title="All 2 branches missed.">    } else if (prior == QUARTIC_PRIOR) {</span>
+<span class="nc" id="L663">      double sigmaQu = sigma * sigma * sigma * sigma;</span>
+<span class="nc" id="L664">      double lambda = 1 / 2.0 / sigmaQu;</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">      for (int i = 0; i &lt; x.length; i++) {</span>
+<span class="nc" id="L666">        double w = x[i];</span>
+<span class="nc" id="L667">        value += batchScale * w * w * w * w * lambda;</span>
+<span class="nc" id="L668">        derivative[i] += batchScale * w / sigmaQu;</span>
+      }
+    }
+<span class="nc" id="L671">  }</span>
+
+
+  protected Pair&lt;double[][][], double[][][]&gt; getCondProbs(CRFCliqueTree cTree, int[][][] docData) {
+    // first index position is curr index, second index curr-class, third index prev-class
+    // e.g. [1][2][3] means curr is at position 1 with class 2, prev is at position 0 with class 3
+<span class="nc" id="L677">    double[][][] prevGivenCurr = new double[docData.length][][];</span>
+    // first index position is curr index, second index curr-class, third index next-class
+    // e.g. [0][2][3] means curr is at position 0 with class 2, next is at position 1 with class 3
+<span class="nc" id="L680">    double[][][] nextGivenCurr = new double[docData.length][][];</span>
+
+<span class="nc bnc" id="L682" title="All 2 branches missed.">    for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L683">      prevGivenCurr[i] = new double[numClasses][];</span>
+<span class="nc" id="L684">      nextGivenCurr[i] = new double[numClasses][];</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">      for (int j = 0; j &lt; numClasses; j++) {</span>
+<span class="nc" id="L686">        prevGivenCurr[i][j] = new double[numClasses];</span>
+<span class="nc" id="L687">        nextGivenCurr[i][j] = new double[numClasses];</span>
+      }
+    }
+
+    // computing prevGivenCurr and nextGivenCurr
+<span class="nc bnc" id="L692" title="All 2 branches missed.">    for (int i=0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L693">      int[] labelPair = new int[2];</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">      for (int l1 = 0; l1 &lt; numClasses; l1++) {</span>
+<span class="nc" id="L695">        labelPair[0] = l1;</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">        for (int l2 = 0; l2 &lt; numClasses; l2++) {</span>
+<span class="nc" id="L697">          labelPair[1] = l2;</span>
+<span class="nc" id="L698">          double prob = cTree.logProb(i, labelPair);</span>
+          // log.info(prob);
+<span class="nc bnc" id="L700" title="All 2 branches missed.">          if (i-1 &gt;= 0)</span>
+<span class="nc" id="L701">            nextGivenCurr[i-1][l1][l2] = prob;</span>
+<span class="nc" id="L702">          prevGivenCurr[i][l2][l1] = prob;</span>
+        }
+      }
+
+      if (DEBUG2) {
+        log.info(&quot;unnormalized conditionals:&quot;);
+        if (i&gt;0) {
+        log.info(&quot;nextGivenCurr[&quot; + (i-1) + &quot;]:&quot;);
+        for (int a = 0; a &lt; nextGivenCurr[i-1].length; a++) {
+          for (int b = 0; b &lt; nextGivenCurr[i-1][a].length; b++)
+            log.info((nextGivenCurr[i-1][a][b])+&quot;\t&quot;);
+          log.info();
+        }
+        }
+        log.info(&quot;prevGivenCurr[&quot; + (i) + &quot;]:&quot;);
+        for (int a = 0; a &lt; prevGivenCurr[i].length; a++) {
+          for (int b = 0; b &lt; prevGivenCurr[i][a].length; b++)
+            log.info((prevGivenCurr[i][a][b])+&quot;\t&quot;);
+          log.info();
+        }
+      }
+
+<span class="nc bnc" id="L724" title="All 2 branches missed.">      for (int j=0; j&lt; numClasses; j++) {</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        if (i-1 &gt;= 0) {</span>
+          // ArrayMath.normalize(nextGivenCurr[i-1][j]);
+<span class="nc" id="L727">          ArrayMath.logNormalize(nextGivenCurr[i-1][j]);</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">          for (int k = 0; k &lt; nextGivenCurr[i-1][j].length; k++)</span>
+<span class="nc" id="L729">            nextGivenCurr[i-1][j][k] = Math.exp(nextGivenCurr[i-1][j][k]);</span>
+        }
+        // ArrayMath.normalize(prevGivenCurr[i][j]);
+<span class="nc" id="L732">        ArrayMath.logNormalize(prevGivenCurr[i][j]);</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">        for (int k = 0; k &lt; prevGivenCurr[i][j].length; k++)</span>
+<span class="nc" id="L734">          prevGivenCurr[i][j][k] = Math.exp(prevGivenCurr[i][j][k]);</span>
+      }
+
+      if (DEBUG2) {
+        log.info(&quot;normalized conditionals:&quot;);
+        if (i&gt;0) {
+        log.info(&quot;nextGivenCurr[&quot; + (i-1) + &quot;]:&quot;);
+        for (int a = 0; a &lt; nextGivenCurr[i-1].length; a++) {
+          for (int b = 0; b &lt; nextGivenCurr[i-1][a].length; b++)
+            log.info((nextGivenCurr[i-1][a][b])+&quot;\t&quot;);
+          log.info();
+        }
+        }
+        log.info(&quot;prevGivenCurr[&quot; + (i) + &quot;]:&quot;);
+        for (int a = 0; a &lt; prevGivenCurr[i].length; a++) {
+          for (int b = 0; b &lt; prevGivenCurr[i][a].length; b++)
+            log.info((prevGivenCurr[i][a][b])+&quot;\t&quot;);
+          log.info();
+        }
+      }
+    }
+
+<span class="nc" id="L756">    return new Pair&lt;&gt;(prevGivenCurr, nextGivenCurr);</span>
+  }
+
+  protected static void combine2DArr(double[][] combineInto, double[][] toBeCombined, double scale) {
+<span class="nc bnc" id="L760" title="All 2 branches missed.">    for (int i = 0; i &lt; toBeCombined.length; i++)</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">      for (int j = 0; j &lt; toBeCombined[i].length; j++)</span>
+<span class="nc" id="L762">        combineInto[i][j] += toBeCombined[i][j] * scale;</span>
+<span class="nc" id="L763">  }</span>
+
+  protected static void combine2DArr(double[][] combineInto, double[][] toBeCombined) {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">    for (int i = 0; i &lt; toBeCombined.length; i++)</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">      for (int j = 0; j &lt; toBeCombined[i].length; j++)</span>
+<span class="nc" id="L768">        combineInto[i][j] += toBeCombined[i][j];</span>
+<span class="nc" id="L769">  }</span>
+
+  // TODO(mengqiu) add dimension checks
+  protected static void combine2DArr(double[][] combineInto, Map&lt;Integer, double[]&gt; toBeCombined) {
+<span class="nc bnc" id="L773" title="All 2 branches missed.">    for (Map.Entry&lt;Integer, double[]&gt; entry: toBeCombined.entrySet()) {</span>
+<span class="nc" id="L774">      int key = entry.getKey();</span>
+<span class="nc" id="L775">      double[] source = entry.getValue();</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">      for (int i = 0; i&lt; source.length; i++)</span>
+<span class="nc" id="L777">        combineInto[key][i] += source[i];</span>
+<span class="nc" id="L778">    }</span>
+<span class="nc" id="L779">  }</span>
+
+  protected static void combine2DArr(double[][] combineInto, Map&lt;Integer, double[]&gt; toBeCombined, double scale) {
+<span class="nc bnc" id="L782" title="All 2 branches missed.">    for (Map.Entry&lt;Integer, double[]&gt; entry: toBeCombined.entrySet()) {</span>
+<span class="nc" id="L783">      int key = entry.getKey();</span>
+<span class="nc" id="L784">      double[] source = entry.getValue();</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">      for (int i = 0; i&lt; source.length; i++)</span>
+<span class="nc" id="L786">        combineInto[key][i] += source[i] * scale;</span>
+<span class="nc" id="L787">    }</span>
+<span class="nc" id="L788">  }</span>
+
+  // this used to be computed lazily, but that was clearly erroneous for multithreading!
+  @Override
+  public int domainDimension() {
+<span class="nc" id="L793">    return domainDimension;</span>
+  }
+
+  /**
+   * Takes a double array of weights and creates a 2D array where:
+   *
+   * the first element is the mapped index of the clique size (e.g., node-0, edge-1) matching featuresIndex i
+   * the second element is the number of output classes for that clique size
+   *
+   * @return a 2D weight array
+   */
+  public static double[][] to2D(double[] weights, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map) {
+<span class="nc" id="L805">    double[][] newWeights = new double[map.length][];</span>
+<span class="nc" id="L806">    int index = 0;</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">    for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L808">      int labelSize = labelIndices.get(map[i]).size();</span>
+<span class="nc" id="L809">      newWeights[i] = new double[labelSize];</span>
+      try {
+<span class="nc" id="L811">        System.arraycopy(weights, index, newWeights[i], 0, labelSize);</span>
+<span class="nc" id="L812">      } catch (Exception ex) {</span>
+<span class="nc" id="L813">        log.info(&quot;weights: &quot; + Arrays.toString(weights));</span>
+<span class="nc" id="L814">        log.info(&quot;newWeights[&quot;+i+&quot;]: &quot; + Arrays.toString(newWeights[i]));</span>
+<span class="nc" id="L815">        throw new RuntimeException(ex);</span>
+<span class="nc" id="L816">      }</span>
+<span class="nc" id="L817">      index += labelSize;</span>
+    }
+<span class="nc" id="L819">    return newWeights;</span>
+  }
+
+  public double[][] to2D(double[] weights) {
+<span class="nc" id="L823">    return to2D(weights, this.labelIndices, this.map);</span>
+  }
+
+  public static void to2D(double[] weights, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, double[][] newWeights) {
+<span class="nc" id="L827">    int index = 0;</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">    for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L829">      int labelSize = labelIndices.get(map[i]).size();</span>
+      try {
+<span class="nc" id="L831">        System.arraycopy(weights, index, newWeights[i], 0, labelSize);</span>
+<span class="nc" id="L832">      } catch (Exception ex) {</span>
+<span class="nc" id="L833">        log.info(&quot;weights: &quot; + Arrays.toString(weights));</span>
+<span class="nc" id="L834">        log.info(&quot;newWeights[&quot;+i+&quot;]: &quot; + Arrays.toString(newWeights[i]));</span>
+<span class="nc" id="L835">        throw new RuntimeException(ex);</span>
+<span class="nc" id="L836">      }</span>
+<span class="nc" id="L837">      index += labelSize;</span>
+    }
+<span class="nc" id="L839">  }</span>
+
+  public void to2D(double[] weights1D, double[][] newWeights) {
+<span class="nc" id="L842">    to2D(weights1D, this.labelIndices, this.map, newWeights);</span>
+<span class="nc" id="L843">  }</span>
+
+  /** Beware: this changes the input weights array in place. */
+  public double[][] to2D(double[] weights1D, double wScale) {
+<span class="nc bnc" id="L847" title="All 2 branches missed.">    for (int i = 0; i &lt; weights1D.length; i++)</span>
+<span class="nc" id="L848">      weights1D[i] = weights1D[i] * wScale;</span>
+
+<span class="nc" id="L850">    return to2D(weights1D, this.labelIndices, this.map);</span>
+  }
+
+  /** Beware: this changes the input weights array in place. */
+  public void to2D(double[] weights1D, double wScale, double[][] newWeights) {
+<span class="nc bnc" id="L855" title="All 2 branches missed.">    for (int i = 0; i &lt; weights1D.length; i++)</span>
+<span class="nc" id="L856">      weights1D[i] = weights1D[i] * wScale;</span>
+
+<span class="nc" id="L858">    to2D(weights1D, this.labelIndices, this.map, newWeights);</span>
+<span class="nc" id="L859">  }</span>
+
+  public static void clear2D(double[][] arr2D) {
+<span class="nc bnc" id="L862" title="All 2 branches missed.">    for (int i = 0; i &lt; arr2D.length; i++)</span>
+<span class="nc bnc" id="L863" title="All 2 branches missed.">      for (int j = 0; j &lt; arr2D[i].length; j++)</span>
+<span class="nc" id="L864">        arr2D[i][j] = 0.0;</span>
+<span class="nc" id="L865">  }</span>
+
+  public static void to1D(double[][] weights, double[] newWeights) {
+<span class="nc" id="L868">    int index = 0;</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">    for (double[] weightVector : weights) {</span>
+<span class="nc" id="L870">      System.arraycopy(weightVector, 0, newWeights, index, weightVector.length);</span>
+<span class="nc" id="L871">      index += weightVector.length;</span>
+    }
+<span class="nc" id="L873">  }</span>
+
+  public static double[] to1D(double[][] weights, int domainDimension) {
+<span class="nc" id="L876">    double[] newWeights = new double[domainDimension];</span>
+<span class="nc" id="L877">    int index = 0;</span>
+<span class="nc bnc" id="L878" title="All 2 branches missed.">    for (double[] weightVector : weights) {</span>
+<span class="nc" id="L879">      System.arraycopy(weightVector, 0, newWeights, index, weightVector.length);</span>
+<span class="nc" id="L880">      index += weightVector.length;</span>
+    }
+<span class="nc" id="L882">    return newWeights;</span>
+  }
+
+  public double[] to1D(double[][] weights) {
+<span class="nc" id="L886">    return to1D(weights, domainDimension());</span>
+  }
+
+  public int[][] getWeightIndices() {
+<span class="nc bnc" id="L890" title="All 2 branches missed.">    if (weightIndices == null) {</span>
+<span class="nc" id="L891">      weightIndices = new int[map.length][];</span>
+<span class="nc" id="L892">      int index = 0;</span>
+<span class="nc bnc" id="L893" title="All 2 branches missed.">      for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L894">        weightIndices[i] = new int[labelIndices.get(map[i]).size()];</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">        for (int j = 0; j &lt; labelIndices.get(map[i]).size(); j++) {</span>
+<span class="nc" id="L896">          weightIndices[i][j] = index;</span>
+<span class="nc" id="L897">          index++;</span>
+        }
+      }
+    }
+<span class="nc" id="L901">    return weightIndices;</span>
+  }
+
+  protected double[][] empty2D() {
+<span class="nc" id="L905">    double[][] d = new double[map.length][];</span>
+    // int index = 0;
+<span class="nc bnc" id="L907" title="All 2 branches missed.">    for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L908">      d[i] = new double[labelIndices.get(map[i]).size()];</span>
+    }
+<span class="nc" id="L910">    return d;</span>
+  }
+
+  public int[][] getLabels() {
+<span class="nc" id="L914">    return labels;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,1059 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RVFDataset.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.classify</a> &gt; <span class="el_source">RVFDataset.java</span></div><h1>RVFDataset.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.classify;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Random;
+import java.util.Set;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.HashIndex;
+
+
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * An interfacing class for {@link ClassifierFactory} that incrementally builds
+ * a more memory-efficient representation of a {@link List} of {@link RVFDatum}
+ * objects for the purposes of training a {@link Classifier} with a
+ * {@link ClassifierFactory}.
+ *
+ * @author Jenny Finkel (jrfinkel@stanford.edu)
+ * @author Rajat Raina (added methods to record data sources and ids)
+ * @author Anna Rafferty (various refactoring with GeneralDataset/Dataset)
+ * @author Sarah Spikes (sdspikes@cs.stanford.edu) (Templatization)
+ *
+ * @param &lt;L&gt; The type of the labels in the Dataset
+ * @param &lt;F&gt; The type of the features in the Dataset
+ */
+<span class="pc bpc" id="L49" title="1 of 2 branches missed.">public class RVFDataset&lt;L, F&gt; extends GeneralDataset&lt;L, F&gt;  {  // implements Iterable&lt;RVFDatum&lt;L, F&gt;&gt;, Serializable</span>
+
+  private static final long serialVersionUID = -3841757837680266182L;
+
+  private double[][] values;  // [datumIndex][i] values of features listed in int[][] data
+  private double[] minValues; // = null; //stores the minValues of all features
+                              // for normalization.
+  private double[] maxValues; // = null; //stores the maxValues of all features
+                              // for normalization.
+  double[] means;
+  double[] stdevs; // means and stdevs of features, used for
+
+  /** A logger for this class */
+<span class="fc" id="L62">  private static final Redwood.RedwoodChannels logger = Redwood.channels(RVFDataset.class);</span>
+
+  /*
+   * Store source and id of each datum; optional, and not fully supported.
+   */
+  private ArrayList&lt;Pair&lt;String, String&gt;&gt; sourcesAndIds;
+
+  public RVFDataset() {
+<span class="fc" id="L70">    this(10);</span>
+<span class="fc" id="L71">  }</span>
+
+  public RVFDataset(int numDatums, Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex) {
+<span class="fc" id="L74">    this(numDatums);</span>
+<span class="fc" id="L75">    this.labelIndex = labelIndex;</span>
+<span class="fc" id="L76">    this.featureIndex = featureIndex;</span>
+<span class="fc" id="L77">  }</span>
+
+  public RVFDataset(Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex) {
+<span class="nc" id="L80">    this(10);</span>
+<span class="nc" id="L81">    this.labelIndex = labelIndex;</span>
+<span class="nc" id="L82">    this.featureIndex = featureIndex;</span>
+<span class="nc" id="L83">  }</span>
+
+<span class="fc" id="L85">  public RVFDataset(int numDatums) {</span>
+<span class="fc" id="L86">    initialize(numDatums);</span>
+<span class="fc" id="L87">  }</span>
+
+  /**
+   * Constructor that fully specifies a Dataset. Needed this for
+   * MulticlassDataset.
+   */
+<span class="nc" id="L93">  public RVFDataset(Index&lt;L&gt; labelIndex, int[] labels, Index&lt;F&gt; featureIndex, int[][] data, double[][] values) {</span>
+<span class="nc" id="L94">    this.labelIndex = labelIndex;</span>
+<span class="nc" id="L95">    this.labels = labels;</span>
+<span class="nc" id="L96">    this.featureIndex = featureIndex;</span>
+<span class="nc" id="L97">    this.data = data;</span>
+<span class="nc" id="L98">    this.values = values;</span>
+<span class="nc" id="L99">    this.size = labels.length;</span>
+<span class="nc" id="L100">  }</span>
+
+  @Override
+  public Pair&lt;GeneralDataset&lt;L, F&gt;, GeneralDataset&lt;L, F&gt;&gt; split(double percentDev) {
+<span class="nc" id="L104">    int devSize = (int) (percentDev * size());</span>
+<span class="nc" id="L105">    int trainSize = size() - devSize;</span>
+
+<span class="nc" id="L107">    int[][] devData = new int[devSize][];</span>
+<span class="nc" id="L108">    double[][] devValues = new double[devSize][];</span>
+<span class="nc" id="L109">    int[] devLabels = new int[devSize];</span>
+
+<span class="nc" id="L111">    int[][] trainData = new int[trainSize][];</span>
+<span class="nc" id="L112">    double[][] trainValues = new double[trainSize][];</span>
+<span class="nc" id="L113">    int[] trainLabels = new int[trainSize];</span>
+
+<span class="nc" id="L115">    synchronized (System.class) {</span>
+<span class="nc" id="L116">      System.arraycopy(data, 0, devData, 0, devSize);</span>
+<span class="nc" id="L117">      System.arraycopy(values, 0, devValues, 0, devSize);</span>
+<span class="nc" id="L118">      System.arraycopy(labels, 0, devLabels, 0, devSize);</span>
+
+<span class="nc" id="L120">      System.arraycopy(data, devSize, trainData, 0, trainSize);</span>
+<span class="nc" id="L121">      System.arraycopy(values, devSize, trainValues, 0, trainSize);</span>
+<span class="nc" id="L122">      System.arraycopy(labels, devSize, trainLabels, 0, trainSize);</span>
+<span class="nc" id="L123">    }</span>
+
+<span class="nc" id="L125">    RVFDataset&lt;L, F&gt; dev = new RVFDataset&lt;&gt;(labelIndex, devLabels, featureIndex, devData, devValues);</span>
+<span class="nc" id="L126">    RVFDataset&lt;L, F&gt; train = new RVFDataset&lt;&gt;(labelIndex, trainLabels, featureIndex, trainData, trainValues);</span>
+
+<span class="nc" id="L128">    return new Pair&lt;&gt;(train, dev);</span>
+
+  }
+
+  public void scaleFeaturesGaussian() {
+<span class="nc" id="L133">    means = new double[this.numFeatures()];</span>
+    // Arrays.fill(means, 0); // not needed; Java arrays zero initialized
+
+<span class="nc bnc" id="L136" title="All 2 branches missed.">    for (int i = 0; i &lt; this.size(); i++) {</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++)</span>
+<span class="nc" id="L138">        means[data[i][j]] += values[i][j];</span>
+    }
+<span class="nc" id="L140">    ArrayMath.multiplyInPlace(means, 1.0 / this.size());</span>
+
+<span class="nc" id="L142">    stdevs = new double[this.numFeatures()];</span>
+    // Arrays.fill(stdevs, 0); // not needed; Java arrays zero initialized
+<span class="nc" id="L144">    double[] deltaX = new double[this.numFeatures()];</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">    for (int i = 0; i &lt; this.size(); i++) {</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">      for (int f = 0; f &lt; this.numFeatures(); f++)</span>
+<span class="nc" id="L148">        deltaX[f] = -means[f];</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++)</span>
+<span class="nc" id="L150">        deltaX[data[i][j]] += values[i][j];</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">      for (int f = 0; f &lt; this.numFeatures(); f++) {</span>
+<span class="nc" id="L152">        stdevs[f] += deltaX[f] * deltaX[f];</span>
+      }
+    }
+<span class="nc bnc" id="L155" title="All 2 branches missed.">    for (int f = 0; f &lt; this.numFeatures(); f++) {</span>
+<span class="nc" id="L156">      stdevs[f] /= (this.size() - 1);</span>
+<span class="nc" id="L157">      stdevs[f] = Math.sqrt(stdevs[f]);</span>
+    }
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    for (int i = 0; i &lt; this.size(); i++) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L161">        int fID = data[i][j];</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (stdevs[fID] != 0)</span>
+<span class="nc" id="L163">          values[i][j] = (values[i][j] - means[fID]) / stdevs[fID];</span>
+      }
+    }
+
+<span class="nc" id="L167">  }</span>
+
+  /**
+   * Scales feature values linearly such that each feature value lies between 0
+   * and 1.
+   *
+   */
+  public void scaleFeatures() {
+    // TODO: should also implement a method that scales the features using the
+    // mean and std.
+<span class="nc" id="L177">    minValues = new double[featureIndex.size()];</span>
+<span class="nc" id="L178">    maxValues = new double[featureIndex.size()];</span>
+<span class="nc" id="L179">    Arrays.fill(minValues, Double.POSITIVE_INFINITY);</span>
+<span class="nc" id="L180">    Arrays.fill(maxValues, Double.NEGATIVE_INFINITY);</span>
+
+    // first identify the max and min values for each feature.
+    // System.out.printf(&quot;number of datums: %d dataset size: %d\n&quot;,data.length,size());
+<span class="nc bnc" id="L184" title="All 2 branches missed.">    for (int i = 0; i &lt; size(); i++) {</span>
+      // System.out.printf(&quot;datum %d length %d\n&quot;, i,data[i].length);
+<span class="nc bnc" id="L186" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L187">        int f = data[i][j];</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (values[i][j] &lt; minValues[f])</span>
+<span class="nc" id="L189">          minValues[f] = values[i][j];</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (values[i][j] &gt; maxValues[f])</span>
+<span class="nc" id="L191">          maxValues[f] = values[i][j];</span>
+      }
+    }
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">    for (int f = 0; f &lt; featureIndex.size(); f++) {</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">      if (minValues[f] == Double.POSITIVE_INFINITY)</span>
+<span class="nc" id="L197">        throw new RuntimeException(&quot;minValue for feature &quot; + f + &quot; not assigned. &quot;);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">      if (maxValues[f] == Double.NEGATIVE_INFINITY)</span>
+<span class="nc" id="L199">        throw new RuntimeException(&quot;maxValue for feature &quot; + f + &quot; not assigned.&quot;);</span>
+    }
+
+    // now scale each value such that it's between 0 and 1.
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    for (int i = 0; i &lt; size(); i++) {</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L205">        int f = data[i][j];</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (minValues[f] != maxValues[f])// the equality can happen for binary</span>
+                                         // features which always take the value
+                                         // of 1.0
+<span class="nc" id="L209">          values[i][j] = (values[i][j] - minValues[f]) / (maxValues[f] - minValues[f]);</span>
+      }
+    }
+
+    /*
+    for(int f = 0; f &lt; featureIndex.size(); f++){
+      if(minValues[f] == maxValues[f])
+        throw new RuntimeException(&quot;minValue for feature &quot;+f+&quot; is equal to maxValue:&quot;+minValues[f]);
+    }
+    */
+<span class="nc" id="L219">  }</span>
+
+  /**
+   * Checks if the dataset has any unbounded values. Always good to use this
+   * before training a model on the dataset. This way, one can avoid seeing the
+   * infamous 4's that get printed by the QuasiNewton Method when NaNs exist in
+   * the data! -Ramesh
+   */
+  public void ensureRealValues() {
+<span class="nc" id="L228">    double[][] values = getValuesArray();</span>
+<span class="nc" id="L229">    int[][] data = getDataArray();</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">    for (int i = 0; i &lt; size(); i++) {</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">      for (int j = 0; j &lt; values[i].length; j++) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (Double.isNaN(values[i][j])) {</span>
+<span class="nc" id="L233">          int fID = data[i][j];</span>
+<span class="nc" id="L234">          F feature = featureIndex.get(fID);</span>
+<span class="nc" id="L235">          throw new RuntimeException(&quot;datum &quot; + i + &quot; has a NaN value for feature:&quot; + feature);</span>
+        }
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (Double.isInfinite(values[i][j])) {</span>
+<span class="nc" id="L238">          int fID = data[i][j];</span>
+<span class="nc" id="L239">          F feature = featureIndex.get(fID);</span>
+<span class="nc" id="L240">          throw new RuntimeException(&quot;datum &quot; + i + &quot; has infinite value for feature:&quot; + feature);</span>
+        }
+      }
+    }
+<span class="nc" id="L244">  }</span>
+
+  /**
+   * Scales the values of each feature in each linearly using the min and max
+   * values found in the training set. NOTE1: Not guaranteed to be between 0 and
+   * 1 for a test datum. NOTE2: Also filters out features from each datum that
+   * are not seen at training time.
+   *
+   * @param dataset
+   * @return a new dataset
+   */
+  public RVFDataset&lt;L, F&gt; scaleDataset(RVFDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L256">    RVFDataset&lt;L, F&gt; newDataset = new RVFDataset&lt;&gt;(this.featureIndex, this.labelIndex);</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">    for (int i = 0; i &lt; dataset.size(); i++) {</span>
+<span class="nc" id="L258">      RVFDatum&lt;L, F&gt; datum = dataset.getDatum(i);</span>
+<span class="nc" id="L259">      newDataset.add(scaleDatum(datum));</span>
+    }
+<span class="nc" id="L261">    return newDataset;</span>
+  }
+
+  /**
+   * Scales the values of each feature linearly using the min and max values
+   * found in the training set. NOTE1: Not guaranteed to be between 0 and 1 for
+   * a test datum. NOTE2: Also filters out features from the datum that are not
+   * seen at training time.
+   *
+   * @param datum
+   * @return a new datum
+   */
+  public RVFDatum&lt;L, F&gt; scaleDatum(RVFDatum&lt;L, F&gt; datum) {
+    // scale this dataset before scaling the datum
+<span class="nc bnc" id="L275" title="All 4 branches missed.">    if (minValues == null || maxValues == null)</span>
+<span class="nc" id="L276">      scaleFeatures();</span>
+<span class="nc" id="L277">    Counter&lt;F&gt; scaledFeatures = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    for (F feature : datum.asFeatures()) {</span>
+<span class="nc" id="L279">      int fID = this.featureIndex.indexOf(feature);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">      if (fID &gt;= 0) {</span>
+<span class="nc" id="L281">        double oldVal = datum.asFeaturesCounter().getCount(feature);</span>
+        double newVal;
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (minValues[fID] != maxValues[fID])</span>
+<span class="nc" id="L284">          newVal = (oldVal - minValues[fID]) / (maxValues[fID] - minValues[fID]);</span>
+        else
+<span class="nc" id="L286">          newVal = oldVal;</span>
+<span class="nc" id="L287">        scaledFeatures.incrementCount(feature, newVal);</span>
+      }
+<span class="nc" id="L289">    }</span>
+<span class="nc" id="L290">    return new RVFDatum&lt;&gt;(scaledFeatures, datum.label());</span>
+  }
+
+  public RVFDataset&lt;L, F&gt; scaleDatasetGaussian(RVFDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L294">    RVFDataset&lt;L, F&gt; newDataset = new RVFDataset&lt;&gt;(this.featureIndex, this.labelIndex);</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">    for (int i = 0; i &lt; dataset.size(); i++) {</span>
+<span class="nc" id="L296">      RVFDatum&lt;L, F&gt; datum = dataset.getDatum(i);</span>
+<span class="nc" id="L297">      newDataset.add(scaleDatumGaussian(datum));</span>
+    }
+<span class="nc" id="L299">    return newDataset;</span>
+  }
+
+  public RVFDatum&lt;L, F&gt; scaleDatumGaussian(RVFDatum&lt;L, F&gt; datum) {
+    // scale this dataset before scaling the datum
+<span class="nc bnc" id="L304" title="All 4 branches missed.">    if (means == null || stdevs == null)</span>
+<span class="nc" id="L305">      scaleFeaturesGaussian();</span>
+<span class="nc" id="L306">    Counter&lt;F&gt; scaledFeatures = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    for (F feature : datum.asFeatures()) {</span>
+<span class="nc" id="L308">      int fID = this.featureIndex.indexOf(feature);</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">      if (fID &gt;= 0) {</span>
+<span class="nc" id="L310">        double oldVal = datum.asFeaturesCounter().getCount(feature);</span>
+        double newVal;
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        if (stdevs[fID] != 0)</span>
+<span class="nc" id="L313">          newVal = (oldVal - means[fID]) / stdevs[fID];</span>
+        else
+<span class="nc" id="L315">          newVal = oldVal;</span>
+<span class="nc" id="L316">        scaledFeatures.incrementCount(feature, newVal);</span>
+      }
+<span class="nc" id="L318">    }</span>
+<span class="nc" id="L319">    return new RVFDatum&lt;&gt;(scaledFeatures, datum.label());</span>
+  }
+
+  @Override
+  public Pair&lt;GeneralDataset&lt;L, F&gt;, GeneralDataset&lt;L, F&gt;&gt; split(int start, int end) {
+<span class="nc" id="L324">    int devSize = end - start;</span>
+<span class="nc" id="L325">    int trainSize = size() - devSize;</span>
+
+<span class="nc" id="L327">    int[][] devData = new int[devSize][];</span>
+<span class="nc" id="L328">    double[][] devValues = new double[devSize][];</span>
+<span class="nc" id="L329">    int[] devLabels = new int[devSize];</span>
+
+<span class="nc" id="L331">    int[][] trainData = new int[trainSize][];</span>
+<span class="nc" id="L332">    double[][] trainValues = new double[trainSize][];</span>
+<span class="nc" id="L333">    int[] trainLabels = new int[trainSize];</span>
+
+<span class="nc" id="L335">    synchronized (System.class) {</span>
+<span class="nc" id="L336">      System.arraycopy(data, start, devData, 0, devSize);</span>
+<span class="nc" id="L337">      System.arraycopy(values, start, devValues, 0, devSize);</span>
+<span class="nc" id="L338">      System.arraycopy(labels, start, devLabels, 0, devSize);</span>
+
+<span class="nc" id="L340">      System.arraycopy(data, 0, trainData, 0, start);</span>
+<span class="nc" id="L341">      System.arraycopy(data, end, trainData, start, size() - end);</span>
+<span class="nc" id="L342">      System.arraycopy(values, 0, trainValues, 0, start);</span>
+<span class="nc" id="L343">      System.arraycopy(values, end, trainValues, start, size() - end);</span>
+<span class="nc" id="L344">      System.arraycopy(labels, 0, trainLabels, 0, start);</span>
+<span class="nc" id="L345">      System.arraycopy(labels, end, trainLabels, start, size() - end);</span>
+<span class="nc" id="L346">    }</span>
+
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    if (this instanceof WeightedRVFDataset&lt;?,?&gt;) {</span>
+<span class="nc" id="L349">      float[] trainWeights = new float[trainSize];</span>
+<span class="nc" id="L350">      float[] devWeights = new float[devSize];</span>
+
+<span class="nc" id="L352">      WeightedRVFDataset&lt;L, F&gt; w = (WeightedRVFDataset&lt;L, F&gt;)this;</span>
+
+<span class="nc" id="L354">      synchronized (System.class) {</span>
+<span class="nc" id="L355">        System.arraycopy(w.weights, start, devWeights, 0, devSize);</span>
+<span class="nc" id="L356">        System.arraycopy(w.weights, 0, trainWeights, 0, start);</span>
+<span class="nc" id="L357">        System.arraycopy(w.weights, end, trainWeights, start, size() - end);</span>
+<span class="nc" id="L358">      }</span>
+
+<span class="nc" id="L360">      WeightedRVFDataset&lt;L, F&gt; dev = new WeightedRVFDataset&lt;&gt;(labelIndex, devLabels, featureIndex, devData, devValues, devWeights);</span>
+<span class="nc" id="L361">      WeightedRVFDataset&lt;L, F&gt; train = new WeightedRVFDataset&lt;&gt;(labelIndex, trainLabels, featureIndex, trainData, trainValues, trainWeights);</span>
+
+<span class="nc" id="L363">      return new Pair&lt;&gt;(train, dev);</span>
+    } else {
+
+<span class="nc" id="L366">      GeneralDataset&lt;L, F&gt; dev = new RVFDataset&lt;&gt;(labelIndex, devLabels, featureIndex, devData, devValues);</span>
+<span class="nc" id="L367">      GeneralDataset&lt;L, F&gt; train = new RVFDataset&lt;&gt;(labelIndex, trainLabels, featureIndex, trainData, trainValues);</span>
+
+<span class="nc" id="L369">      return new Pair&lt;&gt;(train, dev);</span>
+    }
+
+  }
+
+  // TODO: Check that this does what we want for Datum other than RVFDatum
+  @Override
+  // If you edit me, also take care of WeightedRVFDataset
+  public void add(Datum&lt;L, F&gt; d) {
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">    if (d instanceof RVFDatum&lt;?, ?&gt;) {</span>
+<span class="fc" id="L379">      addLabel(d.label());</span>
+<span class="fc" id="L380">      addFeatures(((RVFDatum&lt;L, F&gt;) d).asFeaturesCounter());</span>
+<span class="fc" id="L381">      size++;</span>
+    } else {
+<span class="nc" id="L383">      addLabel(d.label());</span>
+<span class="nc" id="L384">      addFeatures(Counters.asCounter(d.asFeatures()));</span>
+<span class="nc" id="L385">      size++;</span>
+    }
+<span class="fc" id="L387">  }</span>
+
+  // If you edit me, also take care of WeightedRVFDataset
+  public void add(Datum&lt;L, F&gt; d, String src, String id) {
+<span class="nc bnc" id="L391" title="All 2 branches missed.">    if (d instanceof RVFDatum&lt;?, ?&gt;) {</span>
+<span class="nc" id="L392">      addLabel(d.label());</span>
+<span class="nc" id="L393">      addFeatures(((RVFDatum&lt;L, F&gt;) d).asFeaturesCounter());</span>
+<span class="nc" id="L394">      addSourceAndId(src, id);</span>
+<span class="nc" id="L395">      size++;</span>
+    } else {
+<span class="nc" id="L397">      addLabel(d.label());</span>
+<span class="nc" id="L398">      addFeatures(Counters.asCounter(d.asFeatures()));</span>
+<span class="nc" id="L399">      addSourceAndId(src, id);</span>
+<span class="nc" id="L400">      size++;</span>
+    }
+<span class="nc" id="L402">  }</span>
+
+  // TODO shouldn't have both this and getRVFDatum
+  @Override
+  public RVFDatum&lt;L, F&gt; getDatum(int index) {
+<span class="nc" id="L407">    return getRVFDatum(index);</span>
+  }
+
+  /**
+   * @return the index-ed datum
+   *
+   *         Note, this returns a new RVFDatum object, not the original RVFDatum
+   *         that was added to the dataset.
+   */
+  @Override
+  public RVFDatum&lt;L, F&gt; getRVFDatum(int index) {
+<span class="fc" id="L418">    ClassicCounter&lt;F&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="fc bfc" id="L419" title="All 2 branches covered.">    for (int i = 0; i &lt; data[index].length; i++) {</span>
+<span class="fc" id="L420">      c.incrementCount(featureIndex.get(data[index][i]), values[index][i]);</span>
+    }
+<span class="fc" id="L422">    return new RVFDatum&lt;&gt;(c, labelIndex.get(labels[index]));</span>
+  }
+
+  public RVFDatum&lt;L, F&gt; getRVFDatumWithId(int index) {
+<span class="nc" id="L426">    RVFDatum&lt;L, F&gt; datum = getRVFDatum(index);</span>
+<span class="nc" id="L427">    datum.setID(getRVFDatumId(index));</span>
+<span class="nc" id="L428">    return datum;</span>
+  }
+
+  public String getRVFDatumSource(int index) {
+<span class="nc" id="L432">    return sourcesAndIds.get(index).first();</span>
+  }
+
+  public String getRVFDatumId(int index) {
+<span class="nc" id="L436">    return sourcesAndIds.get(index).second();</span>
+  }
+
+  public void addAllWithSourcesAndIds(RVFDataset&lt;L, F&gt; data) {
+<span class="nc bnc" id="L440" title="All 2 branches missed.">    for(int index=0 ; index&lt;data.size ; index++) {</span>
+<span class="nc" id="L441">      this.add(data.getRVFDatumWithId(index), data.getRVFDatumSource(index), data.getRVFDatumId(index));</span>
+    }
+<span class="nc" id="L443">  }</span>
+
+  public void addAll(Iterable&lt;? extends Datum&lt;L,F&gt;&gt; data) {
+<span class="fc bfc" id="L446" title="All 2 branches covered.">    for (Datum&lt;L, F&gt; d : data) {</span>
+<span class="fc" id="L447">      this.add(d);</span>
+<span class="fc" id="L448">    }</span>
+<span class="fc" id="L449">  }</span>
+  private void addSourceAndId(String src, String id) {
+<span class="nc" id="L451">    sourcesAndIds.add(new Pair&lt;&gt;(src, id));</span>
+<span class="nc" id="L452">  }</span>
+
+  private void addLabel(L label) {
+<span class="pc bpc" id="L455" title="1 of 2 branches missed.">    if (labels.length == size) {</span>
+<span class="nc" id="L456">      int[] newLabels = new int[size * 2];</span>
+<span class="nc" id="L457">      synchronized (System.class) {</span>
+<span class="nc" id="L458">        System.arraycopy(labels, 0, newLabels, 0, size);</span>
+<span class="nc" id="L459">      }</span>
+<span class="nc" id="L460">      labels = newLabels;</span>
+    }
+<span class="fc" id="L462">    labels[size] = labelIndex.addToIndex(label);</span>
+<span class="fc" id="L463">  }</span>
+
+  private void addFeatures(Counter&lt;F&gt; features) {
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">    if (data.length == size) {</span>
+<span class="nc" id="L467">      int[][] newData = new int[size * 2][];</span>
+<span class="nc" id="L468">      double[][] newValues = new double[size * 2][];</span>
+<span class="nc" id="L469">      synchronized (System.class) {</span>
+<span class="nc" id="L470">        System.arraycopy(data, 0, newData, 0, size);</span>
+<span class="nc" id="L471">        System.arraycopy(values, 0, newValues, 0, size);</span>
+<span class="nc" id="L472">      }</span>
+<span class="nc" id="L473">      data = newData;</span>
+<span class="nc" id="L474">      values = newValues;</span>
+    }
+
+<span class="fc" id="L477">    final List&lt;F&gt; featureNames = new ArrayList&lt;&gt;(features.keySet());</span>
+<span class="fc" id="L478">    final int nFeatures = featureNames.size();</span>
+<span class="fc" id="L479">    data[size] = new int[nFeatures];</span>
+<span class="fc" id="L480">    values[size] = new double[nFeatures];</span>
+<span class="fc bfc" id="L481" title="All 2 branches covered.">    for (int i = 0; i &lt; nFeatures; ++i) {</span>
+<span class="fc" id="L482">      F feature = featureNames.get(i);</span>
+<span class="fc" id="L483">      int fID = featureIndex.addToIndex(feature);</span>
+<span class="pc bpc" id="L484" title="1 of 2 branches missed.">      if (fID &gt;= 0) {</span>
+<span class="fc" id="L485">        data[size][i] = fID;</span>
+<span class="fc" id="L486">        values[size][i] = features.getCount(feature);</span>
+      } else {
+        // Usually a feature present at test but not training time.
+<span class="nc bnc" id="L489" title="All 4 branches missed.">        assert featureIndex.isLocked() : &quot;Could not add feature to index: &quot; + feature;</span>
+      }
+    }
+<span class="fc" id="L492">  }</span>
+
+  /**
+   * Resets the Dataset so that it is empty and ready to collect data.
+   */
+  @Override
+  public void clear() {
+<span class="nc" id="L499">    clear(10);</span>
+<span class="nc" id="L500">  }</span>
+
+  /**
+   * Resets the Dataset so that it is empty and ready to collect data.
+   */
+  @Override
+  public void clear(int numDatums) {
+<span class="nc" id="L507">    initialize(numDatums);</span>
+<span class="nc" id="L508">  }</span>
+
+  @Override
+  protected void initialize(int numDatums) {
+<span class="fc" id="L512">    labelIndex = new HashIndex&lt;&gt;();</span>
+<span class="fc" id="L513">    featureIndex = new HashIndex&lt;&gt;();</span>
+<span class="fc" id="L514">    labels = new int[numDatums];</span>
+<span class="fc" id="L515">    data = new int[numDatums][];</span>
+<span class="fc" id="L516">    values = new double[numDatums][];</span>
+<span class="fc" id="L517">    sourcesAndIds = new ArrayList&lt;&gt;(numDatums);</span>
+<span class="fc" id="L518">    size = 0;</span>
+<span class="fc" id="L519">  }</span>
+
+  /**
+   * Prints some summary statistics to the logger for the Dataset.
+   */
+  @Override
+  public void summaryStatistics() {
+<span class="nc" id="L526">    logger.info(&quot;numDatums: &quot; + size);</span>
+<span class="nc" id="L527">    StringBuilder sb = new StringBuilder(&quot;numLabels: &quot;);</span>
+<span class="nc" id="L528">    sb.append(labelIndex.size()).append(&quot; [&quot;);</span>
+<span class="nc" id="L529">    Iterator&lt;L&gt; iter = labelIndex.iterator();</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">    while (iter.hasNext()) {</span>
+<span class="nc" id="L531">      sb.append(iter.next());</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">      if (iter.hasNext()) {</span>
+<span class="nc" id="L533">        sb.append(&quot;, &quot;);</span>
+      }
+    }
+<span class="nc" id="L536">    sb.append(']');</span>
+<span class="nc" id="L537">    logger.info(sb.toString());</span>
+<span class="nc" id="L538">    logger.info(&quot;numFeatures (Phi(X) types): &quot; + featureIndex.size());</span>
+    /*for(int i = 0; i &lt; data.length; i++) {
+      for(int j = 0; j &lt; data[i].length; j++) {
+      System.out.println(data[i][j]);
+      }
+      }*/
+<span class="nc" id="L544">  }</span>
+
+  /**
+   * prints the full feature matrix in tab-delimited form. These can be BIG
+   * matrices, so be careful! [Can also use printFullFeatureMatrixWithValues]
+   */
+  public void printFullFeatureMatrix(PrintWriter pw) {
+<span class="nc" id="L551">    String sep = &quot;\t&quot;;</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">    for (int i = 0; i &lt; featureIndex.size(); i++) {</span>
+<span class="nc" id="L553">      pw.print(sep + featureIndex.get(i));</span>
+    }
+<span class="nc" id="L555">    pw.println();</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">    for (int i = 0; i &lt; labels.length; i++) {</span>
+<span class="nc" id="L557">      pw.print(labelIndex.get(i));</span>
+<span class="nc" id="L558">      Set&lt;Integer&gt; feats = Generics.newHashSet();</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L560">        int feature = data[i][j];</span>
+<span class="nc" id="L561">        feats.add(Integer.valueOf(feature));</span>
+      }
+<span class="nc bnc" id="L563" title="All 2 branches missed.">      for (int j = 0; j &lt; featureIndex.size(); j++) {</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        if (feats.contains(Integer.valueOf(j))) {</span>
+<span class="nc" id="L565">          pw.print(sep + &quot;1&quot;);</span>
+        } else {
+<span class="nc" id="L567">          pw.print(sep + &quot;0&quot;);</span>
+        }
+      }
+<span class="nc" id="L570">      pw.println();</span>
+    }
+<span class="nc" id="L572">  }</span>
+
+  /**
+   * Modification of printFullFeatureMatrix to correct bugs and print values
+   * (Rajat). Prints the full feature matrix in tab-delimited form. These can be
+   * BIG matrices, so be careful!
+   */
+  public void printFullFeatureMatrixWithValues(PrintWriter pw) {
+<span class="nc" id="L580">    String sep = &quot;\t&quot;;</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">    for (int i = 0; i &lt; featureIndex.size(); i++) {</span>
+<span class="nc" id="L582">      pw.print(sep + featureIndex.get(i));</span>
+    }
+<span class="nc" id="L584">    pw.println();</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) { // changed labels.length to size</span>
+<span class="nc" id="L586">      pw.print(labelIndex.get(labels[i])); // changed i to labels[i]</span>
+<span class="nc" id="L587">      Map&lt;Integer, Double&gt; feats = Generics.newHashMap();</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L589">        int feature = data[i][j];</span>
+<span class="nc" id="L590">        double val = values[i][j];</span>
+<span class="nc" id="L591">        feats.put(Integer.valueOf(feature), new Double(val));</span>
+      }
+<span class="nc bnc" id="L593" title="All 2 branches missed.">      for (int j = 0; j &lt; featureIndex.size(); j++) {</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        if (feats.containsKey(Integer.valueOf(j))) {</span>
+<span class="nc" id="L595">          pw.print(sep + feats.get(Integer.valueOf(j)));</span>
+        } else {
+<span class="nc" id="L597">          pw.print(sep);</span>
+<span class="nc" id="L598">          pw.print(' ');</span>
+        }
+      }
+<span class="nc" id="L601">      pw.println();</span>
+    }
+<span class="nc" id="L603">    pw.flush();</span>
+<span class="nc" id="L604">  }</span>
+
+  /**
+   * Constructs a Dataset by reading in a file in SVM light format.
+   *
+   */
+  public static RVFDataset&lt;String, String&gt; readSVMLightFormat(String filename) {
+<span class="nc" id="L611">    return readSVMLightFormat(filename, new HashIndex&lt;&gt;(), new HashIndex&lt;&gt;());</span>
+  }
+
+  /**
+   * Constructs a Dataset by reading in a file in SVM light format. The lines
+   * parameter is filled with the lines of the file for further processing (if
+   * lines is null, it is assumed no line information is desired)
+   */
+  public static RVFDataset&lt;String, String&gt; readSVMLightFormat(String filename, List&lt;String&gt; lines) {
+<span class="nc" id="L620">    return readSVMLightFormat(filename, new HashIndex&lt;&gt;(), new HashIndex&lt;&gt;(), lines);</span>
+  }
+
+  /**
+   * Constructs a Dataset by reading in a file in SVM light format. the created
+   * dataset has the same feature and label index as given
+   */
+  public static RVFDataset&lt;String, String&gt; readSVMLightFormat(String filename, Index&lt;String&gt; featureIndex, Index&lt;String&gt; labelIndex) {
+<span class="nc" id="L628">    return readSVMLightFormat(filename, featureIndex, labelIndex, null);</span>
+  }
+
+  /**
+   * Removes all features from the dataset that are not in featureSet.
+   *
+   * @param featureSet
+   */
+  public void selectFeaturesFromSet(Set&lt;F&gt; featureSet) {
+<span class="nc" id="L637">    HashIndex&lt;F&gt; newFeatureIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L638">    int[] featMap = new int[featureIndex.size()];</span>
+<span class="nc" id="L639">    Arrays.fill(featMap, -1);</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">    for (F feature : featureSet) {</span>
+<span class="nc" id="L641">      int oldID = featureIndex.indexOf(feature);</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">      if (oldID &gt;= 0) { // it's a valid feature in the index</span>
+<span class="nc" id="L643">        int newID = newFeatureIndex.addToIndex(feature);</span>
+<span class="nc" id="L644">        featMap[oldID] = newID;</span>
+      }
+<span class="nc" id="L646">    }</span>
+<span class="nc" id="L647">    featureIndex = newFeatureIndex;</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L649">      List&lt;Integer&gt; featList = new ArrayList&lt;&gt;(data[i].length);</span>
+<span class="nc" id="L650">      List&lt;Double&gt; valueList = new ArrayList&lt;&gt;(values[i].length);</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">        if (featMap[data[i][j]] &gt;= 0) {</span>
+<span class="nc" id="L653">          featList.add(featMap[data[i][j]]);</span>
+<span class="nc" id="L654">          valueList.add(values[i][j]);</span>
+        }
+      }
+<span class="nc" id="L657">      data[i] = new int[featList.size()];</span>
+<span class="nc" id="L658">      values[i] = new double[valueList.size()];</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L660">        data[i][j] = featList.get(j);</span>
+<span class="nc" id="L661">        values[i][j] = valueList.get(j);</span>
+      }
+    }
+<span class="nc" id="L664">  }</span>
+
+  /**
+   * Applies a feature count threshold to the RVFDataset. All features that
+   * occur fewer than &lt;i&gt;k&lt;/i&gt; times are expunged.
+   */
+  public void applyFeatureCountThreshold(int k) {
+<span class="nc" id="L671">    float[] counts = getFeatureCounts();</span>
+<span class="nc" id="L672">    HashIndex&lt;F&gt; newFeatureIndex = new HashIndex&lt;&gt;();</span>
+
+<span class="nc" id="L674">    int[] featMap = new int[featureIndex.size()];</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">    for (int i = 0; i &lt; featMap.length; i++) {</span>
+<span class="nc" id="L676">      F feat = featureIndex.get(i);</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">      if (counts[i] &gt;= k) {</span>
+<span class="nc" id="L678">        int newIndex = newFeatureIndex.size();</span>
+<span class="nc" id="L679">        newFeatureIndex.add(feat);</span>
+<span class="nc" id="L680">        featMap[i] = newIndex;</span>
+<span class="nc" id="L681">      } else {</span>
+<span class="nc" id="L682">        featMap[i] = -1;</span>
+      }
+      // featureIndex.remove(feat);
+    }
+
+<span class="nc" id="L687">    featureIndex = newFeatureIndex;</span>
+    // counts = null; // This is unnecessary; JVM can clean it up
+
+<span class="nc bnc" id="L690" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L691">      List&lt;Integer&gt; featList = new ArrayList&lt;&gt;(data[i].length);</span>
+<span class="nc" id="L692">      List&lt;Double&gt; valueList = new ArrayList&lt;&gt;(values[i].length);</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">        if (featMap[data[i][j]] &gt;= 0) {</span>
+<span class="nc" id="L695">          featList.add(featMap[data[i][j]]);</span>
+<span class="nc" id="L696">          valueList.add(values[i][j]);</span>
+        }
+      }
+<span class="nc" id="L699">      data[i] = new int[featList.size()];</span>
+<span class="nc" id="L700">      values[i] = new double[valueList.size()];</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L702">        data[i][j] = featList.get(j);</span>
+<span class="nc" id="L703">        values[i][j] = valueList.get(j);</span>
+      }
+    }
+<span class="nc" id="L706">  }</span>
+
+  /**
+   * Applies a feature max count threshold to the RVFDataset. All features that
+   * occur greater than &lt;i&gt;k&lt;/i&gt; times are expunged.
+   */
+  @Override
+  public void applyFeatureMaxCountThreshold(int k) {
+<span class="nc" id="L714">    float[] counts = getFeatureCounts();</span>
+<span class="nc" id="L715">    HashIndex&lt;F&gt; newFeatureIndex = new HashIndex&lt;&gt;();</span>
+
+<span class="nc" id="L717">    int[] featMap = new int[featureIndex.size()];</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">    for (int i = 0; i &lt; featMap.length; i++) {</span>
+<span class="nc" id="L719">      F feat = featureIndex.get(i);</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">      if (counts[i] &lt;= k) {</span>
+<span class="nc" id="L721">        int newIndex = newFeatureIndex.size();</span>
+<span class="nc" id="L722">        newFeatureIndex.add(feat);</span>
+<span class="nc" id="L723">        featMap[i] = newIndex;</span>
+<span class="nc" id="L724">      } else {</span>
+<span class="nc" id="L725">        featMap[i] = -1;</span>
+      }
+      // featureIndex.remove(feat);
+    }
+
+<span class="nc" id="L730">    featureIndex = newFeatureIndex;</span>
+    // counts = null; // This is unnecessary; JVM can clean it up
+
+<span class="nc bnc" id="L733" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L734">      List&lt;Integer&gt; featList = new ArrayList&lt;&gt;(data[i].length);</span>
+<span class="nc" id="L735">      List&lt;Double&gt; valueList = new ArrayList&lt;&gt;(values[i].length);</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        if (featMap[data[i][j]] &gt;= 0) {</span>
+<span class="nc" id="L738">          featList.add(featMap[data[i][j]]);</span>
+<span class="nc" id="L739">          valueList.add(values[i][j]);</span>
+        }
+      }
+<span class="nc" id="L742">      data[i] = new int[featList.size()];</span>
+<span class="nc" id="L743">      values[i] = new double[valueList.size()];</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">      for (int j = 0; j &lt; data[i].length; j++) {</span>
+<span class="nc" id="L745">        data[i][j] = featList.get(j);</span>
+<span class="nc" id="L746">        values[i][j] = valueList.get(j);</span>
+      }
+    }
+<span class="nc" id="L749">  }</span>
+
+  private static RVFDataset&lt;String, String&gt; readSVMLightFormat(String filename, Index&lt;String&gt; featureIndex, Index&lt;String&gt; labelIndex, List&lt;String&gt; lines) {
+<span class="nc" id="L752">    BufferedReader in = null;</span>
+    RVFDataset&lt;String, String&gt; dataset;
+    try {
+<span class="nc" id="L755">      dataset = new RVFDataset&lt;&gt;(10, featureIndex, labelIndex);</span>
+<span class="nc" id="L756">      in = IOUtils.readerFromString(filename);</span>
+
+<span class="nc bnc" id="L758" title="All 2 branches missed.">      while (in.ready()) {</span>
+<span class="nc" id="L759">        String line = in.readLine();</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">        if (lines != null)</span>
+<span class="nc" id="L761">          lines.add(line);</span>
+<span class="nc" id="L762">        dataset.add(svmLightLineToRVFDatum(line));</span>
+<span class="nc" id="L763">      }</span>
+<span class="nc" id="L764">    } catch (IOException e) {</span>
+<span class="nc" id="L765">      throw new RuntimeIOException(e);</span>
+    } finally {
+<span class="nc" id="L767">      IOUtils.closeIgnoringExceptions(in);</span>
+<span class="nc" id="L768">    }</span>
+<span class="nc" id="L769">    return dataset;</span>
+  }
+
+  public static RVFDatum&lt;String, String&gt; svmLightLineToRVFDatum(String l) {
+<span class="nc" id="L773">    l = l.replaceFirst(&quot;#.*$&quot;, &quot;&quot;); // remove any trailing comments</span>
+<span class="nc" id="L774">    String[] line = l.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L775">    ClassicCounter&lt;String&gt; features = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">    for (int i = 1; i &lt; line.length; i++) {</span>
+<span class="nc" id="L777">      String[] f = line[i].split(&quot;:&quot;);</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">      if (f.length != 2) {</span>
+<span class="nc" id="L779">        throw new IllegalArgumentException(&quot;Bad data format: &quot; + l);</span>
+      }
+<span class="nc" id="L781">      double val = Double.parseDouble(f[1]);</span>
+<span class="nc" id="L782">      features.incrementCount(f[0], val);</span>
+    }
+<span class="nc" id="L784">    return new RVFDatum&lt;&gt;(features, line[0]);</span>
+  }
+
+  // todo [cdm 2012]: This duplicates the functionality of the methods above. Should be refactored.
+  /**
+   * Read SVM-light formatted data into this dataset.
+   *
+   * A strict SVM-light format is expected, where labels and features are both
+   * encoded as integers. These integers are converted into the dataset label
+   * and feature types using the indexes stored in this dataset.
+   *
+   * @param file The file from which the data should be read.
+   */
+  public void readSVMLightFormat(File file) {
+<span class="fc bfc" id="L798" title="All 2 branches covered.">    for (String line : IOUtils.readLines(file)) {</span>
+<span class="fc" id="L799">      line = line.replaceAll(&quot;#.*&quot;, &quot;&quot;); // remove any trailing comments</span>
+<span class="fc" id="L800">      String[] items = line.split(&quot;\\s+&quot;);</span>
+<span class="fc" id="L801">      Integer label = Integer.parseInt(items[0]);</span>
+<span class="fc" id="L802">      Counter&lt;F&gt; features = new ClassicCounter&lt;&gt;();</span>
+<span class="fc bfc" id="L803" title="All 2 branches covered.">      for (int i = 1; i &lt; items.length; i++) {</span>
+<span class="fc" id="L804">        String[] featureItems = items[i].split(&quot;:&quot;);</span>
+<span class="fc" id="L805">        int feature = Integer.parseInt(featureItems[0]);</span>
+<span class="fc" id="L806">        double value = Double.parseDouble(featureItems[1]);</span>
+<span class="fc" id="L807">        features.incrementCount(this.featureIndex.get(feature), value);</span>
+      }
+<span class="fc" id="L809">      this.add(new RVFDatum&lt;&gt;(features, this.labelIndex.get(label)));</span>
+<span class="fc" id="L810">    }</span>
+<span class="fc" id="L811">  }</span>
+
+  /**
+   * Write the dataset in SVM-light format to the file.
+   *
+   * A strict SVM-light format will be written, where labels and features are
+   * both encoded as integers, using the label and feature indexes of this
+   * dataset. Datasets written by this method can be read by
+   * {@link #readSVMLightFormat(File)}.
+   *
+   * @param file The location where the dataset should be written.
+   */
+  public void writeSVMLightFormat(File file) throws FileNotFoundException {
+<span class="fc" id="L824">    PrintWriter writer = new PrintWriter(file);</span>
+<span class="fc" id="L825">    writeSVMLightFormat(writer);</span>
+<span class="fc" id="L826">    writer.close();</span>
+<span class="fc" id="L827">  }</span>
+
+  public void writeSVMLightFormat(PrintWriter writer) {
+<span class="fc bfc" id="L830" title="All 2 branches covered.">    for (RVFDatum&lt;L, F&gt; datum : this) {</span>
+<span class="fc" id="L831">      writer.print(this.labelIndex.indexOf(datum.label()));</span>
+<span class="fc" id="L832">      Counter&lt;F&gt; features = datum.asFeaturesCounter();</span>
+<span class="fc bfc" id="L833" title="All 2 branches covered.">      for (F feature : features.keySet()) {</span>
+<span class="fc" id="L834">        double count = features.getCount(feature);</span>
+<span class="fc" id="L835">        writer.format(Locale.ENGLISH, &quot; %s:%f&quot;, this.featureIndex.indexOf(feature), count);</span>
+<span class="fc" id="L836">      }</span>
+<span class="fc" id="L837">      writer.println();</span>
+<span class="fc" id="L838">    }</span>
+<span class="fc" id="L839">  }</span>
+
+  /**
+   * Prints the sparse feature matrix using
+   * {@link #printSparseFeatureMatrix(PrintWriter)} to {@link System#out
+   * System.out}.
+   */
+  @Override
+  public void printSparseFeatureMatrix() {
+<span class="nc" id="L848">    printSparseFeatureMatrix(new PrintWriter(System.out, true));</span>
+<span class="nc" id="L849">  }</span>
+
+  /**
+   * Prints a sparse feature matrix representation of the Dataset. Prints the
+   * actual {@link Object#toString()} representations of features.
+   */
+  @Override
+  public void printSparseFeatureMatrix(PrintWriter pw) {
+<span class="nc" id="L857">    String sep = &quot;\t&quot;;</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L859">      pw.print(labelIndex.get(labels[i]));</span>
+<span class="nc" id="L860">      int[] datum = data[i];</span>
+<span class="nc bnc" id="L861" title="All 2 branches missed.">      for (int feat : datum) {</span>
+<span class="nc" id="L862">        pw.print(sep);</span>
+<span class="nc" id="L863">        pw.print(featureIndex.get(feat));</span>
+      }
+<span class="nc" id="L865">      pw.println();</span>
+    }
+<span class="nc" id="L867">  }</span>
+
+  /**
+   * Prints a sparse feature-value output of the Dataset. Prints the actual
+   * {@link Object#toString()} representations of features. This is probably
+   * what you want for RVFDataset since the above two methods seem useless and
+   * unused.
+   */
+  public void printSparseFeatureValues(PrintWriter pw) {
+<span class="nc bnc" id="L876" title="All 2 branches missed.">    for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc" id="L877">      printSparseFeatureValues(i, pw);</span>
+    }
+<span class="nc" id="L879">  }</span>
+
+  /**
+   * Prints a sparse feature-value output of the Dataset. Prints the actual
+   * {@link Object#toString()} representations of features. This is probably
+   * what you want for RVFDataset since the above two methods seem useless and
+   * unused.
+   */
+  public void printSparseFeatureValues(int datumNo, PrintWriter pw) {
+<span class="nc" id="L888">    pw.print(labelIndex.get(labels[datumNo]));</span>
+<span class="nc" id="L889">    pw.print('\t');</span>
+<span class="nc" id="L890">    pw.println(&quot;LABEL&quot;);</span>
+<span class="nc" id="L891">    int[] datum = data[datumNo];</span>
+<span class="nc" id="L892">    double[] vals = values[datumNo];</span>
+<span class="nc bnc" id="L893" title="All 4 branches missed.">    assert datum.length == vals.length;</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">    for (int i = 0; i &lt; datum.length; i++) {</span>
+<span class="nc" id="L895">      pw.print(featureIndex.get(datum[i]));</span>
+<span class="nc" id="L896">      pw.print('\t');</span>
+<span class="nc" id="L897">      pw.println(vals[i]);</span>
+    }
+<span class="nc" id="L899">    pw.println();</span>
+<span class="nc" id="L900">  }</span>
+
+  public static void main(String[] args) {
+<span class="nc" id="L903">    RVFDataset&lt;String, String&gt; data = new RVFDataset&lt;&gt;();</span>
+<span class="nc" id="L904">    ClassicCounter&lt;String&gt; c1 = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L905">    c1.incrementCount(&quot;fever&quot;, 3.5);</span>
+<span class="nc" id="L906">    c1.incrementCount(&quot;cough&quot;, 1.1);</span>
+<span class="nc" id="L907">    c1.incrementCount(&quot;congestion&quot;, 4.2);</span>
+
+<span class="nc" id="L909">    ClassicCounter&lt;String&gt; c2 = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L910">    c2.incrementCount(&quot;fever&quot;, 1.5);</span>
+<span class="nc" id="L911">    c2.incrementCount(&quot;cough&quot;, 2.1);</span>
+<span class="nc" id="L912">    c2.incrementCount(&quot;nausea&quot;, 3.2);</span>
+
+<span class="nc" id="L914">    ClassicCounter&lt;String&gt; c3 = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L915">    c3.incrementCount(&quot;cough&quot;, 2.5);</span>
+<span class="nc" id="L916">    c3.incrementCount(&quot;congestion&quot;, 3.2);</span>
+
+<span class="nc" id="L918">    data.add(new RVFDatum&lt;&gt;(c1, &quot;cold&quot;));</span>
+<span class="nc" id="L919">    data.add(new RVFDatum&lt;&gt;(c2, &quot;flu&quot;));</span>
+<span class="nc" id="L920">    data.add(new RVFDatum&lt;&gt;(c3, &quot;cold&quot;));</span>
+<span class="nc" id="L921">    data.summaryStatistics();</span>
+
+<span class="nc" id="L923">    LinearClassifierFactory&lt;String, String&gt; factory = new LinearClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L924">    factory.useQuasiNewton();</span>
+
+<span class="nc" id="L926">    LinearClassifier&lt;String, String&gt; c = factory.trainClassifier(data);</span>
+
+<span class="nc" id="L928">    ClassicCounter&lt;String&gt; c4 = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L929">    c4.incrementCount(&quot;cough&quot;, 2.3);</span>
+<span class="nc" id="L930">    c4.incrementCount(&quot;fever&quot;, 1.3);</span>
+
+<span class="nc" id="L932">    RVFDatum&lt;String, String&gt; datum = new RVFDatum&lt;&gt;(c4);</span>
+
+<span class="nc" id="L934">    c.justificationOf((Datum&lt;String, String&gt;) datum);</span>
+<span class="nc" id="L935">  }</span>
+
+  @Override
+  public double[][] getValuesArray() {
+<span class="nc bnc" id="L939" title="All 2 branches missed.">    if (size == 0) {</span>
+<span class="nc" id="L940">      return new double[0][];</span>
+    }
+<span class="nc" id="L942">    values = trimToSize(values);</span>
+<span class="nc" id="L943">    data = trimToSize(data);</span>
+<span class="nc bnc" id="L944" title="All 4 branches missed.">    assert values.length == size;</span>
+<span class="nc bnc" id="L945" title="All 4 branches missed.">    assert values.length == size();</span>
+<span class="nc" id="L946">    return values;</span>
+  }
+
+  @Override
+  public String toString() {
+<span class="nc" id="L951">    return &quot;Dataset of size &quot; + size;</span>
+  }
+
+  public String toSummaryString() {
+<span class="nc" id="L955">    StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L956">    PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc" id="L957">    pw.println(&quot;Number of data points: &quot; + size());</span>
+
+<span class="nc" id="L959">    pw.print(&quot;Number of labels: &quot; + labelIndex.size() + &quot; [&quot;);</span>
+<span class="nc" id="L960">    Iterator&lt;L&gt; iter = labelIndex.iterator();</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">    while (iter.hasNext()) {</span>
+<span class="nc" id="L962">      pw.print(iter.next());</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">      if (iter.hasNext()) {</span>
+<span class="nc" id="L964">        pw.print(&quot;, &quot;);</span>
+      }
+    }
+<span class="nc" id="L967">    pw.println(&quot;]&quot;);</span>
+<span class="nc" id="L968">    pw.println(&quot;Number of features (Phi(X) types): &quot; + featureIndex.size());</span>
+<span class="nc" id="L969">    pw.println(&quot;Number of active feature types: &quot; + numFeatureTypes());</span>
+<span class="nc" id="L970">    pw.println(&quot;Number of active feature tokens: &quot; + numFeatureTokens());</span>
+
+<span class="nc" id="L972">    return sw.toString();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public Iterator&lt;RVFDatum&lt;L, F&gt;&gt; iterator() {
+<span class="fc" id="L980">    return new Iterator&lt;RVFDatum&lt;L, F&gt;&gt;() {</span>
+      private int index; // = 0;
+
+      @Override
+      public boolean hasNext() {
+<span class="fc bfc" id="L985" title="All 2 branches covered.">        return this.index &lt; size;</span>
+      }
+
+      public RVFDatum&lt;L, F&gt; next() {
+<span class="pc bpc" id="L989" title="1 of 2 branches missed.">        if (index &gt;= size) {</span>
+<span class="nc" id="L990">          throw new NoSuchElementException();</span>
+        }
+<span class="fc" id="L992">        RVFDatum&lt;L, F&gt; next = getRVFDatum(this.index);</span>
+<span class="fc" id="L993">        ++this.index;</span>
+<span class="fc" id="L994">        return next;</span>
+      }
+
+      @Override
+      public void remove() {
+<span class="nc" id="L999">        throw new UnsupportedOperationException();</span>
+      }
+    };
+  }
+
+  /**
+   * Randomizes the data array in place. Needs to be redefined here because we
+   * need to randomize the values as well.
+   */
+  @Override
+  public void randomize(long randomSeed) {
+<span class="nc" id="L1010">    Random rand = new Random(randomSeed);</span>
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">    for (int j = size - 1; j &gt; 0; j--) {</span>
+<span class="nc" id="L1012">      int randIndex = rand.nextInt(j);</span>
+<span class="nc" id="L1013">      int[] tmp = data[randIndex];</span>
+<span class="nc" id="L1014">      data[randIndex] = data[j];</span>
+<span class="nc" id="L1015">      data[j] = tmp;</span>
+
+<span class="nc" id="L1017">      int tmpl = labels[randIndex];</span>
+<span class="nc" id="L1018">      labels[randIndex] = labels[j];</span>
+<span class="nc" id="L1019">      labels[j] = tmpl;</span>
+
+<span class="nc" id="L1021">      double[] tmpv = values[randIndex];</span>
+<span class="nc" id="L1022">      values[randIndex] = values[j];</span>
+<span class="nc" id="L1023">      values[j] = tmpv;</span>
+    }
+<span class="nc" id="L1025">  }</span>
+
+  /**
+   * Randomizes the data array in place. Needs to be redefined here because we
+   * need to randomize the values as well.
+   */
+  @Override
+  public &lt;E&gt; void shuffleWithSideInformation(long randomSeed, List&lt;E&gt; sideInformation) {
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">    if (size != sideInformation.size()) {</span>
+<span class="nc" id="L1034">      throw new IllegalArgumentException(&quot;shuffleWithSideInformation: sideInformation not of same size as Dataset&quot;);</span>
+    }
+<span class="nc" id="L1036">    Random rand = new Random(randomSeed);</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">    for (int j = size - 1; j &gt; 0; j--) {</span>
+<span class="nc" id="L1038">      int randIndex = rand.nextInt(j);</span>
+
+<span class="nc" id="L1040">      int[] tmp = data[randIndex];</span>
+<span class="nc" id="L1041">      data[randIndex] = data[j];</span>
+<span class="nc" id="L1042">      data[j] = tmp;</span>
+
+<span class="nc" id="L1044">      int tmpl = labels[randIndex];</span>
+<span class="nc" id="L1045">      labels[randIndex] = labels[j];</span>
+<span class="nc" id="L1046">      labels[j] = tmpl;</span>
+
+<span class="nc" id="L1048">      double[] tmpv = values[randIndex];</span>
+<span class="nc" id="L1049">      values[randIndex] = values[j];</span>
+<span class="nc" id="L1050">      values[j] = tmpv;</span>
+
+<span class="nc" id="L1052">      E tmpE = sideInformation.get(randIndex);</span>
+<span class="nc" id="L1053">      sideInformation.set(randIndex, sideInformation.get(j));</span>
+<span class="nc" id="L1054">      sideInformation.set(j, tmpE);</span>
+    }
+<span class="nc" id="L1056">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

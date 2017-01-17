@@ -1,0 +1,259 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ChineseUnknownWordModel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">ChineseUnknownWordModel.java</span></div><h1>ChineseUnknownWordModel.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.Map;
+import java.util.Set;
+
+import edu.stanford.nlp.io.EncodingPrintWriter;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.ling.WordTag;
+import edu.stanford.nlp.ling.Tag;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Index;
+
+/**
+ * Stores, trains, and scores with an unknown word model.  A couple
+ * of filters deterministically force rewrites for certain proper
+ * nouns, dates, and cardinal and ordinal numbers; when none of these
+ * filters are met, either the distribution of terminals with the same
+ * first character is used, or Good-Turing smoothing is used. Although
+ * this is developed for Chinese, the training and storage methods
+ * could be used cross-linguistically.
+ *
+ * @author Roger Levy
+ */
+public class ChineseUnknownWordModel extends BaseUnknownWordModel  {
+
+  /** A logger for this class */
+<span class="nc" id="L30">  private static Redwood.RedwoodChannels log = Redwood.channels(ChineseUnknownWordModel.class);</span>
+
+  private static final String encoding = &quot;GB18030&quot;; // used only for debugging
+
+  private final boolean useUnicodeType;
+
+
+  /* These strings are stored in ascii-type Unicode encoding.  To
+   * edit them, either use the Unicode codes or use native2ascii or a
+   * similar program to convert the file into a Chinese encoding, then
+   * convert back. */
+  private static final String numberMatch = &quot;.*[0-9\uff10-\uff19\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07\u4ebf\u96F6\u3007\u25cb\u25ef].*&quot;;
+  private static final String dateMatch = numberMatch + &quot;[\u5e74\u6708\u65e5\u53f7]&quot;;
+  private static final String ordinalMatch = &quot;\u7b2c.*&quot;;
+  // uses midDot characters as one clue of being proper name
+  private static final String properNameMatch = &quot;.*[\u00b7\u0387\u2022\u2024\u2027\u2219\u22C5\u30FB].*&quot;;
+
+  private final Set&lt;String&gt; seenFirst;
+
+
+  public ChineseUnknownWordModel(Options op, Lexicon lex,
+                                 Index&lt;String&gt; wordIndex,
+                                 Index&lt;String&gt; tagIndex,
+                                 ClassicCounter&lt;IntTaggedWord&gt; unSeenCounter,
+                                 Map&lt;Label,ClassicCounter&lt;String&gt;&gt; tagHash,
+                                 Map&lt;String,Float&gt; unknownGT,
+                                 boolean useGT,
+                                 Set&lt;String&gt; seenFirst) {
+<span class="nc" id="L58">    super(op, lex, wordIndex, tagIndex,</span>
+          unSeenCounter, tagHash, unknownGT, null);
+<span class="nc bnc" id="L60" title="All 2 branches missed.">    this.useFirst = !useGT;</span>
+<span class="nc" id="L61">    this.useGT = useGT;</span>
+<span class="nc" id="L62">    this.useUnicodeType = op.lexOptions.useUnicodeType;</span>
+<span class="nc" id="L63">    this.seenFirst = seenFirst;</span>
+<span class="nc" id="L64">  }</span>
+
+  /**
+   * This constructor creates an UWM with empty data structures.  Only
+   * use if loading in the data separately, such as by reading in text
+   * lines containing the data.
+   * TODO: would need to set useGT correctly if you saved a model with
+   * useGT and then wanted to recover it from text.
+   */
+  public ChineseUnknownWordModel(Options op, Lexicon lex,
+                                 Index&lt;String&gt; wordIndex,
+                                 Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L76">    this(op, lex, wordIndex, tagIndex,</span>
+            new ClassicCounter&lt;&gt;(),
+<span class="nc" id="L78">         Generics.&lt;Label,ClassicCounter&lt;String&gt;&gt;newHashMap(),</span>
+<span class="nc" id="L79">         Generics.&lt;String,Float&gt;newHashMap(),</span>
+<span class="nc" id="L80">         false, Generics.&lt;String&gt;newHashSet());</span>
+<span class="nc" id="L81">  }</span>
+
+  @Override
+  public float score(IntTaggedWord itw, String word) {
+    // Label tagL = itw.tagLabel();
+    // String tag = tagL.value();
+<span class="nc" id="L87">    String tag = itw.tagString(tagIndex);</span>
+<span class="nc" id="L88">    Label tagL = new Tag(tag);</span>
+
+    float logProb;
+
+    if (VERBOSE) EncodingPrintWriter.out.println(&quot;Scoring unknown word |&quot; + word + &quot;| with tag &quot; + tag, encoding);
+
+<span class="nc bnc" id="L94" title="All 2 branches missed.">    if (word.matches(dateMatch)) {</span>
+      //EncodingPrintWriter.out.println(&quot;Date match for &quot; + word,encoding);
+<span class="nc bnc" id="L96" title="All 2 branches missed.">      if (tag.equals(&quot;NT&quot;)) {</span>
+<span class="nc" id="L97">        logProb = 0.0f;</span>
+      } else {
+<span class="nc" id="L99">        logProb = Float.NEGATIVE_INFINITY;</span>
+      }
+<span class="nc bnc" id="L101" title="All 2 branches missed.">    } else if (word.matches(numberMatch)) {</span>
+      //EncodingPrintWriter.out.println(&quot;Number match for &quot; + word,encoding);
+<span class="nc bnc" id="L103" title="All 4 branches missed.">      if (tag.equals(&quot;CD&quot;) &amp;&amp; (!word.matches(ordinalMatch))) {</span>
+<span class="nc" id="L104">        logProb = 0.0f;</span>
+<span class="nc bnc" id="L105" title="All 4 branches missed.">      } else if (tag.equals(&quot;OD&quot;) &amp;&amp; word.matches(ordinalMatch)) {</span>
+<span class="nc" id="L106">        logProb = 0.0f;</span>
+      } else {
+<span class="nc" id="L108">        logProb = Float.NEGATIVE_INFINITY;</span>
+      }
+<span class="nc bnc" id="L110" title="All 2 branches missed.">    } else if (word.matches(properNameMatch)) {</span>
+      //EncodingPrintWriter.out.println(&quot;Proper name match for &quot; + word,encoding);
+<span class="nc bnc" id="L112" title="All 2 branches missed.">      if (tag.equals(&quot;NR&quot;)) {</span>
+<span class="nc" id="L113">        logProb = 0.0f;</span>
+      } else {
+<span class="nc" id="L115">        logProb = Float.NEGATIVE_INFINITY;</span>
+      }
+    /* -------------
+      // this didn't seem to work -- too categorical
+      int type = Character.getType(word.charAt(0));
+      // the below may not normalize probs over options, but is probably okay
+      if (type == Character.START_PUNCTUATION) {
+        if (tag.equals(&quot;PU-LPAREN&quot;) || tag.equals(&quot;PU-PAREN&quot;) ||
+            tag.equals(&quot;PU-LQUOTE&quot;) || tag.equals(&quot;PU-QUOTE&quot;) ||
+            tag.equals(&quot;PU&quot;)) {
+          // if (VERBOSE) log.info(&quot;ChineseUWM: unknown L Punc&quot;);
+          logProb = 0.0f;
+        } else {
+          logProb = Float.NEGATIVE_INFINITY;
+        }
+      } else if (type == Character.END_PUNCTUATION) {
+        if (tag.equals(&quot;PU-RPAREN&quot;) || tag.equals(&quot;PU-PAREN&quot;) ||
+            tag.equals(&quot;PU-RQUOTE&quot;) || tag.equals(&quot;PU-QUOTE&quot;) ||
+            tag.equals(&quot;PU&quot;)) {
+          // if (VERBOSE) log.info(&quot;ChineseUWM: unknown R Punc&quot;);
+          logProb = 0.0f;
+        } else {
+          logProb = Float.NEGATIVE_INFINITY;
+        }
+      } else {
+        if (tag.equals(&quot;PU-OTHER&quot;) || tag.equals(&quot;PU-ENDSENT&quot;) ||
+            tag.equals(&quot;PU&quot;)) {
+          // if (VERBOSE) log.info(&quot;ChineseUWM: unknown O Punc&quot;);
+          logProb = 0.0f;
+        } else {
+          logProb = Float.NEGATIVE_INFINITY;
+        }
+      }
+    ------------- */
+    } else {
+      first:
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (useFirst) {</span>
+<span class="nc" id="L152">          String first = word.substring(0, 1);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">          if (useUnicodeType) {</span>
+<span class="nc" id="L154">            char ch = word.charAt(0);</span>
+<span class="nc" id="L155">            int type = Character.getType(ch);</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            if (type != Character.OTHER_LETTER) {</span>
+              // standard Chinese characters are of type &quot;OTHER_LETTER&quot;!!
+<span class="nc" id="L158">              first = Integer.toString(type);</span>
+            }
+          }
+<span class="nc bnc" id="L161" title="All 2 branches missed.">          if ( ! seenFirst.contains(first)) {</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (useGT) {</span>
+<span class="nc" id="L163">              logProb = scoreGT(tag);</span>
+<span class="nc" id="L164">              break first;</span>
+            } else {
+<span class="nc" id="L166">              first = unknown;</span>
+            }
+          }
+
+          /* get the Counter of terminal rewrites for the relevant tag */
+<span class="nc" id="L171">          ClassicCounter&lt;String&gt; wordProbs = tagHash.get(tagL);</span>
+
+          /* if the proposed tag has never been seen before, issue a
+             warning and return probability 0. */
+<span class="nc bnc" id="L175" title="All 2 branches missed.">          if (wordProbs == null) {</span>
+            if (VERBOSE) log.info(&quot;Warning: proposed tag is unseen in training data!&quot;);
+<span class="nc" id="L177">            logProb = Float.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">          } else if (wordProbs.containsKey(first)) {</span>
+<span class="nc" id="L179">            logProb = (float) wordProbs.getCount(first);</span>
+          } else {
+<span class="nc" id="L181">            logProb = (float) wordProbs.getCount(unknown);</span>
+          }
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        } else if (useGT) {</span>
+<span class="nc" id="L184">          logProb = scoreGT(tag);</span>
+        } else {
+          if (VERBOSE) log.info(&quot;Warning: no unknown word model in place!\nGiving the combination &quot; + word + &quot; &quot; + tag + &quot; zero probability.&quot;);
+<span class="nc" id="L187">          logProb = Float.NEGATIVE_INFINITY; // should never get this!</span>
+        }
+    }
+
+    if (VERBOSE) EncodingPrintWriter.out.println(&quot;Unknown word estimate for &quot; + word + &quot; as &quot; + tag + &quot;: &quot; + logProb, encoding);
+<span class="nc" id="L192">    return logProb;</span>
+  }
+
+
+
+  public static void main(String[] args) {
+<span class="nc" id="L198">    System.out.println(&quot;Testing unknown matching&quot;);</span>
+<span class="nc" id="L199">    String s = &quot;\u5218\u00b7\u9769\u547d&quot;;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">    if (s.matches(properNameMatch)) {</span>
+<span class="nc" id="L201">      System.out.println(&quot;hooray names!&quot;);</span>
+    } else {
+<span class="nc" id="L203">      System.out.println(&quot;Uh-oh names!&quot;);</span>
+    }
+<span class="nc" id="L205">    String s1 = &quot;\uff13\uff10\uff10\uff10&quot;;</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    if (s1.matches(numberMatch)) {</span>
+<span class="nc" id="L207">      System.out.println(&quot;hooray numbers!&quot;);</span>
+    } else {
+<span class="nc" id="L209">      System.out.println(&quot;Uh-oh numbers!&quot;);</span>
+    }
+<span class="nc" id="L211">    String s11 = &quot;\u767e\u5206\u4e4b\u56db\u5341\u4e09\u70b9\u4e8c&quot;;</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">    if (s11.matches(numberMatch)) {</span>
+<span class="nc" id="L213">      System.out.println(&quot;hooray numbers!&quot;);</span>
+    } else {
+<span class="nc" id="L215">      System.out.println(&quot;Uh-oh numbers!&quot;);</span>
+    }
+<span class="nc" id="L217">    String s12 = &quot;\u767e\u5206\u4e4b\u4e09\u5341\u516b\u70b9\u516d&quot;;</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">    if (s12.matches(numberMatch)) {</span>
+<span class="nc" id="L219">      System.out.println(&quot;hooray numbers!&quot;);</span>
+    } else {
+<span class="nc" id="L221">      System.out.println(&quot;Uh-oh numbers!&quot;);</span>
+    }
+<span class="nc" id="L223">    String s2 = &quot;\u4e09\u6708&quot;;</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">    if (s2.matches(dateMatch)) {</span>
+<span class="nc" id="L225">      System.out.println(&quot;hooray dates!&quot;);</span>
+    } else {
+<span class="nc" id="L227">      System.out.println(&quot;Uh-oh dates!&quot;);</span>
+    }
+
+<span class="nc" id="L230">    System.out.println(&quot;Testing tagged word&quot;);</span>
+<span class="nc" id="L231">    ClassicCounter&lt;TaggedWord&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L232">    TaggedWord tw1 = new TaggedWord(&quot;w&quot;, &quot;t&quot;);</span>
+<span class="nc" id="L233">    c.incrementCount(tw1);</span>
+<span class="nc" id="L234">    TaggedWord tw2 = new TaggedWord(&quot;w&quot;, &quot;t2&quot;);</span>
+<span class="nc" id="L235">    System.out.println(c.containsKey(tw2));</span>
+<span class="nc" id="L236">    System.out.println(tw1.equals(tw2));</span>
+
+<span class="nc" id="L238">    WordTag wt1 = toWordTag(tw1);</span>
+<span class="nc" id="L239">    WordTag wt2 = toWordTag(tw2);</span>
+<span class="nc" id="L240">    WordTag wt3 = new WordTag(&quot;w&quot;, &quot;t2&quot;);</span>
+<span class="nc" id="L241">    System.out.println(wt1.equals(wt2));</span>
+<span class="nc" id="L242">    System.out.println(wt2.equals(wt3));</span>
+<span class="nc" id="L243">  }</span>
+
+  private static WordTag toWordTag(TaggedWord tw) {
+<span class="nc" id="L246">    return new WordTag(tw.word(), tw.tag());</span>
+  }
+
+  private static final long serialVersionUID = 221L;
+
+
+  @Override
+  public String getSignature(String word, int loc) {
+<span class="nc" id="L254">    throw new UnsupportedOperationException();</span>
+  }
+
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

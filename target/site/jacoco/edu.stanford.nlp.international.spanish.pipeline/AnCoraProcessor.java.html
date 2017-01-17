@@ -1,0 +1,459 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AnCoraProcessor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.spanish.pipeline</a> &gt; <span class="el_source">AnCoraProcessor.java</span></div><h1>AnCoraProcessor.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.spanish.pipeline; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.stats.TwoDimensionalCounter;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.trees.international.spanish.*;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.Predicate;
+
+/**
+ * A tool which accepts raw AnCora-3.0 Spanish XML files and produces
+ * normalized / pre-processed PTB-style treebanks for use with CoreNLP
+ * tools.
+ *
+ * This is a substitute for an awkward and complicated string of
+ * command-line invocations. The produced corpus is the standard
+ * treebank which has been used to train the CoreNLP Spanish models.
+ *
+ * The preprocessing steps performed here include:
+ *
+ * - Expansion and automatic tagging of multi-word tokens (see
+ *   {@link MultiWordPreprocessor},
+ *   {@link SpanishTreeNormalizer#normalizeForMultiWord(Tree, TreeFactory)}
+ * - Heuristic parsing of expanded multi-word tokens (see
+ *   {@link MultiWordTreeExpander}
+ * - Splitting of elided forms (&lt;em&gt;al&lt;/em&gt;, &lt;em&gt;del&lt;/em&gt;,
+ *   &lt;em&gt;conmigo&lt;/em&gt;, etc.) and clitic pronouns from verb forms (see
+ *   {@link SpanishTreeNormalizer#expandElisions(Tree)},
+ *   {@link SpanishTreeNormalizer#expandCliticPronouns(Tree)}
+ * - Miscellaneous cleanup of parse trees, spelling fixes, parsing
+ *   error corrections (see {@link SpanishTreeNormalizer})
+ *
+ * Apart from raw corpus data, this processor depends upon unigram
+ * part-of-speech tag data. If not provided explicitly to the
+ * processor, the data will be collected from the given files. (You can
+ * pre-compute POS data from AnCora XML using {@link AnCoraPOSStats}.)
+ *
+ * For invocation options, execute the class with no arguments.
+ *
+ * @author Jon Gauthier
+ */
+public class AnCoraProcessor  {
+
+  /** A logger for this class */
+<span class="nc" id="L55">  private static Redwood.RedwoodChannels log = Redwood.channels(AnCoraProcessor.class);</span>
+
+  private final List&lt;File&gt; inputFiles;
+  private final Properties options;
+
+  private final TwoDimensionalCounter&lt;String, String&gt; unigramTagger;
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public AnCoraProcessor(List&lt;File&gt; inputFiles, Properties options)
+<span class="nc" id="L64">    throws IOException, ClassNotFoundException {</span>
+
+<span class="nc" id="L66">    this.inputFiles = inputFiles;</span>
+<span class="nc" id="L67">    this.options = options;</span>
+
+<span class="nc bnc" id="L69" title="All 2 branches missed.">    if (options.containsKey(&quot;unigramTagger&quot;)) {</span>
+<span class="nc" id="L70">      ObjectInputStream ois = new ObjectInputStream(new FileInputStream(options.getProperty</span>
+<span class="nc" id="L71">        (&quot;unigramTagger&quot;)));</span>
+<span class="nc" id="L72">      unigramTagger = (TwoDimensionalCounter&lt;String, String&gt;) ois.readObject();</span>
+<span class="nc" id="L73">    } else {</span>
+<span class="nc" id="L74">      unigramTagger = new TwoDimensionalCounter&lt;&gt;();</span>
+    }
+<span class="nc" id="L76">  }</span>
+
+  public List&lt;Tree&gt; process() throws
+    InterruptedException, IOException, ExecutionException {
+
+    // Each of the following subroutines are multithreaded; there is a bottleneck between the
+    // method calls
+<span class="nc" id="L83">    List&lt;Tree&gt; trees = loadTrees();</span>
+<span class="nc" id="L84">    trees = fixMultiWordTokens(trees);</span>
+
+<span class="nc" id="L86">    return trees;</span>
+  }
+
+  /**
+   * Use {@link SpanishXMLTreeReader} to load the trees from the provided files,
+   * and begin collecting some statistics to be used in later MWE cleanup.
+   *
+   * NB: Much of the important cleanup happens implicitly here; the XML tree reader triggers the
+   * tree normalization routine.
+   */
+  private List&lt;Tree&gt; loadTrees() throws
+    InterruptedException, IOException, ExecutionException {
+<span class="nc" id="L98">    boolean ner = PropertiesUtils.getBool(options, &quot;ner&quot;, false);</span>
+<span class="nc" id="L99">    final String encoding = new SpanishTreebankLanguagePack().getEncoding();</span>
+
+<span class="nc" id="L101">    final SpanishXMLTreeReaderFactory trf = new SpanishXMLTreeReaderFactory(true, true, ner, false);</span>
+
+<span class="nc" id="L103">    List&lt;Tree&gt; trees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    for (File file : inputFiles) {</span>
+<span class="nc" id="L105">      Pair&lt;TwoDimensionalCounter&lt;String, String&gt;, List&lt;Tree&gt;&gt; ret = processTreeFile(file, trf,</span>
+                                                                                    encoding);
+
+<span class="nc" id="L108">      Counters.addInPlace(unigramTagger, ret.first());</span>
+<span class="nc" id="L109">      trees.addAll(ret.second());</span>
+<span class="nc" id="L110">    }</span>
+
+<span class="nc" id="L112">    return trees;</span>
+  }
+
+  /**
+   * Processes a single file containing AnCora XML trees. Returns MWE statistics for the trees in
+   * the file and the actual parsed trees.
+   */
+  private static Pair&lt;TwoDimensionalCounter&lt;String, String&gt;, List&lt;Tree&gt;&gt; processTreeFile(
+    File file, SpanishXMLTreeReaderFactory trf, String encoding) {
+
+<span class="nc" id="L122">    TwoDimensionalCounter&lt;String, String&gt; tagger = new TwoDimensionalCounter&lt;&gt;();</span>
+
+    try {
+<span class="nc" id="L125">      Reader in = new BufferedReader(new InputStreamReader(new FileInputStream(file),</span>
+                                                           encoding));
+<span class="nc" id="L127">      TreeReader tr = trf.newTreeReader(file.getPath(), in);</span>
+
+<span class="nc" id="L129">      List&lt;Tree&gt; trees = new ArrayList&lt;&gt;();</span>
+      Tree t, splitPoint;
+
+<span class="nc bnc" id="L132" title="All 2 branches missed.">      while ((t = tr.readTree()) != null) {</span>
+        // We may need to split the current tree into multiple parts.
+        // (If not, a call to `split` with a `null` split-point is a
+        // no-op
+        do {
+<span class="nc" id="L137">          splitPoint = findSplitPoint(t);</span>
+<span class="nc" id="L138">          Pair&lt;Tree, Tree&gt; split = split(t, splitPoint);</span>
+
+<span class="nc" id="L140">          Tree toAdd = split.first();</span>
+<span class="nc" id="L141">          t = split.second();</span>
+
+<span class="nc" id="L143">          trees.add(toAdd);</span>
+<span class="nc" id="L144">          updateTagger(tagger, toAdd);</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        } while (splitPoint != null);</span>
+      }
+
+<span class="nc" id="L148">      tr.close();</span>
+
+<span class="nc" id="L150">      return new Pair&lt;&gt;(tagger, trees);</span>
+<span class="nc" id="L151">    } catch (IOException e) {</span>
+<span class="nc" id="L152">      e.printStackTrace();</span>
+<span class="nc" id="L153">      return null;</span>
+    }
+  }
+
+  private static void updateTagger(TwoDimensionalCounter&lt;String, String&gt; tagger, Tree t) {
+<span class="nc" id="L158">    List&lt;CoreLabel&gt; yield = t.taggedLabeledYield();</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    for (CoreLabel label : yield) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">      if (label.tag().equals(SpanishTreeNormalizer.MW_TAG))</span>
+<span class="nc" id="L161">        continue;</span>
+
+<span class="nc" id="L163">      tagger.incrementCount(label.word(), label.tag());</span>
+<span class="nc" id="L164">    }</span>
+<span class="nc" id="L165">  }</span>
+
+<span class="nc" id="L167">  private static TreeNormalizer splittingNormalizer = new SpanishSplitTreeNormalizer();</span>
+<span class="nc" id="L168">  private static TreeFactory splittingTreeFactory = new LabeledScoredTreeFactory();</span>
+
+  /**
+   * Split the given tree based on a split point such that the
+   * terminals leading up to the split point are in the left returned
+   * tree and those following the split point are in the left returned
+   * tree.
+   *
+   * AnCora contains a nontrivial amount of trees with multiple
+   * sentences in them. This method is used to break apart these
+   * sentences into separate trees.
+   *
+   * @param t Tree from which to extract a subtree. This may be
+   *          modified during processing.
+   * @param splitPoint Point up to which to extract. If {@code null},
+   *                   {@code t} is returned unchanged in the place of
+   *                   the right tree.
+   * @return A pair where the left tree contains every terminal leading
+   *         up to and including {@code splitPoint} and the right tree
+   *         contains every terminal following {@code splitPoint}.
+   *         Both trees may be normalized before return.
+   */
+  static Pair&lt;Tree, Tree&gt; split(Tree t, Tree splitPoint) {
+<span class="nc bnc" id="L191" title="All 2 branches missed.">    if (splitPoint == null)</span>
+<span class="nc" id="L192">      return new Pair&lt;&gt;(t, null);</span>
+
+<span class="nc" id="L194">    Tree left = t.prune(new LeftOfFilter(splitPoint, t));</span>
+<span class="nc" id="L195">    Tree right = t.prune(new RightOfExclusiveFilter(splitPoint, t));</span>
+
+<span class="nc" id="L197">    left = splittingNormalizer.normalizeWholeTree(left, splittingTreeFactory);</span>
+<span class="nc" id="L198">    right = splittingNormalizer.normalizeWholeTree(right, splittingTreeFactory);</span>
+
+<span class="nc" id="L200">    return new Pair&lt;&gt;(left, right);</span>
+  }
+
+  /**
+   * Accepts any tree node to the left of the provided node (or the
+   * provided node itself).
+   */
+  private static class LeftOfFilter implements Predicate&lt;Tree&gt;, Serializable {
+
+    private static final long serialVersionUID = -5146948439247427344L;
+
+    private Tree reference;
+    private Tree root;
+
+    /**
+     * @param reference Node to which nodes provided to this filter
+     *                  should be compared
+     * @param root Root of the tree which contains the reference node
+     *             and all nodes which may be provided to the filter
+     */
+<span class="nc" id="L220">    private LeftOfFilter(Tree reference, Tree root) {</span>
+<span class="nc" id="L221">      this.reference = reference;</span>
+<span class="nc" id="L222">      this.root = root;</span>
+<span class="nc" id="L223">    }</span>
+
+    @Override
+    public boolean test(Tree obj) {
+<span class="nc bnc" id="L227" title="All 6 branches missed.">      if (obj == reference || obj.dominates(reference) || reference.dominates(obj))</span>
+<span class="nc" id="L228">        return true;</span>
+
+<span class="nc" id="L230">      Tree rightmostDescendant = getRightmostDescendant(obj);</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">      return Trees.rightEdge(rightmostDescendant, root) &lt;= Trees.leftEdge(reference, root);</span>
+    }
+
+    private Tree getRightmostDescendant(Tree t) {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">      if (t.isLeaf()) return t;</span>
+<span class="nc" id="L236">      else return getRightmostDescendant(t.children()[t.children().length - 1]);</span>
+    }
+  }
+
+  /**
+   * Accepts any tree node to the right of the provided node.
+   */
+  private static class RightOfExclusiveFilter implements Predicate&lt;Tree&gt;, Serializable {
+
+    private static final long serialVersionUID = 8283161954004080591L;
+
+    private Tree root;
+
+    // This should be the leftmost terminal node of the filtered tree
+    private Tree firstToKeep;
+
+    /**
+     * @param reference Node to which nodes provided to this filter
+     *                  should be compared
+     * @param root Root of the tree which contains the reference node
+     *             and all nodes which may be provided to the filter
+     */
+<span class="nc" id="L258">    private RightOfExclusiveFilter(Tree reference, Tree root) {</span>
+<span class="nc" id="L259">      this.root = root;</span>
+
+<span class="nc" id="L261">      firstToKeep = getFollowingTerminal(reference, root);</span>
+<span class="nc" id="L262">    }</span>
+
+    @Override
+    public boolean test(Tree obj) {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">      if (obj.dominates(firstToKeep))</span>
+<span class="nc" id="L267">        return true;</span>
+
+<span class="nc" id="L269">      Tree leftmostDescendant = getLeftmostDescendant(obj);</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">      return Trees.rightEdge(leftmostDescendant, root) &gt; Trees.leftEdge(firstToKeep, root);</span>
+    }
+
+    /**
+     * Get the terminal node which immediately follows the given node.
+     */
+    private Tree getFollowingTerminal(Tree terminal, Tree root) {
+<span class="nc" id="L277">      Tree sibling = getRightSiblingOrRightAncestor(terminal, root);</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">      if (sibling == null)</span>
+<span class="nc" id="L279">        return null;</span>
+<span class="nc" id="L280">      return getLeftmostDescendant(sibling);</span>
+    }
+
+    /**
+     * Get the right sibling of the given node, or some node which is
+     * the right sibling of an ancestor of the given node.
+     *
+     * If no such node can be found, this method returns {@code null}.
+     */
+    private Tree getRightSiblingOrRightAncestor(Tree t, Tree root) {
+<span class="nc" id="L290">      Tree parent = t.parent(root);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      if (parent == null) return null;</span>
+
+<span class="nc" id="L293">      int idxWithinParent = parent.objectIndexOf(t);</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">      if (idxWithinParent &lt; parent.numChildren() - 1)</span>
+        // Easy case: just return the immediate right sibling
+<span class="nc" id="L296">        return parent.getChild(idxWithinParent + 1);</span>
+
+<span class="nc" id="L298">      return getRightSiblingOrRightAncestor(parent, root);</span>
+    }
+
+    private Tree getLeftmostDescendant(Tree t) {
+<span class="nc bnc" id="L302" title="All 2 branches missed.">      if (t.isLeaf()) return t;</span>
+<span class="nc" id="L303">      else return getLeftmostDescendant(t.children()[0]);</span>
+    }
+  }
+
+  /**
+   * Matches a point in the AnCora corpus which is the delimiter
+   * between two sentences.
+   *
+   * @see {@link #split(Tree, Tree)}
+   */
+<span class="nc" id="L313">  private static final TregexPattern pSplitPoint =</span>
+<span class="nc" id="L314">    TregexPattern.compile(&quot;fp $+ /^[^f]/ &gt; S|sentence&quot;);</span>
+
+  /**
+   * Find the next point (preterminal) at which the given tree should
+   * be split.
+   *
+   * @param t
+   * @return The endpoint of a subtree which should be extracted, or
+   *         {@code null} if there are no subtrees which need to be
+   *         extracted.
+   */
+  static Tree findSplitPoint(Tree t) {
+<span class="nc" id="L326">    TregexMatcher m = pSplitPoint.matcher(t);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">    if (m.find())</span>
+<span class="nc" id="L328">      return m.getMatch();</span>
+<span class="nc" id="L329">    return null;</span>
+  }
+
+  private class MultiWordProcessor implements ThreadsafeProcessor&lt;Collection&lt;Tree&gt;,
+    Collection&lt;Tree&gt;&gt; {
+
+    private final TreeNormalizer tn;
+    private final Factory&lt;TreeNormalizer&gt; tnf;
+    private final TreeFactory tf;
+
+    private final boolean ner;
+
+    // NB: TreeNormalizer is not thread-safe, and so we need to accept + store a
+    // TreeNormalizer factory instead
+    public MultiWordProcessor(Factory&lt;TreeNormalizer&gt; tnf, TreeFactory tf,
+<span class="nc" id="L344">                              boolean ner) {</span>
+<span class="nc" id="L345">      this.tnf = tnf;</span>
+<span class="nc" id="L346">      this.tn = tnf.create();</span>
+<span class="nc" id="L347">      this.tf = tf;</span>
+<span class="nc" id="L348">      this.ner = ner;</span>
+<span class="nc" id="L349">    }</span>
+
+    @Override
+    public Collection&lt;Tree&gt; process(Collection&lt;Tree&gt; coll) {
+<span class="nc" id="L353">      List&lt;Tree&gt; ret = new ArrayList&lt;&gt;();</span>
+
+      // Apparently TsurgeonPatterns are not thread safe
+<span class="nc" id="L356">      MultiWordTreeExpander expander = new MultiWordTreeExpander();</span>
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">      for (Tree t : coll) {</span>
+        // Begin with basic POS / phrasal category inference
+<span class="nc" id="L360">        MultiWordPreprocessor</span>
+<span class="nc" id="L361">          .traverseAndFix(t, null, AnCoraProcessor.this.unigramTagger, ner);</span>
+
+        // Now &quot;decompress&quot; further the expanded trees formed by multiword token splitting
+<span class="nc" id="L364">        t = expander.expandPhrases(t, tn, tf);</span>
+
+<span class="nc" id="L366">        t = tn.normalizeWholeTree(t, tf);</span>
+
+<span class="nc" id="L368">        ret.add(t);</span>
+<span class="nc" id="L369">      }</span>
+
+<span class="nc" id="L371">      return ret;</span>
+    }
+
+    @Override
+    public ThreadsafeProcessor&lt;Collection&lt;Tree&gt;, Collection&lt;Tree&gt;&gt; newInstance() {
+<span class="nc" id="L376">      return new MultiWordProcessor(tnf, tf, ner);</span>
+    }
+  }
+
+  /**
+   * Fix tree structure, phrasal categories and part-of-speech labels in newly expanded
+   * multi-word tokens.
+   */
+  private List&lt;Tree&gt; fixMultiWordTokens(List&lt;Tree&gt; trees)
+    throws InterruptedException, ExecutionException {
+<span class="nc" id="L386">    boolean ner = PropertiesUtils.getBool(options, &quot;ner&quot;, false);</span>
+
+    // Shared resources
+<span class="nc" id="L389">    Factory&lt;TreeNormalizer&gt; tnf = new Factory&lt;TreeNormalizer&gt;() {</span>
+      @Override public TreeNormalizer create() {
+<span class="nc" id="L391">        return new SpanishTreeNormalizer(true, false, false);</span>
+      }
+    };
+<span class="nc" id="L394">    TreeFactory tf = new LabeledScoredTreeFactory();</span>
+
+<span class="nc" id="L396">    ThreadsafeProcessor&lt;Collection&lt;Tree&gt;, Collection&lt;Tree&gt;&gt; processor =</span>
+      new MultiWordProcessor(tnf, tf, ner);
+
+<span class="nc" id="L399">    int availableProcessors = Runtime.getRuntime().availableProcessors();</span>
+<span class="nc" id="L400">    MulticoreWrapper&lt;Collection&lt;Tree&gt;, Collection&lt;Tree&gt;&gt; wrapper =</span>
+            new MulticoreWrapper&lt;&gt;(availableProcessors, processor,
+                    false);
+
+    // Chunk our work so that parallelization is actually worth it
+<span class="nc" id="L405">    int numChunks = availableProcessors * 20;</span>
+<span class="nc" id="L406">    List&lt;List&lt;Tree&gt;&gt; chunked = CollectionUtils.partitionIntoFolds(trees, numChunks);</span>
+<span class="nc" id="L407">    List&lt;Tree&gt; ret = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L409" title="All 2 branches missed.">    for (final Collection&lt;Tree&gt; coll : chunked) {</span>
+<span class="nc" id="L410">      wrapper.put(coll);</span>
+
+<span class="nc bnc" id="L412" title="All 2 branches missed.">      while (wrapper.peek())</span>
+<span class="nc" id="L413">        ret.addAll(wrapper.poll());</span>
+<span class="nc" id="L414">    }</span>
+
+<span class="nc" id="L416">    wrapper.join();</span>
+
+<span class="nc bnc" id="L418" title="All 2 branches missed.">    while (wrapper.peek())</span>
+<span class="nc" id="L419">      ret.addAll(wrapper.poll());</span>
+
+<span class="nc" id="L421">    return ret;</span>
+  }
+
+<span class="nc" id="L424">  private static final String usage =</span>
+<span class="nc" id="L425">    String.format(&quot;Usage: java %s [OPTIONS] file(s)%n%n&quot;, AnCoraProcessor.class.getName()) +</span>
+      &quot;Options:\n&quot; +
+      &quot;    -unigramTagger &lt;tagger_path&gt;: Path to a serialized `TwoDimensionalCounter` which\n&quot; +
+      &quot;        should be used for unigram tagging in multi-word token expansion. If this option\n&quot; +
+      &quot;        is not provided, a unigram tagger will be built from the provided corpus data.\n&quot; +
+      &quot;        (This option is useful if you are processing splits of the corpus separately but\n&quot; +
+      &quot;        want each step to benefit from a complete tagger.)\n&quot; +
+      &quot;    -ner: Add NER-specific information to trees\n&quot;;
+
+<span class="nc" id="L434">  private static final Map&lt;String, Integer&gt; argOptionDefs = new HashMap&lt;&gt;();</span>
+  static {
+<span class="nc" id="L436">    argOptionDefs.put(&quot;unigramTagger&quot;, 1);</span>
+<span class="nc" id="L437">    argOptionDefs.put(&quot;ner&quot;, 0);</span>
+<span class="nc" id="L438">  }</span>
+
+  public static void main(String[] args)
+    throws InterruptedException, IOException, ExecutionException, ClassNotFoundException {
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    if (args.length &lt; 1)</span>
+<span class="nc" id="L443">      log.info(usage);</span>
+
+<span class="nc" id="L445">    Properties options = StringUtils.argsToProperties(args, argOptionDefs);</span>
+<span class="nc" id="L446">    String[] remainingArgs = options.getProperty(&quot;&quot;).split(&quot; &quot;);</span>
+<span class="nc" id="L447">    List&lt;File&gt; fileList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">    for (String arg : remainingArgs)</span>
+<span class="nc" id="L449">      fileList.add(new File(arg));</span>
+
+<span class="nc" id="L451">    AnCoraProcessor processor = new AnCoraProcessor(fileList, options);</span>
+<span class="nc" id="L452">    List&lt;Tree&gt; trees = processor.process();</span>
+
+<span class="nc bnc" id="L454" title="All 2 branches missed.">    for (Tree t : trees)</span>
+<span class="nc" id="L455">      System.out.println(t);</span>
+<span class="nc" id="L456">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

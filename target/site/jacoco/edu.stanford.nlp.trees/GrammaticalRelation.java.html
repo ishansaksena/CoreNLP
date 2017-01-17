@@ -1,0 +1,638 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GrammaticalRelation.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees</a> &gt; <span class="el_source">GrammaticalRelation.java</span></div><h1>GrammaticalRelation.java</h1><pre class="source lang-java linenums">// Stanford Dependencies - Code for producing and using Stanford dependencies.
+// Copyright © 2005-2014 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    parser-support@lists.stanford.edu
+//    http://nlp.stanford.edu/software/stanford-dependencies.shtml
+
+package edu.stanford.nlp.trees;
+
+import edu.stanford.nlp.international.Language;
+import edu.stanford.nlp.trees.international.pennchinese.ChineseGrammaticalRelations;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.TregexPatternCompiler;
+import edu.stanford.nlp.util.ArraySet;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.ObjectStreamException;
+import java.io.Serializable;
+import java.util.*;
+import java.util.concurrent.locks.Lock;
+import java.util.regex.Pattern;
+
+
+/**
+ * {@code GrammaticalRelation} is used to define a
+ * standardized, hierarchical set of grammatical relations,
+ * together with patterns for identifying them in
+ * parse trees.
+ *
+ * Each {@code GrammaticalRelation} has:
+ * &lt;ul&gt;
+ *   &lt;li&gt;A {@code String} short name, which should be a lowercase
+ *       abbreviation of some kind (in the fure mainly Universal Dependency names).&lt;/li&gt;
+ *   &lt;li&gt;A {@code String} long name, which should be descriptive.&lt;/li&gt;
+ *   &lt;li&gt;A parent in the {@code GrammaticalRelation} hierarchy.&lt;/li&gt;
+ *   &lt;li&gt;A {@link Pattern {@code Pattern}} called
+ *   {@code sourcePattern} which matches (parent) nodes from which
+ *   this {@code GrammaticalRelation} could hold.  (Note: this is done
+ *   with the Java regex Pattern {@code matches()} predicate. The pattern
+ *   must match the
+ *   whole node name, and {@code ^} or {@code $} aren't needed.
+ *   Tregex constructions like __ do not work. Use &quot;.*&quot; to be applicable
+ *   at all nodes. This prefiltering is used for efficiency.)&lt;/li&gt;
+ *   &lt;li&gt;A list of zero or more {@link TregexPattern
+ *   {@code TregexPattern}s} called {@code targetPatterns},
+ *   which describe the local tree structure which must hold between
+ *   the source node and a target node for the
+ *   {@code GrammaticalRelation} to apply. (Note: {@code tregex}
+ *   regular expressions match with the {@code find()} method, while
+ *   literal string label descriptions that are not regular expressions must
+ *   be {@code equals()}.)&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * The {@code targetPatterns} associated
+ * with a {@code GrammaticalRelation} are designed as follows.
+ * In order to recognize a grammatical relation X holding between
+ * nodes A and B in a parse tree, we want to associate with
+ * {@code GrammaticalRelation} X a {@link TregexPattern
+ * {@code TregexPattern}} such that:
+ * &lt;ul&gt;
+ *   &lt;li&gt;the root of the pattern matches A, and&lt;/li&gt;
+ *   &lt;li&gt;the pattern includes a node labeled &quot;target&quot;, which matches B.&lt;/li&gt;
+ * &lt;/ul&gt;
+ * For example, for the grammatical relation {@code PREDICATE}
+ * which holds between a clause and its primary verb phrase, we might
+ * want to use the pattern {@code &quot;S &lt; VP=target&quot;}, in which the
+ * root will match a clause and the node labeled {@code &quot;target&quot;}
+ * will match the verb phrase.&lt;p&gt;
+ *
+ * For a given grammatical relation, the method {@link
+ * GrammaticalRelation#getRelatedNodes {@code getRelatedNodes()}}
+ * takes a {@code Tree} node as an argument and attempts to
+ * return other nodes which have this grammatical relation to the
+ * argument node.  By default, this method operates as follows: it
+ * steps through the patterns in the pattern list, trying to match
+ * each pattern against the argument node, until it finds some
+ * matches.  If a pattern matches, all matching nodes (that is, each
+ * node which corresponds to node label &quot;target&quot; in some match) are
+ * returned as a list; otherwise the next pattern is tried.&lt;p&gt;
+ *
+ * For some grammatical relations, we need more sophisticated logic to
+ * identify related nodes.  In such cases, {@link
+ * GrammaticalRelation#getRelatedNodes {@code getRelatedNodes()}}
+ * can be overridden on a per-relation basis using anonymous subclassing.&lt;p&gt;
+ *
+ * @see GrammaticalStructure
+ * @see EnglishGrammaticalStructure
+ * @see EnglishGrammaticalRelations
+ * @see edu.stanford.nlp.trees.international.pennchinese.ChineseGrammaticalRelations
+ *
+ * @author Bill MacCartney
+ * @author Galen Andrew (refactoring English-specific stuff)
+ * @author Ilya Sherman (refactoring annotation-relation pairing, which is now gone)
+ */
+public class GrammaticalRelation implements Comparable&lt;GrammaticalRelation&gt;, Serializable  {
+
+  /** A logger for this class */
+<span class="fc" id="L120">  private static final Redwood.RedwoodChannels log = Redwood.channels(GrammaticalRelation.class);</span>
+
+  private static final long serialVersionUID = 892618003417550128L;
+
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">  private static final boolean DEBUG = System.getProperty(&quot;GrammaticalRelation&quot;, null) != null;</span>
+
+  private static final EnumMap&lt;Language, Map&lt;String, GrammaticalRelation&gt;&gt;
+<span class="fc" id="L127">    stringsToRelations = new EnumMap&lt;&gt;(Language.class);</span>
+
+  /**
+   * The &quot;governor&quot; grammatical relation, which is the inverse of &quot;dependent&quot;.&lt;p&gt;
+   * &lt;p/&gt;
+   * Example: &quot;the red car&quot; &amp;rarr; {@code gov}(red, car)
+   */
+<span class="fc" id="L134">  public static final GrammaticalRelation GOVERNOR =</span>
+    new GrammaticalRelation(Language.Any, &quot;gov&quot;, &quot;governor&quot;, null);
+
+
+  /**
+   * The &quot;dependent&quot; grammatical relation, which is the inverse of &quot;governor&quot;.&lt;p&gt;
+   * &lt;p/&gt;
+   * Example: &quot;the red car&quot; &amp;rarr; {@code dep}(car, red)
+   */
+<span class="fc" id="L143">  public static final GrammaticalRelation DEPENDENT =</span>
+    new GrammaticalRelation(Language.Any, &quot;dep&quot;, &quot;dependent&quot;, null);
+
+
+  /**
+   *  The &quot;root&quot; grammatical relation between a faked &quot;ROOT&quot; node, and the root of the sentence.
+   */
+<span class="fc" id="L150">  public static final GrammaticalRelation ROOT =</span>
+    new GrammaticalRelation(Language.Any, &quot;root&quot;, &quot;root&quot;, null);
+
+
+  /**
+   * Dummy relation, used while collapsing relations, e.g., in English &amp;amp; Chinese GrammaticalStructure
+   */
+<span class="fc" id="L157">  public static final GrammaticalRelation KILL =</span>
+    new GrammaticalRelation(Language.Any, &quot;KILL&quot;, &quot;dummy relation kill&quot;, null);
+
+
+  /**
+   * Returns the GrammaticalRelation having the given string
+   * representation (e.g. &quot;nsubj&quot;), or null if no such is found.
+   *
+   * @param s The short name of the GrammaticalRelation
+   * @param values The set of GrammaticalRelations to look for it among.
+   * @return The GrammaticalRelation with that name
+   */
+  public static GrammaticalRelation valueOf(String s, Collection&lt;GrammaticalRelation&gt; values, Lock readValuesLock) {
+<span class="fc" id="L170">    readValuesLock.lock();</span>
+    try {
+<span class="fc bfc" id="L172" title="All 2 branches covered.">      for (GrammaticalRelation reln : values) {</span>
+<span class="fc bfc" id="L173" title="All 2 branches covered.">        if (reln.toString().equals(s)) return reln;</span>
+<span class="fc" id="L174">      }</span>
+    } finally {
+<span class="pc" id="L176">      readValuesLock.unlock();</span>
+<span class="fc" id="L177">    }</span>
+
+<span class="fc" id="L179">    return null;</span>
+  }
+
+  /**
+   * Returns the GrammaticalRelation having the given string
+   * representation (e.g. &quot;nsubj&quot;), or null if no such is found.
+   *
+   * @param s The short name of the GrammaticalRelation
+   * @param map The map from string to GrammaticalRelation
+   * @return The GrammaticalRelation with that name
+   */
+  public static GrammaticalRelation valueOf(String s, Map&lt;String, GrammaticalRelation&gt; map) {
+<span class="fc bfc" id="L191" title="All 2 branches covered.">    if (map.containsKey(s)) {</span>
+<span class="fc" id="L192">      return map.get(s);</span>
+    }
+<span class="fc" id="L194">    return null;</span>
+  }
+
+  /** Convert from a String representation of a GrammaticalRelation to a
+   *  GrammaticalRelation.  Where possible, you should avoid using this
+   *  method and simply work with true GrammaticalRelations rather than
+   *  String representations.  Correct behavior of this method depends
+   *  on the underlying data structure resources used being kept in sync
+   *  with the toString() and equals() methods.  However, there is really
+   *  no choice but to use this method when storing GrammaticalRelations
+   *  to text files and then reading them back in, so this method is not
+   *  deprecated.
+   *
+   *  @param s The String representation of a GrammaticalRelation
+   *  @return The grammatical relation represented by this String
+   */
+  public static GrammaticalRelation valueOf(Language language, String s) {
+    GrammaticalRelation reln;
+<span class="fc" id="L212">    synchronized (stringsToRelations) {</span>
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">      reln = (stringsToRelations.get(language) != null ? valueOf(s, stringsToRelations.get(language)) : null);</span>
+<span class="pc" id="L214">    }</span>
+<span class="fc bfc" id="L215" title="All 2 branches covered.">    if (reln == null) {</span>
+      // TODO this breaks the hierarchical structure of the classes,
+      //      but it makes English relations that much likelier to work.
+<span class="fc" id="L218">      reln = EnglishGrammaticalRelations.valueOf(s);</span>
+    }
+<span class="fc bfc" id="L220" title="All 2 branches covered.">    if (reln == null) {</span>
+      // the block below fails when 'specific' includes underscores.
+      // this is possible on weird web text, which generates relations such as prep______
+      /*
+      String[] names = s.split(&quot;_&quot;);
+      String specific = names.length &gt; 1? names[1] : null;
+      reln = new GrammaticalRelation(language, names[0], null, null, null, specific);
+      */
+      String name;
+      String specific;
+<span class="fc" id="L230">      int underscorePosition = s.indexOf('_');</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">      if (underscorePosition &gt; 0) {</span>
+<span class="fc" id="L232">        name = s.substring(0, underscorePosition);</span>
+<span class="fc" id="L233">        specific = s.substring(underscorePosition + 1);</span>
+      } else {
+<span class="fc" id="L235">        name = s;</span>
+<span class="fc" id="L236">        specific = null;</span>
+      }
+<span class="fc" id="L238">      reln = new GrammaticalRelation(language, name, null, null, specific);</span>
+
+    }
+<span class="fc" id="L241">    return reln;</span>
+  }
+
+  public static GrammaticalRelation valueOf(String s) {
+<span class="fc" id="L245">    return valueOf(Language.Any, s);</span>
+  }
+
+  /**
+   * This function is used to determine whether the GrammaticalRelation in
+   * question is one that was created to be a thin wrapper around a String
+   * representation by valueOf(String), or whether it is a full-fledged
+   * GrammaticalRelation created by direct invocation of the constructor.
+   *
+   * @return Whether this relation is just a wrapper created by valueOf(String)
+   */
+  public boolean isFromString() {
+<span class="fc bfc" id="L257" title="All 2 branches covered.">    return longName == null;</span>
+  }
+
+  /* Non-static stuff */
+  private final Language language;
+  private final String shortName;
+  private final String longName;
+  private final GrammaticalRelation parent;
+<span class="fc" id="L265">  private final List&lt;GrammaticalRelation&gt; children = new ArrayList&lt;&gt;();</span>
+  // a regexp for node values at which this relation can hold
+  private final Pattern sourcePattern;
+<span class="fc" id="L268">  private final List&lt;TregexPattern&gt; targetPatterns = new ArrayList&lt;&gt;();</span>
+  private final String specific; // to hold the specific prep or conjunction associated with the grammatical relation
+
+  // TODO document constructor
+  // TODO change to put specificString after longName, and then use String... for targetPatterns
+  private GrammaticalRelation(Language language,
+                             String shortName,
+                             String longName,
+                             GrammaticalRelation parent,
+                             String sourcePattern,
+                             TregexPatternCompiler tregexCompiler,
+                             String[] targetPatterns,
+<span class="fc" id="L280">                             String specificString) {</span>
+<span class="fc" id="L281">    this.language = language;</span>
+<span class="fc" id="L282">    this.shortName = shortName;</span>
+<span class="fc" id="L283">    this.longName = longName;</span>
+<span class="fc" id="L284">    this.parent = parent;</span>
+<span class="fc" id="L285">    this.specific = specificString; // this can be null!</span>
+
+<span class="fc bfc" id="L287" title="All 2 branches covered.">    if (parent != null) {</span>
+<span class="fc" id="L288">      parent.addChild(this);</span>
+    }
+
+<span class="fc bfc" id="L291" title="All 2 branches covered.">    if (sourcePattern != null) {</span>
+      try {
+<span class="fc" id="L293">        this.sourcePattern = Pattern.compile(sourcePattern);</span>
+<span class="nc" id="L294">      } catch (java.util.regex.PatternSyntaxException e) {</span>
+<span class="nc" id="L295">        throw new RuntimeException(&quot;Bad pattern: &quot; + sourcePattern);</span>
+<span class="fc" id="L296">      }</span>
+    } else {
+<span class="fc" id="L298">      this.sourcePattern = null;</span>
+    }
+
+<span class="fc bfc" id="L301" title="All 2 branches covered.">    for (String pattern : targetPatterns) {</span>
+      try {
+<span class="fc" id="L303">        TregexPattern p = tregexCompiler.compile(pattern);</span>
+<span class="fc" id="L304">        this.targetPatterns.add(p);</span>
+<span class="nc" id="L305">      } catch (edu.stanford.nlp.trees.tregex.TregexParseException pe) {</span>
+<span class="nc" id="L306">        throw new RuntimeException(&quot;Bad pattern: &quot; + pattern, pe);</span>
+<span class="fc" id="L307">      }</span>
+    }
+
+    GrammaticalRelation previous;
+<span class="fc" id="L311">    synchronized (stringsToRelations) {</span>
+<span class="fc" id="L312">      Map&lt;String, GrammaticalRelation&gt; sToR = stringsToRelations.get(language);</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">      if (sToR == null) {</span>
+<span class="fc" id="L314">        sToR = Generics.newHashMap();</span>
+<span class="fc" id="L315">        stringsToRelations.put(language, sToR);</span>
+      }
+<span class="fc" id="L317">      previous = sToR.put(toString(), this);</span>
+<span class="pc" id="L318">    }</span>
+<span class="fc bfc" id="L319" title="All 2 branches covered.">    if (previous != null) {</span>
+<span class="pc bpc" id="L320" title="1 of 4 branches missed.">      if (!previous.isFromString() &amp;&amp; !isFromString()) {</span>
+<span class="nc" id="L321">        throw new IllegalArgumentException(&quot;There is already a relation named &quot; + toString() + '!');</span>
+      } else {
+        /* We get here if we previously just built a fake relation from a string
+         * we previously read in from a file.
+         */
+        // TODO is it worth copying all of the information from this real
+        //      relation into the old fake one?
+      }
+    }
+<span class="fc" id="L330">  }</span>
+
+  // This is the main constructor used
+  public GrammaticalRelation(Language language,
+                             String shortName,
+                             String longName,
+                             GrammaticalRelation parent,
+                             String sourcePattern,
+                             TregexPatternCompiler tregexCompiler,
+                             String... targetPatterns) {
+<span class="fc" id="L340">    this(language, shortName, longName, parent, sourcePattern, tregexCompiler, targetPatterns, null);</span>
+<span class="fc" id="L341">  }</span>
+
+  // Used for non-leaf relations with no patterns
+  public GrammaticalRelation(Language language,
+                             String shortName,
+                             String longName,
+                             GrammaticalRelation parent) {
+<span class="fc" id="L348">    this(language, shortName, longName, parent, null, null, StringUtils.EMPTY_STRING_ARRAY, null);</span>
+<span class="fc" id="L349">  }</span>
+
+  // used to create collapsed relations with specificString
+  public GrammaticalRelation(Language language,
+                             String shortName,
+                             String longName,
+                             GrammaticalRelation parent,
+                             String specificString) {
+<span class="fc" id="L357">    this(language, shortName, longName, parent, null, null, StringUtils.EMPTY_STRING_ARRAY, specificString);</span>
+<span class="fc" id="L358">  }</span>
+
+  private void addChild(GrammaticalRelation child) {
+<span class="fc" id="L361">    children.add(child);</span>
+<span class="fc" id="L362">  }</span>
+
+  /** Given a {@code Tree} node {@code t}, attempts to
+   *  return a list of nodes to which node {@code t} has this
+   *  grammatical relation, with {@code t} as the governor.
+   *
+   *  @param t Target for finding dependents of t related by this GR
+   *  @param root The root of the Tree
+   *  @return A Collection of dependent nodes to which t bears this GR
+   */
+  public Collection&lt;TreeGraphNode&gt; getRelatedNodes(TreeGraphNode t, TreeGraphNode root, HeadFinder headFinder) {
+<span class="fc" id="L373">    Set&lt;TreeGraphNode&gt; nodeList = new ArraySet&lt;&gt;();</span>
+<span class="fc bfc" id="L374" title="All 2 branches covered.">    for (TregexPattern p : targetPatterns) {    // cdm: I deleted: &amp;&amp; nodeList.isEmpty()</span>
+      // Initialize the TregexMatcher with the HeadFinder so that we
+      // can use the same HeadFinder through the entire process of
+      // building the dependencies
+<span class="fc" id="L378">      TregexMatcher m = p.matcher(root, headFinder);</span>
+<span class="fc bfc" id="L379" title="All 2 branches covered.">      while (m.findAt(t)) {</span>
+<span class="fc" id="L380">        TreeGraphNode target = (TreeGraphNode) m.getNode(&quot;target&quot;);</span>
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">        if (target == null) {</span>
+<span class="nc" id="L382">          throw new AssertionError(&quot;Expression has no target: &quot; + p);</span>
+        }
+<span class="fc" id="L384">        nodeList.add(target);</span>
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L386">          log.info(&quot;found &quot; + this + &quot;(&quot; + t + &quot;-&quot; + t.headWordNode() + &quot;, &quot; + m.getNode(&quot;target&quot;) + &quot;-&quot; + ((TreeGraphNode) m.getNode(&quot;target&quot;)).headWordNode() + &quot;) using pattern &quot; + p);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">          for (String nodeName : m.getNodeNames()) {</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">            if (nodeName.equals(&quot;target&quot;))</span>
+<span class="nc" id="L389">              continue;</span>
+<span class="nc" id="L390">            log.info(&quot;  node &quot; + nodeName + &quot;: &quot; + m.getNode(nodeName));</span>
+<span class="nc" id="L391">          }</span>
+        }
+<span class="fc" id="L393">      }</span>
+<span class="fc" id="L394">    }</span>
+<span class="fc" id="L395">    return nodeList;</span>
+  }
+
+  /** Returns {@code true} iff the value of {@code Tree}
+   *  node {@code t} matches the {@code sourcePattern} for
+   *  this {@code GrammaticalRelation}, indicating that this
+   *  {@code GrammaticalRelation} is one that could hold between
+   *  {@code Tree} node {@code t} and some other node.
+   */
+  public boolean isApplicable(Tree t) {
+    // log.info(&quot;Testing whether &quot; + sourcePattern + &quot; matches &quot; + ((TreeGraphNode) t).toOneLineString());
+<span class="pc bpc" id="L406" title="1 of 4 branches missed.">    return (sourcePattern != null) &amp;&amp; (t.value() != null) &amp;&amp;</span>
+<span class="fc bfc" id="L407" title="All 2 branches covered.">             sourcePattern.matcher(t.value()).matches();</span>
+  }
+
+  /** Returns whether this is equal to or an ancestor of gr in the grammatical relations hierarchy. */
+  public boolean isAncestor(GrammaticalRelation gr) {
+<span class="fc bfc" id="L412" title="All 2 branches covered.">    while (gr != null) {</span>
+      // Changed this test from this == gr (mrsmith)
+<span class="fc bfc" id="L414" title="All 2 branches covered.">      if (this.equals(gr)) { return true; }</span>
+<span class="fc" id="L415">      gr = gr.parent;</span>
+    }
+<span class="fc" id="L417">    return false;</span>
+  }
+
+  /**
+   * Returns short name (abbreviation) for this
+   * {@code GrammaticalRelation}.  toString() for collapsed
+   * relations will include the word that was collapsed.
+   * &lt;br/&gt;
+   * &lt;i&gt;Implementation note:&lt;/i&gt; Note that this method must be synced with
+   * the equals() and valueOf(String) methods
+   */
+  @Override
+  public final String toString() {
+<span class="fc bfc" id="L430" title="All 2 branches covered.">    if (specific == null) {</span>
+<span class="fc" id="L431">      return shortName;</span>
+    } else {
+<span class="fc bfc" id="L433" title="All 2 branches covered.">      char sep = language == Language.UniversalEnglish ? ':' : '_';</span>
+<span class="fc" id="L434">      return shortName + sep + specific;</span>
+    }
+  }
+
+  /**
+   * Returns a {@code String} representation of this
+   * {@code GrammaticalRelation} and the hierarchy below
+   * it, with one node per line, indented according to level.
+   *
+   * @return {@code String} representation of this
+   *         {@code GrammaticalRelation}
+   */
+  public String toPrettyString() {
+<span class="nc" id="L447">    StringBuilder buf = new StringBuilder(&quot;\n&quot;);</span>
+<span class="nc" id="L448">    toPrettyString(0, buf);</span>
+<span class="nc" id="L449">    return buf.toString();</span>
+  }
+
+  /**
+   * Returns a {@code String} representation of this
+   * {@code GrammaticalRelation} and the hierarchy below
+   * it, with one node per line, indented according to
+   * {@code indentLevel}.
+   *
+   * @param indentLevel how many levels to indent (0 for root node)
+   */
+  private void toPrettyString(int indentLevel, StringBuilder buf) {
+<span class="nc bnc" id="L461" title="All 2 branches missed.">    for (int i = 0; i &lt; indentLevel; i++) {</span>
+<span class="nc" id="L462">      buf.append(&quot;  &quot;);</span>
+    }
+<span class="nc" id="L464">    buf.append(shortName).append(&quot; (&quot;).append(longName).append(&quot;): &quot;).append(targetPatterns);</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">    for (GrammaticalRelation child : children) {</span>
+<span class="nc" id="L466">      buf.append('\n');</span>
+<span class="nc" id="L467">      child.toPrettyString(indentLevel + 1, buf);</span>
+<span class="nc" id="L468">    }</span>
+<span class="nc" id="L469">  }</span>
+
+  /** Grammatical relations are equal with other grammatical relations if they
+   *  have the same shortName and specific (if present).
+   *  &lt;i&gt;Implementation note:&lt;/i&gt; Note that this method must be synced with
+   *  the toString() and valueOf(String) methods
+   *
+   *  @param o Object to be compared
+   *  @return Whether equal
+   */
+  @SuppressWarnings({&quot;StringEquality&quot;, &quot;ThrowableInstanceNeverThrown&quot;})
+  @Override
+  public boolean equals(Object o) {
+<span class="fc bfc" id="L482" title="All 2 branches covered.">    if (this == o) return true;</span>
+<span class="pc bpc" id="L483" title="1 of 2 branches missed.">    if (o instanceof String) {</span>
+      // TODO: Remove this. It's broken but was meant to cover legacy code. It would be correct to just return false.
+<span class="nc" id="L485">      new Throwable(&quot;Warning: comparing GrammaticalRelation to String&quot;).printStackTrace();</span>
+<span class="nc" id="L486">      return this.toString().equals(o);</span>
+    }
+<span class="pc bpc" id="L488" title="1 of 2 branches missed.">    if (!(o instanceof GrammaticalRelation)) return false;</span>
+
+<span class="fc" id="L490">    final GrammaticalRelation gr = (GrammaticalRelation) o;</span>
+    // == okay for language as enum!
+    // TODO(gabor) perhaps Language.Any shouldn't be equal to any language? This is a bit of a hack around some dependencies caring about language and others not.
+<span class="pc bpc" id="L493" title="1 of 2 branches missed.">    return (this.language.compatibleWith(gr.language)) &amp;&amp;</span>
+<span class="pc bpc" id="L494" title="2 of 6 branches missed.">             this.shortName.equals(gr.shortName) &amp;&amp;</span>
+             (this.specific == gr.specific ||
+<span class="pc bpc" id="L496" title="1 of 2 branches missed.">              (this.specific != null &amp;&amp; this.specific.equals(gr.specific)));</span>
+  }
+
+  @Override
+  public int hashCode() {
+<span class="fc" id="L501">    int result = 17;</span>
+<span class="pc bpc" id="L502" title="1 of 2 branches missed.">    result = 29 * result + (language != null ? language.toString().hashCode() : 0);</span>
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">    result = 29 * result + (shortName != null ? shortName.hashCode() : 0);</span>
+<span class="fc bfc" id="L504" title="All 2 branches covered.">    result = 29 * result + (specific != null ? specific.hashCode() : 0);</span>
+<span class="fc" id="L505">    return result;</span>
+  }
+
+  @Override
+  public int compareTo(GrammaticalRelation o) {
+<span class="fc" id="L510">    String thisN = this.toString();</span>
+<span class="fc" id="L511">    String oN = o.toString();</span>
+<span class="fc" id="L512">    return thisN.compareTo(oN);</span>
+  }
+
+  public String getLongName() {
+<span class="nc" id="L516">    return longName;</span>
+  }
+
+  public String getShortName() {
+<span class="fc" id="L520">    return shortName;</span>
+  }
+
+  /**
+   * Get the language of the grammatical relation.
+   */
+  public Language getLanguage() {
+<span class="nc" id="L527">    return this.language;</span>
+  }
+
+  public String getSpecific() {
+<span class="fc" id="L531">    return specific;</span>
+  }
+
+  /**
+   * When deserializing a GrammaticalRelation, it needs to be matched
+   * up with the existing singleton relation of the same type.
+   *
+   * TODO: there are a bunch of things wrong with this.  For one
+   * thing, it's crazy slow, since it goes through all the existing
+   * relations in an array.  For another, it would be cleaner to have
+   * subclasses for the English and Chinese relations
+   */
+  protected Object readResolve() throws ObjectStreamException {
+<span class="nc bnc" id="L544" title="All 5 branches missed.">    switch (language) {</span>
+    case Any: {
+<span class="nc bnc" id="L546" title="All 2 branches missed.">      if (shortName.equals(GOVERNOR.shortName)) {</span>
+<span class="nc" id="L547">        return GOVERNOR;</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      } else if (shortName.equals(DEPENDENT.shortName)) {</span>
+<span class="nc" id="L549">        return DEPENDENT;</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">      } else if (shortName.equals(ROOT.shortName)) {</span>
+<span class="nc" id="L551">        return ROOT;</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">      } else if (shortName.equals(KILL.shortName)) {</span>
+<span class="nc" id="L553">        return KILL;</span>
+      } else {
+<span class="nc" id="L555">        throw new RuntimeException(&quot;Unknown general relation &quot; + shortName);</span>
+      }
+    }
+    case English: {
+<span class="nc" id="L559">      GrammaticalRelation rel = EnglishGrammaticalRelations.valueOf(toString());</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">      if (rel == null) {</span>
+<span class="nc bnc" id="L561" title="All 14 branches missed.">        switch (shortName) {</span>
+          case &quot;conj&quot;:
+<span class="nc" id="L563">            return EnglishGrammaticalRelations.getConj(specific);</span>
+          case &quot;prep&quot;:
+<span class="nc" id="L565">            return EnglishGrammaticalRelations.getPrep(specific);</span>
+          case &quot;prepc&quot;:
+<span class="nc" id="L567">            return EnglishGrammaticalRelations.getPrepC(specific);</span>
+          default:
+            // TODO: we need to figure out what to do with relations
+            // which were serialized and then deprecated.  Perhaps there
+            // is a good way to make them singletons
+<span class="nc" id="L572">            return this;</span>
+          //throw new RuntimeException(&quot;Unknown English relation &quot; + this);
+        }
+      } else {
+<span class="nc" id="L576">        return rel;</span>
+      }
+    }
+    case Chinese: {
+<span class="nc" id="L580">      GrammaticalRelation rel = ChineseGrammaticalRelations.valueOf(toString());</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">      if (rel == null) {</span>
+        // TODO: we need to figure out what to do with relations
+        // which were serialized and then deprecated.  Perhaps there
+        // is a good way to make them singletons
+<span class="nc" id="L585">        return this;</span>
+        //throw new RuntimeException(&quot;Unknown Chinese relation &quot; + this);
+      }
+<span class="nc" id="L588">      return rel;</span>
+    }
+    case UniversalEnglish:
+<span class="nc" id="L591">      GrammaticalRelation rel = UniversalEnglishGrammaticalRelations.valueOf(toString());</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">      if (rel == null) {</span>
+<span class="nc bnc" id="L593" title="All 18 branches missed.">        switch (shortName) {</span>
+          case &quot;conj&quot;:
+<span class="nc" id="L595">            return UniversalEnglishGrammaticalRelations.getConj(specific);</span>
+          case &quot;nmod&quot;:
+<span class="nc" id="L597">            return UniversalEnglishGrammaticalRelations.getNmod(specific);</span>
+          case &quot;acl&quot;:
+<span class="nc" id="L599">            return UniversalEnglishGrammaticalRelations.getAcl(specific);</span>
+          case &quot;advcl&quot;:
+<span class="nc" id="L601">            return UniversalEnglishGrammaticalRelations.getAdvcl(specific);</span>
+          default:
+            // TODO: we need to figure out what to do with relations
+            // which were serialized and then deprecated.  Perhaps there
+            // is a good way to make them singletons
+<span class="nc" id="L606">            return this;</span>
+          //throw new RuntimeException(&quot;Unknown English relation &quot; + this);
+        }
+      } else {
+<span class="nc" id="L610">        return rel;</span>
+      }
+
+    default: {
+<span class="nc" id="L614">      throw new RuntimeException(&quot;Unknown language &quot; + language);</span>
+    }
+    }
+  }
+
+  /**
+   * Returns the parent of this {@code GrammaticalRelation}.
+   */
+  public GrammaticalRelation getParent() {
+<span class="fc" id="L623">    return parent;</span>
+  }
+
+  public static void main(String[] args) {
+<span class="nc" id="L627">    final String[] names = {&quot;dep&quot;, &quot;pred&quot;, &quot;prep_to&quot;,&quot;rcmod&quot;};</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">    for (String name : names) {</span>
+<span class="nc" id="L629">      GrammaticalRelation reln = valueOf(Language.English, name);</span>
+<span class="nc" id="L630">      System.out.println(&quot;Data for GrammaticalRelation loaded as valueOf(\&quot;&quot; + name + &quot;\&quot;):&quot;);</span>
+<span class="nc" id="L631">      System.out.println(&quot;\tShort name:    &quot; + reln.getShortName());</span>
+<span class="nc" id="L632">      System.out.println(&quot;\tLong name:     &quot; + reln.getLongName());</span>
+<span class="nc" id="L633">      System.out.println(&quot;\tSpecific name: &quot; + reln.getSpecific());</span>
+    }
+<span class="nc" id="L635">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

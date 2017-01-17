@@ -1,0 +1,1525 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LexicalizedParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">LexicalizedParser.java</span></div><h1>LexicalizedParser.java</h1><pre class="source lang-java linenums">// Stanford Parser -- a probabilistic lexicalized NL CFG parser
+// Copyright (c) 2002 - 2014 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software Foundation,
+// Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//    parser-support@lists.stanford.edu
+//    http://nlp.stanford.edu/software/lex-parser.shtml
+
+package edu.stanford.nlp.parser.lexparser;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.parser.common.ArgUtils;
+import edu.stanford.nlp.parser.common.ParserGrammar;
+import edu.stanford.nlp.parser.common.ParserQuery;
+import edu.stanford.nlp.parser.common.ParserUtils;
+import edu.stanford.nlp.parser.metrics.Eval;
+import edu.stanford.nlp.parser.metrics.ParserQueryEval;
+import edu.stanford.nlp.process.TokenizerFactory;
+import edu.stanford.nlp.util.ErasureUtils;
+import java.util.function.Function;
+import edu.stanford.nlp.util.HashIndex;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.tagger.io.TaggedFileRecord;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.ReflectionLoading;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.Triple;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+
+
+
+/**
+ * This class provides the top-level API and command-line interface to a set
+ * of reasonably good treebank-trained parsers.  The name reflects the main
+ * factored parsing model, which provides a lexicalized PCFG parser
+ * implemented as a product
+ * model of a plain PCFG parser and a lexicalized dependency parser.
+ * But you can also run either component parser alone.  In particular, it
+ * is often useful to do unlexicalized PCFG parsing by using just that
+ * component parser.
+ * &lt;p&gt;
+ * See the package documentation for more details and examples of use.
+ * &lt;p&gt;
+ * For information on invoking the parser from the command-line, and for
+ * a more detailed list of options, see the {@link #main} method.
+ * &lt;p&gt;
+ * Note that training on a 1 million word treebank requires a fair amount of
+ * memory to run.  Try -mx1500m to increase the memory allocated by the JVM.
+ *
+ * @author Dan Klein (original version)
+ * @author Christopher Manning (better features, ParserParams, serialization)
+ * @author Roger Levy (internationalization)
+ * @author Teg Grenager (grammar compaction, tokenization, etc.)
+ * @author Galen Andrew (considerable refactoring)
+ * @author John Bauer (made threadsafe)
+ */
+public class LexicalizedParser extends ParserGrammar implements Serializable  {
+
+  /** A logger for this class */
+<span class="nc" id="L96">  private static final Redwood.RedwoodChannels log = Redwood.channels(LexicalizedParser.class);</span>
+
+  public Lexicon lex;
+  public BinaryGrammar bg;
+  public UnaryGrammar ug;
+  public DependencyGrammar dg;
+  public Index&lt;String&gt; stateIndex, wordIndex, tagIndex;
+
+  private Options op;
+
+  @Override
+<span class="nc" id="L107">  public Options getOp() { return op; }</span>
+
+  public Reranker reranker; // = null;
+
+  @Override
+<span class="nc" id="L112">  public TreebankLangParserParams getTLPParams() { return op.tlpParams; }</span>
+
+  @Override
+<span class="nc" id="L115">  public TreebankLanguagePack treebankLanguagePack() { return getTLPParams().treebankLanguagePack(); }</span>
+
+  @Override
+  public String[] defaultCoreNLPFlags() {
+<span class="nc" id="L119">    return getTLPParams().defaultCoreNLPFlags();</span>
+  }
+
+  @Override
+  public boolean requiresTags() {
+<span class="nc" id="L124">    return false;</span>
+  }
+
+  private static final String SERIALIZED_PARSER_PROPERTY = &quot;edu.stanford.nlp.SerializedLexicalizedParser&quot;;
+<span class="nc bnc" id="L128" title="All 2 branches missed.">  public static final String DEFAULT_PARSER_LOC = ((System.getenv(&quot;NLP_PARSER&quot;) != null) ?</span>
+<span class="nc" id="L129">                                                   System.getenv(&quot;NLP_PARSER&quot;) :</span>
+                                                   &quot;edu/stanford/nlp/models/lexparser/englishPCFG.ser.gz&quot;);
+
+  /**
+   * Construct a new LexicalizedParser object from a previously
+   * serialized grammar read from a System property
+   * {@code edu.stanford.nlp.SerializedLexicalizedParser}, or a
+   * default classpath location
+   * ({@code edu/stanford/nlp/models/lexparser/englishPCFG.ser.gz}).
+   */
+  public static LexicalizedParser loadModel() {
+<span class="nc" id="L140">    return loadModel(new Options());</span>
+  }
+
+  /**
+   * Construct a new LexicalizedParser object from a previously
+   * serialized grammar read from a System property
+   * {@code edu.stanford.nlp.SerializedLexicalizedParser}, or a
+   * default classpath location
+   * ({@code edu/stanford/nlp/models/lexparser/englishPCFG.ser.gz}).
+   *
+   * @param op Options to the parser.  These get overwritten by the
+   *           Options read from the serialized parser; I think the only
+   *           thing determined by them is the encoding of the grammar
+   *           iff it is a text grammar
+   */
+  public static LexicalizedParser loadModel(Options op,
+                                            String ... extraFlags) {
+<span class="nc" id="L157">    String source = System.getProperty(SERIALIZED_PARSER_PROPERTY);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">    if (source == null) {</span>
+<span class="nc" id="L159">      source = DEFAULT_PARSER_LOC;</span>
+    }
+<span class="nc" id="L161">    return loadModel(source, op, extraFlags);</span>
+  }
+
+  public static LexicalizedParser loadModel(String parserFileOrUrl,
+                                            String ... extraFlags) {
+<span class="nc" id="L166">    return loadModel(parserFileOrUrl, new Options(), extraFlags);</span>
+  }
+
+  public static LexicalizedParser loadModel(String parserFileOrUrl,
+                                            List&lt;String&gt; extraFlags) {
+<span class="nc" id="L171">    String[] flags = new String[extraFlags.size()];</span>
+<span class="nc" id="L172">    extraFlags.toArray(flags);</span>
+<span class="nc" id="L173">    return loadModel(parserFileOrUrl, flags);</span>
+  }
+
+  /**
+   * Construct a new LexicalizedParser.  This loads a grammar
+   * that was previously assembled and stored as a serialized file.
+   * @param parserFileOrUrl Filename/URL to load parser from
+   * @param op Options for this parser. These will normally be overwritten
+   *     by options stored in the file
+   * @throws IllegalArgumentException If parser data cannot be loaded
+   */
+  public static LexicalizedParser loadModel(String parserFileOrUrl, Options op,
+                                            String ... extraFlags) {
+    //    log.info(&quot;Loading parser from file &quot; + parserFileOrUrl);
+<span class="nc" id="L187">    LexicalizedParser parser = getParserFromFile(parserFileOrUrl, op);</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">    if (extraFlags.length &gt; 0) {</span>
+<span class="nc" id="L189">      parser.setOptionFlags(extraFlags);</span>
+    }
+<span class="nc" id="L191">    return parser;</span>
+  }
+
+  /**
+   * Reads one object from the given ObjectInputStream, which is
+   * assumed to be a LexicalizedParser.  Throws a ClassCastException
+   * if this is not true.  The stream is not closed.
+   */
+  public static LexicalizedParser loadModel(ObjectInputStream ois) {
+    try {
+<span class="nc" id="L201">      Object o = ois.readObject();</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">      if (o instanceof LexicalizedParser) {</span>
+<span class="nc" id="L203">        return (LexicalizedParser) o;</span>
+      }
+<span class="nc" id="L205">      throw new ClassCastException(&quot;Wanted LexicalizedParser, got &quot; +</span>
+<span class="nc" id="L206">                                   o.getClass());</span>
+<span class="nc" id="L207">    } catch (IOException e) {</span>
+<span class="nc" id="L208">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L209">    } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L210">      throw new RuntimeException(e);</span>
+    }
+  }
+
+  public static LexicalizedParser loadModelFromZip(String zipFilename,
+                                                   String modelName) {
+<span class="nc" id="L216">    LexicalizedParser parser = null;</span>
+    try {
+<span class="nc" id="L218">      File file = new File(zipFilename);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">      if (file.exists()) {</span>
+<span class="nc" id="L220">        ZipFile zin = new ZipFile(file);</span>
+<span class="nc" id="L221">        ZipEntry zentry = zin.getEntry(modelName);</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (zentry != null) {</span>
+<span class="nc" id="L223">          InputStream in = zin.getInputStream(zentry);</span>
+          // gunzip it if necessary
+<span class="nc bnc" id="L225" title="All 2 branches missed.">          if (modelName.endsWith(&quot;.gz&quot;)) {</span>
+<span class="nc" id="L226">            in = new GZIPInputStream(in);</span>
+          }
+<span class="nc" id="L228">          ObjectInputStream ois = new ObjectInputStream(in);</span>
+<span class="nc" id="L229">          parser = loadModel(ois);</span>
+<span class="nc" id="L230">          ois.close();</span>
+<span class="nc" id="L231">          in.close();</span>
+        }
+<span class="nc" id="L233">        zin.close();</span>
+<span class="nc" id="L234">      } else {</span>
+<span class="nc" id="L235">        throw new FileNotFoundException(&quot;Could not find &quot; + modelName +</span>
+                                        &quot; inside &quot; + zipFilename);
+      }
+<span class="nc" id="L238">    } catch (IOException e) {</span>
+<span class="nc" id="L239">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L240">    }</span>
+<span class="nc" id="L241">    return parser;</span>
+  }
+
+  public static LexicalizedParser copyLexicalizedParser(LexicalizedParser parser) {
+<span class="nc" id="L245">    return new LexicalizedParser(parser.lex, parser.bg, parser.ug, parser.dg, parser.stateIndex, parser.wordIndex, parser.tagIndex, parser.op);</span>
+  }
+
+<span class="nc" id="L248">  public LexicalizedParser(Lexicon lex, BinaryGrammar bg, UnaryGrammar ug, DependencyGrammar dg, Index&lt;String&gt; stateIndex, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex, Options op) {</span>
+<span class="nc" id="L249">    this.lex = lex;</span>
+<span class="nc" id="L250">    this.bg = bg;</span>
+<span class="nc" id="L251">    this.ug = ug;</span>
+<span class="nc" id="L252">    this.dg = dg;</span>
+<span class="nc" id="L253">    this.stateIndex = stateIndex;</span>
+<span class="nc" id="L254">    this.wordIndex = wordIndex;</span>
+<span class="nc" id="L255">    this.tagIndex = tagIndex;</span>
+<span class="nc" id="L256">    this.op = op;</span>
+<span class="nc" id="L257">  }</span>
+
+
+  /**
+   * Construct a new LexicalizedParser.
+   *
+   * @param trainTreebank a treebank to train from
+   */
+  public static LexicalizedParser trainFromTreebank(Treebank trainTreebank,
+                                                    GrammarCompactor compactor,
+                                                    Options op) {
+<span class="nc" id="L268">    return getParserFromTreebank(trainTreebank, null, 1.0, compactor, op, null, null);</span>
+  }
+
+  public static LexicalizedParser trainFromTreebank(String treebankPath,
+                                                    FileFilter filt,
+                                                    Options op) {
+<span class="nc" id="L274">    return trainFromTreebank(makeTreebank(treebankPath, op, filt), op);</span>
+  }
+
+  public static LexicalizedParser trainFromTreebank(Treebank trainTreebank,
+                                                    Options op) {
+<span class="nc" id="L279">    return trainFromTreebank(trainTreebank, null, op);</span>
+  }
+
+
+  /**
+   * Will process a list of strings into a list of HasWord and return
+   * the parse tree associated with that list.
+   */
+  public Tree parseStrings(List&lt;String&gt; lst) {
+<span class="nc" id="L288">    List&lt;Word&gt; words = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    for (String word : lst) {</span>
+<span class="nc" id="L290">      words.add(new Word(word));</span>
+<span class="nc" id="L291">    }</span>
+<span class="nc" id="L292">    return parse(words);</span>
+  }
+
+  /**
+   * Parses the list of HasWord.  If the parse fails for some reason,
+   * an X tree is returned instead of barfing.
+   */
+  public Tree parse(List&lt;? extends HasWord&gt; lst) {
+    try {
+<span class="nc" id="L301">      ParserQuery pq = parserQuery();</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">      if (pq.parse(lst)) {</span>
+<span class="nc" id="L303">        Tree bestparse = pq.getBestParse();</span>
+        // -10000 denotes unknown words
+<span class="nc" id="L305">        bestparse.setScore(pq.getPCFGScore() % -10000.0);</span>
+<span class="nc" id="L306">        return bestparse;</span>
+      }
+<span class="nc" id="L308">    } catch (Exception e) {</span>
+<span class="nc" id="L309">      log.info(&quot;Following exception caught during parsing:&quot;);</span>
+<span class="nc" id="L310">      e.printStackTrace();</span>
+<span class="nc" id="L311">      log.info(&quot;Recovering using fall through strategy: will construct an (X ...) tree.&quot;);</span>
+<span class="nc" id="L312">    }</span>
+    // if can't parse or exception, fall through
+<span class="nc" id="L314">    return ParserUtils.xTree(lst);</span>
+  }
+
+  public List&lt;Tree&gt; parseMultiple(final List&lt;? extends List&lt;? extends HasWord&gt;&gt; sentences) {
+<span class="nc" id="L318">    List&lt;Tree&gt; trees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    for (List&lt;? extends HasWord&gt; sentence : sentences) {</span>
+<span class="nc" id="L320">      trees.add(parse(sentence));</span>
+<span class="nc" id="L321">    }</span>
+<span class="nc" id="L322">    return trees;</span>
+  }
+
+  /**
+   * Will launch multiple threads which calls {@code parse} on
+   * each of the {@code sentences} in order, returning the
+   * resulting parse trees in the same order.
+   */
+  public List&lt;Tree&gt; parseMultiple(final List&lt;? extends List&lt;? extends HasWord&gt;&gt; sentences, final int nthreads) {
+<span class="nc" id="L331">    MulticoreWrapper&lt;List&lt;? extends HasWord&gt;, Tree&gt; wrapper = new MulticoreWrapper&lt;&gt;(nthreads, new ThreadsafeProcessor&lt;List&lt;? extends HasWord&gt;, Tree&gt;() {</span>
+      @Override
+      public Tree process(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L334">        return parse(sentence);</span>
+      }
+
+      @Override
+      public ThreadsafeProcessor&lt;List&lt;? extends HasWord&gt;, Tree&gt; newInstance() {
+<span class="nc" id="L339">        return this;</span>
+      }
+    });
+<span class="nc" id="L342">    List&lt;Tree&gt; trees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">    for (List&lt;? extends HasWord&gt; sentence : sentences) {</span>
+<span class="nc" id="L344">      wrapper.put(sentence);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">      while (wrapper.peek()) {</span>
+<span class="nc" id="L346">        trees.add(wrapper.poll());</span>
+      }
+<span class="nc" id="L348">    }</span>
+<span class="nc" id="L349">    wrapper.join();</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">    while (wrapper.peek()) {</span>
+<span class="nc" id="L351">      trees.add(wrapper.poll());</span>
+    }
+<span class="nc" id="L353">    return trees;</span>
+  }
+
+  /** Return a TreePrint for formatting parsed output trees.
+   *  @return A TreePrint for formatting parsed output trees.
+   */
+  public TreePrint getTreePrint() {
+<span class="nc" id="L360">    return op.testOptions.treePrint(op.tlpParams);</span>
+  }
+
+  /**
+   * Similar to parse(), but instead of returning an X tree on failure, returns null.
+   */
+  public Tree parseTree(List&lt;? extends HasWord&gt; sentence) {
+<span class="nc" id="L367">    ParserQuery pq = parserQuery();</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">    if (pq.parse(sentence)) {</span>
+<span class="nc" id="L369">      return pq.getBestParse();</span>
+    } else {
+<span class="nc" id="L371">      return null;</span>
+    }
+  }
+
+  @Override
+  public List&lt;Eval&gt; getExtraEvals() {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    if (reranker != null) {</span>
+<span class="nc" id="L378">      return reranker.getEvals();</span>
+    } else {
+<span class="nc" id="L380">      return Collections.emptyList();</span>
+    }
+  }
+
+
+  @Override
+  public List&lt;ParserQueryEval&gt; getParserQueryEvals() {
+<span class="nc" id="L387">    return Collections.emptyList();</span>
+  }
+
+
+  @Override
+  public ParserQuery parserQuery() {
+<span class="nc bnc" id="L393" title="All 2 branches missed.">    if (reranker == null) {</span>
+<span class="nc" id="L394">      return new LexicalizedParserQuery(this);</span>
+    } else {
+<span class="nc" id="L396">      return new RerankingParserQuery(op, new LexicalizedParserQuery(this), reranker);</span>
+    }
+  }
+
+  public LexicalizedParserQuery lexicalizedParserQuery() {
+<span class="nc" id="L401">    return new LexicalizedParserQuery(this);</span>
+  }
+
+  public static LexicalizedParser getParserFromFile(String parserFileOrUrl, Options op) {
+<span class="nc" id="L405">    LexicalizedParser pd = getParserFromSerializedFile(parserFileOrUrl);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">    if (pd == null) {</span>
+<span class="nc" id="L407">      pd = getParserFromTextFile(parserFileOrUrl, op);</span>
+    }
+<span class="nc" id="L409">    return pd;</span>
+  }
+
+  private static Treebank makeTreebank(String treebankPath, Options op, FileFilter filt) {
+<span class="nc" id="L413">    log.info(&quot;Training a parser from treebank dir: &quot; + treebankPath);</span>
+<span class="nc" id="L414">    Treebank trainTreebank = op.tlpParams.diskTreebank();</span>
+<span class="nc" id="L415">    log.info(&quot;Reading trees...&quot;);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">    if (filt == null) {</span>
+<span class="nc" id="L417">      trainTreebank.loadPath(treebankPath);</span>
+    } else {
+<span class="nc" id="L419">      trainTreebank.loadPath(treebankPath, filt);</span>
+    }
+
+<span class="nc" id="L422">    Timing.tick(&quot;done [read &quot; + trainTreebank.size() + &quot; trees].&quot;);</span>
+<span class="nc" id="L423">    return trainTreebank;</span>
+  }
+
+  private static DiskTreebank makeSecondaryTreebank(String treebankPath, Options op, FileFilter filt) {
+<span class="nc" id="L427">    log.info(&quot;Additionally training using secondary disk treebank: &quot; + treebankPath + ' ' + filt);</span>
+<span class="nc" id="L428">    DiskTreebank trainTreebank = op.tlpParams.diskTreebank();</span>
+<span class="nc" id="L429">    log.info(&quot;Reading trees...&quot;);</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">    if (filt == null) {</span>
+<span class="nc" id="L431">      trainTreebank.loadPath(treebankPath);</span>
+    } else {
+<span class="nc" id="L433">      trainTreebank.loadPath(treebankPath, filt);</span>
+    }
+<span class="nc" id="L435">    Timing.tick(&quot;done [read &quot; + trainTreebank.size() + &quot; trees].&quot;);</span>
+<span class="nc" id="L436">    return trainTreebank;</span>
+  }
+
+  public Lexicon getLexicon() {
+<span class="nc" id="L440">    return lex;</span>
+  }
+
+  /**
+   * Saves the parser defined by pd to the given filename.
+   * If there is an error, a RuntimeIOException is thrown.
+   */
+  public void saveParserToSerialized(String filename) {
+    try {
+<span class="nc" id="L449">      log.info(&quot;Writing parser in serialized format to file &quot; + filename + ' ');</span>
+<span class="nc" id="L450">      ObjectOutputStream out = IOUtils.writeStreamFromString(filename);</span>
+<span class="nc" id="L451">      out.writeObject(this);</span>
+<span class="nc" id="L452">      out.close();</span>
+<span class="nc" id="L453">      log.info(&quot;done.&quot;);</span>
+<span class="nc" id="L454">    } catch (IOException ioe) {</span>
+<span class="nc" id="L455">      throw new RuntimeIOException(ioe);</span>
+<span class="nc" id="L456">    }</span>
+<span class="nc" id="L457">  }</span>
+
+  /**
+   * Saves the parser defined by pd to the given filename.
+   * If there is an error, a RuntimeIOException is thrown.
+   */
+  // todo: [cdm 2015] This doesn't use character encoding and it should!
+  public void saveParserToTextFile(String filename) {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">    if (reranker != null) {</span>
+<span class="nc" id="L466">      throw new UnsupportedOperationException(&quot;Sorry, but parsers with rerankers cannot be saved to text file&quot;);</span>
+    }
+    try {
+<span class="nc" id="L469">      log.info(&quot;Writing parser in text grammar format to file &quot; + filename);</span>
+      OutputStream os;
+<span class="nc bnc" id="L471" title="All 2 branches missed.">      if (filename.endsWith(&quot;.gz&quot;)) {</span>
+        // it's faster to do the buffering _outside_ the gzipping as here
+<span class="nc" id="L473">        os = new BufferedOutputStream(new GZIPOutputStream(new FileOutputStream(filename)));</span>
+      } else {
+<span class="nc" id="L475">        os = new BufferedOutputStream(new FileOutputStream(filename));</span>
+      }
+<span class="nc" id="L477">      PrintWriter out = new PrintWriter(os);</span>
+<span class="nc" id="L478">      String prefix = &quot;BEGIN &quot;;</span>
+
+<span class="nc" id="L480">      out.println(prefix + &quot;OPTIONS&quot;);</span>
+<span class="nc" id="L481">      op.writeData(out);</span>
+<span class="nc" id="L482">      out.println();</span>
+<span class="nc" id="L483">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L485">      out.println(prefix + &quot;STATE_INDEX&quot;);</span>
+<span class="nc" id="L486">      stateIndex.saveToWriter(out);</span>
+<span class="nc" id="L487">      out.println();</span>
+<span class="nc" id="L488">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L490">      out.println(prefix + &quot;WORD_INDEX&quot;);</span>
+<span class="nc" id="L491">      wordIndex.saveToWriter(out);</span>
+<span class="nc" id="L492">      out.println();</span>
+<span class="nc" id="L493">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L495">      out.println(prefix + &quot;TAG_INDEX&quot;);</span>
+<span class="nc" id="L496">      tagIndex.saveToWriter(out);</span>
+<span class="nc" id="L497">      out.println();</span>
+<span class="nc" id="L498">      log.info(&quot;.&quot;);</span>
+
+<span class="nc bnc" id="L500" title="All 2 branches missed.">      String uwmClazz = ((lex.getUnknownWordModel() == null) ? &quot;null&quot; :</span>
+<span class="nc" id="L501">                   lex.getUnknownWordModel().getClass().getCanonicalName());</span>
+<span class="nc" id="L502">      out.println(prefix + &quot;LEXICON &quot; + uwmClazz);</span>
+<span class="nc" id="L503">      lex.writeData(out);</span>
+<span class="nc" id="L504">      out.println();</span>
+<span class="nc" id="L505">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L507">      out.println(prefix + &quot;UNARY_GRAMMAR&quot;);</span>
+<span class="nc" id="L508">      ug.writeData(out);</span>
+<span class="nc" id="L509">      out.println();</span>
+<span class="nc" id="L510">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L512">      out.println(prefix + &quot;BINARY_GRAMMAR&quot;);</span>
+<span class="nc" id="L513">      bg.writeData(out);</span>
+<span class="nc" id="L514">      out.println();</span>
+<span class="nc" id="L515">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L517">      out.println(prefix + &quot;DEPENDENCY_GRAMMAR&quot;);</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">      if (dg != null) {</span>
+<span class="nc" id="L519">        dg.writeData(out);</span>
+      }
+<span class="nc" id="L521">      out.println();</span>
+<span class="nc" id="L522">      log.info(&quot;.&quot;);</span>
+
+<span class="nc" id="L524">      out.flush();</span>
+<span class="nc" id="L525">      out.close();</span>
+<span class="nc" id="L526">      log.info(&quot;done.&quot;);</span>
+<span class="nc" id="L527">    } catch (IOException e) {</span>
+<span class="nc" id="L528">      log.info(&quot;Trouble saving parser data to ASCII format.&quot;);</span>
+<span class="nc" id="L529">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L530">    }</span>
+<span class="nc" id="L531">  }</span>
+
+  private static void confirmBeginBlock(String file, String line) {
+<span class="nc bnc" id="L534" title="All 2 branches missed.">    if (line == null) {</span>
+<span class="nc" id="L535">      throw new RuntimeException(file + &quot;: expecting BEGIN block; got end of file.&quot;);</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">    } else if (! line.startsWith(&quot;BEGIN&quot;)) {</span>
+<span class="nc" id="L537">      throw new RuntimeException(file + &quot;: expecting BEGIN block; got &quot; + line);</span>
+    }
+<span class="nc" id="L539">  }</span>
+
+  protected static LexicalizedParser getParserFromTextFile(String textFileOrUrl, Options op) {
+    try {
+<span class="nc" id="L543">      Timing tim = new Timing();</span>
+<span class="nc" id="L544">      BufferedReader in = IOUtils.readerFromString(textFileOrUrl);</span>
+<span class="nc" id="L545">      Timing.startTime();</span>
+
+<span class="nc" id="L547">      String line = in.readLine();</span>
+<span class="nc" id="L548">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L549">      op.readData(in);</span>
+
+<span class="nc" id="L551">      line = in.readLine();</span>
+<span class="nc" id="L552">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L553">      Index&lt;String&gt; stateIndex = HashIndex.loadFromReader(in);</span>
+
+<span class="nc" id="L555">      line = in.readLine();</span>
+<span class="nc" id="L556">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L557">      Index&lt;String&gt; wordIndex = HashIndex.loadFromReader(in);</span>
+
+<span class="nc" id="L559">      line = in.readLine();</span>
+<span class="nc" id="L560">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L561">      Index&lt;String&gt; tagIndex = HashIndex.loadFromReader(in);</span>
+
+<span class="nc" id="L563">      line = in.readLine();</span>
+<span class="nc" id="L564">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L565">      Lexicon lex = op.tlpParams.lex(op, wordIndex, tagIndex);</span>
+<span class="nc" id="L566">      String uwmClazz = line.split(&quot; +&quot;)[2];</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">      if (!uwmClazz.equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L568">        UnknownWordModel model = ReflectionLoading.loadByReflection(uwmClazz, op, lex, wordIndex, tagIndex);</span>
+<span class="nc" id="L569">        lex.setUnknownWordModel(model);</span>
+      }
+<span class="nc" id="L571">      lex.readData(in);</span>
+
+<span class="nc" id="L573">      line = in.readLine();</span>
+<span class="nc" id="L574">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L575">      UnaryGrammar ug = new UnaryGrammar(stateIndex);</span>
+<span class="nc" id="L576">      ug.readData(in);</span>
+
+<span class="nc" id="L578">      line = in.readLine();</span>
+<span class="nc" id="L579">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L580">      BinaryGrammar bg = new BinaryGrammar(stateIndex);</span>
+<span class="nc" id="L581">      bg.readData(in);</span>
+
+<span class="nc" id="L583">      line = in.readLine();</span>
+<span class="nc" id="L584">      confirmBeginBlock(textFileOrUrl, line);</span>
+<span class="nc" id="L585">      DependencyGrammar dg = new MLEDependencyGrammar(op.tlpParams, op.directional, op.distance, op.coarseDistance, op.trainOptions.basicCategoryTagsInDependencyGrammar, op, wordIndex, tagIndex);</span>
+<span class="nc" id="L586">      dg.readData(in);</span>
+
+<span class="nc" id="L588">      in.close();</span>
+<span class="nc" id="L589">      log.info(&quot;Loading parser from text file &quot; + textFileOrUrl + &quot; ... done [&quot; + tim.toSecondsString() + &quot; sec].&quot;);</span>
+<span class="nc" id="L590">      return new LexicalizedParser(lex, bg, ug, dg, stateIndex, wordIndex, tagIndex, op);</span>
+<span class="nc" id="L591">    } catch (IOException e) {</span>
+<span class="nc" id="L592">      e.printStackTrace();</span>
+    }
+<span class="nc" id="L594">    return null;</span>
+  }
+
+
+  public static LexicalizedParser getParserFromSerializedFile(String serializedFileOrUrl) {
+    try {
+<span class="nc" id="L600">      Timing tim = new Timing();</span>
+<span class="nc" id="L601">      ObjectInputStream in = IOUtils.readStreamFromString(serializedFileOrUrl);</span>
+<span class="nc" id="L602">      LexicalizedParser pd = loadModel(in);</span>
+
+<span class="nc" id="L604">      in.close();</span>
+<span class="nc" id="L605">      log.info(&quot;Loading parser from serialized file &quot; + serializedFileOrUrl + &quot; ... done [&quot; + tim.toSecondsString() + &quot; sec].&quot;);</span>
+<span class="nc" id="L606">      return pd;</span>
+<span class="nc" id="L607">    } catch (InvalidClassException ice) {</span>
+      // For this, it's not a good idea to continue and try it as a text file!
+<span class="nc" id="L609">      throw new RuntimeException(&quot;Invalid class in file: &quot; + serializedFileOrUrl, ice);</span>
+<span class="nc" id="L610">    } catch (FileNotFoundException fnfe) {</span>
+      // For this, it's not a good idea to continue and try it as a text file!
+<span class="nc" id="L612">      throw new RuntimeException(&quot;File not found: &quot; + serializedFileOrUrl, fnfe);</span>
+<span class="nc" id="L613">    } catch (StreamCorruptedException sce) {</span>
+      // suppress error message, on the assumption that we've really got
+      // a text grammar, and that'll be tried next
+<span class="nc" id="L616">    } catch (Exception e) {</span>
+<span class="nc" id="L617">      e.printStackTrace();</span>
+<span class="nc" id="L618">    }</span>
+<span class="nc" id="L619">    return null;</span>
+  }
+
+
+  private static void printOptions(boolean train, Options op) {
+<span class="nc" id="L624">    op.display();</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">    if (train) {</span>
+<span class="nc" id="L626">      op.trainOptions.display();</span>
+    } else {
+<span class="nc" id="L628">      op.testOptions.display();</span>
+    }
+<span class="nc" id="L630">    op.tlpParams.display();</span>
+<span class="nc" id="L631">  }</span>
+
+  public static TreeAnnotatorAndBinarizer buildTrainBinarizer(Options op) {
+<span class="nc" id="L634">    TreebankLangParserParams tlpParams = op.tlpParams;</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">    if (!op.trainOptions.leftToRight) {</span>
+<span class="nc bnc" id="L636" title="All 4 branches missed.">      return new TreeAnnotatorAndBinarizer(tlpParams, op.forceCNF, !op.trainOptions.outsideFactor(), !op.trainOptions.predictSplits, op);</span>
+    } else {
+<span class="nc bnc" id="L638" title="All 4 branches missed.">      return new TreeAnnotatorAndBinarizer(tlpParams.headFinder(), new LeftHeadFinder(), tlpParams, op.forceCNF, !op.trainOptions.outsideFactor(), !op.trainOptions.predictSplits, op);</span>
+    }
+  }
+
+  public static CompositeTreeTransformer buildTrainTransformer(Options op) {
+<span class="nc" id="L643">    TreeAnnotatorAndBinarizer binarizer = buildTrainBinarizer(op);</span>
+<span class="nc" id="L644">    return buildTrainTransformer(op, binarizer);</span>
+  }
+
+  // todo [cdm2015]: This method should be used in TreeAnnotatorAndBinarizer#getAnnotatedBinaryTreebankFromTreebank and moved to that class
+  public static CompositeTreeTransformer buildTrainTransformer(Options op, TreeAnnotatorAndBinarizer binarizer) {
+<span class="nc" id="L649">    TreebankLangParserParams tlpParams = op.tlpParams;</span>
+<span class="nc" id="L650">    TreebankLanguagePack tlp = tlpParams.treebankLanguagePack();</span>
+<span class="nc" id="L651">    CompositeTreeTransformer trainTransformer =</span>
+      new CompositeTreeTransformer();
+<span class="nc bnc" id="L653" title="All 2 branches missed.">    if (op.trainOptions.preTransformer != null) {</span>
+<span class="nc" id="L654">      trainTransformer.addTransformer(op.trainOptions.preTransformer);</span>
+    }
+<span class="nc bnc" id="L656" title="All 2 branches missed.">    if (op.trainOptions.collinsPunc) {</span>
+<span class="nc" id="L657">      CollinsPuncTransformer collinsPuncTransformer =</span>
+        new CollinsPuncTransformer(tlp);
+<span class="nc" id="L659">      trainTransformer.addTransformer(collinsPuncTransformer);</span>
+    }
+
+<span class="nc" id="L662">    trainTransformer.addTransformer(binarizer);</span>
+
+<span class="nc bnc" id="L664" title="All 2 branches missed.">    if (op.wordFunction != null) {</span>
+<span class="nc" id="L665">      TreeTransformer wordFunctionTransformer =</span>
+        new TreeLeafLabelTransformer(op.wordFunction);
+<span class="nc" id="L667">      trainTransformer.addTransformer(wordFunctionTransformer);</span>
+    }
+<span class="nc" id="L669">    return trainTransformer;</span>
+  }
+
+  /** @return A triple of binaryTrainTreebank, binarySecondaryTrainTreebank, binaryTuneTreebank.
+   */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  // todo [cdm2015]: This method should be difference-resolved with TreeAnnotatorAndBinarizer#getAnnotatedBinaryTreebankFromTreebank and then deleted
+  public static Triple&lt;Treebank, Treebank, Treebank&gt; getAnnotatedBinaryTreebankFromTreebank(Treebank trainTreebank,
+      Treebank secondaryTreebank,
+      Treebank tuneTreebank,
+      Options op) {
+    // setup tree transforms
+<span class="nc" id="L681">    TreebankLangParserParams tlpParams = op.tlpParams;</span>
+<span class="nc" id="L682">    TreebankLanguagePack tlp = tlpParams.treebankLanguagePack();</span>
+
+<span class="nc bnc" id="L684" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L685">      PrintWriter pwErr = tlpParams.pw(System.err);</span>
+<span class="nc" id="L686">      pwErr.print(&quot;Training &quot;);</span>
+<span class="nc" id="L687">      pwErr.println(trainTreebank.textualSummary(tlp));</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">      if (secondaryTreebank != null) {</span>
+<span class="nc" id="L689">        pwErr.print(&quot;Secondary training &quot;);</span>
+<span class="nc" id="L690">        pwErr.println(secondaryTreebank.textualSummary(tlp));</span>
+      }
+    }
+
+<span class="nc" id="L694">    log.info(&quot;Binarizing trees...&quot;);</span>
+
+<span class="nc" id="L696">    TreeAnnotatorAndBinarizer binarizer = buildTrainBinarizer(op);</span>
+<span class="nc" id="L697">    CompositeTreeTransformer trainTransformer = buildTrainTransformer(op, binarizer);</span>
+
+    Treebank wholeTreebank;
+<span class="nc bnc" id="L700" title="All 2 branches missed.">    if (secondaryTreebank == null) {</span>
+<span class="nc" id="L701">      wholeTreebank = trainTreebank;</span>
+    } else {
+<span class="nc" id="L703">      wholeTreebank = new CompositeTreebank(trainTreebank, secondaryTreebank);</span>
+    }
+
+<span class="nc bnc" id="L706" title="All 2 branches missed.">    if (op.trainOptions.selectiveSplit) {</span>
+<span class="nc" id="L707">      op.trainOptions.splitters = ParentAnnotationStats.getSplitCategories(wholeTreebank, op.trainOptions.tagSelectiveSplit, 0, op.trainOptions.selectiveSplitCutOff, op.trainOptions.tagSelectiveSplitCutOff, tlp);</span>
+<span class="nc" id="L708">      removeDeleteSplittersFromSplitters(tlp, op);</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L710">        List&lt;String&gt; list = new ArrayList&lt;&gt;(op.trainOptions.splitters);</span>
+<span class="nc" id="L711">        Collections.sort(list);</span>
+<span class="nc" id="L712">        log.info(&quot;Parent split categories: &quot; + list);</span>
+      }
+    }
+
+<span class="nc bnc" id="L716" title="All 2 branches missed.">    if (op.trainOptions.selectivePostSplit) {</span>
+      // Do all the transformations once just to learn selective splits on annotated categories
+<span class="nc" id="L718">      TreeTransformer myTransformer = new TreeAnnotator(tlpParams.headFinder(), tlpParams, op);</span>
+<span class="nc" id="L719">      wholeTreebank = wholeTreebank.transform(myTransformer);</span>
+<span class="nc" id="L720">      op.trainOptions.postSplitters = ParentAnnotationStats.getSplitCategories(wholeTreebank, true, 0, op.trainOptions.selectivePostSplitCutOff, op.trainOptions.tagSelectivePostSplitCutOff, tlp);</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L722">        log.info(&quot;Parent post annotation split categories: &quot; + op.trainOptions.postSplitters);</span>
+      }
+    }
+<span class="nc bnc" id="L725" title="All 2 branches missed.">    if (op.trainOptions.hSelSplit) {</span>
+      // We run through all the trees once just to gather counts for hSelSplit!
+<span class="nc" id="L727">      int ptt = op.trainOptions.printTreeTransformations;</span>
+<span class="nc" id="L728">      op.trainOptions.printTreeTransformations = 0;</span>
+<span class="nc" id="L729">      binarizer.setDoSelectiveSplit(false);</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">      for (Tree tree : wholeTreebank) {</span>
+<span class="nc" id="L731">        trainTransformer.transformTree(tree);</span>
+<span class="nc" id="L732">      }</span>
+<span class="nc" id="L733">      binarizer.setDoSelectiveSplit(true);</span>
+<span class="nc" id="L734">      op.trainOptions.printTreeTransformations = ptt;</span>
+    }
+    // we've done all the setup now. here's where the train treebank is transformed.
+<span class="nc" id="L737">    trainTreebank = trainTreebank.transform(trainTransformer);</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">    if (secondaryTreebank != null) {</span>
+<span class="nc" id="L739">      secondaryTreebank = secondaryTreebank.transform(trainTransformer);</span>
+    }
+<span class="nc bnc" id="L741" title="All 2 branches missed.">    if (op.trainOptions.printAnnotatedStateCounts) {</span>
+<span class="nc" id="L742">      binarizer.printStateCounts();</span>
+    }
+<span class="nc bnc" id="L744" title="All 2 branches missed.">    if (op.trainOptions.printAnnotatedRuleCounts) {</span>
+<span class="nc" id="L745">      binarizer.printRuleCounts();</span>
+    }
+
+<span class="nc bnc" id="L748" title="All 2 branches missed.">    if (tuneTreebank != null) {</span>
+<span class="nc" id="L749">      tuneTreebank = tuneTreebank.transform(trainTransformer);</span>
+    }
+
+<span class="nc" id="L752">    Timing.tick(&quot;done.&quot;);</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L754">      binarizer.dumpStats();</span>
+    }
+
+<span class="nc" id="L757">    return new Triple&lt;&gt;(trainTreebank, secondaryTreebank, tuneTreebank);</span>
+  }
+
+  private static void removeDeleteSplittersFromSplitters(TreebankLanguagePack tlp, Options op) {
+<span class="nc bnc" id="L761" title="All 2 branches missed.">    if (op.trainOptions.deleteSplitters != null) {</span>
+<span class="nc" id="L762">      List&lt;String&gt; deleted = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">      for (String del : op.trainOptions.deleteSplitters) {</span>
+<span class="nc" id="L764">        String baseDel = tlp.basicCategory(del);</span>
+<span class="nc" id="L765">        boolean checkBasic = del.equals(baseDel);</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">        for (Iterator&lt;String&gt; it = op.trainOptions.splitters.iterator(); it.hasNext(); ) {</span>
+<span class="nc" id="L767">          String elem = it.next();</span>
+<span class="nc" id="L768">          String baseElem = tlp.basicCategory(elem);</span>
+<span class="nc bnc" id="L769" title="All 6 branches missed.">          boolean delStr = checkBasic &amp;&amp; baseElem.equals(baseDel) || elem.equals(del);</span>
+<span class="nc bnc" id="L770" title="All 2 branches missed.">          if (delStr) {</span>
+<span class="nc" id="L771">            it.remove();</span>
+<span class="nc" id="L772">            deleted.add(elem);</span>
+          }
+<span class="nc" id="L774">        }</span>
+<span class="nc" id="L775">      }</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L777">        log.info(&quot;Removed from vertical splitters: &quot; + deleted);</span>
+      }
+    }
+<span class="nc" id="L780">  }</span>
+
+
+  // TODO: Make below method work with arbitrarily large secondary treebank via iteration
+  // TODO: Have weight implemented for training lexicon
+
+  /**
+   * A method for training from two different treebanks, the second of which is presumed
+   * to be orders of magnitude larger.
+   * &lt;p/&gt;
+   * Trees are not read into memory but processed as they are read from disk.
+   * &lt;p/&gt;
+   * A weight (typically &amp;lt;= 1) can be put on the second treebank.
+   *
+   * @param trainTreebank A treebank to train from
+   * @param secondaryTrainTreebank Another treebank to train from
+   * @param weight A weight factor to give the secondary treebank. If the weight
+   *     is 0.25, each example in the secondaryTrainTreebank will be treated as
+   *     1/4 of an example sentence.
+   * @param compactor A class for compacting grammars. May be null.
+   * @param op Options for how the grammar is built from the treebank
+   * @param tuneTreebank  A treebank to tune free params on (may be null)
+   * @param extraTaggedWords A list of words to add to the Lexicon
+   * @return The trained LexicalizedParser
+   */
+  public static LexicalizedParser
+  getParserFromTreebank(Treebank trainTreebank,
+                        Treebank secondaryTrainTreebank,
+                        double weight,
+                        GrammarCompactor compactor,
+                        Options op,
+                        Treebank tuneTreebank,
+                        List&lt;List&lt;TaggedWord&gt;&gt; extraTaggedWords)
+  {
+    // log.info(&quot;Currently &quot; + new Date()); // now printed when command-line args are printed
+<span class="nc" id="L815">    printOptions(true, op);</span>
+<span class="nc" id="L816">    Timing.startTime();</span>
+
+<span class="nc" id="L818">    Triple&lt;Treebank, Treebank, Treebank&gt; treebanks = TreeAnnotatorAndBinarizer.getAnnotatedBinaryTreebankFromTreebank(trainTreebank, secondaryTrainTreebank, tuneTreebank, op);</span>
+<span class="nc" id="L819">    Timing.tick(&quot;done.&quot;);</span>
+
+<span class="nc" id="L821">    Treebank trainTreebankRaw = trainTreebank;</span>
+<span class="nc" id="L822">    trainTreebank = treebanks.first();</span>
+<span class="nc" id="L823">    secondaryTrainTreebank = treebanks.second();</span>
+<span class="nc" id="L824">    tuneTreebank = treebanks.third();</span>
+
+    // +1 to account for the boundary symbol
+<span class="nc" id="L827">    trainTreebank = new FilteringTreebank(trainTreebank, new LengthTreeFilter(op.trainOptions.trainLengthLimit + 1));</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">    if (secondaryTrainTreebank != null) {</span>
+<span class="nc" id="L829">      secondaryTrainTreebank = new FilteringTreebank(secondaryTrainTreebank, new LengthTreeFilter(op.trainOptions.trainLengthLimit + 1));</span>
+    }
+<span class="nc bnc" id="L831" title="All 2 branches missed.">    if (tuneTreebank != null) {</span>
+<span class="nc" id="L832">      tuneTreebank = new FilteringTreebank(tuneTreebank, new LengthTreeFilter(op.trainOptions.trainLengthLimit + 1));</span>
+    }
+
+    Index&lt;String&gt; stateIndex;
+    Index&lt;String&gt; wordIndex;
+    Index&lt;String&gt; tagIndex;
+
+    Pair&lt;UnaryGrammar, BinaryGrammar&gt; bgug;
+    Lexicon lex;
+
+<span class="nc bnc" id="L842" title="All 2 branches missed.">    if (op.trainOptions.predictSplits) {</span>
+<span class="nc" id="L843">      SplittingGrammarExtractor extractor = new SplittingGrammarExtractor(op);</span>
+<span class="nc" id="L844">      log.info(&quot;Extracting PCFG...&quot;);</span>
+      // TODO: make use of the tagged text
+<span class="nc bnc" id="L846" title="All 2 branches missed.">      if (secondaryTrainTreebank == null) {</span>
+<span class="nc" id="L847">        extractor.extract(trainTreebank);</span>
+      } else {
+<span class="nc" id="L849">        extractor.extract(trainTreebank, 1.0, secondaryTrainTreebank, weight);</span>
+      }
+<span class="nc" id="L851">      bgug = extractor.bgug;</span>
+<span class="nc" id="L852">      lex = extractor.lex;</span>
+<span class="nc" id="L853">      stateIndex = extractor.stateIndex;</span>
+<span class="nc" id="L854">      wordIndex = extractor.wordIndex;</span>
+<span class="nc" id="L855">      tagIndex = extractor.tagIndex;</span>
+<span class="nc" id="L856">      Timing.tick(&quot;done.&quot;);</span>
+<span class="nc" id="L857">    } else {</span>
+<span class="nc" id="L858">      stateIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L859">      wordIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L860">      tagIndex = new HashIndex&lt;&gt;();</span>
+
+      // extract grammars
+<span class="nc" id="L863">      BinaryGrammarExtractor bgExtractor = new BinaryGrammarExtractor(op, stateIndex);</span>
+      // Extractor lexExtractor = new LexiconExtractor();
+      //TreeExtractor uwmExtractor = new UnknownWordModelExtractor(trainTreebank.size());
+<span class="nc" id="L866">      log.info(&quot;Extracting PCFG...&quot;);</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">      if (secondaryTrainTreebank == null) {</span>
+<span class="nc" id="L868">        bgug = bgExtractor.extract(trainTreebank);</span>
+      } else {
+<span class="nc" id="L870">        bgug = bgExtractor.extract(trainTreebank, 1.0,</span>
+                                   secondaryTrainTreebank, weight);
+      }
+<span class="nc" id="L873">      Timing.tick(&quot;done.&quot;);</span>
+
+<span class="nc" id="L875">      log.info(&quot;Extracting Lexicon...&quot;);</span>
+<span class="nc" id="L876">      lex = op.tlpParams.lex(op, wordIndex, tagIndex);</span>
+
+<span class="nc" id="L878">      double trainSize = trainTreebank.size();</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">      if (secondaryTrainTreebank != null) {</span>
+<span class="nc" id="L880">        trainSize += (secondaryTrainTreebank.size() * weight);</span>
+      }
+<span class="nc bnc" id="L882" title="All 2 branches missed.">      if (extraTaggedWords != null) {</span>
+<span class="nc" id="L883">        trainSize += extraTaggedWords.size();</span>
+      }
+
+<span class="nc" id="L886">      lex.initializeTraining(trainSize);</span>
+      // wsg2012: The raw treebank has CoreLabels, which we need for FactoredLexicon
+      // training. If TreeAnnotator is updated so that it produces CoreLabels, then we can
+      // remove the trainTreebankRaw.
+<span class="nc" id="L890">      lex.train(trainTreebank, trainTreebankRaw);</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">      if (secondaryTrainTreebank != null) {</span>
+<span class="nc" id="L892">        lex.train(secondaryTrainTreebank, weight);</span>
+      }
+<span class="nc bnc" id="L894" title="All 2 branches missed.">      if (extraTaggedWords != null) {</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">        for (List&lt;TaggedWord&gt; sentence : extraTaggedWords) {</span>
+          // TODO: specify a weight?
+<span class="nc" id="L897">          lex.trainUnannotated(sentence, 1.0);</span>
+<span class="nc" id="L898">        }</span>
+      }
+<span class="nc" id="L900">      lex.finishTraining();</span>
+<span class="nc" id="L901">      Timing.tick(&quot;done.&quot;);</span>
+    }
+
+    //TODO: wsg2011 Not sure if this should come before or after
+    //grammar compaction
+<span class="nc bnc" id="L906" title="All 2 branches missed.">    if (op.trainOptions.ruleSmoothing) {</span>
+<span class="nc" id="L907">      log.info(&quot;Smoothing PCFG...&quot;);</span>
+<span class="nc" id="L908">      Function&lt;Pair&lt;UnaryGrammar,BinaryGrammar&gt;,Pair&lt;UnaryGrammar,BinaryGrammar&gt;&gt; smoother = new LinearGrammarSmoother(op.trainOptions, stateIndex, tagIndex);</span>
+<span class="nc" id="L909">      bgug = smoother.apply(bgug);</span>
+<span class="nc" id="L910">      Timing.tick(&quot;done.&quot;);</span>
+    }
+
+<span class="nc bnc" id="L913" title="All 2 branches missed.">    if (compactor != null) {</span>
+<span class="nc" id="L914">      log.info(&quot;Compacting grammar...&quot;);</span>
+<span class="nc" id="L915">      Triple&lt;Index&lt;String&gt;, UnaryGrammar, BinaryGrammar&gt; compacted = compactor.compactGrammar(bgug, stateIndex);</span>
+<span class="nc" id="L916">      stateIndex = compacted.first();</span>
+<span class="nc" id="L917">      bgug.setFirst(compacted.second());</span>
+<span class="nc" id="L918">      bgug.setSecond(compacted.third());</span>
+<span class="nc" id="L919">      Timing.tick(&quot;done.&quot;);</span>
+    }
+
+<span class="nc" id="L922">    log.info(&quot;Compiling grammar...&quot;);</span>
+<span class="nc" id="L923">    BinaryGrammar bg = bgug.second;</span>
+<span class="nc" id="L924">    bg.splitRules();</span>
+<span class="nc" id="L925">    UnaryGrammar ug = bgug.first;</span>
+<span class="nc" id="L926">    ug.purgeRules();</span>
+<span class="nc" id="L927">    Timing.tick(&quot;done&quot;);</span>
+
+<span class="nc" id="L929">    DependencyGrammar dg = null;</span>
+<span class="nc bnc" id="L930" title="All 2 branches missed.">    if (op.doDep) {</span>
+<span class="nc" id="L931">      log.info(&quot;Extracting Dependencies...&quot;);</span>
+<span class="nc" id="L932">      AbstractTreeExtractor&lt;DependencyGrammar&gt; dgExtractor = new MLEDependencyGrammarExtractor(op, wordIndex, tagIndex);</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">      if (secondaryTrainTreebank == null) {</span>
+<span class="nc" id="L934">        dg = dgExtractor.extract(trainTreebank);</span>
+      } else {
+<span class="nc" id="L936">        dg = dgExtractor.extract(trainTreebank, 1.0, secondaryTrainTreebank, weight);</span>
+      }
+      //log.info(&quot;Extracting Unknown Word Model...&quot;);
+      //UnknownWordModel uwm = (UnknownWordModel)uwmExtractor.extract(trainTreebank);
+      //Timing.tick(&quot;done.&quot;);
+<span class="nc" id="L941">      Timing.tick(&quot;done.&quot;);</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">      if (tuneTreebank != null) {</span>
+<span class="nc" id="L943">        log.info(&quot;Tuning Dependency Model...&quot;);</span>
+<span class="nc" id="L944">        dg.setLexicon(lex); // MG2008: needed if using PwGt model</span>
+<span class="nc" id="L945">        dg.tune(tuneTreebank);</span>
+<span class="nc" id="L946">        Timing.tick(&quot;done.&quot;);</span>
+      }
+    }
+
+<span class="nc" id="L950">    log.info(&quot;Done training parser.&quot;);</span>
+<span class="nc bnc" id="L951" title="All 2 branches missed.">    if (op.trainOptions.trainTreeFile!=null) {</span>
+      try {
+<span class="nc" id="L953">        log.info(&quot;Writing out binary trees to &quot;+ op.trainOptions.trainTreeFile+&quot;...&quot;);</span>
+<span class="nc" id="L954">        IOUtils.writeObjectToFile(trainTreebank, op.trainOptions.trainTreeFile);</span>
+<span class="nc" id="L955">        IOUtils.writeObjectToFile(secondaryTrainTreebank, op.trainOptions.trainTreeFile);</span>
+<span class="nc" id="L956">        Timing.tick(&quot;done.&quot;);</span>
+<span class="nc" id="L957">      } catch (Exception e) {</span>
+<span class="nc" id="L958">        log.info(&quot;Problem writing out binary trees.&quot;);</span>
+<span class="nc" id="L959">      }</span>
+    }
+<span class="nc" id="L961">    return new LexicalizedParser(lex, bg, ug, dg, stateIndex, wordIndex, tagIndex, op);</span>
+  }
+
+
+  /**
+   * This will set options to the parser, in a way exactly equivalent to
+   * passing in the same sequence of command-line arguments.  This is a useful
+   * convenience method when building a parser programmatically. The options
+   * passed in should
+   * be specified like command-line arguments, including with an initial
+   * minus sign.
+   * &lt;p/&gt;
+   * &lt;i&gt;Notes:&lt;/i&gt; This can be used to set parsing-time flags for a
+   * serialized parser.  You can also still change things serialized
+   * in Options, but this will probably degrade parsing performance.
+   * The vast majority of command line flags can be passed to this
+   * method, but you cannot pass in options that specify the treebank
+   * or grammar to be loaded, the grammar to be written, trees or
+   * files to be parsed or details of their encoding, nor the
+   * TreebankLangParserParams ({@code -tLPP}) to use. The
+   * TreebankLangParserParams should be set up on construction of a
+   * LexicalizedParser, by constructing an Options that uses
+   * the required TreebankLangParserParams, and passing that to a
+   * LexicalizedParser constructor.  Note that despite this
+   * method being an instance method, many flags are actually set as
+   * static class variables.
+   *
+   * @param flags Arguments to the parser, for example,
+   *              {&quot;-outputFormat&quot;, &quot;typedDependencies&quot;, &quot;-maxLength&quot;, &quot;70&quot;}
+   * @throws IllegalArgumentException If an unknown flag is passed in
+   */
+  @Override
+  public void setOptionFlags(String... flags) {
+<span class="nc" id="L994">    op.setOptions(flags);</span>
+<span class="nc" id="L995">  }</span>
+
+
+  /**
+   * A main program for using the parser with various options.
+   * This program can be used for building and serializing
+   * a parser from treebank data, for parsing sentences from a file
+   * or URL using a serialized or text grammar parser,
+   * and (mainly for parser quality testing)
+   * for training and testing a parser on a treebank all in one go.
+   *
+   * &lt;p&gt;
+   * Sample Usages:
+   * &lt;ul&gt;
+   *   &lt;li&gt; &lt;b&gt;Train a parser (saved to &lt;i&gt;serializedGrammarFilename&lt;/i&gt;)
+   *      from a directory of trees (&lt;i&gt;trainFilesPath&lt;/i&gt;, with an optional &lt;i&gt;fileRange&lt;/i&gt;, e.g., 0-1000):&lt;/b&gt;
+   *    {@code java -mx1500m edu.stanford.nlp.parser.lexparser.LexicalizedParser [-v] -train trainFilesPath [fileRange] -saveToSerializedFile serializedGrammarFilename}
+   *   &lt;/li&gt;
+   *
+   *   &lt;li&gt; &lt;b&gt;Train a parser (not saved) from a directory of trees, and test it (reporting scores) on a directory of trees&lt;/b&gt;
+   *    {@code java -mx1500m edu.stanford.nlp.parser.lexparser.LexicalizedParser [-v] -train trainFilesPath [fileRange] -testTreebank testFilePath [fileRange] }
+   *   &lt;/li&gt;
+   *
+   *   &lt;li&gt; &lt;b&gt;Parse one or more files, given a serialized grammar and a list of files&lt;/b&gt;
+   *    {@code java -mx512m edu.stanford.nlp.parser.lexparser.LexicalizedParser [-v] serializedGrammarPath filename [filename]*}
+   *   &lt;/li&gt;
+   *
+   *   &lt;li&gt; &lt;b&gt;Test and report scores for a serialized grammar on trees in an output directory&lt;/b&gt;
+   *    {@code java -mx512m edu.stanford.nlp.parser.lexparser.LexicalizedParser [-v] -loadFromSerializedFile serializedGrammarPath -testTreebank testFilePath [fileRange]}
+   *   &lt;/li&gt;
+   * &lt;/ul&gt;
+   *
+   *&lt;p&gt;
+   * If the {@code serializedGrammarPath} ends in {@code .gz},
+   * then the grammar is written and read as a compressed file (GZip).
+   * If the {@code serializedGrammarPath} is a URL, starting with
+   * {@code http://}, then the parser is read from the URL.
+   * A fileRange specifies a numeric value that must be included within a
+   * filename for it to be used in training or testing (this works well with
+   * most current treebanks).  It can be specified like a range of pages to be
+   * printed, for instance as {@code 200-2199} or
+   * {@code 1-300,500-725,9000} or just as {@code 1} (if all your
+   * trees are in a single file, either omit this parameter or just give a dummy
+   * argument such as {@code 0}).
+   * If the filename to parse is &quot;-&quot; then the parser parses from stdin.
+   * If no files are supplied to parse, then a hardwired sentence
+   * is parsed.
+   *
+   * &lt;p&gt;
+   * The parser can write a grammar as either a serialized Java object file
+   * or in a text format (or as both), specified with the following options:
+   * &lt;blockquote&gt;{@code
+   * java edu.stanford.nlp.parser.lexparser.LexicalizedParser
+   * [-v] -train
+   * trainFilesPath [fileRange] [-saveToSerializedFile grammarPath]
+   * [-saveToTextFile grammarPath]
+   * }&lt;/blockquote&gt;
+   *
+   * &lt;p&gt;
+   * In the same position as the verbose flag ({@code -v}), many other
+   * options can be specified.  The most useful to an end user are:
+   * &lt;ul&gt;
+   * &lt;LI&gt;{@code -tLPP class} Specify a different
+   * TreebankLangParserParams, for when using a different language or
+   * treebank (the default is English Penn Treebank). &lt;i&gt;This option MUST occur
+   * before any other language-specific options that are used (or else they
+   * are ignored!).&lt;/i&gt;
+   * (It's usually a good idea to specify this option even when loading a
+   * serialized grammar; it is necessary if the language pack specifies a
+   * needed character encoding or you wish to specify language-specific
+   * options on the command line.)&lt;/LI&gt;
+   * &lt;LI&gt;{@code -encoding charset} Specify the character encoding of the
+   * input and output files.  This will override the value in the
+   * {@code TreebankLangParserParams}, provided this option appears
+   * &lt;i&gt;after&lt;/i&gt; any {@code -tLPP} option.&lt;/LI&gt;
+   * &lt;LI&gt;{@code -tokenized} Says that the input is already separated
+   * into whitespace-delimited tokens.  If this option is specified, any
+   * tokenizer specified for the language is ignored, and a universal (Unicode)
+   * tokenizer, which divides only on whitespace, is used.
+   * Unless you also specify
+   * {@code -escaper}, the tokens &lt;i&gt;must&lt;/i&gt; all be correctly
+   * tokenized tokens of the appropriate treebank for the parser to work
+   * well (for instance, if using the Penn English Treebank, you must have
+   * coded &quot;(&quot; as &quot;-LRB-&quot;, &quot;3/4&quot; as &quot;3\/4&quot;, etc.)&lt;/LI&gt;
+   * &lt;li&gt;{@code -escaper class} Specify a class of type
+   * {@link Function}&amp;lt;List&amp;lt;HasWord&amp;gt;,List&amp;lt;HasWord&amp;gt;&amp;gt; to do
+   * customized escaping of tokenized text.  This class will be run over the
+   * tokenized text and can fix the representation of tokens. For instance,
+   * it could change &quot;(&quot; to &quot;-LRB-&quot; for the Penn English Treebank.  A
+   * provided escaper that does such things for the Penn English Treebank is
+   * {@code edu.stanford.nlp.process.PTBEscapingProcessor}
+   * &lt;li&gt;{@code -tokenizerFactory class} Specifies a
+   * TokenizerFactory class to be used for tokenization&lt;/li&gt;
+   * &lt;li&gt;{@code -tokenizerOptions options} Specifies options to a
+   * TokenizerFactory class to be used for tokenization.   A comma-separated
+   * list. For PTBTokenizer, options of interest include
+   * {@code americanize=false} and {@code asciiQuotes} (for German).
+   * Note that any choice of tokenizer options that conflicts with the
+   * tokenization used in the parser training data will likely degrade parser
+   * performance. &lt;/li&gt;
+   * &lt;li&gt;{@code -sentences token } Specifies a token that marks sentence
+   * boundaries.  A value of {@code newline} causes sentence breaking on
+   * newlines.  A value of {@code onePerElement} causes each element
+   * (using the XML {@code -parseInside} option) to be treated as a
+   * sentence. All other tokens will be interpreted literally, and must be
+   * exactly the same as tokens returned by the tokenizer.  For example,
+   * you might specify &quot;|||&quot; and put that symbol sequence as a token between
+   * sentences.
+   * If no explicit sentence breaking option is chosen, sentence breaking
+   * is done based on a set of language-particular sentence-ending patterns.
+   * &lt;/li&gt;
+   * &lt;LI&gt;{@code -parseInside element} Specifies that parsing should only
+   * be done for tokens inside the indicated XML-style
+   * elements (done as simple pattern matching, rather than XML parsing).
+   * For example, if this is specified as {@code sentence}, then
+   * the text inside the {@code sentence} element
+   * would be parsed.
+   * Using &quot;-parseInside s&quot; gives you support for the input format of
+   * Charniak's parser. Sentences cannot span elements. Whether the
+   * contents of the element are treated as one sentence or potentially
+   * multiple sentences is controlled by the {@code -sentences} flag.
+   * The default is potentially multiple sentences.
+   * This option gives support for extracting and parsing
+   * text from very simple SGML and XML documents, and is provided as a
+   * user convenience for that purpose. If you want to really parse XML
+   * documents before NLP parsing them, you should use an XML parser, and then
+   * call to a LexicalizedParser on appropriate CDATA.
+   * &lt;LI&gt;{@code -tagSeparator char} Specifies to look for tags on words
+   * following the word and separated from it by a special character
+   * {@code char}.  For instance, many tagged corpora have the
+   * representation &quot;house/NN&quot; and you would use {@code -tagSeparator /}.
+   * Notes: This option requires that the input be pretokenized.
+   * The separator has to be only a single character, and there is no
+   * escaping mechanism. However, splitting is done on the &lt;i&gt;last&lt;/i&gt;
+   * instance of the character in the token, so that cases like
+   * &quot;3\/4/CD&quot; are handled correctly.  The parser will in all normal
+   * circumstances use the tag you provide, but will override it in the
+   * case of very common words in cases where the tag that you provide
+   * is not one that it regards as a possible tagging for the word.
+   * The parser supports a format where only some of the words in a sentence
+   * have a tag (if you are calling the parser programmatically, you indicate
+   * them by having them implement the {@code HasTag} interface).
+   * You can do this at the command-line by only having tags after some words,
+   * but you are limited by the fact that there is no way to escape the
+   * tagSeparator character.&lt;/LI&gt;
+   * &lt;LI&gt;{@code -maxLength leng} Specify the longest sentence that
+   * will be parsed (and hence indirectly the amount of memory
+   * needed for the parser). If this is not specified, the parser will
+   * try to dynamically grow its parse chart when long sentence are
+   * encountered, but may run out of memory trying to do so.&lt;/LI&gt;
+   * &lt;LI&gt;{@code -outputFormat styles} Choose the style(s) of output
+   * sentences: {@code penn} for prettyprinting as in the Penn
+   * treebank files, or {@code oneline} for printing sentences one
+   * per line, {@code words}, {@code wordsAndTags},
+   * {@code dependencies}, {@code typedDependencies},
+   * or {@code typedDependenciesCollapsed}.
+   * Multiple options may be specified as a comma-separated
+   * list.  See TreePrint class for further documentation.&lt;/LI&gt;
+   * &lt;LI&gt;{@code -outputFormatOptions} Provide options that control the
+   * behavior of various {@code -outputFormat} choices, such as
+   * {@code lexicalize}, {@code stem}, {@code markHeadNodes},
+   * or {@code xml}.  {@link edu.stanford.nlp.trees.TreePrint}
+   * Options are specified as a comma-separated list.&lt;/LI&gt;
+   * &lt;LI&gt;{@code -writeOutputFiles} Write output files corresponding
+   * to the input files, with the same name but a {@code &quot;.stp&quot;}
+   * file extension.  The format of these files depends on the
+   * {@code outputFormat} option.  (If not specified, output is sent
+   * to stdout.)&lt;/LI&gt;
+   * &lt;LI&gt;{@code -outputFilesExtension} The extension that is appended to
+   * the filename that is being parsed to produce an output file name (with the
+   * -writeOutputFiles option). The default is {@code stp}.  Don't
+   * include the period.
+   * &lt;LI&gt;{@code -outputFilesDirectory} The directory in which output
+   * files are written (when the -writeOutputFiles option is specified).
+   * If not specified, output files are written in the same directory as the
+   * input files.
+   * &lt;LI&gt;{@code -nthreads} Parsing files and testing on treebanks
+   * can use multiple threads.  This option tells the parser how many
+   * threads to use.  A negative number indicates to use as many
+   * threads as the machine has cores.
+   * &lt;/ul&gt;
+   * See also the package documentation for more details and examples of use.
+   *
+   * @param args Command line arguments, as above
+   */
+  public static void main(String[] args) {
+<span class="nc" id="L1181">    boolean train = false;</span>
+<span class="nc" id="L1182">    boolean saveToSerializedFile = false;</span>
+<span class="nc" id="L1183">    boolean saveToTextFile = false;</span>
+<span class="nc" id="L1184">    String serializedInputFileOrUrl = null;</span>
+<span class="nc" id="L1185">    String textInputFileOrUrl = null;</span>
+<span class="nc" id="L1186">    String serializedOutputFileOrUrl = null;</span>
+<span class="nc" id="L1187">    String textOutputFileOrUrl = null;</span>
+<span class="nc" id="L1188">    String treebankPath = null;</span>
+<span class="nc" id="L1189">    Treebank testTreebank = null;</span>
+<span class="nc" id="L1190">    Treebank tuneTreebank = null;</span>
+<span class="nc" id="L1191">    String testPath = null;</span>
+<span class="nc" id="L1192">    FileFilter testFilter = null;</span>
+<span class="nc" id="L1193">    String tunePath = null;</span>
+<span class="nc" id="L1194">    FileFilter tuneFilter = null;</span>
+<span class="nc" id="L1195">    FileFilter trainFilter = null;</span>
+<span class="nc" id="L1196">    String secondaryTreebankPath = null;</span>
+<span class="nc" id="L1197">    double secondaryTreebankWeight = 1.0;</span>
+<span class="nc" id="L1198">    FileFilter secondaryTrainFilter = null;</span>
+
+    // variables needed to process the files to be parsed
+<span class="nc" id="L1201">    TokenizerFactory&lt;? extends HasWord&gt; tokenizerFactory = null;</span>
+<span class="nc" id="L1202">    String tokenizerOptions = null;</span>
+<span class="nc" id="L1203">    String tokenizerFactoryClass = null;</span>
+<span class="nc" id="L1204">    String tokenizerMethod = null;</span>
+<span class="nc" id="L1205">    boolean tokenized = false; // whether or not the input file has already been tokenized</span>
+<span class="nc" id="L1206">    Function&lt;List&lt;HasWord&gt;, List&lt;HasWord&gt;&gt; escaper = null;</span>
+<span class="nc" id="L1207">    String tagDelimiter = null;</span>
+<span class="nc" id="L1208">    String sentenceDelimiter = null;</span>
+<span class="nc" id="L1209">    String elementDelimiter = null;</span>
+<span class="nc" id="L1210">    int argIndex = 0;</span>
+<span class="nc bnc" id="L1211" title="All 2 branches missed.">    if (args.length &lt; 1) {</span>
+<span class="nc" id="L1212">      log.info(&quot;Basic usage (see Javadoc for more): java edu.stanford.nlp.parser.lexparser.LexicalizedParser parserFileOrUrl filename*&quot;);</span>
+<span class="nc" id="L1213">      return;</span>
+    }
+
+<span class="nc" id="L1216">    Options op = new Options();</span>
+<span class="nc" id="L1217">    List&lt;String&gt; optionArgs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1218">    String encoding = null;</span>
+    // while loop through option arguments
+<span class="nc bnc" id="L1220" title="All 4 branches missed.">    while (argIndex &lt; args.length &amp;&amp; args[argIndex].charAt(0) == '-') {</span>
+<span class="nc bnc" id="L1221" title="All 2 branches missed.">      if (args[argIndex].equalsIgnoreCase(&quot;-train&quot;) ||</span>
+<span class="nc bnc" id="L1222" title="All 2 branches missed.">          args[argIndex].equalsIgnoreCase(&quot;-trainTreebank&quot;)) {</span>
+<span class="nc" id="L1223">        train = true;</span>
+<span class="nc" id="L1224">        Pair&lt;String, FileFilter&gt; treebankDescription = ArgUtils.getTreebankDescription(args, argIndex, &quot;-train&quot;);</span>
+<span class="nc" id="L1225">        argIndex = argIndex + ArgUtils.numSubArgs(args, argIndex) + 1;</span>
+<span class="nc" id="L1226">        treebankPath = treebankDescription.first();</span>
+<span class="nc" id="L1227">        trainFilter = treebankDescription.second();</span>
+<span class="nc bnc" id="L1228" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-train2&quot;)) {</span>
+        // train = true;     // cdm july 2005: should require -train for this
+<span class="nc" id="L1230">        Triple&lt;String, FileFilter, Double&gt; treebankDescription = ArgUtils.getWeightedTreebankDescription(args, argIndex, &quot;-train2&quot;);</span>
+<span class="nc" id="L1231">        argIndex = argIndex + ArgUtils.numSubArgs(args, argIndex) + 1;</span>
+<span class="nc" id="L1232">        secondaryTreebankPath = treebankDescription.first();</span>
+<span class="nc" id="L1233">        secondaryTrainFilter = treebankDescription.second();</span>
+<span class="nc" id="L1234">        secondaryTreebankWeight = treebankDescription.third();</span>
+<span class="nc bnc" id="L1235" title="All 4 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tLPP&quot;) &amp;&amp; (argIndex + 1 &lt; args.length)) {</span>
+        try {
+<span class="nc" id="L1237">          op.tlpParams = (TreebankLangParserParams) Class.forName(args[argIndex + 1]).newInstance();</span>
+<span class="nc" id="L1238">        } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L1239">          log.info(&quot;Class not found: &quot; + args[argIndex + 1]);</span>
+<span class="nc" id="L1240">          throw new RuntimeException(e);</span>
+<span class="nc" id="L1241">        } catch (InstantiationException e) {</span>
+<span class="nc" id="L1242">          log.info(&quot;Couldn't instantiate: &quot; + args[argIndex + 1] + &quot;: &quot; + e.toString());</span>
+<span class="nc" id="L1243">          throw new RuntimeException(e);</span>
+<span class="nc" id="L1244">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1245">          log.info(&quot;Illegal access&quot; + e);</span>
+<span class="nc" id="L1246">          throw new RuntimeException(e);</span>
+<span class="nc" id="L1247">        }</span>
+<span class="nc" id="L1248">        argIndex += 2;</span>
+<span class="nc bnc" id="L1249" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-encoding&quot;)) {</span>
+        // sets encoding for TreebankLangParserParams
+        // redone later to override any serialized parser one read in
+<span class="nc" id="L1252">        encoding = args[argIndex + 1];</span>
+<span class="nc" id="L1253">        op.tlpParams.setInputEncoding(encoding);</span>
+<span class="nc" id="L1254">        op.tlpParams.setOutputEncoding(encoding);</span>
+<span class="nc" id="L1255">        argIndex += 2;</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tokenized&quot;)) {</span>
+<span class="nc" id="L1257">        tokenized = true;</span>
+<span class="nc" id="L1258">        argIndex += 1;</span>
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-escaper&quot;)) {</span>
+        try {
+<span class="nc" id="L1261">          escaper = ReflectionLoading.loadByReflection(args[argIndex + 1]);</span>
+<span class="nc" id="L1262">        } catch (Exception e) {</span>
+<span class="nc" id="L1263">          log.info(&quot;Couldn't instantiate escaper &quot; + args[argIndex + 1] + &quot;: &quot; + e);</span>
+<span class="nc" id="L1264">        }</span>
+<span class="nc" id="L1265">        argIndex += 2;</span>
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tokenizerOptions&quot;)) {</span>
+<span class="nc" id="L1267">        tokenizerOptions = args[argIndex + 1];</span>
+<span class="nc" id="L1268">        argIndex += 2;</span>
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tokenizerFactory&quot;)) {</span>
+<span class="nc" id="L1270">        tokenizerFactoryClass = args[argIndex + 1];</span>
+<span class="nc" id="L1271">        argIndex += 2;</span>
+<span class="nc bnc" id="L1272" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tokenizerMethod&quot;)) {</span>
+<span class="nc" id="L1273">        tokenizerMethod = args[argIndex + 1];</span>
+<span class="nc" id="L1274">        argIndex += 2;</span>
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-sentences&quot;)) {</span>
+<span class="nc" id="L1276">        sentenceDelimiter = args[argIndex + 1];</span>
+<span class="nc bnc" id="L1277" title="All 2 branches missed.">        if (sentenceDelimiter.equalsIgnoreCase(&quot;newline&quot;)) {</span>
+<span class="nc" id="L1278">          sentenceDelimiter = &quot;\n&quot;;</span>
+        }
+<span class="nc" id="L1280">        argIndex += 2;</span>
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-parseInside&quot;)) {</span>
+<span class="nc" id="L1282">        elementDelimiter = args[argIndex + 1];</span>
+<span class="nc" id="L1283">        argIndex += 2;</span>
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tagSeparator&quot;)) {</span>
+<span class="nc" id="L1285">        tagDelimiter = args[argIndex + 1];</span>
+<span class="nc" id="L1286">        argIndex += 2;</span>
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-loadFromSerializedFile&quot;) ||</span>
+<span class="nc bnc" id="L1288" title="All 2 branches missed.">                 args[argIndex].equalsIgnoreCase(&quot;-model&quot;)) {</span>
+        // load the parser from a binary serialized file
+        // the next argument must be the path to the parser file
+<span class="nc" id="L1291">        serializedInputFileOrUrl = args[argIndex + 1];</span>
+<span class="nc" id="L1292">        argIndex += 2;</span>
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-loadFromTextFile&quot;)) {</span>
+        // load the parser from declarative text file
+        // the next argument must be the path to the parser file
+<span class="nc" id="L1296">        textInputFileOrUrl = args[argIndex + 1];</span>
+<span class="nc" id="L1297">        argIndex += 2;</span>
+<span class="nc bnc" id="L1298" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-saveToSerializedFile&quot;)) {</span>
+<span class="nc" id="L1299">        saveToSerializedFile = true;</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">        if (ArgUtils.numSubArgs(args, argIndex) &lt; 1) {</span>
+<span class="nc" id="L1301">          log.info(&quot;Missing path: -saveToSerialized filename&quot;);</span>
+        } else {
+<span class="nc" id="L1303">          serializedOutputFileOrUrl = args[argIndex + 1];</span>
+        }
+<span class="nc" id="L1305">        argIndex += 2;</span>
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-saveToTextFile&quot;)) {</span>
+        // save the parser to declarative text file
+<span class="nc" id="L1308">        saveToTextFile = true;</span>
+<span class="nc" id="L1309">        textOutputFileOrUrl = args[argIndex + 1];</span>
+<span class="nc" id="L1310">        argIndex += 2;</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-saveTrainTrees&quot;)) {</span>
+        // save the training trees to a binary file
+<span class="nc" id="L1313">        op.trainOptions.trainTreeFile = args[argIndex + 1];</span>
+<span class="nc" id="L1314">        argIndex += 2;</span>
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-treebank&quot;) ||</span>
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">                 args[argIndex].equalsIgnoreCase(&quot;-testTreebank&quot;) ||</span>
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">                 args[argIndex].equalsIgnoreCase(&quot;-test&quot;)) {</span>
+<span class="nc" id="L1318">        Pair&lt;String, FileFilter&gt; treebankDescription = ArgUtils.getTreebankDescription(args, argIndex, &quot;-test&quot;);</span>
+<span class="nc" id="L1319">        argIndex = argIndex + ArgUtils.numSubArgs(args, argIndex) + 1;</span>
+<span class="nc" id="L1320">        testPath = treebankDescription.first();</span>
+<span class="nc" id="L1321">        testFilter = treebankDescription.second();</span>
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">      } else if (args[argIndex].equalsIgnoreCase(&quot;-tune&quot;)) {</span>
+<span class="nc" id="L1323">        Pair&lt;String, FileFilter&gt; treebankDescription = ArgUtils.getTreebankDescription(args, argIndex, &quot;-tune&quot;);</span>
+<span class="nc" id="L1324">        argIndex = argIndex + ArgUtils.numSubArgs(args, argIndex) + 1;</span>
+<span class="nc" id="L1325">        tunePath = treebankDescription.first();</span>
+<span class="nc" id="L1326">        tuneFilter = treebankDescription.second();</span>
+<span class="nc" id="L1327">      } else {</span>
+<span class="nc" id="L1328">        int oldIndex = argIndex;</span>
+<span class="nc" id="L1329">        argIndex = op.setOptionOrWarn(args, argIndex);</span>
+<span class="nc" id="L1330">        optionArgs.addAll(Arrays.asList(args).subList(oldIndex, argIndex));</span>
+<span class="nc" id="L1331">      }</span>
+    } // end while loop through arguments
+
+    // all other arguments are order dependent and
+    // are processed in order below
+
+<span class="nc bnc" id="L1337" title="All 4 branches missed.">    if (tuneFilter != null || tunePath != null) {</span>
+<span class="nc bnc" id="L1338" title="All 2 branches missed.">      if (tunePath == null) {</span>
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">        if (treebankPath == null) {</span>
+<span class="nc" id="L1340">          throw new RuntimeException(&quot;No tune treebank path specified...&quot;);</span>
+        } else {
+<span class="nc" id="L1342">          log.info(&quot;No tune treebank path specified.  Using train path: \&quot;&quot; + treebankPath + '\&quot;');</span>
+<span class="nc" id="L1343">          tunePath = treebankPath;</span>
+        }
+      }
+<span class="nc" id="L1346">      tuneTreebank = op.tlpParams.testMemoryTreebank();</span>
+<span class="nc" id="L1347">      tuneTreebank.loadPath(tunePath, tuneFilter);</span>
+    }
+
+<span class="nc bnc" id="L1350" title="All 4 branches missed.">    if (!train &amp;&amp; op.testOptions.verbose) {</span>
+<span class="nc" id="L1351">      StringUtils.logInvocationString(log, args);</span>
+    }
+    LexicalizedParser lp; // always initialized in next if-then-else block
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">    if (train) {</span>
+<span class="nc" id="L1355">      StringUtils.logInvocationString(log, args);</span>
+
+      // so we train a parser using the treebank
+<span class="nc" id="L1358">      GrammarCompactor compactor = null;</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">      if (op.trainOptions.compactGrammar() == 3) {</span>
+<span class="nc" id="L1360">        compactor = new ExactGrammarCompactor(op, false, false);</span>
+      }
+
+<span class="nc" id="L1363">      Treebank trainTreebank = makeTreebank(treebankPath, op, trainFilter);</span>
+
+<span class="nc" id="L1365">      Treebank secondaryTrainTreebank = null;</span>
+<span class="nc bnc" id="L1366" title="All 2 branches missed.">      if (secondaryTreebankPath != null) {</span>
+<span class="nc" id="L1367">        secondaryTrainTreebank = makeSecondaryTreebank(secondaryTreebankPath, op, secondaryTrainFilter);</span>
+      }
+
+<span class="nc" id="L1370">      List&lt;List&lt;TaggedWord&gt;&gt; extraTaggedWords = null;</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">      if (op.trainOptions.taggedFiles != null) {</span>
+<span class="nc" id="L1372">        extraTaggedWords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1373">        List&lt;TaggedFileRecord&gt; fileRecords = TaggedFileRecord.createRecords(new Properties(), op.trainOptions.taggedFiles);</span>
+<span class="nc bnc" id="L1374" title="All 2 branches missed.">        for (TaggedFileRecord record : fileRecords) {</span>
+<span class="nc bnc" id="L1375" title="All 2 branches missed.">          for (List&lt;TaggedWord&gt; sentence : record.reader()) {</span>
+<span class="nc" id="L1376">            extraTaggedWords.add(sentence);</span>
+<span class="nc" id="L1377">          }</span>
+<span class="nc" id="L1378">        }</span>
+      }
+
+<span class="nc" id="L1381">      lp = getParserFromTreebank(trainTreebank, secondaryTrainTreebank, secondaryTreebankWeight, compactor, op, tuneTreebank, extraTaggedWords);</span>
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">    } else if (textInputFileOrUrl != null) {</span>
+      // so we load the parser from a text grammar file
+<span class="nc" id="L1384">      lp = getParserFromTextFile(textInputFileOrUrl, op);</span>
+    } else {
+      // so we load a serialized parser
+<span class="nc bnc" id="L1387" title="All 4 branches missed.">      if (serializedInputFileOrUrl == null &amp;&amp; argIndex &lt; args.length) {</span>
+        // the next argument must be the path to the serialized parser
+<span class="nc" id="L1389">        serializedInputFileOrUrl = args[argIndex];</span>
+<span class="nc" id="L1390">        argIndex++;</span>
+      }
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">      if (serializedInputFileOrUrl == null) {</span>
+<span class="nc" id="L1393">        log.info(&quot;No grammar specified, exiting...&quot;);</span>
+<span class="nc" id="L1394">        return;</span>
+      }
+<span class="nc" id="L1396">      String[] extraArgs = new String[optionArgs.size()];</span>
+<span class="nc" id="L1397">      extraArgs = optionArgs.toArray(extraArgs);</span>
+      try {
+<span class="nc" id="L1399">        lp = loadModel(serializedInputFileOrUrl, op, extraArgs);</span>
+<span class="nc" id="L1400">        op = lp.op;</span>
+<span class="nc" id="L1401">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1402">        log.info(&quot;Error loading parser, exiting...&quot;);</span>
+<span class="nc" id="L1403">        throw e;</span>
+<span class="nc" id="L1404">      }</span>
+    }
+
+    // set up tokenizerFactory with options if provided
+<span class="nc bnc" id="L1408" title="All 4 branches missed.">    if (tokenizerFactoryClass != null || tokenizerOptions != null) {</span>
+      try {
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">        if (tokenizerFactoryClass != null) {</span>
+<span class="nc" id="L1411">          Class&lt;TokenizerFactory&lt;? extends HasWord&gt;&gt; clazz = ErasureUtils.uncheckedCast(Class.forName(tokenizerFactoryClass));</span>
+          Method factoryMethod;
+<span class="nc bnc" id="L1413" title="All 2 branches missed.">          if (tokenizerOptions != null) {</span>
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">            factoryMethod = clazz.getMethod(tokenizerMethod != null ? tokenizerMethod : &quot;newWordTokenizerFactory&quot;, String.class);</span>
+<span class="nc" id="L1415">            tokenizerFactory = ErasureUtils.uncheckedCast(factoryMethod.invoke(null, tokenizerOptions));</span>
+          } else {
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">            factoryMethod = clazz.getMethod(tokenizerMethod != null ? tokenizerMethod : &quot;newTokenizerFactory&quot;);</span>
+<span class="nc" id="L1418">            tokenizerFactory = ErasureUtils.uncheckedCast(factoryMethod.invoke(null));</span>
+          }
+<span class="nc" id="L1420">        } else {</span>
+          // have options but no tokenizer factory.  use the parser
+          // langpack's factory and set its options
+<span class="nc" id="L1423">          tokenizerFactory = lp.op.langpack().getTokenizerFactory();</span>
+<span class="nc" id="L1424">          tokenizerFactory.setOptions(tokenizerOptions);</span>
+        }
+<span class="nc" id="L1426">      } catch (IllegalAccessException | InvocationTargetException | ClassNotFoundException | NoSuchMethodException e) {</span>
+<span class="nc" id="L1427">        log.info(&quot;Couldn't instantiate TokenizerFactory &quot; + tokenizerFactoryClass + &quot; with options &quot; + tokenizerOptions);</span>
+<span class="nc" id="L1428">        throw new RuntimeException(e);</span>
+<span class="nc" id="L1429">      }</span>
+    }
+
+
+    // the following has to go after reading parser to make sure
+    // op and tlpParams are the same for train and test
+    // THIS IS BUTT UGLY BUT IT STOPS USER SPECIFIED ENCODING BEING
+    // OVERWRITTEN BY ONE SPECIFIED IN SERIALIZED PARSER
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">    if (encoding != null) {</span>
+<span class="nc" id="L1438">      op.tlpParams.setInputEncoding(encoding);</span>
+<span class="nc" id="L1439">      op.tlpParams.setOutputEncoding(encoding);</span>
+    }
+
+<span class="nc bnc" id="L1442" title="All 4 branches missed.">    if (testFilter != null || testPath != null) {</span>
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">      if (testPath == null) {</span>
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">        if (treebankPath == null) {</span>
+<span class="nc" id="L1445">          throw new RuntimeException(&quot;No test treebank path specified...&quot;);</span>
+        } else {
+<span class="nc" id="L1447">          log.info(&quot;No test treebank path specified.  Using train path: \&quot;&quot; + treebankPath + '\&quot;');</span>
+<span class="nc" id="L1448">          testPath = treebankPath;</span>
+        }
+      }
+<span class="nc" id="L1451">      testTreebank = op.tlpParams.testMemoryTreebank();</span>
+<span class="nc" id="L1452">      testTreebank.loadPath(testPath, testFilter);</span>
+    }
+
+<span class="nc" id="L1455">    op.trainOptions.sisterSplitters = Generics.newHashSet(Arrays.asList(op.tlpParams.sisterSplitters()));</span>
+
+    // at this point we should be sure that op.tlpParams is
+    // set appropriately (from command line, or from grammar file),
+    // and will never change again.  -- Roger
+
+    // Now what do we do with the parser we've made
+<span class="nc bnc" id="L1462" title="All 2 branches missed.">    if (saveToTextFile) {</span>
+      // save the parser to textGrammar format
+<span class="nc bnc" id="L1464" title="All 2 branches missed.">      if (textOutputFileOrUrl != null) {</span>
+<span class="nc" id="L1465">        lp.saveParserToTextFile(textOutputFileOrUrl);</span>
+      } else {
+<span class="nc" id="L1467">        log.info(&quot;Usage: must specify a text grammar output path&quot;);</span>
+      }
+    }
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">    if (saveToSerializedFile) {</span>
+<span class="nc bnc" id="L1471" title="All 2 branches missed.">      if (serializedOutputFileOrUrl != null) {</span>
+<span class="nc" id="L1472">        lp.saveParserToSerialized(serializedOutputFileOrUrl);</span>
+<span class="nc bnc" id="L1473" title="All 4 branches missed.">      } else if (textOutputFileOrUrl == null &amp;&amp; testTreebank == null) {</span>
+        // no saving/parsing request has been specified
+<span class="nc" id="L1475">        log.info(&quot;usage: &quot; + &quot;java edu.stanford.nlp.parser.lexparser.LexicalizedParser &quot; + &quot;-train trainFilesPath [fileRange] -saveToSerializedFile serializedParserFilename&quot;);</span>
+      }
+    }
+
+<span class="nc bnc" id="L1479" title="All 4 branches missed.">    if (op.testOptions.verbose || train) {</span>
+      // Tell the user a little or a lot about what we have made
+      // get lexicon size separately as it may have its own prints in it....
+<span class="nc bnc" id="L1482" title="All 2 branches missed.">      String lexNumRules = lp.lex != null ? Integer.toString(lp.lex.numRules()): &quot;&quot;;</span>
+<span class="nc" id="L1483">      log.info(&quot;Grammar\tStates\tTags\tWords\tUnaryR\tBinaryR\tTaggings&quot;);</span>
+<span class="nc" id="L1484">      log.info(&quot;Grammar\t&quot; +</span>
+<span class="nc" id="L1485">          lp.stateIndex.size() + '\t' +</span>
+<span class="nc" id="L1486">          lp.tagIndex.size() + '\t' +</span>
+<span class="nc bnc" id="L1487" title="All 2 branches missed.">          lp.wordIndex.size() + '\t' +</span>
+<span class="nc bnc" id="L1488" title="All 2 branches missed.">          (lp.ug != null ? lp.ug.numRules(): &quot;&quot;) + '\t' +</span>
+<span class="nc" id="L1489">          (lp.bg != null ? lp.bg.numRules(): &quot;&quot;) + '\t' +</span>
+          lexNumRules);
+<span class="nc" id="L1491">      log.info(&quot;ParserPack is &quot; + op.tlpParams.getClass().getName());</span>
+<span class="nc" id="L1492">      log.info(&quot;Lexicon is &quot; + lp.lex.getClass().getName());</span>
+<span class="nc bnc" id="L1493" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L1494">        log.info(&quot;Tags are: &quot; + lp.tagIndex);</span>
+        // log.info(&quot;States are: &quot; + lp.pd.stateIndex); // This is too verbose. It was already printed out by the below printOptions command if the flag -printStates is given (at training time)!
+      }
+<span class="nc" id="L1497">      printOptions(false, op);</span>
+    }
+
+<span class="nc bnc" id="L1500" title="All 2 branches missed.">    if (testTreebank != null) {</span>
+      // test parser on treebank
+<span class="nc" id="L1502">      EvaluateTreebank evaluator = new EvaluateTreebank(lp);</span>
+<span class="nc" id="L1503">      evaluator.testOnTreebank(testTreebank);</span>
+<span class="nc bnc" id="L1504" title="All 2 branches missed.">    } else if (argIndex &gt;= args.length) {</span>
+      // no more arguments, so we just parse our own test sentence
+<span class="nc" id="L1506">      PrintWriter pwOut = op.tlpParams.pw();</span>
+<span class="nc" id="L1507">      PrintWriter pwErr = op.tlpParams.pw(System.err);</span>
+<span class="nc" id="L1508">      ParserQuery pq = lp.parserQuery();</span>
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">      if (pq.parse(op.tlpParams.defaultTestSentence())) {</span>
+<span class="nc" id="L1510">        lp.getTreePrint().printTree(pq.getBestParse(), pwOut);</span>
+      } else {
+<span class="nc" id="L1512">        pwErr.println(&quot;Error. Can't parse test sentence: &quot; +</span>
+<span class="nc" id="L1513">                      op.tlpParams.defaultTestSentence());</span>
+      }
+<span class="nc" id="L1515">    } else {</span>
+      // We parse filenames given by the remaining arguments
+<span class="nc" id="L1517">      ParseFiles.parseFiles(args, argIndex, tokenized, tokenizerFactory, elementDelimiter, sentenceDelimiter, escaper, tagDelimiter, op, lp.getTreePrint(), lp);</span>
+    }
+
+<span class="nc" id="L1520">  } // end main</span>
+
+  private static final long serialVersionUID = 2;
+
+} // end class LexicalizedParser
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

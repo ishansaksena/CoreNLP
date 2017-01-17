@@ -1,0 +1,507 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SemgrexPattern.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.semgraph.semgrex</a> &gt; <span class="el_source">SemgrexPattern.java</span></div><h1>SemgrexPattern.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.semgraph.semgrex;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphFactory;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.ling.*;
+import edu.stanford.nlp.trees.ud.CoNLLUDocumentReader;
+import edu.stanford.nlp.trees.GrammaticalStructure;
+import edu.stanford.nlp.trees.MemoryTreebank;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeNormalizer;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+
+/**
+ * A SemgrexPattern is a pattern for matching node and edge configurations a dependency graph.
+ * Patterns are written in a similar style to {@code tgrep} or {@code Tregex} and operate over
+ * {@code SemanticGraph} objects, which contain {@code IndexedWord nodes}.  Unlike
+ * {@code tgrep} but like Unix {@code grep}, there is no pre-indexing
+ * of the data to be searched.  Rather there is a linear scan through the graph
+ * where matches are sought. &lt;p/&gt;
+ *
+ * A node is represented by a set of attributes and their values contained by
+ * curly braces: {attr1:value1;attr2:value2;...}.  Therefore, {} represents any
+ * node in the graph.  Attributes must be plain strings; values can be strings
+ * or regular expressions blocked off by &quot;/&quot;.  Regular expressions must
+ * match the whole attribute value, so that /NN/ matches &quot;NN&quot; only, while /NN.* /
+ * matches &quot;NN&quot;, &quot;NNS&quot;, &quot;NNP&quot;, etc. &lt;p/&gt;
+ *
+ * For example, {@code {lemma:slice;tag:/VB.* /}} represents any verb nodes
+ * with &quot;slice&quot; as their lemma.  Attributes are extracted using
+ * {@code edu.stanford.nlp.ling.AnnotationLookup}. &lt;p/&gt;
+ *
+ * The root of the graph can be marked by the $ sign, that is {@code {$}}
+ * represents the root node. &lt;p/&gt;
+ *
+ * Relations are defined by a symbol representing the type of relationship and a
+ * string or regular expression representing the value of the relationship. A
+ * relationship string of {@code %} means any relationship.  It is
+ * also OK simply to omit the relationship symbol altogether.
+ * &lt;p/&gt;
+ *
+ * Currently supported node relations and their symbols: &lt;p/&gt;
+ *
+ * &lt;table border = &quot;1&quot;&gt;
+ * &lt;tr&gt;&lt;th&gt;Symbol&lt;th&gt;Meaning
+ * &lt;tr&gt;&lt;td&gt;A &amp;lt;reln B &lt;td&gt; A is the dependent of a relation reln with B
+ * &lt;tr&gt;&lt;td&gt;A &amp;gt;reln B &lt;td&gt;A is the governor of a relation reln with B
+ * &lt;tr&gt;&lt;td&gt;A &amp;lt;&amp;lt;reln B &lt;td&gt;A is the dependent of a relation reln in a chain to B following dep-&amp;gt;gov paths
+ * &lt;tr&gt;&lt;td&gt;A &amp;gt;&amp;gt;reln B &lt;td&gt;A is the governor of a relation reln in a chain to B following gov-&amp;gt;dep paths
+ * &lt;tr&gt;&lt;td&gt;A x,y&amp;lt;&amp;lt;reln B &lt;td&gt;A is the dependent of a relation reln in a chain to B following dep-&amp;gt;gov paths between distances of x and y
+ * &lt;tr&gt;&lt;td&gt;A x,y&amp;gt;&amp;gt;reln B &lt;td&gt;A is the governor of a relation reln in a chain to B following gov-&amp;gt;dep paths between distances of x and y
+ * &lt;tr&gt;&lt;td&gt;A == B &lt;td&gt;A and B are the same nodes in the same graph
+ * &lt;tr&gt;&lt;td&gt;A . B &lt;td&gt;A immediately precedes B, i.e. A.index() == B.index() - 1
+ * &lt;tr&gt;&lt;td&gt;A $+ B &lt;td&gt;B is a right immediate sibling of A, i.e. A and B have the same parent and A.index() == B.index() - 1
+ * &lt;tr&gt;&lt;td&gt;A $- B &lt;td&gt;B is a left immediate sibling of A, i.e. A and B have the same parent and A.index() == B.index() + 1
+ * &lt;tr&gt;&lt;td&gt;A $++ B &lt;td&gt;B is a right sibling of A, i.e. A and B have the same parent and A.index() &lt; B.index()
+ * &lt;tr&gt;&lt;td&gt;A $-- B &lt;td&gt;B is a left sibling of A, i.e. A and B have the same parent and A.index() &gt; B.index()
+ * &lt;tr&gt;&lt;td&gt;A @ B &lt;td&gt;A is aligned to B (this is only used when you have two dependency graphs which are aligned)
+ * &lt;/table&gt;
+ * &lt;p/&gt;
+ *
+ * In a chain of relations, all relations are relative to the first
+ * node in the chain. For example, &quot;{@code {} &amp;gt;nsubj {} &amp;gt;dobj
+ * {}}&quot; means &quot;any node that is the governor of both a nsubj and
+ * a dobj relation&quot;.  If instead what you want is a node that is the
+ * governor of a nsubj relation with a node that is itself the
+ * governor of dobj relation, you should use parentheses and write: &quot;{@code {} &amp;gt;nsubj
+ * ({} &amp;gt;dobj {})}&quot;. &lt;p/&gt;
+ *
+ * If a relation type is specified for the &amp;lt;&amp;lt; relation, the
+ * relation type is only used for the first relation in the sequence.
+ * Therefore, if B depends on A with the relation type foo, the
+ * pattern {@code {} &amp;lt;&amp;lt;foo {}} will then match B and
+ * everything that depends on B. &lt;p/&gt;
+ *
+ * Similarly, if a relation type is specified for the &amp;gt;&amp;gt;
+ * relation, the relation type is only used for the last relation in
+ * the sequence.  Therefore, if A governs B with the relation type
+ * foo, the pattern {@code {} &amp;gt;&amp;gt;foo {}} will then match A
+ * and all of the nodes which have a sequence leading to A. &lt;p/&gt;
+ *
+ * &lt;h3&gt;Boolean relational operators&lt;/h3&gt;
+ *
+ * Relations can be combined using the '&amp;amp;' and '|' operators, negated with
+ * the '!' operator, and made optional with the '?' operator. &lt;p/&gt;
+ *
+ * Relations can be grouped using brackets '[' and ']'.  So the
+ * expression
+ *
+ * &lt;blockquote&gt;
+ *{@code {} [&amp;lt;subj {} | &amp;lt;agent {}] &amp;amp; @ {} }
+ * &lt;/blockquote&gt;
+ *
+ * matches a node that is either the dep of a subj or agent relationship and
+ * has an alignment to some other node.
+ *
+ * &lt;p&gt; Relations can be negated with the '!' operator, in which case the
+ * expression will match only if there is no node satisfying the relation.
+ *
+ * &lt;p&gt; Relations can be made optional with the '?' operator.  This way the
+ * expression will match even if the optional relation is not satisfied.
+ *
+ * &lt;p&gt; The operator &quot;:&quot; partitions a pattern into separate patterns,
+ * each of which must be matched.  For example, the following is a
+ * pattern where the matched node must have both &quot;foo&quot; and &quot;bar&quot; as
+ * descendants:
+ *
+ * &lt;blockquote&gt;
+ * {@code {}=a &amp;gt;&amp;gt; {word:foo} : {}=a &amp;gt;&amp;gt; {word:bar} }
+ * &lt;/blockquote&gt;
+ *
+ * This pattern could have been written
+ *
+ * &lt;blockquote&gt;
+ * {@code {}=a &amp;gt;&amp;gt; {word:foo} &amp;gt;&amp;gt; {word:bar} }
+ * &lt;/blockquote&gt;
+ *
+ * However, for more complex examples, partitioning a pattern may make
+ * it more readable.
+ *
+ * &lt;p&gt;&lt;h3&gt;Naming nodes&lt;/h3&gt;
+ *
+ * Nodes can be given names (a.k.a. handles) using '='.  A named node will
+ * be stored in a map that maps names to nodes so that if a match is found, the
+ * node corresponding to the named node can be extracted from the map.  For
+ * example {@code ({tag:NN}=noun) } will match a singular noun node and
+ * after a match is found, the map can be queried with the name to retrieved the
+ * matched node using {@link SemgrexMatcher#getNode(String o)} with (String)
+ * argument &quot;noun&quot; (&lt;it&gt;not&lt;/it&gt; &quot;=noun&quot;).  Note that you are not allowed to
+ * name a node that is under the scope of a negation operator (the semantics
+ * would be unclear, since you can't store a node that never gets matched to).
+ * Trying to do so will cause a {@link ParseException} to be thrown. Named nodes
+ * &lt;it&gt;can be put within the scope of an optionality operator&lt;/it&gt;. &lt;p/&gt;
+ *
+ * Named nodes that refer back to previously named nodes need not have a node
+ * description -- this is known as &quot;backreferencing&quot;.  In this case, the
+ * expression will match only when all instances of the same name get matched to
+ * the same node.  For example: the pattern
+ * {@code {} &amp;gt;dobj ({} &amp;gt; {}=foo) &amp;gt;mod ({} &amp;gt; {}=foo) }
+ * will match a graph in which there are two nodes, {@code X} and
+ * {@code Y}, for which {@code X} is the grandparent of
+ * {@code Y} and there are two paths to {@code Y}, one of
+ * which goes through a {@code dobj} and one of which goes
+ * through a {@code mod}. &lt;p/&gt;
+ *
+ * &lt;p&gt;&lt;h3&gt;Naming relations&lt;/h3&gt;
+ *
+ * It is also possible to name relations.  For example, you can write the pattern
+ * {@code {idx:1} &amp;gt;=reln {idx:2}}  The name of the relation will then
+ * be stored in the matcher and can be extracted with {@code getRelnName(&quot;reln&quot;)}
+ * At present, though, there is no backreferencing capability such as with the
+ * named nodes; this is only useful when using the API to extract the name of the
+ * relation used when making the match.
+ * &lt;p/&gt;
+ * In the case of ancestor and descendant relations, the &lt;b&gt;last&lt;/b&gt;
+ * relation in the sequence of relations is the name used.
+ * &lt;p/&gt;
+ *
+ * @author Chloe Kiddon
+ */
+public abstract class SemgrexPattern implements Serializable  {
+
+  /** A logger for this class */
+<span class="fc" id="L169">  private static Redwood.RedwoodChannels log = Redwood.channels(SemgrexPattern.class);</span>
+
+  private static final long serialVersionUID = 1722052832350596732L;
+<span class="fc" id="L172">  private boolean neg = false;</span>
+<span class="fc" id="L173">  private boolean opt = false;</span>
+  private String patternString; // conceptually final, but can't do because of parsing
+
+  protected Env env; //always set with setEnv to make sure that it is also availble to child patterns
+
+  // package private constructor
+<span class="fc" id="L179">  SemgrexPattern() {</span>
+<span class="fc" id="L180">  }</span>
+
+  // NodePattern will return its one child, CoordinationPattern will
+  // return the list of children it conjuncts or disjuncts
+  abstract List&lt;SemgrexPattern&gt; getChildren();
+
+  abstract String localString();
+
+  abstract void setChild(SemgrexPattern child);
+
+  void negate() {
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">    if (opt) {</span>
+<span class="nc" id="L192">      throw new RuntimeException(&quot;Node cannot be both negated and optional.&quot;);</span>
+    }
+<span class="fc" id="L194">    neg = true;</span>
+<span class="fc" id="L195">  }</span>
+
+  void makeOptional() {
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">    if (neg) {</span>
+<span class="nc" id="L199">      throw new RuntimeException(&quot;Node cannot be both negated and optional.&quot;);</span>
+    }
+<span class="fc" id="L201">    opt = true;</span>
+<span class="fc" id="L202">  }</span>
+
+  boolean isNegated() {
+<span class="fc" id="L205">    return neg;</span>
+  }
+
+  boolean isOptional() {
+<span class="fc" id="L209">    return opt;</span>
+  }
+
+  // matcher methods
+  // ------------------------------------------------------------
+
+  // These get implemented in semgrex.CoordinationMatcher and NodeMatcher
+  abstract SemgrexMatcher matcher(SemanticGraph sg, IndexedWord node, Map&lt;String, IndexedWord&gt; namesToNodes,
+      Map&lt;String, String&gt; namesToRelations, VariableStrings variableStrings, boolean ignoreCase);
+
+  abstract SemgrexMatcher matcher(SemanticGraph sg, Alignment alignment, SemanticGraph sg_align, boolean hypToText,
+      IndexedWord node, Map&lt;String, IndexedWord&gt; namesToNodes, Map&lt;String, String&gt; namesToRelations,
+      VariableStrings variableStrings, boolean ignoreCase);
+
+  /**
+   * Get a {@link SemgrexMatcher} for this pattern in this graph.
+   *
+   * @param sg
+   *          the SemanticGraph to match on
+   * @return a SemgrexMatcher
+   */
+  public SemgrexMatcher matcher(SemanticGraph sg) {
+<span class="fc" id="L231">    return matcher(sg, sg.getFirstRoot(), Generics.&lt;String, IndexedWord&gt;newHashMap(), Generics.&lt;String, String&gt;newHashMap(),</span>
+        new VariableStrings(), false);
+  }
+
+  /**
+   * Get a {@link SemgrexMatcher} for this pattern in this graph, with some
+   * initial conditions on the variable assignments
+   */
+  public SemgrexMatcher matcher(SemanticGraph sg, Map&lt;String, IndexedWord&gt; variables) {
+<span class="fc" id="L240">    return matcher(sg, sg.getFirstRoot(), variables, Generics.&lt;String, String&gt;newHashMap(), new VariableStrings(), false);</span>
+  }
+
+  /**
+   * Get a {@link SemgrexMatcher} for this pattern in this graph.
+   *
+   * @param sg
+   *          the SemanticGraph to match on
+   * @param ignoreCase
+   *          will ignore case for matching a pattern with a node; not
+   *          implemented by Coordination Pattern
+   * @return a SemgrexMatcher
+   */
+  public SemgrexMatcher matcher(SemanticGraph sg, boolean ignoreCase) {
+<span class="fc" id="L254">    return matcher(sg, sg.getFirstRoot(), Generics.&lt;String, IndexedWord&gt;newHashMap(), Generics.&lt;String, String&gt;newHashMap(),</span>
+        new VariableStrings(), ignoreCase);
+  }
+
+  public SemgrexMatcher matcher(SemanticGraph hypGraph, Alignment alignment, SemanticGraph txtGraph) {
+<span class="fc" id="L259">    return matcher(hypGraph, alignment, txtGraph, true, hypGraph.getFirstRoot(), Generics.&lt;String, IndexedWord&gt;newHashMap(),</span>
+<span class="fc" id="L260">        Generics.&lt;String, String&gt;newHashMap(), new VariableStrings(), false);</span>
+  }
+
+  public SemgrexMatcher matcher(SemanticGraph hypGraph, Alignment alignment, SemanticGraph txtGraph, boolean ignoreCase) {
+<span class="nc" id="L264">    return matcher(hypGraph, alignment, txtGraph, true, hypGraph.getFirstRoot(), Generics.&lt;String, IndexedWord&gt;newHashMap(),</span>
+<span class="nc" id="L265">        Generics.&lt;String, String&gt;newHashMap(), new VariableStrings(), ignoreCase);</span>
+  }
+
+  // compile method
+  // -------------------------------------------------------------
+
+  /**
+   * Creates a pattern from the given string.
+   *
+   * @param semgrex
+   *          the pattern string
+   * @return a SemgrexPattern for the string.
+   */
+  public static SemgrexPattern compile(String semgrex, Env env) {
+    try {
+<span class="fc" id="L280">      SemgrexParser parser = new SemgrexParser(new StringReader(semgrex + &quot;\n&quot;));</span>
+<span class="fc" id="L281">      SemgrexPattern newPattern = parser.Root();</span>
+<span class="fc" id="L282">      newPattern.setEnv(env);</span>
+<span class="fc" id="L283">      newPattern.patternString = semgrex;</span>
+<span class="fc" id="L284">      return newPattern;</span>
+<span class="nc" id="L285">    } catch (ParseException ex) {</span>
+<span class="nc" id="L286">      throw new SemgrexParseException(&quot;Error parsing semgrex pattern &quot; + semgrex, ex);</span>
+<span class="nc" id="L287">    } catch (TokenMgrError er) {</span>
+<span class="nc" id="L288">      throw new SemgrexParseException(&quot;Error parsing semgrex pattern &quot; + semgrex, er);</span>
+    }
+  }
+
+  public static SemgrexPattern compile(String semgrex) {
+<span class="fc" id="L293">    return compile(semgrex, new Env());</span>
+  }
+
+  public String pattern() {
+<span class="fc" id="L297">    return patternString;</span>
+  }
+
+  /**
+   * Recursively sets the env variable to this pattern and all its children
+   *
+   * @param env
+   */
+  public void setEnv(Env env) {
+<span class="fc" id="L306">    this.env = env;</span>
+<span class="fc" id="L307">    this.getChildren().stream().forEach(p -&gt; p.setEnv(env));</span>
+<span class="fc" id="L308">  }</span>
+
+
+
+  // printing methods
+  // -----------------------------------------------------------
+
+  /**
+   * @return A single-line string representation of the pattern
+   */
+  @Override
+  public abstract String toString();
+
+  /**
+   * @param hasPrecedence indicates that this pattern has precedence in terms
+   * of &quot;order of operations&quot;, so there is no need to parenthesize the
+   * expression
+   */
+  public abstract String toString(boolean hasPrecedence);
+
+  private void prettyPrint(PrintWriter pw, int indent) {
+<span class="fc bfc" id="L329" title="All 2 branches covered.">    for (int i = 0; i &lt; indent; i++) {</span>
+<span class="fc" id="L330">      pw.print(&quot;   &quot;);</span>
+    }
+<span class="fc" id="L332">    pw.println(localString());</span>
+<span class="fc bfc" id="L333" title="All 2 branches covered.">    for (SemgrexPattern child : getChildren()) {</span>
+<span class="fc" id="L334">      child.prettyPrint(pw, indent + 1);</span>
+<span class="fc" id="L335">    }</span>
+<span class="fc" id="L336">  }</span>
+
+  /**
+   * Print a multi-line representation of the pattern illustrating its syntax.
+   */
+  public void prettyPrint(PrintWriter pw) {
+<span class="fc" id="L342">    prettyPrint(pw, 0);</span>
+<span class="fc" id="L343">  }</span>
+
+  /**
+   * Print a multi-line representation of the pattern illustrating its syntax.
+   */
+  public void prettyPrint(PrintStream ps) {
+<span class="fc" id="L349">    prettyPrint(new PrintWriter(new OutputStreamWriter(ps), true));</span>
+<span class="fc" id="L350">  }</span>
+
+  /**
+   * Print a multi-line representation of the pattern illustrating its syntax
+   * to {@code System.out}.
+   */
+  public void prettyPrint() {
+<span class="fc" id="L357">    prettyPrint(System.out);</span>
+<span class="fc" id="L358">  }</span>
+
+  @Override
+  public boolean equals(Object o) {
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">    if (!(o instanceof SemgrexPattern)) return false;</span>
+<span class="fc" id="L363">    return o.toString().equals(this.toString());</span>
+  }
+
+  @Override
+  public int hashCode() {
+    // if (this == null) return 0;
+<span class="nc" id="L369">    return this.toString().hashCode();</span>
+  }
+
+<span class="nc" id="L372">  public enum OutputFormat {</span>
+<span class="nc" id="L373">    LIST,</span>
+<span class="nc" id="L374">    OFFSET</span>
+  };
+
+
+  static final String PATTERN = &quot;-pattern&quot;;
+  static final String TREE_FILE = &quot;-treeFile&quot;;
+  static final String MODE = &quot;-mode&quot;;
+  static final String DEFAULT_MODE = &quot;BASIC&quot;;
+  static final String EXTRAS = &quot;-extras&quot;;
+  static final String CONLLU_FILE = &quot;-conlluFile&quot;;
+  static final String OUTPUT_FORMAT_OPTION = &quot;-outputFormat&quot;;
+  static final String DEFAULT_OUTPUT_FORMAT = &quot;LIST&quot;;
+
+
+
+  public static void help() {
+<span class="nc" id="L390">    log.info(&quot;Possible arguments for SemgrexPattern:&quot;);</span>
+<span class="nc" id="L391">    log.info(PATTERN + &quot;: what pattern to use for matching&quot;);</span>
+<span class="nc" id="L392">    log.info(TREE_FILE + &quot;: a file of trees to process&quot;);</span>
+<span class="nc" id="L393">    log.info(CONLLU_FILE + &quot;: a CoNLL-U file of dependency trees to process&quot;);</span>
+<span class="nc" id="L394">    log.info(MODE + &quot;: what mode for dependencies.  basic, collapsed, or ccprocessed.  To get 'noncollapsed', use basic with extras&quot;);</span>
+<span class="nc" id="L395">    log.info(EXTRAS + &quot;: whether or not to use extras&quot;);</span>
+<span class="nc" id="L396">    log.info(OUTPUT_FORMAT_OPTION + &quot;: output format of matches. list or offset. 'list' prints the graph as a list of dependencies, &quot;</span>
+                         + &quot;'offset' prints the filename and the line offset in the ConLL-U file.&quot;);
+<span class="nc" id="L398">    log.info();</span>
+<span class="nc" id="L399">    log.info(PATTERN + &quot; is required&quot;);</span>
+<span class="nc" id="L400">  }</span>
+
+  /**
+   * Prints out all matches of a semgrex pattern on a file of dependencies.
+   * &lt;br&gt;
+   * Usage:&lt;br&gt;
+   * java edu.stanford.nlp.semgraph.semgrex.SemgrexPattern [args]
+   * &lt;br&gt;
+   * See the help() function for a list of possible arguments to provide.
+   */
+  public static void main(String[] args) throws IOException {
+<span class="nc" id="L411">    Map&lt;String,Integer&gt; flagMap = Generics.newHashMap();</span>
+
+<span class="nc" id="L413">    flagMap.put(PATTERN, 1);</span>
+<span class="nc" id="L414">    flagMap.put(TREE_FILE, 1);</span>
+<span class="nc" id="L415">    flagMap.put(MODE, 1);</span>
+<span class="nc" id="L416">    flagMap.put(EXTRAS, 1);</span>
+<span class="nc" id="L417">    flagMap.put(CONLLU_FILE, 1);</span>
+<span class="nc" id="L418">    flagMap.put(OUTPUT_FORMAT_OPTION, 1);</span>
+
+
+<span class="nc" id="L421">    Map&lt;String, String[]&gt; argsMap = StringUtils.argsToMap(args, flagMap);</span>
+<span class="nc" id="L422">    args = argsMap.get(null);</span>
+
+    // TODO: allow patterns to be extracted from a file
+<span class="nc bnc" id="L425" title="All 4 branches missed.">    if (!(argsMap.containsKey(PATTERN)) || argsMap.get(PATTERN).length == 0) {</span>
+<span class="nc" id="L426">      help();</span>
+<span class="nc" id="L427">      System.exit(2);</span>
+    }
+<span class="nc" id="L429">    SemgrexPattern semgrex = SemgrexPattern.compile(argsMap.get(PATTERN)[0]);</span>
+
+<span class="nc" id="L431">    String modeString = DEFAULT_MODE;</span>
+<span class="nc bnc" id="L432" title="All 4 branches missed.">    if (argsMap.containsKey(MODE) &amp;&amp; argsMap.get(MODE).length &gt; 0) {</span>
+<span class="nc" id="L433">      modeString = argsMap.get(MODE)[0].toUpperCase();</span>
+    }
+<span class="nc" id="L435">    SemanticGraphFactory.Mode mode = SemanticGraphFactory.Mode.valueOf(modeString);</span>
+
+<span class="nc" id="L437">    String outputFormatString = DEFAULT_OUTPUT_FORMAT;</span>
+<span class="nc bnc" id="L438" title="All 4 branches missed.">    if (argsMap.containsKey(OUTPUT_FORMAT_OPTION) &amp;&amp; argsMap.get(OUTPUT_FORMAT_OPTION).length &gt; 0) {</span>
+<span class="nc" id="L439">      outputFormatString = argsMap.get(OUTPUT_FORMAT_OPTION)[0].toUpperCase();</span>
+    }
+<span class="nc" id="L441">    OutputFormat outputFormat = OutputFormat.valueOf(outputFormatString);</span>
+
+<span class="nc" id="L443">    boolean useExtras = true;</span>
+<span class="nc bnc" id="L444" title="All 4 branches missed.">    if (argsMap.containsKey(EXTRAS) &amp;&amp; argsMap.get(EXTRAS).length &gt; 0) {</span>
+<span class="nc" id="L445">      useExtras = Boolean.valueOf(argsMap.get(EXTRAS)[0]);</span>
+    }
+
+<span class="nc" id="L448">    List&lt;SemanticGraph&gt; graphs = Generics.newArrayList();</span>
+    // TODO: allow other sources of graphs, such as dependency files
+<span class="nc bnc" id="L450" title="All 4 branches missed.">    if (argsMap.containsKey(TREE_FILE) &amp;&amp; argsMap.get(TREE_FILE).length &gt; 0) {</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">      for (String treeFile : argsMap.get(TREE_FILE)) {</span>
+<span class="nc" id="L452">        log.info(&quot;Loading file &quot; + treeFile);</span>
+<span class="nc" id="L453">        MemoryTreebank treebank = new MemoryTreebank(new TreeNormalizer());</span>
+<span class="nc" id="L454">        treebank.loadPath(treeFile);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">        for (Tree tree : treebank) {</span>
+          // TODO: allow other languages... this defaults to English
+<span class="nc bnc" id="L457" title="All 2 branches missed.">          SemanticGraph graph = SemanticGraphFactory.makeFromTree(tree, mode, useExtras ? GrammaticalStructure.Extras.MAXIMAL : GrammaticalStructure.Extras.NONE);</span>
+<span class="nc" id="L458">          graphs.add(graph);</span>
+<span class="nc" id="L459">        }</span>
+      }
+    }
+
+<span class="nc bnc" id="L463" title="All 4 branches missed.">    if (argsMap.containsKey(CONLLU_FILE) &amp;&amp; argsMap.get(CONLLU_FILE).length &gt; 0) {</span>
+<span class="nc" id="L464">      CoNLLUDocumentReader reader = new CoNLLUDocumentReader();</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">      for (String conlluFile : argsMap.get(CONLLU_FILE)) {</span>
+<span class="nc" id="L466">        log.info(&quot;Loading file &quot; + conlluFile);</span>
+<span class="nc" id="L467">        Iterator&lt;SemanticGraph&gt; it = reader.getIterator(IOUtils.readerFromString(conlluFile));</span>
+
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L470">          SemanticGraph graph = it.next();</span>
+<span class="nc" id="L471">          graphs.add(graph);</span>
+<span class="nc" id="L472">        }</span>
+      }
+    }
+
+<span class="nc bnc" id="L476" title="All 2 branches missed.">    for (SemanticGraph graph : graphs) {</span>
+<span class="nc" id="L477">      SemgrexMatcher matcher = semgrex.matcher(graph);</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">      if (!(matcher.find())) {</span>
+<span class="nc" id="L479">        continue;</span>
+      }
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">      if (outputFormat == OutputFormat.LIST) {</span>
+<span class="nc" id="L483">        log.info(&quot;Matched graph:&quot;);</span>
+<span class="nc" id="L484">        log.info(graph.toString(SemanticGraph.OutputFormat.LIST));</span>
+<span class="nc" id="L485">        boolean found = true;</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        while (found) {</span>
+<span class="nc" id="L487">          log.info(&quot;Matches at: &quot; + matcher.getMatch().value() + &quot;-&quot; + matcher.getMatch().index());</span>
+<span class="nc" id="L488">          List&lt;String&gt; nodeNames = Generics.newArrayList();</span>
+<span class="nc" id="L489">          nodeNames.addAll(matcher.getNodeNames());</span>
+<span class="nc" id="L490">          Collections.sort(nodeNames);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">          for (String name : nodeNames) {</span>
+<span class="nc" id="L492">            log.info(&quot;  &quot; + name + &quot;: &quot; + matcher.getNode(name).value() + &quot;-&quot; + matcher.getNode(name).index());</span>
+<span class="nc" id="L493">          }</span>
+<span class="nc" id="L494">          log.info();</span>
+<span class="nc" id="L495">          found = matcher.find();</span>
+<span class="nc" id="L496">        }</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">      } else if (outputFormat == OutputFormat.OFFSET) {</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        if (graph.vertexListSorted().isEmpty()) {</span>
+<span class="nc" id="L499">          continue;</span>
+        }
+<span class="nc" id="L501">        System.out.printf(&quot;+%d %s%n&quot;, graph.vertexListSorted().get(0).get(CoreAnnotations.LineNumberAnnotation.class),</span>
+<span class="nc" id="L502">            argsMap.get(CONLLU_FILE)[0]);</span>
+      }
+<span class="nc" id="L504">    }</span>
+<span class="nc" id="L505">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,1169 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ISODateInstance.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.pascal</a> &gt; <span class="el_source">ISODateInstance.java</span></div><h1>ISODateInstance.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.pascal; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ie.QuantifiableEntityNormalizer;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.process.PTBTokenizer;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+
+import java.io.BufferedReader;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Represents dates and times according to ISO8601 standard while also allowing for
+ * wild cards - e.g., can represent &quot;21 June&quot; without a year.
+ * (Standard ISO8601 only allows removing less precise annotations (e.g.,
+ * 200706 rather than 20070621 but not a way to represent 0621 without a year.)
+ * &lt;p/&gt;
+ * Format stores date and time separately since the majority of current use
+ * cases involve only one of these items.  Standard ISO 8601 instead
+ * requires &amp;lt;date&amp;gt;T&amp;lt;time&amp;gt;.
+ * &lt;p/&gt;
+ * Ranges are specified within the strings via forward slash.  For example
+ * 6 June - 8 June is represented ****0606/****0608.  6 June onward is
+ * ****0606/ and until 8 June is /****0608.
+ *
+ * @author Anna Rafferty
+ *         TODO: add time support - currently just dates are supported
+ */
+public class ISODateInstance  {
+
+  /** A logger for this class */
+<span class="fc" id="L39">  private static Redwood.RedwoodChannels log = Redwood.channels(ISODateInstance.class);</span>
+
+  private static final boolean DEBUG = false;
+<span class="pc" id="L42">  private ArrayList&lt;String&gt; tokens = new ArrayList&lt;&gt;(); //each token contains some piece of the date, from our input.</span>
+
+  public static final String OPEN_RANGE_AFTER = &quot;A&quot;;
+  public static final String OPEN_RANGE_BEFORE = &quot;B&quot;;
+  public static final String BOUNDED_RANGE = &quot;C&quot;;
+  public static final String NO_RANGE = &quot;&quot;;
+  public static final int DAY_OF_HALF_MONTH = 15;
+  public static final int LAST_DAY_OF_MONTH = 31;//close enough for our purposes
+  public static final String MONTH_OF_HALF_YEAR = &quot;07&quot;;
+  public static final String LAST_MONTH_OF_YEAR = &quot;12&quot;;
+  /**
+   * String of the format &amp;lt;year&amp;gt;&amp;lt;month&amp;gt;&amp;lt;day&amp;gt;.  Representations
+   * by week are also allowed. If a more general field (such as year)
+   * is not specified when a less general one (such as month) is, the characters
+   * normally filled by the more general field are replaced by asterisks. For example,
+   * 21 June would be \&quot;****0621\&quot;.  Less general fields are simply truncated;
+   * for example, June 2007 would be \&quot;200706\&quot;.
+   */
+<span class="pc" id="L60">  private String isoDate = &quot;&quot;;</span>
+
+  //Variable for marking if we were unable to parse the string associated with this isoDate
+<span class="pc" id="L63">  private boolean unparseable = false;</span>
+
+  //private String isoTime = &quot;&quot;;
+
+
+  /**
+   * Creates an empty date instance; you probably
+   * don't want this in most cases.
+   */
+<span class="nc" id="L72">  public ISODateInstance() {</span>
+
+<span class="nc" id="L74">  }</span>
+
+  /**
+   * Takes a string that represents a date, and attempts to
+   * normalize it into ISO 8601-compatible format.
+   */
+<span class="fc" id="L80">  public ISODateInstance(String date) {</span>
+<span class="fc" id="L81">    extractFields(date);</span>
+<span class="fc" id="L82">  }</span>
+
+<span class="fc" id="L84">  public ISODateInstance(String date, String openRangeMarker) {</span>
+<span class="fc" id="L85">    extractFields(date);</span>
+    //now process the range marker; if a range was found independently, we ignore the marker
+<span class="pc bpc" id="L87" title="3 of 4 branches missed.">    if ( ! ISODateInstance.NO_RANGE.equals(openRangeMarker) &amp;&amp; ! isoDate.contains(&quot;/&quot;)) {</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">      if (ISODateInstance.OPEN_RANGE_AFTER.equals(openRangeMarker)) {</span>
+<span class="nc" id="L89">        isoDate = isoDate + '/';</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">      } else if (ISODateInstance.OPEN_RANGE_BEFORE.equals(openRangeMarker)) {</span>
+<span class="nc" id="L91">        isoDate = '/' + isoDate;</span>
+      }
+    }
+<span class="fc" id="L94">  }</span>
+
+  /**
+   * Constructor for a range of dates, beginning at date start and finishing at date end
+   *
+   */
+<span class="fc" id="L100">  public ISODateInstance(ISODateInstance start, ISODateInstance end) {</span>
+<span class="fc" id="L101">    String startString = start.getDateString();</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">    if (start.isRange()) {</span>
+<span class="nc" id="L103">      startString = start.getStartDate();</span>
+    }
+<span class="fc" id="L105">    String endString = end.getDateString();</span>
+<span class="pc bpc" id="L106" title="1 of 2 branches missed.">    if (end.isRange()) {</span>
+<span class="nc" id="L107">      endString = end.getEndDate();</span>
+    }
+
+<span class="fc" id="L110">    isoDate = startString + '/' + endString;</span>
+<span class="pc bpc" id="L111" title="2 of 4 branches missed.">    unparseable = (start.isUnparseable() || end.isUnparseable());</span>
+<span class="fc" id="L112">  }</span>
+
+  /**
+   * Construct a new ISODate based on its relation to a referenceDate.
+   * relativeDate should be something like &quot;today&quot; or &quot;tomorrow&quot; or &quot;last year&quot;
+   * and the resulting ISODate will be the same as the referenceDate, a day later,
+   * or a year earlier, respectively.
+   *
+   */
+<span class="fc" id="L121">  public ISODateInstance(ISODateInstance referenceDate, String relativeDate) {</span>
+<span class="fc" id="L122">    Pair&lt;DateField, Integer&gt; relation = relativeDateMap.get(relativeDate.toLowerCase());</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">    if (relation != null) {</span>
+<span class="pc bpc" id="L124" title="3 of 4 branches missed.">      switch (relation.first()) {</span>
+        case DAY:
+<span class="fc" id="L126">          incrementDay(referenceDate, relation);</span>
+<span class="fc" id="L127">          break;</span>
+        case MONTH:
+<span class="nc" id="L129">          incrementMonth(referenceDate, relation);</span>
+<span class="nc" id="L130">          break;</span>
+        case YEAR:
+<span class="nc" id="L132">          incrementYear(referenceDate, relation);</span>
+          break;
+      }
+    }
+<span class="fc" id="L136">  }</span>
+
+
+  private void incrementYear(ISODateInstance referenceDate, Pair&lt;DateField, Integer&gt; relation) {
+<span class="nc" id="L140">    String origDateString = referenceDate.getStartDate();</span>
+<span class="nc" id="L141">    String yearString = origDateString.substring(0, 4);</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">    if (yearString.contains(&quot;*&quot;)) {</span>
+<span class="nc" id="L143">      isoDate = origDateString;</span>
+<span class="nc" id="L144">      return;</span>
+    }
+<span class="nc" id="L146">    isoDate = makeStringYearChange(origDateString, Integer.parseInt(yearString) + relation.second());</span>
+<span class="nc" id="L147">  }</span>
+
+  private void incrementMonth(ISODateInstance referenceDate, Pair&lt;DateField, Integer&gt; relation) {
+<span class="nc" id="L150">    String origDateString = referenceDate.getStartDate();</span>
+<span class="nc" id="L151">    String monthString = origDateString.substring(4, 6);</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">    if (monthString.contains(&quot;*&quot;)) {</span>
+<span class="nc" id="L153">      isoDate = origDateString;</span>
+<span class="nc" id="L154">      return;</span>
+    }
+    //Month is not a variable
+<span class="nc" id="L157">    Integer monthNum = Integer.parseInt(monthString);</span>
+    //Check if we're an edge case
+<span class="nc bnc" id="L159" title="All 4 branches missed.">    if (((monthNum + relation.second()) &gt; 12) || ((monthNum + relation.second) &lt; 1)) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">      boolean decreasing = ((monthNum + relation.second) &lt; 1);</span>
+<span class="nc" id="L161">      int newMonthNum = (monthNum + relation.second()) % 12;</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">      if (newMonthNum &lt; 0) {</span>
+<span class="nc" id="L163">        newMonthNum *= -1;</span>
+      }
+      //Set the month appropriately
+<span class="nc" id="L166">      isoDate = makeStringMonthChange(origDateString, newMonthNum);</span>
+      //Increment the year if possible
+<span class="nc" id="L168">      String yearString = origDateString.substring(0, 4);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">      if (!yearString.contains(&quot;*&quot;)) {</span>
+        //How much we increment depends on above mod
+<span class="nc" id="L171">        int numYearsToIncrement = (int) Math.ceil(relation.second() / 12.0);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (decreasing) {</span>
+<span class="nc" id="L173">          isoDate = makeStringYearChange(isoDate, Integer.parseInt(yearString) - numYearsToIncrement);</span>
+        } else {
+<span class="nc" id="L175">          isoDate = makeStringYearChange(isoDate, Integer.parseInt(yearString) + numYearsToIncrement);</span>
+        }
+      }
+<span class="nc" id="L178">    } else {</span>
+<span class="nc" id="L179">      isoDate = makeStringMonthChange(origDateString, (monthNum + relation.second()));</span>
+    }
+<span class="nc" id="L181">  }</span>
+
+
+  private void incrementDay(ISODateInstance referenceDate, Pair&lt;DateField, Integer&gt; relation) {
+<span class="fc" id="L185">    String origDateString = referenceDate.getStartDate();</span>
+<span class="fc" id="L186">    String dayString = origDateString.substring(origDateString.length() - 2, origDateString.length());</span>
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">    if (dayString.contains(&quot;*&quot;)) {</span>
+<span class="nc" id="L188">      isoDate = origDateString;</span>
+<span class="nc" id="L189">      return;</span>
+    }
+    //Date is not a variable
+<span class="fc" id="L192">    Integer dayNum = Integer.parseInt(dayString);</span>
+<span class="fc" id="L193">    String monthString = origDateString.substring(origDateString.length() - 4, origDateString.length() - 2);</span>
+<span class="fc" id="L194">    int numDaysInMonth = 30;//default - assume this if month is a variable</span>
+<span class="fc" id="L195">    int monthNum = -1;//ie, we don't know the month yet - this remains -1 if the month is a variable</span>
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">    if (!monthString.contains(&quot;*&quot;)) {</span>
+      //Set appropriate numDaysInMonth and monthNum
+<span class="fc" id="L198">      monthNum = Integer.parseInt(monthString);</span>
+<span class="fc" id="L199">      numDaysInMonth = daysPerMonth.get(monthNum);</span>
+    }
+
+    //Now, find out if we're an edge case (potential to increment month)
+<span class="fc bfc" id="L203" title="All 4 branches covered.">    if (dayNum + relation.second() &lt;= numDaysInMonth &amp;&amp; dayNum + relation.second() &gt;= 1) {</span>
+      //Not an edge case - just increment the day, create a new string, and return
+<span class="fc" id="L205">      dayNum += relation.second();</span>
+<span class="fc" id="L206">      isoDate = makeStringDayChange(origDateString, dayNum);</span>
+<span class="fc" id="L207">      return;</span>
+    }
+
+    //Since we're an edge case, the month can't be a variable - if it is a variable, just set this to the reference string
+<span class="pc bpc" id="L211" title="1 of 2 branches missed.">    if (monthNum == -1) {</span>
+<span class="nc" id="L212">      isoDate = origDateString;</span>
+<span class="nc" id="L213">      return;</span>
+    }
+    //At this point, neither our day nor our month is a variable
+<span class="fc" id="L216">    isoDate = origDateString;</span>
+<span class="fc bfc" id="L217" title="All 2 branches covered.">    boolean decreasing = (dayNum + relation.second() &lt; 1);</span>
+    //Need to increment the month, set the date appropriately - we need the new month num to set the day appropriately, so do month first
+    int newMonthNum;
+    //Now, check if we're an edge case for month
+<span class="pc bpc" id="L221" title="2 of 8 branches missed.">    if ((monthNum + 1 &gt; 12 &amp;&amp; !decreasing) || (monthNum - 1 &lt; 1 &amp;&amp; decreasing)) {</span>
+      //First, change the month
+<span class="fc bfc" id="L223" title="All 2 branches covered.">      if (decreasing) {</span>
+<span class="fc" id="L224">        newMonthNum = 12;</span>
+      } else {
+<span class="fc" id="L226">        newMonthNum = 1;</span>
+      }
+      //If we can, increment the year
+      //TODO: fix this to work more nicely with variables and thus handle more cases
+<span class="fc" id="L230">      String yearString = origDateString.substring(0, 4);</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">      if (!yearString.contains(&quot;*&quot;)) {</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        if (decreasing) {</span>
+<span class="fc" id="L233">          isoDate = makeStringYearChange(isoDate, Integer.parseInt(yearString) - 1);</span>
+        } else {
+<span class="fc" id="L235">          isoDate = makeStringYearChange(isoDate, Integer.parseInt(yearString) + 1);</span>
+        }
+      }
+<span class="fc" id="L238">    } else {</span>
+      //We're not an edge case for month - just increment
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">      if (decreasing) {</span>
+<span class="fc" id="L241">        newMonthNum = monthNum - 1;</span>
+      } else {
+<span class="nc" id="L243">        newMonthNum = monthNum + 1;</span>
+      }
+    }
+    //do the increment
+<span class="fc" id="L247">    isoDate = makeStringMonthChange(isoDate, newMonthNum);</span>
+    int newDateNum;
+<span class="fc bfc" id="L249" title="All 2 branches covered.">    if (decreasing) {</span>
+<span class="fc" id="L250">      newDateNum = -relation.second() + daysPerMonth.get(newMonthNum) - dayNum;</span>
+    } else {
+<span class="fc" id="L252">      newDateNum = relation.second() - dayNum + daysPerMonth.get(monthNum);</span>
+    }
+    //Now, change the day in our original string to be appropriate
+<span class="fc" id="L255">    isoDate = makeStringDayChange(isoDate, newDateNum);</span>
+
+
+<span class="fc" id="L258">  }</span>
+
+  /**
+   * Changes the day portion of the origDate String to be the String
+   * value of newDay in two character format. (e.g., 9 -&gt; &quot;09&quot;)
+   *
+   */
+  private static String makeStringDayChange(String origDate, int newDay) {
+<span class="fc bfc" id="L266" title="All 2 branches covered.">    String newDayString = (newDay &lt; 10 ? (&quot;0&quot; + newDay) : String.valueOf(newDay));</span>
+<span class="fc" id="L267">    return origDate.substring(0, origDate.length() - 2) + newDayString;</span>
+  }
+
+  /**
+   * Changes the month portion of the origDate String to be the String
+   * value of newDay in two character format. (e.g., 9 -&gt; &quot;09&quot;)
+   *
+   */
+  private static String makeStringMonthChange(String origDate, int newMonth) {
+<span class="fc bfc" id="L276" title="All 2 branches covered.">    String newMonthString = (newMonth &lt; 10 ? (&quot;0&quot; + newMonth) : String.valueOf(newMonth));</span>
+<span class="fc" id="L277">    return origDate.substring(0, 4) + newMonthString + origDate.substring(6, 8);</span>
+  }
+
+  /**
+   * Changes the year portion of the origDate String to be the String
+   * value of newDay in two character format. (e.g., 9 -&gt; &quot;09&quot;)
+   *
+   */
+  private static String makeStringYearChange(String origDate, int newYear) {
+<span class="fc" id="L286">    String newYearString = String.valueOf(newYear);</span>
+<span class="pc bpc" id="L287" title="1 of 2 branches missed.">    while (newYearString.length() &lt; 4) {</span>
+<span class="nc" id="L288">      newYearString = '0' + newYearString;//we're compatible with year 1!</span>
+    }
+<span class="fc" id="L290">    return newYearString + origDate.substring(4, origDate.length());</span>
+  }
+
+
+  /**
+   * Enum for the fields *
+   */
+<span class="pc" id="L297">  public static enum DateField {</span>
+<span class="fc" id="L298">    DAY, MONTH, YEAR</span>
+  }
+
+
+  /**
+   * Map for mapping a relativeDate String to a pair with the field that should be modified and the amount to modify it *
+   */
+<span class="fc" id="L305">  public static final Map&lt;String, Pair&lt;DateField, Integer&gt;&gt; relativeDateMap = Generics.newHashMap();</span>
+
+  static {
+    //Add entries to the relative datemap
+<span class="fc" id="L309">    relativeDateMap.put(&quot;today&quot;, new Pair&lt;&gt;(DateField.DAY, 0));</span>
+<span class="fc" id="L310">    relativeDateMap.put(&quot;tomorrow&quot;, new Pair&lt;&gt;(DateField.DAY, 1));</span>
+<span class="fc" id="L311">    relativeDateMap.put(&quot;yesterday&quot;, new Pair&lt;&gt;(DateField.DAY, -1));</span>
+
+
+  }
+
+<span class="fc" id="L316">  public static final Map&lt;Integer, Integer&gt; daysPerMonth = Generics.newHashMap();</span>
+
+  static {
+    //Add month entries
+<span class="fc" id="L320">    daysPerMonth.put(1, 31);</span>
+<span class="fc" id="L321">    daysPerMonth.put(2, 28);</span>
+<span class="fc" id="L322">    daysPerMonth.put(3, 31);</span>
+<span class="fc" id="L323">    daysPerMonth.put(4, 30);</span>
+<span class="fc" id="L324">    daysPerMonth.put(5, 31);</span>
+<span class="fc" id="L325">    daysPerMonth.put(6, 30);</span>
+<span class="fc" id="L326">    daysPerMonth.put(7, 31);</span>
+<span class="fc" id="L327">    daysPerMonth.put(8, 31);</span>
+<span class="fc" id="L328">    daysPerMonth.put(9, 30);</span>
+<span class="fc" id="L329">    daysPerMonth.put(10, 31);</span>
+<span class="fc" id="L330">    daysPerMonth.put(11, 30);</span>
+<span class="fc" id="L331">    daysPerMonth.put(12, 31);</span>
+  }
+
+  /**
+   * Takes a string already formatted in ISODateInstance format
+   * (such as one previously written out using toString) and creates
+   * a new date instance from it
+   *
+   */
+  public static ISODateInstance fromDateString(String date) {
+<span class="nc" id="L341">    ISODateInstance d = new ISODateInstance();</span>
+<span class="nc" id="L342">    d.isoDate = date;</span>
+<span class="nc" id="L343">    return d;</span>
+  }
+
+  public String toString() {
+<span class="fc" id="L347">    return isoDate;</span>
+  }
+
+  /**
+   * Provided for backwards compatibility with DateInstance;
+   * returns the same thing as toString()
+   *
+   */
+  public String getDateString() {
+<span class="fc" id="L356">    return this.toString();</span>
+  }
+
+  /**
+   * Uses regexp matching to match  month, day, and year fields.
+   * TODO: Find a way to mark what's already been handled in the string
+   */
+  private boolean extractFields(String inputDate) {
+
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">    if (tokens.size() &lt; 2) {</span>
+<span class="fc" id="L366">      tokenizeDate(inputDate);</span>
+    }
+    if (DEBUG) {
+      log.info(&quot;Extracting date: &quot; + inputDate);
+    }
+    //first we see if it's a hyphen and two parseable dates - if not, we treat it as one date
+<span class="fc" id="L372">    Pair&lt;String, String&gt; dateEndpoints = getRangeDates(inputDate);</span>
+<span class="fc bfc" id="L373" title="All 2 branches covered.">    if (dateEndpoints != null) {</span>
+<span class="fc" id="L374">      ISODateInstance date1 = new ISODateInstance(dateEndpoints.first());</span>
+<span class="pc bpc" id="L375" title="1 of 4 branches missed.">      if (dateEndpoints.first().contains(&quot; &quot;) &amp;&amp; !dateEndpoints.second().contains(&quot; &quot;)) {</span>
+        //consider whether it's a leading modifier; e.g., &quot;June 8-10&quot; will be split into June 8, and 10 when really we'd like June 8 and June 10
+<span class="fc" id="L377">        String date = dateEndpoints.first().substring(0, dateEndpoints.first().indexOf(' ')) + ' ' + dateEndpoints.second();</span>
+<span class="fc" id="L378">        ISODateInstance date2 = new ISODateInstance(date);</span>
+<span class="pc bpc" id="L379" title="2 of 4 branches missed.">        if (!date1.isUnparseable() &amp;&amp; !date2.isUnparseable()) {</span>
+<span class="fc" id="L380">          isoDate = (new ISODateInstance(date1, date2)).getDateString();</span>
+<span class="fc" id="L381">          return true;</span>
+        }
+      }
+
+<span class="fc" id="L385">      ISODateInstance date2 = new ISODateInstance(dateEndpoints.second());</span>
+<span class="pc bpc" id="L386" title="2 of 4 branches missed.">      if (!date1.isUnparseable() &amp;&amp; !date2.isUnparseable()) {</span>
+<span class="fc" id="L387">        isoDate = (new ISODateInstance(date1, date2)).getDateString();</span>
+<span class="fc" id="L388">        return true;</span>
+      }
+    }
+
+<span class="fc bfc" id="L392" title="All 2 branches covered.">    if (extractYYYYMMDD(inputDate)) {</span>
+<span class="fc" id="L393">      return true;</span>
+    }
+<span class="fc bfc" id="L395" title="All 2 branches covered.">    if (extractMMDDYY(inputDate)) {</span>
+<span class="fc" id="L396">      return true;</span>
+    }
+<span class="fc" id="L398">    boolean passed = false;</span>
+<span class="pc bpc" id="L399" title="1 of 4 branches missed.">    passed = extractYear(inputDate) || passed;</span>
+<span class="fc bfc" id="L400" title="All 4 branches covered.">    passed = extractMonth(inputDate) || passed;</span>
+<span class="fc bfc" id="L401" title="All 4 branches covered.">    passed = extractDay(inputDate) || passed;</span>
+
+    //slightly hacky, but check for some common modifiers that get grouped into the date
+<span class="pc bpc" id="L404" title="1 of 4 branches missed.">    passed = addExtraRanges(inputDate) || passed;</span>
+
+<span class="fc bfc" id="L406" title="All 2 branches covered.">    if (!passed) {//couldn't parse</span>
+      //try one more trick
+<span class="fc" id="L408">      unparseable = true;</span>
+<span class="fc" id="L409">      boolean weekday = extractWeekday(inputDate);</span>
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">      if (!weekday) {</span>
+<span class="nc" id="L411">        isoDate = inputDate;</span>
+      }
+    }
+<span class="fc" id="L414">    return passed;</span>
+  }
+
+<span class="fc" id="L417">  private static String[] rangeIndicators = {&quot;--&quot;, &quot;-&quot;};</span>
+
+  /**
+   * Attempts to find the two sides of a range in the given string.
+   * Uses rangeIndicators to find possible matches.
+   *
+   */
+  private static Pair&lt;String, String&gt; getRangeDates(String inputDate) {
+<span class="fc bfc" id="L425" title="All 2 branches covered.">    for (String curIndicator : rangeIndicators) {</span>
+<span class="fc" id="L426">      String[] dates = inputDate.split(curIndicator);</span>
+<span class="fc bfc" id="L427" title="All 2 branches covered.">      if (dates.length == 2) {</span>
+<span class="fc" id="L428">        return new Pair&lt;&gt;(dates[0], dates[1]);</span>
+      }
+    }
+<span class="fc" id="L431">    return null;</span>
+  }
+
+  private boolean addExtraRanges(String inputDate) {
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">    if (isRange()) {</span>
+<span class="nc" id="L436">      return false;</span>
+    }
+<span class="fc" id="L438">    inputDate = inputDate.toLowerCase();</span>
+<span class="pc bpc" id="L439" title="1 of 2 branches missed.">    if (inputDate.contains(&quot;half&quot;)) {</span>
+<span class="nc bnc" id="L440" title="All 4 branches missed.">      if (inputDate.contains(&quot;first&quot;) &amp;&amp; isoDate.length() &lt;= 6) {</span>
+<span class="nc" id="L441">        String firstDate = isoDate + &quot;01&quot;;</span>
+        String secondDate;
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (isoDate.length() == 4) {//year</span>
+<span class="nc" id="L444">          secondDate = isoDate + MONTH_OF_HALF_YEAR;</span>
+        } else {//month
+<span class="nc" id="L446">          secondDate = isoDate + DAY_OF_HALF_MONTH;</span>
+        }
+<span class="nc" id="L448">        isoDate = firstDate + '/' + secondDate;</span>
+<span class="nc" id="L449">        return true;</span>
+<span class="nc bnc" id="L450" title="All 4 branches missed.">      } else if (inputDate.contains(&quot;second&quot;) &amp;&amp; isoDate.length() &lt;= 6) {</span>
+        String firstDate;
+        String secondDate;
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (isoDate.length() == 4) {//year</span>
+<span class="nc" id="L454">          firstDate = isoDate + MONTH_OF_HALF_YEAR;</span>
+<span class="nc" id="L455">          secondDate = isoDate + LAST_MONTH_OF_YEAR;</span>
+<span class="nc" id="L456">          isoDate = firstDate + '/' + secondDate;</span>
+        } else {//month
+<span class="nc" id="L458">          firstDate = isoDate + DAY_OF_HALF_MONTH;</span>
+<span class="nc" id="L459">          secondDate = isoDate + LAST_DAY_OF_MONTH;</span>
+        }
+<span class="nc" id="L461">        isoDate = firstDate + '/' + secondDate;</span>
+<span class="nc" id="L462">        return true;</span>
+      }
+    }
+
+<span class="fc" id="L466">    return false;</span>
+  }
+
+  /**
+   * Returns true iff this date represents a range
+   * The range must have at least a start or end
+   * date, but is not guaranteed to have both
+   *
+   * @return Whether this date represents a range
+   */
+  public boolean isRange() {
+<span class="pc bpc" id="L477" title="1 of 2 branches missed.">    if (unparseable) {</span>
+<span class="nc" id="L478">      return false;</span>
+    }
+<span class="fc" id="L480">    return isoDate.matches(&quot;/&quot;);</span>
+  }
+
+  /**
+   * Returns true iff we were unable to parse the input
+   * String associated with this date; in that case,
+   * we just store the input string and shortcircuit
+   * all of the comparison methods
+   *
+   */
+  public boolean isUnparseable() {
+<span class="fc" id="L491">    return unparseable;</span>
+  }
+
+
+  /**
+   * Returns this date or if it is a range,
+   * the date the range starts.  If the date
+   * is of the form /&amp;lt;date&amp;gt;, &quot;&quot; is returned
+   *
+   * @return Start date of range
+   */
+  public String getStartDate() {
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">    if (!isRange()) {</span>
+<span class="fc" id="L504">      return isoDate;</span>
+    }
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    if (isoDate.startsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L507">      return &quot;&quot;;</span>
+    }
+<span class="nc" id="L509">    return isoDate.split(&quot;/&quot;)[0];</span>
+  }
+
+  /**
+   * Returns this date or if it is a range,
+   * the date the range ends.  If the date
+   * is of the form &amp;lt;date&amp;gt;/, &quot;&quot; is returned
+   *
+   * @return End date of range
+   */
+  public String getEndDate() {
+<span class="nc bnc" id="L520" title="All 2 branches missed.">    if (!isRange()) {</span>
+<span class="nc" id="L521">      return isoDate;</span>
+    }
+<span class="nc bnc" id="L523" title="All 2 branches missed.">    if (isoDate.endsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L524">      return &quot;&quot;;</span>
+    }
+<span class="nc" id="L526">    String[] split = isoDate.split(&quot;/&quot;);</span>
+<span class="nc" id="L527">    return split[split.length - 1];</span>
+  }
+
+  /* -------------------------- Static Comparison Methods -------------------------- */
+  /**
+   * Returns true if date1 is after date2
+   * &lt;p/&gt;
+   * Several tricky cases exist, and implementation tries to
+   * go with the common sense interpretation:
+   * When a year and a month are given for one, but only a month
+   * for the other, it is assumed that both have the same year
+   * e.g:
+   * ****12 is after 200211
+   * &lt;p/&gt;
+   * When a year and a month are given for one but only a year
+   * for the other, it is assumed that one of these is after the
+   * other only if the years differ, e.g.:
+   * 2003 is after 200211
+   * 2002 is not after 200211
+   * 200211 is not after 2002
+   *
+   * @return Whether date2 is after date1
+   */
+  static boolean isAfter(String date1, String date2) {
+<span class="pc bpc" id="L551" title="2 of 4 branches missed.">    if (!isDateFormat(date1) || !isDateFormat(date2)) {</span>
+<span class="nc" id="L552">      return false;</span>
+    }
+<span class="fc" id="L554">    boolean after = true;</span>
+    //first check years
+<span class="fc" id="L556">    String year = date1.substring(0, 4);</span>
+<span class="fc" id="L557">    String yearOther = date2.substring(0, 4);</span>
+<span class="pc bpc" id="L558" title="1 of 4 branches missed.">    if (year.contains(&quot;*&quot;) || yearOther.contains(&quot;*&quot;)) {</span>
+<span class="pc bpc" id="L559" title="2 of 4 branches missed.">      after = after &amp;&amp; checkWildcardCompatibility(year, yearOther);</span>
+<span class="fc bfc" id="L560" title="All 2 branches covered.">    } else if (Integer.parseInt(year) &gt; Integer.parseInt(yearOther)) {</span>
+<span class="fc" id="L561">      return true;</span>
+<span class="fc bfc" id="L562" title="All 2 branches covered.">    } else if (Integer.parseInt(year) &lt; Integer.parseInt(yearOther)) {</span>
+<span class="fc" id="L563">      return false;</span>
+    }
+
+<span class="pc bpc" id="L566" title="1 of 4 branches missed.">    if (date1.length() &lt; 6 || date2.length() &lt; 6) {</span>
+<span class="pc bpc" id="L567" title="2 of 4 branches missed.">      if (year.contains(&quot;*&quot;) || yearOther.contains(&quot;*&quot;)) {</span>
+<span class="nc" id="L568">        return after;</span>
+      } else {
+<span class="pc bpc" id="L570" title="2 of 4 branches missed.">        return after &amp;&amp; (Integer.parseInt(year) != Integer.parseInt(yearOther));</span>
+      }
+    }
+    //then check months
+<span class="fc" id="L574">    String month = date1.substring(4, 6);</span>
+<span class="fc" id="L575">    String monthOther = date2.substring(4, 6);</span>
+<span class="fc bfc" id="L576" title="All 4 branches covered.">    if (month.contains(&quot;*&quot;) || monthOther.contains(&quot;*&quot;)) {</span>
+<span class="pc bpc" id="L577" title="2 of 4 branches missed.">      after = after &amp;&amp; checkWildcardCompatibility(month, monthOther);</span>
+<span class="fc bfc" id="L578" title="All 2 branches covered.">    } else if (Integer.parseInt(month) &gt; Integer.parseInt(monthOther)) {</span>
+<span class="fc" id="L579">      return true;</span>
+<span class="fc bfc" id="L580" title="All 2 branches covered.">    } else if (Integer.parseInt(month) &lt; Integer.parseInt(monthOther)) {</span>
+<span class="fc" id="L581">      return false;</span>
+    }
+
+<span class="fc bfc" id="L584" title="All 4 branches covered.">    if (date1.length() &lt; 8 || date2.length() &lt; 8) {</span>
+<span class="pc bpc" id="L585" title="1 of 4 branches missed.">      if (month.contains(&quot;*&quot;) || monthOther.contains(&quot;*&quot;)) {</span>
+<span class="fc" id="L586">        return after;</span>
+      } else {
+<span class="nc bnc" id="L588" title="All 4 branches missed.">        return after &amp;&amp; (Integer.parseInt(month) != Integer.parseInt(monthOther));</span>
+      }
+    }
+
+    //then check days
+<span class="fc" id="L593">    String day = date1.substring(6, 8);</span>
+<span class="fc" id="L594">    String dayOther = date2.substring(6, 8);</span>
+<span class="pc bpc" id="L595" title="2 of 4 branches missed.">    if (day.contains(&quot;*&quot;) || dayOther.contains(&quot;*&quot;)) {</span>
+<span class="nc bnc" id="L596" title="All 4 branches missed.">      after = after &amp;&amp; checkWildcardCompatibility(day, dayOther);</span>
+<span class="pc bpc" id="L597" title="1 of 2 branches missed.">    } else if (Integer.parseInt(day) &gt; Integer.parseInt(dayOther)) {</span>
+<span class="fc" id="L598">      return true;</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">    } else if (Integer.parseInt(day) &lt;= Integer.parseInt(dayOther)) {</span>
+<span class="nc" id="L600">      return false;</span>
+    }
+
+<span class="nc" id="L603">    return after;</span>
+  }
+
+  /**
+   * Right now, we say they're compatible iff one of them is all
+   * wildcards or they are equivalent
+   *
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  private static boolean checkWildcardAfterCompatibility(String txt1, String txt2) {
+<span class="nc bnc" id="L613" title="All 2 branches missed.">    if (txt1.length() != txt2.length()) {</span>
+<span class="nc" id="L614">      return false;</span>
+    }
+
+<span class="nc bnc" id="L617" title="All 2 branches missed.">    for (int i = 0; i &lt; txt1.length(); i++) {</span>
+<span class="nc" id="L618">      Character t1 = txt1.charAt(i);</span>
+<span class="nc" id="L619">      Character t2 = txt2.charAt(i);</span>
+<span class="nc bnc" id="L620" title="All 6 branches missed.">      if (!(t1.equals('*') || t2.equals('*') || t1.equals(t2))) {</span>
+<span class="nc" id="L621">        return false;</span>
+      }
+    }
+<span class="nc" id="L624">    return true;</span>
+  }
+
+  /**
+   * Returns true if the given txt contains only digits and &quot;*&quot; characters;
+   * false otherwise
+   *
+   */
+  private static boolean isDateFormat(String txt) {
+<span class="fc" id="L633">    String numberValue = txt.replace(&quot;*&quot;, &quot;&quot;);//remove wildcards</span>
+    try {
+<span class="fc" id="L635">      Integer.parseInt(numberValue);</span>
+<span class="fc" id="L636">      return true;</span>
+<span class="nc" id="L637">    } catch (Exception e) {</span>
+<span class="nc" id="L638">      return false;</span>
+    }
+  }
+
+  /**
+   * Returns true iff date1 could represent the same value as date2
+   * e.g.
+   * ****07 is compatible with 200207 (and 200207 is compatible with ****07)
+   * 200207 is compatible with 20020714 (?maybe need a better idea of use case here...)
+   *
+   */
+  public static boolean isCompatible(String date1, String date2) {
+<span class="fc" id="L650">    boolean compatible = true;</span>
+    //first check years
+<span class="pc bpc" id="L652" title="1 of 4 branches missed.">    compatible = compatible &amp;&amp; isYearCompatible(date1, date2);</span>
+
+    //then check months
+<span class="pc bpc" id="L655" title="1 of 4 branches missed.">    compatible = compatible &amp;&amp; isMonthCompatible(date1, date2);</span>
+
+    //then check days
+<span class="pc bpc" id="L658" title="1 of 4 branches missed.">    compatible = compatible &amp;&amp; isDayCompatible(date1, date2);</span>
+
+<span class="fc" id="L660">    return compatible;</span>
+
+  }
+
+  /**
+   * Checks if the years represented by the two dates are compatible
+   * If either lacks a year, we return true.
+   *
+   */
+  private static boolean isYearCompatible(String date1, String date2) {
+<span class="fc" id="L670">    boolean compatible = true;</span>
+<span class="pc bpc" id="L671" title="2 of 4 branches missed.">    if (date1.length() &lt; 4 || date2.length() &lt; 4) {</span>
+<span class="nc" id="L672">      return compatible;</span>
+    }
+    //first check years
+<span class="fc" id="L675">    String year = date1.substring(0, 4);</span>
+<span class="fc" id="L676">    String yearOther = date2.substring(0, 4);</span>
+<span class="pc bpc" id="L677" title="1 of 4 branches missed.">    if (year.contains(&quot;*&quot;) || yearOther.contains(&quot;*&quot;)) {</span>
+<span class="pc bpc" id="L678" title="2 of 4 branches missed.">      compatible = compatible &amp;&amp; checkWildcardCompatibility(year, yearOther);</span>
+<span class="fc bfc" id="L679" title="All 2 branches covered.">    } else if (!year.equals(yearOther)) {</span>
+<span class="fc" id="L680">      return false;</span>
+    }
+<span class="fc" id="L682">    return compatible;</span>
+  }
+
+  /**
+   * Checks if the months represented by the two dates are compatible
+   * If either lacks a month, we return true.
+   *
+   */
+  private static boolean isMonthCompatible(String date1, String date2) {
+<span class="fc" id="L691">    boolean compatible = true;</span>
+<span class="pc bpc" id="L692" title="2 of 4 branches missed.">    if (date1.length() &lt; 6 || date2.length() &lt; 6) {</span>
+<span class="nc" id="L693">      return compatible;</span>
+    }
+    //then check months
+<span class="fc" id="L696">    String month = date1.substring(4, 6);</span>
+<span class="fc" id="L697">    String monthOther = date2.substring(4, 6);</span>
+<span class="pc bpc" id="L698" title="1 of 4 branches missed.">    if (month.contains(&quot;*&quot;) || monthOther.contains(&quot;*&quot;)) {</span>
+<span class="pc bpc" id="L699" title="2 of 4 branches missed.">      compatible = (compatible &amp;&amp; checkWildcardCompatibility(month, monthOther));</span>
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">    } else if (!month.equals(monthOther)) {</span>
+<span class="nc" id="L701">      return false;</span>
+    }
+<span class="fc" id="L703">    return compatible;</span>
+  }
+
+  /**
+   * Checks if the days represented by the two dates are compatible
+   * If either lacks a day, we return true.
+   *
+   */
+  private static boolean isDayCompatible(String date1, String date2) {
+<span class="fc" id="L712">    boolean compatible = true;</span>
+<span class="pc bpc" id="L713" title="2 of 4 branches missed.">    if (date1.length() &lt; 8 || date2.length() &lt; 8) {</span>
+<span class="nc" id="L714">      return compatible;</span>
+    }
+    //then check days
+<span class="fc" id="L717">    String day = date1.substring(6, 8);</span>
+<span class="fc" id="L718">    String dayOther = date2.substring(6, 8);</span>
+<span class="pc bpc" id="L719" title="2 of 4 branches missed.">    if (day.contains(&quot;*&quot;) || dayOther.contains(&quot;*&quot;)) {</span>
+<span class="nc bnc" id="L720" title="All 4 branches missed.">      compatible = compatible &amp;&amp; checkWildcardCompatibility(day, dayOther);</span>
+<span class="pc bpc" id="L721" title="1 of 2 branches missed.">    } else if (!day.equals(dayOther)) {</span>
+<span class="nc" id="L722">      return false;</span>
+    }
+<span class="fc" id="L724">    return compatible;</span>
+  }
+
+
+  /**
+   */
+  private static boolean checkWildcardCompatibility(String txt1, String txt2) {
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">    if (txt1.length() != txt2.length()) {</span>
+<span class="nc" id="L732">      return false;</span>
+    }
+<span class="fc bfc" id="L734" title="All 2 branches covered.">    for (int i = 0; i &lt; txt1.length(); i++) {</span>
+<span class="fc" id="L735">      Character t1 = txt1.charAt(i);</span>
+<span class="fc" id="L736">      Character t2 = txt2.charAt(i);</span>
+<span class="pc bpc" id="L737" title="3 of 6 branches missed.">      if (!(t1.equals('*') || t2.equals('*') || t1.equals(t2))) {</span>
+<span class="nc" id="L738">        return false;</span>
+      }
+    }
+<span class="fc" id="L741">    return true;</span>
+  }
+
+
+  /* -------------------------- Instance Comparison Methods -------------------------- */
+  /**
+   * Returns true iff this date
+   * contains the date represented by other.
+   * A range contains a date if it
+   * is equal to or after the start date and equal to or
+   * before the end date.  For open ranges, contains
+   * is also inclusive of the one end point.
+   *
+   */
+  public boolean contains(ISODateInstance other) {
+<span class="nc bnc" id="L756" title="All 4 branches missed.">    if (this.isUnparseable() || other.isUnparseable()) {</span>
+<span class="nc" id="L757">      return this.isoDate.equals(other.isoDate);</span>
+    }
+<span class="nc" id="L759">    String start = this.getStartDate();</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">    if (!start.equals(&quot;&quot;)) {//we have a start date, need to make sure other is after it</span>
+<span class="nc" id="L761">      String startOther = other.getStartDate();</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">      if (startOther.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L763">        return false;//incompatible</span>
+      } else {
+<span class="nc bnc" id="L765" title="All 2 branches missed.">        if (!isAfter(startOther, start)) {</span>
+<span class="nc" id="L766">          return false;</span>
+        }
+      }
+    }
+    //now we've found out that the start date is appropriate, check the end date
+<span class="nc" id="L771">    String end = this.getEndDate();</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">    if (!end.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L773">      String endOther = other.getEndDate();</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">      if (endOther.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L775">        return false;</span>
+      } else {
+<span class="nc bnc" id="L777" title="All 2 branches missed.">        if (!isAfter(end, endOther)) {</span>
+<span class="nc" id="L778">          return false;</span>
+        }
+      }
+    }
+<span class="nc" id="L782">    return true;//passes both start and end</span>
+  }
+
+
+  /**
+   * Returns true if this date instance is after
+   * the given dateString.  If this date instance
+   * is a range, then returns true only if both
+   * start and end dates are after dateString.
+   * &lt;p/&gt;
+   * Several tricky cases exist, and implementation tries to
+   * go with the commonsense interpretation:
+   * When a year and a month are given for one, but only a month
+   * for the other, it is assumed that both have the same year
+   * e.g:
+   * ****12 is after 200211
+   * &lt;p/&gt;
+   * When a year and a month are given for one but only a year
+   * for the other, it is assumed that one of these is after the
+   * other only if the years differ, e.g.:
+   * 2003 is after 200211
+   * 2002 is not after 200211
+   * 200211 is not after 2002
+   *
+   */
+  public boolean isAfter(String dateString) {
+<span class="nc bnc" id="L808" title="All 2 branches missed.">    if (this.isUnparseable()) {</span>
+<span class="nc" id="L809">      return false;</span>
+    }
+<span class="nc bnc" id="L811" title="All 2 branches missed.">    if (!isDateFormat(dateString)) {</span>
+<span class="nc" id="L812">      return false;</span>
+    }
+<span class="nc" id="L814">    return isAfter(this.getEndDate(), dateString);</span>
+  }
+
+  public boolean isCompatibleDate(ISODateInstance other) {
+<span class="nc bnc" id="L818" title="All 4 branches missed.">    if (this.isUnparseable() || other.isUnparseable()) {</span>
+<span class="nc" id="L819">      return this.isoDate.equals(other.isoDate);</span>
+    }
+
+    //first see if either is a range
+<span class="nc bnc" id="L823" title="All 2 branches missed.">    if (this.isRange()) {</span>
+<span class="nc" id="L824">      return this.contains(other);</span>
+<span class="nc bnc" id="L825" title="All 2 branches missed.">    } else if (other.isRange()) {</span>
+<span class="nc" id="L826">      return false;//not compatible if other is range and this isn't</span>
+    } else {
+<span class="nc" id="L828">      return isCompatible(isoDate, other.getDateString());</span>
+    }
+  }
+
+  /**
+   * Looks if the years for the two dates are compatible.
+   * This method does not consider ranges and uses only the
+   * start date.
+   *
+   */
+  public boolean isYearCompatible(ISODateInstance other) {
+<span class="nc bnc" id="L839" title="All 4 branches missed.">    if (this.isUnparseable() || other.isUnparseable()) {</span>
+<span class="nc" id="L840">      return this.isoDate.equals(other.isoDate);</span>
+    }
+
+<span class="nc" id="L843">    return isYearCompatible(isoDate, other.getDateString());</span>
+  }
+
+  /**
+   * Looks if the months for the two dates are compatible.
+   * This method does not consider ranges and uses only the
+   * start date.
+   *
+   */
+  public boolean isMonthCompatible(ISODateInstance other) {
+<span class="nc bnc" id="L853" title="All 4 branches missed.">    if (this.isUnparseable() || other.isUnparseable()) {</span>
+<span class="nc" id="L854">      return this.isoDate.equals(other.isoDate);</span>
+    }
+
+<span class="nc" id="L857">    return isMonthCompatible(isoDate, other.getDateString());</span>
+  }
+
+  /**
+   * Looks if the days for the two dates are compatible.
+   * This method does not consider ranges and uses only the
+   * start date.
+   *
+   */
+  public boolean isDayCompatible(ISODateInstance other) {
+<span class="nc bnc" id="L867" title="All 4 branches missed.">    if (this.isUnparseable() || other.isUnparseable()) {</span>
+<span class="nc" id="L868">      return this.isoDate.equals(other.isoDate);</span>
+    }
+
+<span class="nc" id="L871">    return isDayCompatible(isoDate, other.getDateString());</span>
+  }
+
+
+  /* -------------------------- Tokenization and Field Extraction -------------------------- */
+  //These methods are taken directly from or modified slightly from {@link DateInstance}
+
+  private void tokenizeDate(String inputDate) {
+<span class="fc" id="L879">    tokens = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L880">    Pattern pat = Pattern.compile(&quot;[-]&quot;);</span>
+<span class="pc bpc" id="L881" title="1 of 2 branches missed.">    if (inputDate == null) {</span>
+<span class="nc" id="L882">      System.out.println(&quot;Null input date&quot;);</span>
+    }
+<span class="fc" id="L884">    Matcher m = pat.matcher(inputDate);</span>
+<span class="fc" id="L885">    String str = m.replaceAll(&quot; - &quot;);</span>
+<span class="fc" id="L886">    str = str.replaceAll(&quot;,&quot;, &quot; &quot;);</span>
+<span class="fc" id="L887">    PTBTokenizer&lt;Word&gt; tokenizer = PTBTokenizer.newPTBTokenizer(new BufferedReader(new StringReader(str)));</span>
+<span class="fc bfc" id="L888" title="All 2 branches covered.">    while (tokenizer.hasNext()) {</span>
+<span class="fc" id="L889">      Word nextToken = tokenizer.next();</span>
+<span class="fc" id="L890">      tokens.add(nextToken.toString());</span>
+<span class="fc" id="L891">    }</span>
+    if(DEBUG) {
+      System.out.println(&quot;tokens:&quot; + tokens);
+    }
+<span class="fc" id="L895">  }</span>
+
+
+  /**
+   * This method does YYYY-MM-DD style ISO date formats
+   *
+   * @return whether it worked.
+   */
+  private boolean extractYYYYMMDD(String inputDate) {
+<span class="fc" id="L904">    Pattern pat = Pattern.compile(&quot;([12][0-9]{3})[ /-]?([01]?[0-9])[ /-]([0-3]?[0-9])[ \t\r\n\f]*&quot;);</span>
+<span class="fc" id="L905">    Matcher m = pat.matcher(inputDate);</span>
+<span class="fc bfc" id="L906" title="All 2 branches covered.">    if (m.matches()) {</span>
+      if (DEBUG) {
+        log.info(&quot;YYYYMMDD succeeded&quot;);
+      }
+<span class="fc" id="L910">      String monthValue = m.group(2);</span>
+<span class="pc bpc" id="L911" title="1 of 2 branches missed.">      if (monthValue.length() &lt; 2)//we always use two digit months</span>
+      {
+<span class="nc" id="L913">        monthValue = '0' + monthValue;</span>
+      }
+<span class="fc" id="L915">      String dayValue = m.group(3);</span>
+<span class="pc bpc" id="L916" title="1 of 2 branches missed.">      if (dayValue.length() &lt; 2) {</span>
+<span class="nc" id="L917">        dayValue = '0' + dayValue;</span>
+      }
+<span class="fc" id="L919">      String yearString = m.group(1);</span>
+<span class="fc" id="L920">      isoDate = yearString + monthValue + dayValue;</span>
+<span class="fc" id="L921">      return true;</span>
+    }
+<span class="fc" id="L923">    return false;</span>
+  }
+
+  /**
+   * Note: This method copied from {@code DateInstance}; not sure how we tell that it
+   * is MMDD versus DDMM (sometimes it will be ambiguous).
+   *
+   */
+  private boolean extractMMDDYY(String inputDate) {
+<span class="fc" id="L932">    Pattern pat = Pattern.compile(&quot;([0-1]??[0-9])[ \t\n\r\f]*[/-][ \t\n\r\f]*([0-3]??[0-9])[ \t\r\n\f]*[/-][ \t\r\n\f]*([0-2]??[0-9]??[0-9][0-9])[ \t\r\n\f]*&quot;);</span>
+<span class="fc" id="L933">    Matcher m = pat.matcher(inputDate);</span>
+<span class="fc bfc" id="L934" title="All 2 branches covered.">    if (m.matches()) {</span>
+      if (DEBUG) {
+        log.info(&quot;MMDDYY succeeded&quot;);
+      }
+<span class="fc" id="L938">      String monthValue = m.group(1);</span>
+<span class="pc bpc" id="L939" title="1 of 2 branches missed.">      if (monthValue.length() &lt; 2)//we always use two digit months</span>
+      {
+<span class="nc" id="L941">        monthValue = '0' + monthValue;</span>
+      }
+<span class="fc" id="L943">      String dayValue = m.group(2);</span>
+<span class="pc bpc" id="L944" title="1 of 2 branches missed.">      if (dayValue.length() &lt; 2) {</span>
+<span class="nc" id="L945">        dayValue = '0' + dayValue;</span>
+      }
+      String yearString; // always initialized below
+<span class="pc bpc" id="L948" title="1 of 2 branches missed.">      if (m.group(3).length() == 2) {</span>
+<span class="fc" id="L949">        int yearInt = Integer.parseInt(m.group(3));</span>
+        //Now we add &quot;20&quot; or &quot;19&quot; to the front of the two digit year depending on its value....
+<span class="fc bfc" id="L951" title="All 2 branches covered.">        if (yearInt &lt; 50) {</span>
+<span class="fc" id="L952">          yearString = &quot;20&quot; + m.group(3);</span>
+        } else {
+<span class="fc" id="L954">          yearString = &quot;19&quot; + m.group(3);</span>
+        }
+
+<span class="fc" id="L957">      } else {</span>
+<span class="nc" id="L958">        yearString = m.group(3);</span>
+      }
+      //lastYearSet = new Integer(yearString).intValue();
+<span class="fc" id="L961">      isoDate = yearString + monthValue + dayValue;</span>
+<span class="fc" id="L962">      return true;</span>
+    }
+<span class="fc" id="L964">    return false;</span>
+  }
+
+<span class="pc" id="L967">  private Pattern re1 = Pattern.compile(&quot;[1-2][0-9]{3}|'[0-9]{2}&quot;);</span>
+<span class="pc" id="L968">  private Pattern re2 = Pattern.compile(&quot;[0-9][^0-9].*([0-9]{2})\\s*$&quot;);</span>
+
+  public boolean extractYear(String inputDate) {
+    if (DEBUG) {
+      log.info(&quot;Extracting year from: |&quot; + inputDate + '|');
+    }
+    String extract;
+<span class="fc" id="L975">    Matcher m1 = re1.matcher(inputDate);</span>
+<span class="fc" id="L976">    Matcher m2 = re2.matcher(inputDate);</span>
+<span class="fc bfc" id="L977" title="All 2 branches covered.">    if (m1.find()) {</span>
+<span class="fc" id="L978">      extract = m1.group(0);</span>
+<span class="fc bfc" id="L979" title="All 2 branches covered.">    } else if (m2.find()) {</span>
+<span class="fc" id="L980">      extract = m2.group(1);</span>
+    } else {
+<span class="fc" id="L982">      extract = foundMiscYearPattern(inputDate);</span>
+<span class="pc bpc" id="L983" title="2 of 4 branches missed.">      if (extract == null || extract.equals(&quot;&quot;)) {</span>
+<span class="fc" id="L984">        isoDate = &quot;****&quot;;</span>
+<span class="fc" id="L985">        return false;</span>
+      }
+    }
+
+<span class="pc bpc" id="L989" title="1 of 2 branches missed.">    if ( ! &quot;&quot;.equals(extract)) {</span>
+<span class="fc bfc" id="L990" title="All 2 branches covered.">      if (extract.charAt(0) == '\'') {</span>
+<span class="fc" id="L991">        extract = extract.substring(1);</span>
+      }
+<span class="fc" id="L993">      extract = extract.trim();</span>
+<span class="fc bfc" id="L994" title="All 2 branches covered.">      if (extract.length() == 2) {</span>
+<span class="fc bfc" id="L995" title="All 2 branches covered.">        if (extract.charAt(0) &lt; '5') {</span>
+<span class="fc" id="L996">          extract = &quot;20&quot; + extract;</span>
+        } else {
+<span class="fc" id="L998">          extract = &quot;19&quot; + extract;</span>
+        }
+      }
+<span class="pc bpc" id="L1001" title="1 of 2 branches missed.">      if (inputDate.charAt(inputDate.length() - 1) == 's') {//decade or century marker</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">        if (extract.charAt(2) == '0') {//e.g., 1900s -&gt; 1900/1999</span>
+<span class="nc" id="L1003">          String endDate = Integer.toString((Integer.parseInt(extract) + 99));</span>
+<span class="nc" id="L1004">          extract = extract + '/' + endDate;</span>
+<span class="nc" id="L1005">        } else {//e.g., 1920s -&gt; 1920/1929</span>
+<span class="nc" id="L1006">          String endDate = Integer.toString((Integer.parseInt(extract) + 9));</span>
+<span class="nc" id="L1007">          extract = extract + '/' + endDate;</span>
+        }
+      }
+<span class="fc" id="L1010">      isoDate = extract;</span>
+      if (DEBUG) {
+        log.info(&quot;year extracted:&quot; + extract);
+      }
+<span class="fc" id="L1014">      return true;</span>
+    }
+<span class="nc" id="L1016">    isoDate = &quot;****&quot;;</span>
+<span class="nc" id="L1017">    return false;</span>
+  }
+
+  /**
+   * Tries to find a year pattern in the input string that may be somewhat
+   * odd/non-standard.
+   *
+   */
+  private static String foundMiscYearPattern(String inputDate) {
+<span class="fc" id="L1026">    String year = &quot;&quot;;</span>
+<span class="pc bpc" id="L1027" title="1 of 2 branches missed.">    if (inputDate.toLowerCase().contains(&quot;century&quot;)) {</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">      if (inputDate.endsWith(&quot;A.D. &quot;)) {</span>
+<span class="nc" id="L1029">        inputDate = inputDate.substring(0, inputDate.length()-5);</span>
+        if(DEBUG) {
+          System.out.println(&quot;inputDate: |&quot; + inputDate + &quot;|&quot;);
+        }
+      }
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">      if (inputDate.startsWith(&quot;late&quot;)) {</span>
+<span class="nc" id="L1035">        inputDate = inputDate.substring(5, inputDate.length());</span>
+        if(DEBUG) {
+          System.out.println(&quot;inputDate: |&quot; + inputDate + &quot;|&quot;);
+        }
+      }
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">      if (inputDate.startsWith(&quot;early&quot;)) {</span>
+<span class="nc" id="L1041">        inputDate = inputDate.substring(6, inputDate.length());</span>
+        if(DEBUG) {
+          System.out.println(&quot;inputDate: |&quot; + inputDate + &quot;|&quot;);
+        }
+      }
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">      if (Character.isDigit(inputDate.charAt(0))) {</span>
+        // just parse number part, assuming last two letters are st/nd/rd
+<span class="nc" id="L1048">        year = QuantifiableEntityNormalizer.normalizedNumberStringQuiet(inputDate.substring(0, inputDate.length() - 2), 1, &quot;&quot;, null);</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (year == null) {</span>
+<span class="nc" id="L1050">          year = &quot;&quot;;</span>
+        }
+<span class="nc bnc" id="L1052" title="All 2 branches missed.">        if (year.contains(&quot;.&quot;)) {//number format issue</span>
+<span class="nc" id="L1053">          year = year.substring(0, year.indexOf('.'));</span>
+        }
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">        while (year.length() &lt; 4) {</span>
+<span class="nc" id="L1056">          year = year + '*';</span>
+        }
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">      } else if (QuantifiableEntityNormalizer.ordinalsToValues.containsKey(inputDate)) {</span>
+<span class="nc" id="L1059">        year = Double.toString(QuantifiableEntityNormalizer.ordinalsToValues.getCount(inputDate));</span>
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        while (year.length() &lt; 4) {</span>
+<span class="nc" id="L1061">          year = year + '*';</span>
+        }
+      } else {
+        if (DEBUG) {
+          System.out.println(&quot;ISODateInstance: Couldn't parse probable century: &quot; + inputDate);
+        }
+<span class="nc" id="L1067">        year = &quot;&quot;;</span>
+      }
+    }
+<span class="fc" id="L1070">    return year;</span>
+  }
+
+<span class="fc" id="L1073">  private static final Pattern[] extractorArray = {Pattern.compile(&quot;[Jj]anuary|JANUARY|[Jj]an\\.?|JAN\\.?&quot;), Pattern.compile(&quot;[Ff]ebruary|FEBRUARY|[Ff]eb\\.?|FEB\\.?&quot;), Pattern.compile(&quot;[Mm]arch|MARCH|[Mm]ar\\.?|MAR\\.?&quot;), Pattern.compile(&quot;[Aa]pril|APRIL|[Aa]pr\\.?|APR\\.?&quot;), Pattern.compile(&quot;[Mm]ay|MAY&quot;), Pattern.compile(&quot;[Jj]une|JUNE|[Jj]un\\.?|JUN\\.?&quot;), Pattern.compile(&quot;[Jj]uly|JULY|[Jj]ul\\.?|JUL\\.?&quot;), Pattern.compile(&quot;[Aa]ugust|AUGUST|[Aa]ug\\.?|AUG\\.?&quot;), Pattern.compile(&quot;[Ss]eptember|SEPTEMBER|[Ss]ept?\\.?|SEPT?\\.?&quot;), Pattern.compile(&quot;[Oo]ctober|OCTOBER|[Oo]ct\\.?|OCT\\.?&quot;), Pattern.compile(&quot;[Nn]ovember|NOVEMBER|[Nn]ov\\.?|NOV\\.?&quot;), Pattern.compile(&quot;[Dd]ecember|DECEMBER|[Dd]ec(?:\\.|[^aeiou]|$)|DEC(?:\\.|[^aeiou]|$)&quot;)}; // avoid matching &quot;decades&quot;!</span>
+
+  public boolean extractMonth(String inputDate) {
+<span class="fc" id="L1076">    boolean foundMonth = false;</span>
+
+<span class="fc bfc" id="L1078" title="All 2 branches covered.">    for (int i = 0; i &lt; 12; i++) {</span>
+<span class="fc" id="L1079">      String extract = &quot;&quot;;</span>
+<span class="fc" id="L1080">      Matcher m = extractorArray[i].matcher(inputDate);</span>
+<span class="fc bfc" id="L1081" title="All 2 branches covered.">      if (m.find()) {</span>
+<span class="fc" id="L1082">        extract = m.group(0);</span>
+      }
+<span class="fc bfc" id="L1084" title="All 2 branches covered.">      if ( ! &quot;&quot;.equals(extract)) {</span>
+<span class="pc bpc" id="L1085" title="1 of 2 branches missed.">        if (!foundMonth) {</span>
+          if (DEBUG) {
+            log.info(&quot;month extracted: &quot; + extract);
+          }
+<span class="fc" id="L1089">          int monthNum = i + 1;</span>
+<span class="pc bpc" id="L1090" title="1 of 2 branches missed.">          if (isoDate.length() != 4) {</span>
+<span class="nc" id="L1091">            isoDate = &quot;****&quot;;</span>
+          }
+<span class="fc bfc" id="L1093" title="All 2 branches covered.">          String month = (monthNum &lt; 10) ? &quot;0&quot; + monthNum : String.valueOf(monthNum);</span>
+<span class="fc" id="L1094">          isoDate += month;</span>
+<span class="fc" id="L1095">          foundMonth = true;</span>
+        }
+      }
+    }
+<span class="fc" id="L1099">    return foundMonth;</span>
+  }
+
+  public boolean extractDay(String inputDate) {
+    try {
+<span class="fc bfc" id="L1104" title="All 2 branches covered.">      for (String extract : tokens) {</span>
+<span class="pc bpc" id="L1105" title="1 of 2 branches missed.">        if (QuantifiableEntityNormalizer.wordsToValues.containsKey(extract)) {</span>
+<span class="nc" id="L1106">          extract = Integer.toString(Double.valueOf(QuantifiableEntityNormalizer.wordsToValues.getCount(extract)).intValue());</span>
+<span class="pc bpc" id="L1107" title="1 of 2 branches missed.">        } else if (QuantifiableEntityNormalizer.ordinalsToValues.containsKey(extract)) {</span>
+<span class="nc" id="L1108">          extract = Integer.toString(Double.valueOf(QuantifiableEntityNormalizer.ordinalsToValues.getCount(extract)).intValue());</span>
+        }
+<span class="fc" id="L1110">        extract = extract.replaceAll(&quot;[^0-9]&quot;, &quot;&quot;);</span>
+<span class="fc bfc" id="L1111" title="All 2 branches covered.">        if ( ! extract.isEmpty()) {</span>
+<span class="fc" id="L1112">          Long i = Long.parseLong(extract);</span>
+<span class="fc bfc" id="L1113" title="All 4 branches covered.">          if (i.intValue() &lt; 32L &amp;&amp; i.intValue() &gt; 0L) {</span>
+<span class="pc bpc" id="L1114" title="1 of 2 branches missed.">            if (isoDate.length() &lt; 6) { //should already have year and month</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">              if (isoDate.length() != 4) { //throw new RuntimeException(&quot;Error extracting dates; should have had month and year but didn't&quot;);</span>
+<span class="nc" id="L1116">                isoDate = isoDate + &quot;******&quot;;</span>
+              } else {
+<span class="nc" id="L1118">                isoDate = isoDate + &quot;**&quot;;</span>
+              }
+            }
+<span class="fc bfc" id="L1121" title="All 2 branches covered.">            String day = (i &lt; 10) ? &quot;0&quot; + i : String.valueOf(i);</span>
+<span class="fc" id="L1122">            isoDate = isoDate + day;</span>
+<span class="fc" id="L1123">            return true;</span>
+          }
+        }
+<span class="fc" id="L1126">      }</span>
+<span class="nc" id="L1127">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L1128">      log.info(&quot;Exception in extract Day.&quot;);</span>
+<span class="nc" id="L1129">      log.info(&quot;tokens size :&quot; + tokens.size());</span>
+<span class="nc" id="L1130">      e.printStackTrace();</span>
+<span class="fc" id="L1131">    }</span>
+<span class="fc" id="L1132">    return false;</span>
+  }
+
+<span class="fc" id="L1135">  private static final Pattern[] weekdayArray = {Pattern.compile(&quot;[Ss]unday&quot;), Pattern.compile(&quot;[Mm]onday&quot;), Pattern.compile(&quot;[Tt]uesday&quot;), Pattern.compile(&quot;[Ww]ednesday&quot;), Pattern.compile(&quot;[Tt]hursday&quot;), Pattern.compile(&quot;[Ff]riday&quot;), Pattern.compile(&quot;[Ss]aturday&quot;)};</span>
+
+  /**
+   * This is a backup method if everything else fails.  It searches for named
+   * days of the week and if it finds one, it sets that as the date in lowercase form
+   *
+   */
+  public boolean extractWeekday(String inputDate) {
+<span class="pc bpc" id="L1143" title="1 of 2 branches missed.">    for (Pattern p : weekdayArray) {</span>
+<span class="fc" id="L1144">      Matcher m = p.matcher(inputDate);</span>
+<span class="fc bfc" id="L1145" title="All 2 branches covered.">      if (m.find()) {</span>
+<span class="fc" id="L1146">        String extract = m.group(0);</span>
+<span class="fc" id="L1147">        isoDate = extract.toLowerCase();</span>
+<span class="fc" id="L1148">        return true;</span>
+      }
+    }
+<span class="nc" id="L1151">    return false;</span>
+  }
+
+  /**
+   * For testing only
+   *
+   */
+  public static void main(String[] args) {
+<span class="nc" id="L1159">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L1160">    String dateProperty = props.getProperty(&quot;date&quot;);</span>
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">    if (dateProperty != null) {</span>
+<span class="nc" id="L1162">      ISODateInstance d = new ISODateInstance(dateProperty);</span>
+<span class="nc" id="L1163">      System.out.println(dateProperty + &quot; processed as &quot; + d.toString());</span>
+    }
+<span class="nc" id="L1165">  }</span>
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

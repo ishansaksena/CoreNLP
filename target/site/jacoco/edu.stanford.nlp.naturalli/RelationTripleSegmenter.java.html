@@ -1,0 +1,885 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RelationTripleSegmenter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.naturalli</a> &gt; <span class="el_source">RelationTripleSegmenter.java</span></div><h1>RelationTripleSegmenter.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.naturalli;
+
+import edu.stanford.nlp.ie.machinereading.structure.Span;
+import edu.stanford.nlp.ie.util.RelationTriple;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.tokensregex.TokenSequenceMatcher;
+import edu.stanford.nlp.ling.tokensregex.TokenSequencePattern;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexMatcher;
+import edu.stanford.nlp.semgraph.semgrex.SemgrexPattern;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.PriorityQueue;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * This class takes a {@link edu.stanford.nlp.naturalli.SentenceFragment} and converts it to a conventional
+ * OpenIE triple, as materialized in the {@link RelationTriple} class.
+ *
+ * @author Gabor Angeli
+ */
+<span class="pc bpc" id="L25" title="1 of 2 branches missed.">@SuppressWarnings(&quot;WeakerAccess&quot;)</span>
+public class RelationTripleSegmenter {
+
+  private final boolean allowNominalsWithoutNER;
+
+  /** A list of patterns to match relation extractions against */
+<span class="fc" id="L31">  public final List&lt;SemgrexPattern&gt; VERB_PATTERNS = Collections.unmodifiableList(new ArrayList&lt;SemgrexPattern&gt;() {{</span>
+    // { blue cats play [quietly] with yarn,
+    //   Jill blew kisses at Jack,
+    //   cats are standing next to dogs }
+<span class="fc" id="L35">    add(SemgrexPattern.compile(&quot;{$}=verb ?&gt;/cop|aux(pass)?/ {}=be &gt;/.subj(pass)?/ {}=subject &gt;/(nmod|acl|advcl):.*/=prepEdge ( {}=object ?&gt;appos {} = appos ?&gt;case {}=prep) ?&gt;dobj {pos:/N.*/}=relObj&quot;));</span>
+    // { cats are cute,
+    //   horses are grazing peacefully }
+<span class="fc" id="L38">    add(SemgrexPattern.compile(&quot;{$}=object &gt;/.subj(pass)?/ {}=subject &gt;/cop|aux(pass)?/ {}=verb ?&gt;case {}=prep&quot;));</span>
+    // { fish like to swim }
+<span class="fc" id="L40">    add(SemgrexPattern.compile(&quot;{$}=verb &gt;/.subj(pass)?/ {}=subject &gt;xcomp ( {}=object ?&gt;appos {}=appos )&quot;));</span>
+    // { cats have tails }
+<span class="fc" id="L42">    add(SemgrexPattern.compile(&quot;{$}=verb ?&gt;/aux(pass)?/ {}=be &gt;/.subj(pass)?/ {}=subject &gt;/[di]obj|xcomp/ ( {}=object ?&gt;appos {}=appos )&quot;));</span>
+    // { Tom and Jerry were fighting }
+<span class="fc" id="L44">    add(SemgrexPattern.compile(&quot;{$}=verb &gt;/nsubj(pass)?/ ( {}=subject &gt;/conj:and/=subjIgnored {}=object )&quot;));</span>
+    // { mass of iron is 55amu }
+<span class="fc" id="L46">    add(SemgrexPattern.compile(&quot;{pos:/NNS?/}=object &gt;cop {}=relappend1 &gt;/nsubj(pass)?/ ( {}=verb &gt;/nmod:of/ ( {pos:/NNS?/}=subject &gt;case {}=relappend0 ) )&quot;));</span>
+<span class="fc" id="L47">  }});</span>
+
+  /**
+   * &lt;p&gt;
+   *   A set of derivative patterns from {@link RelationTripleSegmenter#VERB_PATTERNS} that ignore the subject
+   *   arc. This is useful primarily for creating a training set for the clause splitter which emulates the
+   *   behavior of the relation triple segmenter component.
+   * &lt;/p&gt;
+   */
+<span class="fc" id="L56">  public final List&lt;SemgrexPattern&gt; VP_PATTERNS = Collections.unmodifiableList(new ArrayList&lt;SemgrexPattern&gt;() {{</span>
+<span class="fc bfc" id="L57" title="All 2 branches covered.">    for (SemgrexPattern pattern : VERB_PATTERNS) {</span>
+<span class="fc" id="L58">      String fullPattern = pattern.pattern();</span>
+<span class="fc" id="L59">      String vpPattern = fullPattern</span>
+<span class="fc" id="L60">          .replace(&quot;&gt;/.subj(pass)?/ {}=subject&quot;, &quot;&quot;)  // drop the subject</span>
+<span class="fc" id="L61">          .replace(&quot;$&quot;, &quot;pos:/V.*/&quot;);                 // but, force the root to be on a verb</span>
+<span class="fc" id="L62">      add(SemgrexPattern.compile(vpPattern));</span>
+<span class="fc" id="L63">    }</span>
+<span class="fc" id="L64">  }});</span>
+
+  /**
+   * A set of nominal patterns, that don't require being in a coherent clause, but do require NER information.
+   */
+<span class="fc" id="L69">  public final List&lt;TokenSequencePattern&gt; NOUN_TOKEN_PATTERNS = Collections.unmodifiableList(new ArrayList&lt;TokenSequencePattern&gt;() {{</span>
+    // { NER nominal_verb NER,
+    //   United States president Obama }
+<span class="fc" id="L72">    add(TokenSequencePattern.compile(&quot;(?$object [ner:/PERSON|ORGANIZATION|LOCATION+/]+ ) (?$beof_comp [ {tag:/NN.*/} &amp; !{ner:/PERSON|ORGANIZATION|LOCATION/} ]+ ) (?$subject [ner:/PERSON|ORGANIZATION|LOCATION/]+ )&quot;));</span>
+    // { NER 's nominal_verb NER,
+    //   America 's president , Obama }
+<span class="fc" id="L75">    add(TokenSequencePattern.compile(&quot;(?$object [ner:/PERSON|ORGANIZATION|LOCATION+/]+ ) /'s/ (?$beof_comp [ {tag:/NN.*/} &amp; !{ner:/PERSON|ORGANIZATION|LOCATION/} ]+ ) /,/? (?$subject [ner:/PERSON|ORGANIZATION|LOCATION/]+ )&quot;));</span>
+    // { NER , NER ,,
+    //   Obama, 28, ...,
+    //   Obama (28) ...}
+<span class="fc" id="L79">    add(TokenSequencePattern.compile(&quot;(?$subject [ner:/PERSON|ORGANIZATION|LOCATION/]+ ) /,/ (?$object [ner:/NUMBER|DURATION|PERSON|ORGANIZATION/]+ ) /,/&quot;));</span>
+<span class="fc" id="L80">    add(TokenSequencePattern.compile(&quot;(?$subject [ner:/PERSON|ORGANIZATION|LOCATION/]+ ) /\\(/ (?$object [ner:/NUMBER|DURATION|PERSON|ORGANIZATION/]+ ) /\\)/&quot;));</span>
+<span class="fc" id="L81">  }});</span>
+
+  /**
+   * A set of nominal patterns using dependencies, that don't require being in a coherent clause, but do require NER information.
+   */
+  private final List&lt;SemgrexPattern&gt; NOUN_DEPENDENCY_PATTERNS;
+
+
+  /**
+   * Create a new relation triple segmenter.
+   *
+   * @param allowNominalsWithoutNER If true, extract all nominal relations and not just those which are warranted based on
+   *                                named entity tags. For most practical applications, this greatly over-produces trivial triples.
+   */
+<span class="fc" id="L95">  public RelationTripleSegmenter(boolean allowNominalsWithoutNER) {</span>
+<span class="fc" id="L96">    this.allowNominalsWithoutNER = allowNominalsWithoutNER;</span>
+<span class="fc" id="L97">    NOUN_DEPENDENCY_PATTERNS = Collections.unmodifiableList(new ArrayList&lt;SemgrexPattern&gt;() {{</span>
+      // { Durin, son of Thorin }
+<span class="fc" id="L99">      add(SemgrexPattern.compile(&quot;{tag:/N.*/}=subject &gt;appos ( {}=relation &gt;/nmod:.*/=relaux {}=object)&quot;));</span>
+      // { Thorin's son, Durin }
+<span class="fc" id="L101">      add(SemgrexPattern.compile(&quot;{}=relation &gt;/nmod:.*/=relaux {}=subject &gt;appos {}=object&quot;));</span>
+      // { Stanford's Chris Manning  }
+<span class="fc" id="L103">      add(SemgrexPattern.compile(&quot;{tag:/N.*/}=object &gt;/nmod:poss/=relaux ( {}=subject &gt;case {} )&quot;));</span>
+      // { Chris Manning of Stanford,
+      //   [There are] cats with tails,
+<span class="fc bfc" id="L106" title="All 2 branches covered.">      if (allowNominalsWithoutNER) {</span>
+<span class="fc" id="L107">        add(SemgrexPattern.compile(&quot;{tag:/N.*/}=subject &gt;/nmod:(?!poss).*/=relaux {}=object&quot;));</span>
+      } else {
+<span class="fc" id="L109">        add(SemgrexPattern.compile(&quot;{ner:/PERSON|ORGANIZATION|LOCATION/}=subject &gt;/nmod:(?!poss).*/=relaux {ner:/..+/}=object&quot;));</span>
+<span class="fc" id="L110">        add(SemgrexPattern.compile(&quot;{tag:/N.*/}=subject &gt;/nmod:(in|with)/=relaux {}=object&quot;));</span>
+      }
+      //  { President Obama }
+<span class="fc bfc" id="L113" title="All 2 branches covered.">      if (allowNominalsWithoutNER) {</span>
+<span class="fc" id="L114">        add(SemgrexPattern.compile(&quot;{tag:/N.*/}=subject &gt;/amod/=arc {}=object&quot;));</span>
+      } else {
+<span class="fc" id="L116">        add(SemgrexPattern.compile(&quot;{ner:/PERSON|ORGANIZATION|LOCATION/}=subject &gt;/amod|compound/=arc {ner:/..+/}=object&quot;));</span>
+      }
+<span class="fc" id="L118">    }});</span>
+<span class="fc" id="L119">  }</span>
+
+  /**
+   * @see RelationTripleSegmenter#RelationTripleSegmenter(boolean)
+   */
+  @SuppressWarnings(&quot;UnusedDeclaration&quot;)
+  public RelationTripleSegmenter() {
+<span class="fc" id="L126">    this(false);</span>
+<span class="fc" id="L127">  }</span>
+
+  /**
+   * Extract the nominal patterns from this sentence.
+   *
+   * @see RelationTripleSegmenter#NOUN_TOKEN_PATTERNS
+   * @see RelationTripleSegmenter#NOUN_DEPENDENCY_PATTERNS
+   *
+   * @param parse The parse tree of the sentence to annotate.
+   * @param tokens The tokens of the sentence to annotate.
+   * @return A list of {@link RelationTriple}s. Note that these do not have an associated tree with them.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  public List&lt;RelationTriple&gt; extract(SemanticGraph parse, List&lt;CoreLabel&gt; tokens) {
+<span class="fc" id="L141">    List&lt;RelationTriple&gt; extractions = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L142">    Set&lt;Triple&lt;Span,String,Span&gt;&gt; alreadyExtracted = new HashSet&lt;&gt;();</span>
+
+    //
+    // Run Token Patterns
+    //
+<span class="fc bfc" id="L147" title="All 2 branches covered.">    for (TokenSequencePattern tokenPattern : NOUN_TOKEN_PATTERNS) {</span>
+<span class="fc" id="L148">      TokenSequenceMatcher tokenMatcher = tokenPattern.matcher(tokens);</span>
+<span class="fc bfc" id="L149" title="All 2 branches covered.">      while (tokenMatcher.find()) {</span>
+        boolean missingPrefixBe;
+<span class="fc" id="L151">        boolean missingSuffixOf = false;</span>
+
+        // Create subject
+<span class="fc" id="L154">        List&lt;? extends CoreMap&gt; subject = tokenMatcher.groupNodes(&quot;$subject&quot;);</span>
+<span class="fc" id="L155">        Span subjectSpan = Util.extractNER(tokens, Span.fromValues(((CoreLabel) subject.get(0)).index() - 1, ((CoreLabel) subject.get(subject.size() - 1)).index()));</span>
+<span class="fc" id="L156">        List&lt;CoreLabel&gt; subjectTokens = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L157" title="All 2 branches covered.">        for (int i : subjectSpan) {</span>
+<span class="fc" id="L158">          subjectTokens.add(tokens.get(i));</span>
+<span class="fc" id="L159">        }</span>
+
+        // Create object
+<span class="fc" id="L162">        List&lt;? extends CoreMap&gt; object = tokenMatcher.groupNodes(&quot;$object&quot;);</span>
+<span class="fc" id="L163">        Span objectSpan = Util.extractNER(tokens, Span.fromValues(((CoreLabel) object.get(0)).index() - 1, ((CoreLabel) object.get(object.size() - 1)).index()));</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">        if (Span.overlaps(subjectSpan, objectSpan)) {</span>
+<span class="nc" id="L165">          continue;</span>
+        }
+<span class="fc" id="L167">        List&lt;CoreLabel&gt; objectTokens = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L168" title="All 2 branches covered.">        for (int i : objectSpan) {</span>
+<span class="fc" id="L169">          objectTokens.add(tokens.get(i));</span>
+<span class="fc" id="L170">        }</span>
+
+        // Create relation
+<span class="pc bpc" id="L173" title="2 of 4 branches missed.">        if (subjectTokens.size() &gt; 0 &amp;&amp; objectTokens.size() &gt; 0) {</span>
+<span class="fc" id="L174">          List&lt;CoreLabel&gt; relationTokens = new ArrayList&lt;&gt;();</span>
+          // (add the 'be')
+<span class="fc" id="L176">          missingPrefixBe = true;</span>
+          // (add a complement to the 'be')
+<span class="fc" id="L178">          List&lt;? extends CoreMap&gt; beofComp = tokenMatcher.groupNodes(&quot;$beof_comp&quot;);</span>
+<span class="pc bpc" id="L179" title="1 of 2 branches missed.">          if (beofComp != null) {</span>
+            // (add the complement
+<span class="fc bfc" id="L181" title="All 2 branches covered.">            for (CoreMap token : beofComp) {</span>
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">              if (token instanceof CoreLabel) {</span>
+<span class="fc" id="L183">                relationTokens.add((CoreLabel) token);</span>
+              } else {
+<span class="nc" id="L185">                relationTokens.add(new CoreLabel(token));</span>
+              }
+<span class="fc" id="L187">            }</span>
+            // (add the 'of')
+<span class="fc" id="L189">            missingSuffixOf = true;</span>
+          }
+          // Add extraction
+<span class="fc" id="L192">          String relationGloss = StringUtils.join(relationTokens.stream().map(CoreLabel::word), &quot; &quot;);</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">          if (!alreadyExtracted.contains(Triple.makeTriple(subjectSpan, relationGloss, objectSpan))) {</span>
+<span class="fc" id="L194">            RelationTriple extraction = new RelationTriple(subjectTokens, relationTokens, objectTokens);</span>
+            //noinspection ConstantConditions
+<span class="fc" id="L196">            extraction.isPrefixBe(missingPrefixBe);</span>
+<span class="fc" id="L197">            extraction.isSuffixOf(missingSuffixOf);</span>
+<span class="fc" id="L198">            extractions.add(extraction);</span>
+<span class="fc" id="L199">            alreadyExtracted.add(Triple.makeTriple(subjectSpan, relationGloss, objectSpan));</span>
+          }
+        }
+<span class="fc" id="L202">      }</span>
+
+      //
+      // Run Semgrex Matches
+      //
+<span class="fc bfc" id="L207" title="All 2 branches covered.">      for (SemgrexPattern semgrex : NOUN_DEPENDENCY_PATTERNS) {</span>
+<span class="fc" id="L208">        SemgrexMatcher matcher = semgrex.matcher(parse);</span>
+<span class="fc bfc" id="L209" title="All 2 branches covered.">        while (matcher.find()) {</span>
+<span class="fc" id="L210">          boolean missingPrefixBe = false;</span>
+<span class="fc" id="L211">          boolean missingSuffixBe = false;</span>
+<span class="fc" id="L212">          boolean istmod = false;</span>
+
+          // Get relaux if applicable
+<span class="fc" id="L215">          String relaux = matcher.getRelnString(&quot;relaux&quot;);</span>
+<span class="fc" id="L216">          String ignoredArc = relaux;</span>
+<span class="fc bfc" id="L217" title="All 2 branches covered.">          if (ignoredArc == null) {</span>
+<span class="fc" id="L218">            ignoredArc = matcher.getRelnString(&quot;arc&quot;);</span>
+          }
+
+          // Create subject
+<span class="fc" id="L222">          IndexedWord subject = matcher.getNode(&quot;subject&quot;);</span>
+<span class="fc" id="L223">          List&lt;IndexedWord&gt; subjectTokens = new ArrayList&lt;&gt;();</span>
+          Span subjectSpan;
+<span class="pc bpc" id="L225" title="1 of 4 branches missed.">          if (subject.ner() != null &amp;&amp; !&quot;O&quot;.equals(subject.ner())) {</span>
+<span class="fc" id="L226">            subjectSpan = Util.extractNER(tokens, Span.fromValues(subject.index() - 1, subject.index()));</span>
+<span class="fc bfc" id="L227" title="All 2 branches covered.">            for (int i : subjectSpan) {</span>
+<span class="fc" id="L228">              subjectTokens.add(new IndexedWord(tokens.get(i)));</span>
+<span class="fc" id="L229">            }</span>
+          } else {
+<span class="fc" id="L231">            subjectTokens = getValidChunk(parse, subject, VALID_SUBJECT_ARCS, Optional.ofNullable(ignoredArc), true).orElse(Collections.singletonList(subject));</span>
+<span class="fc" id="L232">            subjectSpan = Util.tokensToSpan(subjectTokens);</span>
+          }
+
+          // Create object
+<span class="fc" id="L236">          IndexedWord object = matcher.getNode(&quot;object&quot;);</span>
+<span class="fc" id="L237">          List&lt;IndexedWord&gt; objectTokens = new ArrayList&lt;&gt;();</span>
+          Span objectSpan;
+<span class="fc bfc" id="L239" title="All 4 branches covered.">          if (object.ner() != null &amp;&amp; !&quot;O&quot;.equals(object.ner())) {</span>
+<span class="fc" id="L240">            objectSpan = Util.extractNER(tokens, Span.fromValues(object.index() - 1, object.index()));</span>
+<span class="fc bfc" id="L241" title="All 2 branches covered.">            for (int i : objectSpan) {</span>
+<span class="fc" id="L242">              objectTokens.add(new IndexedWord(tokens.get(i)));</span>
+<span class="fc" id="L243">            }</span>
+          } else {
+<span class="fc" id="L245">            objectTokens = getValidChunk(parse, object, VALID_OBJECT_ARCS, Optional.ofNullable(ignoredArc), true).orElse(Collections.singletonList(object));</span>
+<span class="fc" id="L246">            objectSpan = Util.tokensToSpan(objectTokens);</span>
+          }
+
+          // Check that the pair is valid
+<span class="fc bfc" id="L250" title="All 2 branches covered.">          if (Span.overlaps(subjectSpan, objectSpan)) {</span>
+<span class="fc" id="L251">            continue;  // We extracted an identity</span>
+          }
+<span class="fc bfc" id="L253" title="All 2 branches covered.">          if (subjectSpan.end() == objectSpan.start() - 1 &amp;&amp;</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">              (tokens.get(subjectSpan.end()).word().matches(&quot;[\\.,:;\\('\&quot;]&quot;) ||</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">                  &quot;CC&quot;.equals(tokens.get(subjectSpan.end()).tag()))) {</span>
+<span class="nc" id="L256">            continue; // We're straddling a clause</span>
+          }
+<span class="fc bfc" id="L258" title="All 2 branches covered.">          if (objectSpan.end() == subjectSpan.start() - 1 &amp;&amp;</span>
+<span class="fc bfc" id="L259" title="All 2 branches covered.">              (tokens.get(objectSpan.end()).word().matches(&quot;[\\.,:;\\('\&quot;]&quot;) ||</span>
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">                  &quot;CC&quot;.equals(tokens.get(objectSpan.end()).tag()))) {</span>
+<span class="nc" id="L261">            continue; // We're straddling a clause</span>
+          }
+
+          // Get any prepositional edges
+<span class="fc bfc" id="L265" title="All 2 branches covered.">          String expected = relaux == null ? &quot;&quot; : relaux.substring(relaux.indexOf(&quot;:&quot;) + 1).replace(&quot;_&quot;, &quot; &quot;);</span>
+<span class="fc" id="L266">          IndexedWord prepWord = null;</span>
+          // (these usually come from the object)
+<span class="fc" id="L268">          boolean prepositionIsPrefix = false;</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">          for (SemanticGraphEdge edge : parse.outgoingEdgeIterable(object)) {</span>
+<span class="fc bfc" id="L270" title="All 2 branches covered.">            if (edge.getRelation().toString().equals(&quot;case&quot;)) {</span>
+<span class="fc" id="L271">              prepWord = edge.getDependent();</span>
+            }
+<span class="fc" id="L273">          }</span>
+          // (...but sometimes from the subject)
+<span class="fc bfc" id="L275" title="All 2 branches covered.">          if (prepWord == null) {</span>
+<span class="fc bfc" id="L276" title="All 2 branches covered.">            for (SemanticGraphEdge edge : parse.outgoingEdgeIterable(subject)) {</span>
+<span class="fc bfc" id="L277" title="All 2 branches covered.">              if (edge.getRelation().toString().equals(&quot;case&quot;)) {</span>
+<span class="fc" id="L278">                prepositionIsPrefix = true;</span>
+<span class="fc" id="L279">                prepWord = edge.getDependent();</span>
+              }
+<span class="fc" id="L281">            }</span>
+          }
+<span class="fc" id="L283">          List&lt;IndexedWord&gt; prepChunk = Collections.EMPTY_LIST;</span>
+<span class="pc bpc" id="L284" title="1 of 4 branches missed.">          if (prepWord != null &amp;&amp; !expected.equals(&quot;tmod&quot;)) {</span>
+<span class="fc" id="L285">            Optional&lt;List&lt;IndexedWord&gt;&gt; optionalPrepChunk = getValidChunk(parse, prepWord, Collections.singleton(&quot;mwe&quot;), Optional.empty(), true);</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">            if (!optionalPrepChunk.isPresent()) { continue; }</span>
+<span class="fc" id="L287">            prepChunk = optionalPrepChunk.get();</span>
+<span class="fc" id="L288">            Collections.sort(prepChunk, (a, b) -&gt; {</span>
+<span class="nc" id="L289">              double val = a.pseudoPosition() - b.pseudoPosition();</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">              if (val &lt; 0) { return -1; }</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">              if (val &gt; 0) { return 1; }</span>
+<span class="nc" id="L292">              else { return 0; }</span>
+            });  // ascending sort
+          }
+
+          // Get the relation
+<span class="pc bpc" id="L297" title="2 of 4 branches missed.">          if (subjectTokens.size() &gt; 0 &amp;&amp; objectTokens.size() &gt; 0) {</span>
+<span class="fc" id="L298">            LinkedList&lt;IndexedWord&gt; relationTokens = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L299">            IndexedWord relNode = matcher.getNode(&quot;relation&quot;);</span>
+<span class="fc bfc" id="L300" title="All 2 branches covered.">            if (relNode != null) {</span>
+
+              // Case: we have a grounded relation span
+              // (add the relation)
+<span class="fc" id="L304">              relationTokens.add(relNode);</span>
+              // (add any prepositional case markings)
+<span class="fc bfc" id="L306" title="All 2 branches covered.">              if (prepositionIsPrefix) {</span>
+<span class="fc" id="L307">                missingSuffixBe = true;  // We're almost certainly missing a suffix 'be'</span>
+<span class="fc bfc" id="L308" title="All 2 branches covered.">                for (int i = prepChunk.size() - 1; i &gt;=0; --i) { relationTokens.addFirst(prepChunk.get(i)); }</span>
+              } else {
+<span class="fc" id="L310">                relationTokens.addAll(prepChunk);</span>
+              }
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">              if (expected.equalsIgnoreCase(&quot;tmod&quot;)) {</span>
+<span class="nc" id="L313">                istmod = true;</span>
+              }
+
+            } else {
+
+              // Case: we have a hallucinated relation span
+              // (mark it as missing a preceding 'be'
+<span class="fc bfc" id="L320" title="All 2 branches covered.">              if (!expected.equals(&quot;poss&quot;)) {</span>
+<span class="fc" id="L321">                missingPrefixBe = true;</span>
+              }
+              // (add any prepositional case markings)
+<span class="fc bfc" id="L324" title="All 2 branches covered.">              if (prepositionIsPrefix) {</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">                for (int i = prepChunk.size() - 1; i &gt;=0; --i) { relationTokens.addFirst(prepChunk.get(i)); }</span>
+              } else {
+<span class="fc" id="L327">                relationTokens.addAll(prepChunk);</span>
+              }
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">              if (expected.equalsIgnoreCase(&quot;tmod&quot;)) {</span>
+<span class="nc" id="L330">                istmod = true;</span>
+              }
+              // (some fine-tuning)
+<span class="fc bfc" id="L333" title="All 4 branches covered.">              if (allowNominalsWithoutNER &amp;&amp; &quot;of&quot;.equals(expected)) {</span>
+<span class="fc" id="L334">                continue;  // prohibit things like &quot;conductor of electricity&quot; -&gt; &quot;conductor; be of; electricity&quot;</span>
+              }
+            }
+
+
+            // Add extraction
+<span class="fc" id="L340">            String relationGloss = StringUtils.join(relationTokens.stream().map(IndexedWord::word), &quot; &quot;);</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">            if (!alreadyExtracted.contains(Triple.makeTriple(subjectSpan, relationGloss, objectSpan))) {</span>
+<span class="fc" id="L342">              RelationTriple extraction = new RelationTriple(</span>
+<span class="fc" id="L343">                  subjectTokens.stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L344">                  relationTokens.stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L345">                  objectTokens.stream().map(IndexedWord::backingLabel).collect(Collectors.toList()));</span>
+<span class="fc" id="L346">              extraction.istmod(istmod);</span>
+<span class="fc" id="L347">              extraction.isPrefixBe(missingPrefixBe);</span>
+<span class="fc" id="L348">              extraction.isSuffixBe(missingSuffixBe);</span>
+<span class="fc" id="L349">              extractions.add(extraction);</span>
+<span class="fc" id="L350">              alreadyExtracted.add(Triple.makeTriple(subjectSpan, relationGloss, objectSpan));</span>
+            }
+          }
+<span class="fc" id="L353">        }</span>
+<span class="fc" id="L354">      }</span>
+<span class="fc" id="L355">    }</span>
+
+    //
+    // Filter downward polarity extractions
+    //
+<span class="fc" id="L360">    Iterator&lt;RelationTriple&gt; iter = extractions.iterator();</span>
+<span class="fc bfc" id="L361" title="All 2 branches covered.">    while (iter.hasNext()) {</span>
+<span class="fc" id="L362">      RelationTriple term = iter.next();</span>
+<span class="fc" id="L363">      boolean shouldRemove = true;</span>
+<span class="fc bfc" id="L364" title="All 2 branches covered.">      for (CoreLabel token : term) {</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        if (token.get(NaturalLogicAnnotations.PolarityAnnotation.class) == null ||</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">            !token.get(NaturalLogicAnnotations.PolarityAnnotation.class).isDownwards() ) {</span>
+<span class="fc" id="L367">          shouldRemove = false;</span>
+        }
+<span class="fc" id="L369">      }</span>
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">      if (shouldRemove) {</span>
+<span class="nc" id="L371">        iter.remove();   // Don't extract things in downward polarity contexts.</span>
+      }
+<span class="fc" id="L373">    }</span>
+
+    // Return
+<span class="fc" id="L376">    return extractions;</span>
+  }
+
+//  /**
+//   * A counter keeping track of how many times a given pattern has matched. This allows us to learn to iterate
+//   * over patterns in the optimal order; this is just an efficiency tweak (but an effective one!).
+//   */
+//  private final Counter&lt;SemgrexPattern&gt; VERB_PATTERN_HITS = new ClassicCounter&lt;&gt;();
+
+  /** A set of valid arcs denoting a subject entity we are interested in */
+<span class="fc" id="L386">  public final Set&lt;String&gt; VALID_SUBJECT_ARCS = Collections.unmodifiableSet(new HashSet&lt;String&gt;(){{</span>
+<span class="fc" id="L387">    add(&quot;amod&quot;); add(&quot;compound&quot;); add(&quot;aux&quot;); add(&quot;nummod&quot;); add(&quot;nmod:poss&quot;); add(&quot;nmod:tmod&quot;); add(&quot;expl&quot;);</span>
+<span class="fc" id="L388">    add(&quot;nsubj&quot;); add(&quot;case&quot;);</span>
+<span class="fc" id="L389">  }});</span>
+
+  /** A set of valid arcs denoting an object entity we are interested in */
+<span class="fc" id="L392">  public final Set&lt;String&gt; VALID_OBJECT_ARCS = Collections.unmodifiableSet(new HashSet&lt;String&gt;(){{</span>
+<span class="fc" id="L393">    add(&quot;amod&quot;); add(&quot;compound&quot;); add(&quot;aux&quot;); add(&quot;nummod&quot;); add(&quot;nmod&quot;); add(&quot;nsubj&quot;); add(&quot;nmod:*&quot;); add(&quot;nmod:poss&quot;);</span>
+<span class="fc" id="L394">    add(&quot;nmod:tmod&quot;); add(&quot;conj:and&quot;); add(&quot;advmod&quot;); add(&quot;acl&quot;); add(&quot;case&quot;);</span>
+    // add(&quot;advcl&quot;); // Born in Hawaii, Obama is a US citizen; citizen -advcl-&gt; Born.
+<span class="fc" id="L396">  }});</span>
+
+  /** A set of valid arcs denoting an adverbial modifier we are interested in */
+<span class="fc" id="L399">  public final Set&lt;String&gt; VALID_ADVERB_ARCS = Collections.unmodifiableSet(new HashSet&lt;String&gt;(){{</span>
+<span class="fc" id="L400">    add(&quot;amod&quot;); add(&quot;advmod&quot;); add(&quot;conj&quot;); add(&quot;cc&quot;); add(&quot;conj:and&quot;); add(&quot;conj:or&quot;);</span>
+<span class="fc" id="L401">    add(&quot;auxpass&quot;); add(&quot;compound:*&quot;);</span>
+<span class="fc" id="L402">  }});</span>
+
+  /**
+   * @see RelationTripleSegmenter#getValidSubjectChunk(edu.stanford.nlp.semgraph.SemanticGraph, edu.stanford.nlp.ling.IndexedWord, Optional)
+   * @see RelationTripleSegmenter#getValidObjectChunk(edu.stanford.nlp.semgraph.SemanticGraph, edu.stanford.nlp.ling.IndexedWord, Optional)
+   * @see RelationTripleSegmenter#getValidAdverbChunk(edu.stanford.nlp.semgraph.SemanticGraph, edu.stanford.nlp.ling.IndexedWord, Optional)
+   */
+  @SuppressWarnings(&quot;StatementWithEmptyBody&quot;)
+  protected Optional&lt;List&lt;IndexedWord&gt;&gt; getValidChunk(SemanticGraph parse, IndexedWord originalRoot,
+                                                    Set&lt;String&gt; validArcs, Optional&lt;String&gt; ignoredArc,
+                                                    boolean allowExtraArcs) {
+<span class="fc" id="L413">    PriorityQueue&lt;IndexedWord&gt; chunk = new FixedPrioritiesPriorityQueue&lt;&gt;();</span>
+<span class="fc" id="L414">    Set&lt;Double&gt; seenIndices = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L415">    Queue&lt;IndexedWord&gt; fringe = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L416">    IndexedWord root = originalRoot;</span>
+<span class="fc" id="L417">    fringe.add(root);</span>
+
+<span class="fc" id="L419">    boolean isCopula = false;</span>
+<span class="fc" id="L420">    IndexedWord primaryCase = null;</span>
+<span class="fc bfc" id="L421" title="All 2 branches covered.">    for (SemanticGraphEdge edge : parse.outgoingEdgeIterable(originalRoot)) {</span>
+<span class="fc" id="L422">      String shortName = edge.getRelation().getShortName();</span>
+<span class="fc bfc" id="L423" title="All 4 branches covered.">      if (shortName.equals(&quot;cop&quot;) || shortName.equals(&quot;auxpass&quot;)) {</span>
+<span class="fc" id="L424">        isCopula = true;</span>
+      }
+<span class="fc bfc" id="L426" title="All 2 branches covered.">      if (shortName.equals(&quot;case&quot;)) {</span>
+<span class="fc" id="L427">        primaryCase = edge.getDependent();</span>
+      }
+<span class="fc" id="L429">    }</span>
+
+<span class="fc bfc" id="L431" title="All 2 branches covered.">    while (!fringe.isEmpty()) {</span>
+<span class="fc" id="L432">      root = fringe.poll();</span>
+<span class="fc" id="L433">      chunk.add(root, -root.pseudoPosition());</span>
+
+      // Sanity check to prevent infinite loops
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">      if (seenIndices.contains(root.pseudoPosition())) {</span>
+        // TODO(gabor) Indicates a cycle in the tree!
+<span class="nc" id="L438">        return Optional.empty();</span>
+      }
+<span class="fc" id="L440">      seenIndices.add(root.pseudoPosition());</span>
+
+      // Check outgoing edges
+<span class="fc" id="L443">      boolean hasConj = false;</span>
+<span class="fc" id="L444">      boolean hasCC = false;</span>
+<span class="fc bfc" id="L445" title="All 2 branches covered.">      for (SemanticGraphEdge edge : parse.getOutEdgesSorted(root)) {</span>
+<span class="fc" id="L446">        String shortName = edge.getRelation().getShortName();</span>
+<span class="fc" id="L447">        String name = edge.getRelation().toString();</span>
+<span class="fc bfc" id="L448" title="All 2 branches covered.">        if (shortName.startsWith(&quot;conj&quot;)) { hasConj = true; }</span>
+<span class="fc bfc" id="L449" title="All 2 branches covered.">        if (shortName.equals(&quot;cc&quot;)) { hasCC = true; }</span>
+        //noinspection StatementWithEmptyBody
+<span class="fc bfc" id="L451" title="All 8 branches covered.">        if (isCopula &amp;&amp; (shortName.equals(&quot;cop&quot;) || shortName.contains(&quot;subj&quot;) || shortName.equals(&quot;auxpass&quot;) )) {</span>
+          // noop; ignore nsubj, cop for extractions with copula
+<span class="fc bfc" id="L453" title="All 2 branches covered.">        } else if (edge.getDependent() == primaryCase) {</span>
+          // noop: ignore case edge
+<span class="fc bfc" id="L455" title="All 2 branches covered.">        } else if (ignoredArc.isPresent() &amp;&amp;</span>
+<span class="pc bpc" id="L456" title="1 of 6 branches missed.">                   (ignoredArc.get().equals(name) || (ignoredArc.get().startsWith(&quot;conj&quot;) &amp;&amp; name.equals(&quot;cc&quot;)))) {</span>
+          // noop; ignore explicitly requested noop arc, or &quot;CC&quot; if the noop arc is a conj:*
+<span class="fc bfc" id="L458" title="All 4 branches covered.">        } else if (!validArcs.contains(edge.getRelation().getShortName()) &amp;&amp; !validArcs.contains(edge.getRelation().getShortName().replaceAll(&quot;:.*&quot;,&quot;:*&quot;))) {</span>
+<span class="fc bfc" id="L459" title="All 2 branches covered.">          if (!allowExtraArcs) {</span>
+<span class="fc" id="L460">            return Optional.empty();</span>
+          } else {
+            // noop: just some dangling arc
+          }
+        } else {
+<span class="fc" id="L465">          fringe.add(edge.getDependent());</span>
+        }
+<span class="fc" id="L467">      }</span>
+
+      // Ensure that we don't have a conj without a cc, or vice versa
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">      if (Boolean.logicalXor(hasConj, hasCC)) {</span>
+<span class="nc" id="L471">        return Optional.empty();</span>
+      }
+<span class="fc" id="L473">    }</span>
+
+<span class="fc" id="L475">    return Optional.of(chunk.toSortedList());</span>
+  }
+
+  /**
+   * @see RelationTripleSegmenter#getValidChunk(SemanticGraph, IndexedWord, Set, Optional, boolean)
+   */
+  protected Optional&lt;List&lt;IndexedWord&gt;&gt; getValidChunk(SemanticGraph parse, IndexedWord originalRoot,
+                                                    Set&lt;String&gt; validArcs, Optional&lt;String&gt; ignoredArc) {
+<span class="fc" id="L483">    return getValidChunk(parse, originalRoot, validArcs, ignoredArc, false);</span>
+  }
+
+  /**
+   * Get the yield of a given subtree, if it is a valid subject.
+   * Otherwise, return {@link java.util.Optional#empty()}}.
+   * @param parse The parse tree we are extracting a subtree from.
+   * @param root The root of the subtree.
+   * @param noopArc An optional edge type to ignore in gathering the chunk.
+   * @return If this subtree is a valid entity, we return its yield. Otherwise, we return empty.
+   */
+  protected Optional&lt;List&lt;IndexedWord&gt;&gt; getValidSubjectChunk(SemanticGraph parse, IndexedWord root, Optional&lt;String&gt; noopArc) {
+<span class="fc" id="L495">    return getValidChunk(parse, root, VALID_SUBJECT_ARCS, noopArc);</span>
+  }
+
+  /**
+   * Get the yield of a given subtree, if it is a valid object.
+   * Otherwise, return {@link java.util.Optional#empty()}}.
+   * @param parse The parse tree we are extracting a subtree from.
+   * @param root The root of the subtree.
+   * @param noopArc An optional edge type to ignore in gathering the chunk.
+   * @return If this subtree is a valid entity, we return its yield. Otherwise, we return empty.
+   */
+  protected Optional&lt;List&lt;IndexedWord&gt;&gt; getValidObjectChunk(SemanticGraph parse, IndexedWord root, Optional&lt;String&gt; noopArc) {
+<span class="fc" id="L507">    return getValidChunk(parse, root, VALID_OBJECT_ARCS, noopArc);</span>
+  }
+
+  /**
+   * Get the yield of a given subtree, if it is a adverb chunk.
+   * Otherwise, return {@link java.util.Optional#empty()}}.
+   * @param parse The parse tree we are extracting a subtree from.
+   * @param root The root of the subtree.
+   * @param noopArc An optional edge type to ignore in gathering the chunk.
+   * @return If this subtree is a valid adverb, we return its yield. Otherwise, we return empty.
+   */
+  protected Optional&lt;List&lt;IndexedWord&gt;&gt; getValidAdverbChunk(SemanticGraph parse, IndexedWord root, Optional&lt;String&gt; noopArc) {
+<span class="fc" id="L519">    return getValidChunk(parse, root, VALID_ADVERB_ARCS, noopArc);</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   * Try to segment this sentence as a relation triple.
+   * This sentence must already match one of a few strict patterns for a valid OpenIE extraction.
+   * If it does not, then no relation triple is created.
+   * That is, this is &lt;b&gt;not&lt;/b&gt; a relation extractor; it is just a utility to segment what is already a
+   * (subject, relation, object) triple into these three parts.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   This method will only run the verb-centric patterns
+   * &lt;/p&gt;
+   *
+   * @param parse The sentence to process, as a dependency tree.
+   * @param confidence An optional confidence to pass on to the relation triple.
+   * @param consumeAll if true, force the entire parse to be consumed by the pattern.
+   * @return A relation triple, if this sentence matches one of the patterns of a valid relation triple.
+   */
+  @SuppressWarnings(&quot;UnnecessaryLabelOnContinueStatement&quot;)
+  private Optional&lt;RelationTriple&gt; segmentVerb(SemanticGraph parse,
+                                               Optional&lt;Double&gt; confidence,
+                                               boolean consumeAll) {
+    // Run pattern loop
+<span class="fc bfc" id="L545" title="All 2 branches covered.">    PATTERN_LOOP: for (SemgrexPattern pattern : VERB_PATTERNS) {  // For every candidate pattern...</span>
+<span class="fc" id="L546">      SemgrexMatcher m = pattern.matcher(parse);</span>
+<span class="fc bfc" id="L547" title="All 2 branches covered.">      if (m.matches()) {  // ... see if it matches the sentence</span>
+<span class="pc bpc" id="L548" title="1 of 2 branches missed.">        if (&quot;nmod:poss&quot;.equals(m.getRelnString(&quot;prepEdge&quot;))) {</span>
+<span class="nc" id="L549">          continue PATTERN_LOOP;   // nmod:poss is not a preposition!</span>
+        }
+<span class="fc" id="L551">        int numKnownDependents = 2;  // subject and object, at minimum</span>
+<span class="fc" id="L552">        boolean istmod = false;      // this is a tmod relation</span>
+
+        // Object
+<span class="fc" id="L555">        IndexedWord object = m.getNode(&quot;appos&quot;);</span>
+<span class="fc bfc" id="L556" title="All 2 branches covered.">        if (object == null) {</span>
+<span class="fc" id="L557">          object = m.getNode(&quot;object&quot;);</span>
+        }
+<span class="pc bpc" id="L559" title="2 of 6 branches missed.">        if (object != null &amp;&amp; object.tag() != null &amp;&amp; object.tag().startsWith(&quot;W&quot;)) {</span>
+<span class="nc" id="L560">          continue;  // don't extract WH arguments</span>
+        }
+<span class="pc bpc" id="L562" title="2 of 4 branches missed.">        assert object != null;</span>
+
+        // Verb
+<span class="fc" id="L565">        PriorityQueue&lt;IndexedWord&gt; verbChunk = new FixedPrioritiesPriorityQueue&lt;&gt;();</span>
+<span class="fc" id="L566">        IndexedWord verb = m.getNode(&quot;verb&quot;);</span>
+<span class="fc" id="L567">        List&lt;IndexedWord&gt; adverbs = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L568">        Optional&lt;String&gt; subjNoopArc = Optional.empty();</span>
+<span class="fc" id="L569">        Optional&lt;String&gt; objNoopArc = Optional.empty();</span>
+<span class="pc bpc" id="L570" title="2 of 4 branches missed.">        assert verb != null;</span>
+        // Case: a standard extraction with a main verb
+<span class="fc" id="L572">        IndexedWord relObj = m.getNode(&quot;relObj&quot;);</span>
+<span class="fc bfc" id="L573" title="All 2 branches covered.">        for (SemanticGraphEdge edge : parse.outgoingEdgeIterable(verb)) {</span>
+<span class="fc bfc" id="L574" title="All 2 branches covered.">          if (&quot;advmod&quot;.equals(edge.getRelation().toString()) ||</span>
+<span class="fc bfc" id="L575" title="All 2 branches covered.">              &quot;amod&quot;.equals(edge.getRelation().toString()) ||</span>
+<span class="fc bfc" id="L576" title="All 2 branches covered.">              &quot;compound:*&quot;.equals(edge.getRelation().toString().replaceAll(&quot;:.*&quot;, &quot;:*&quot;))) {</span>
+            // Add adverb modifiers
+<span class="fc" id="L578">            String tag = edge.getDependent().backingLabel().tag();</span>
+<span class="fc bfc" id="L579" title="All 2 branches covered.">            if (tag == null ||</span>
+<span class="pc bpc" id="L580" title="2 of 4 branches missed.">                (!tag.startsWith(&quot;W&quot;) &amp;&amp; !edge.getDependent().backingLabel().word().equalsIgnoreCase(&quot;then&quot;))) {  // prohibit advmods like &quot;where&quot;</span>
+<span class="fc" id="L581">              adverbs.add(edge.getDependent());</span>
+            }
+<span class="fc bfc" id="L583" title="All 2 branches covered.">          } else if (edge.getDependent().equals(relObj)) {</span>
+            // Add additional object to the relation
+<span class="fc" id="L585">            Optional&lt;List&lt;IndexedWord&gt;&gt; relObjSpan = getValidChunk(parse, relObj, Collections.singleton(&quot;compound&quot;), Optional.empty());</span>
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">            if (!relObjSpan.isPresent()) {</span>
+<span class="nc" id="L587">              continue PATTERN_LOOP;</span>
+            } else {
+<span class="fc bfc" id="L589" title="All 2 branches covered.">              for (IndexedWord token : relObjSpan.get()) {</span>
+<span class="fc" id="L590">                verbChunk.add(token, -token.pseudoPosition());</span>
+<span class="fc" id="L591">              }</span>
+<span class="fc" id="L592">              numKnownDependents += 1;</span>
+            }
+          }
+<span class="fc" id="L595">        }</span>
+<span class="fc" id="L596">        verbChunk.add(verb, -verb.pseudoPosition());</span>
+
+        // Prepositions
+<span class="fc" id="L599">        IndexedWord prep = m.getNode(&quot;prep&quot;);</span>
+<span class="fc" id="L600">        String prepEdge = m.getRelnString(&quot;prepEdge&quot;);</span>
+<span class="fc bfc" id="L601" title="All 2 branches covered.">        if (prep != null) {</span>
+          // (get the preposition chunk)
+<span class="fc" id="L603">          Optional&lt;List&lt;IndexedWord&gt;&gt; chunk = getValidChunk(parse, prep, Collections.singleton(&quot;mwe&quot;), Optional.empty(), true);</span>
+          // (continue if no chunk found)
+<span class="pc bpc" id="L605" title="1 of 2 branches missed.">          if (!chunk.isPresent()) {</span>
+<span class="nc" id="L606">            continue PATTERN_LOOP;  // Probably something like a conj w/o a cc</span>
+          }
+          // (add the preposition)
+<span class="fc bfc" id="L609" title="All 2 branches covered.">          for (IndexedWord word : chunk.get()) {</span>
+<span class="fc" id="L610">            verbChunk.add(word, Integer.MIN_VALUE / 2 - word.pseudoPosition());</span>
+<span class="fc" id="L611">          }</span>
+        }
+        // (handle special prepositions)
+<span class="fc bfc" id="L614" title="All 2 branches covered.">        if (prepEdge != null) {</span>
+<span class="fc" id="L615">          String prepStringFromEdge = prepEdge.substring(prepEdge.indexOf(&quot;:&quot;) + 1).replace(&quot;_&quot;, &quot; &quot;);</span>
+<span class="fc bfc" id="L616" title="All 2 branches covered.">          if (&quot;tmod&quot;.equals(prepStringFromEdge)) {</span>
+<span class="fc" id="L617">            istmod = true;</span>
+          }
+        }
+
+        // Auxilliary &quot;be&quot;
+<span class="fc" id="L622">        IndexedWord be = m.getNode(&quot;be&quot;);</span>
+<span class="fc bfc" id="L623" title="All 2 branches covered.">        if (be != null) { verbChunk.add(be, -be.pseudoPosition()); numKnownDependents += 1; }</span>
+        // (adverbs have to be well-formed)
+<span class="fc bfc" id="L625" title="All 2 branches covered.">        if (!adverbs.isEmpty()) {</span>
+<span class="fc" id="L626">          Set&lt;IndexedWord&gt; adverbialModifiers = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L627" title="All 2 branches covered.">          for (IndexedWord adv : adverbs) {</span>
+<span class="fc" id="L628">            Optional&lt;List&lt;IndexedWord&gt;&gt; adverbChunk = getValidAdverbChunk(parse, adv, Optional.empty());</span>
+<span class="pc bpc" id="L629" title="1 of 2 branches missed.">            if (adverbChunk.isPresent()) {</span>
+<span class="fc" id="L630">              adverbialModifiers.addAll(adverbChunk.get().stream().collect(Collectors.toList()));</span>
+            } else {
+              continue PATTERN_LOOP;  // Invalid adverbial phrase
+            }
+<span class="fc" id="L634">            numKnownDependents += 1;</span>
+<span class="fc" id="L635">          }</span>
+<span class="fc bfc" id="L636" title="All 2 branches covered.">          for (IndexedWord adverbToken : adverbialModifiers) {</span>
+<span class="fc" id="L637">            verbChunk.add(adverbToken, -adverbToken.pseudoPosition());</span>
+<span class="fc" id="L638">          }</span>
+        }
+
+        // (check for additional edges)
+<span class="pc bpc" id="L642" title="1 of 4 branches missed.">        if (consumeAll &amp;&amp; parse.outDegree(verb) &gt; numKnownDependents) {</span>
+          //noinspection UnnecessaryLabelOnContinueStatement
+<span class="fc" id="L644">          continue PATTERN_LOOP;  // Too many outgoing edges; we didn't consume them all.</span>
+        }
+<span class="fc" id="L646">        List&lt;IndexedWord&gt; relation = verbChunk.toSortedList();</span>
+<span class="fc" id="L647">        int appendI = 0;</span>
+<span class="fc" id="L648">        IndexedWord relAppend = m.getNode(&quot;relappend&quot; + appendI);</span>
+<span class="fc bfc" id="L649" title="All 2 branches covered.">        while (relAppend != null) {</span>
+<span class="fc" id="L650">          relation.add(relAppend);</span>
+<span class="fc" id="L651">          appendI += 1;</span>
+<span class="fc" id="L652">          relAppend = m.getNode(&quot;relappend&quot; + appendI);</span>
+        }
+
+        // Last chance to register ignored edges
+<span class="pc bpc" id="L656" title="1 of 2 branches missed.">        if (!subjNoopArc.isPresent()) {</span>
+<span class="fc" id="L657">          subjNoopArc = Optional.ofNullable(m.getRelnString(&quot;subjIgnored&quot;));</span>
+<span class="fc bfc" id="L658" title="All 2 branches covered.">          if (!subjNoopArc.isPresent()) {</span>
+<span class="fc" id="L659">            subjNoopArc = Optional.ofNullable(m.getRelnString(&quot;prepEdge&quot;));  // For some strange &quot;there are&quot; cases</span>
+          }
+        }
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">        if (!objNoopArc.isPresent()) {</span>
+<span class="fc" id="L663">          objNoopArc = Optional.ofNullable(m.getRelnString(&quot;objIgnored&quot;));</span>
+        }
+
+        // Find the subject
+        // By default, this is just the subject node; but, occasionally we want to follow a
+        // csubj clause to find the real subject.
+<span class="fc" id="L669">        IndexedWord subject = m.getNode(&quot;subject&quot;);</span>
+<span class="pc bpc" id="L670" title="1 of 6 branches missed.">        if (subject != null &amp;&amp; subject.tag() != null &amp;&amp; subject.tag().startsWith(&quot;W&quot;)) {</span>
+<span class="fc" id="L671">          continue;  // don't extract WH subjects</span>
+        }
+
+        // Subject+Object
+<span class="fc" id="L675">        Optional&lt;List&lt;IndexedWord&gt;&gt; subjectSpan = getValidSubjectChunk(parse, subject, subjNoopArc);</span>
+<span class="fc" id="L676">        Optional&lt;List&lt;IndexedWord&gt;&gt; objectSpan = getValidObjectChunk(parse, object, objNoopArc);</span>
+        // Create relation
+<span class="fc bfc" id="L678" title="All 4 branches covered.">        if (subjectSpan.isPresent() &amp;&amp; objectSpan.isPresent() &amp;&amp;</span>
+<span class="pc bpc" id="L679" title="1 of 2 branches missed.">            CollectionUtils.intersection(new HashSet&lt;&gt;(subjectSpan.get()), new HashSet&lt;&gt;(objectSpan.get())).isEmpty()</span>
+            ) {  // ... and has a valid subject+object
+          // Success! Found a valid extraction.
+<span class="fc" id="L682">          RelationTriple.WithTree extraction = new RelationTriple.WithTree(</span>
+<span class="fc" id="L683">              subjectSpan.get().stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L684">              relation.stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L685">              objectSpan.get().stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L686">              parse, confidence.orElse(1.0));</span>
+<span class="fc" id="L687">          extraction.istmod(istmod);</span>
+<span class="fc" id="L688">          return Optional.of(extraction);</span>
+        }
+      }
+<span class="fc" id="L691">    }</span>
+    // Failed to match any pattern; return failure
+<span class="fc" id="L693">    return Optional.empty();</span>
+  }
+
+  /**
+   * Same as {@link RelationTripleSegmenter#segmentVerb}, but with ACL clauses.
+   * This is a bit out of the ordinary, logic-wise, so it sits in its own function.
+   */
+  private Optional&lt;RelationTriple&gt; segmentACL(SemanticGraph parse, Optional&lt;Double&gt; confidence, boolean consumeAll) {
+<span class="fc" id="L701">    IndexedWord subject = parse.getFirstRoot();</span>
+<span class="fc" id="L702">    Optional&lt;List&lt;IndexedWord&gt;&gt; subjectSpan = getValidSubjectChunk(parse, subject, Optional.of(&quot;acl&quot;));</span>
+<span class="fc bfc" id="L703" title="All 2 branches covered.">    if (subjectSpan.isPresent()) {</span>
+      // found a valid subject
+<span class="fc bfc" id="L705" title="All 2 branches covered.">      for (SemanticGraphEdge edgeFromSubj : parse.outgoingEdgeIterable(subject)) {</span>
+<span class="fc bfc" id="L706" title="All 2 branches covered.">        if (&quot;acl&quot;.equals(edgeFromSubj.getRelation().toString())) {</span>
+          // found a valid relation
+<span class="fc" id="L708">          IndexedWord relation = edgeFromSubj.getDependent();</span>
+<span class="fc" id="L709">          List&lt;IndexedWord&gt; relationSpan = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L710">          relationSpan.add(relation);</span>
+<span class="fc" id="L711">          List&lt;IndexedWord&gt; objectSpan = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L712">          List&lt;IndexedWord&gt; ppSpan = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L713">          Optional&lt;IndexedWord&gt; pp = Optional.empty();</span>
+
+          // Get other arguments
+<span class="fc bfc" id="L716" title="All 2 branches covered.">          for (SemanticGraphEdge edgeFromRel : parse.outgoingEdgeIterable(relation)) {</span>
+<span class="fc" id="L717">            String rel = edgeFromRel.getRelation().toString();</span>
+            // Collect adverbs
+<span class="fc bfc" id="L719" title="All 2 branches covered.">            if (&quot;advmod&quot;.equals(rel)) {</span>
+<span class="fc" id="L720">              Optional&lt;List&lt;IndexedWord&gt;&gt; advSpan = getValidAdverbChunk(parse, edgeFromRel.getDependent(), Optional.empty());</span>
+<span class="pc bpc" id="L721" title="1 of 2 branches missed.">              if (!advSpan.isPresent()) {</span>
+<span class="nc" id="L722">                return Optional.empty();  // bad adverb span!</span>
+              }
+<span class="fc" id="L724">              relationSpan.addAll(advSpan.get());</span>
+<span class="fc" id="L725">            }</span>
+            // Collect object
+<span class="fc bfc" id="L727" title="All 2 branches covered.">            else if (rel.endsWith(&quot;obj&quot;)) {</span>
+<span class="pc bpc" id="L728" title="1 of 2 branches missed.">              if (!objectSpan.isEmpty()) {</span>
+<span class="nc" id="L729">                return Optional.empty();  // duplicate objects!</span>
+              }
+<span class="fc" id="L731">              Optional&lt;List&lt;IndexedWord&gt;&gt; maybeObjSpan = getValidObjectChunk(parse, edgeFromRel.getDependent(), Optional.empty());</span>
+<span class="pc bpc" id="L732" title="1 of 2 branches missed.">              if (!maybeObjSpan.isPresent()) {</span>
+<span class="nc" id="L733">                return Optional.empty();  // bad object span!</span>
+              }
+<span class="fc" id="L735">              objectSpan.addAll(maybeObjSpan.get());</span>
+<span class="fc" id="L736">            }</span>
+            // Collect pp
+<span class="pc bpc" id="L738" title="1 of 2 branches missed.">            else if (rel.startsWith(&quot;nmod:&quot;)) {</span>
+<span class="pc bpc" id="L739" title="1 of 2 branches missed.">              if (!ppSpan.isEmpty()) {</span>
+<span class="nc" id="L740">                return Optional.empty();  // duplicate objects!</span>
+              }
+<span class="fc" id="L742">              Optional&lt;List&lt;IndexedWord&gt;&gt; maybePPSpan = getValidObjectChunk(parse, edgeFromRel.getDependent(), Optional.of(&quot;case&quot;));</span>
+<span class="pc bpc" id="L743" title="1 of 2 branches missed.">              if (!maybePPSpan.isPresent()) {</span>
+<span class="nc" id="L744">                return Optional.empty();  // bad object span!</span>
+              }
+<span class="fc" id="L746">              ppSpan.addAll(maybePPSpan.get());</span>
+              // Add the actual preposition, if we can find it
+<span class="fc bfc" id="L748" title="All 2 branches covered.">              for (SemanticGraphEdge edge : parse.outgoingEdgeIterable(edgeFromRel.getDependent())) {</span>
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">                if (&quot;case&quot;.equals(edge.getRelation().toString())) {</span>
+<span class="fc" id="L750">                  pp = Optional.of(edge.getDependent());</span>
+                }
+<span class="fc" id="L752">              }</span>
+<span class="fc" id="L753">            }</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">            else if (consumeAll) {</span>
+<span class="nc" id="L755">              return Optional.empty();  // bad edge out of the relation</span>
+            }
+<span class="fc" id="L757">          }</span>
+
+          // Construct a triple
+          // (canonicalize the triple to be subject; relation; object, folding in the PP)
+<span class="pc bpc" id="L761" title="1 of 4 branches missed.">          if (!ppSpan.isEmpty() &amp;&amp; !objectSpan.isEmpty()) {</span>
+<span class="nc" id="L762">            relationSpan.addAll(objectSpan);</span>
+<span class="nc" id="L763">            objectSpan = ppSpan;</span>
+<span class="fc bfc" id="L764" title="All 2 branches covered.">          } else if (!ppSpan.isEmpty()) {</span>
+<span class="fc" id="L765">            objectSpan = ppSpan;</span>
+          }
+          // (last error checks -- shouldn't ever fire)
+<span class="pc bpc" id="L768" title="4 of 8 branches missed.">          if (!subjectSpan.isPresent() || subjectSpan.get().isEmpty() || relationSpan.isEmpty() || objectSpan.isEmpty()) {</span>
+<span class="nc" id="L769">            return Optional.empty();</span>
+          }
+          // (sort the relation span)
+<span class="fc" id="L772">          Collections.sort(relationSpan, (a, b) -&gt; {</span>
+<span class="fc" id="L773">                double val = a.pseudoPosition() - b.pseudoPosition();</span>
+<span class="pc bpc" id="L774" title="1 of 2 branches missed.">                if (val &lt; 0) {</span>
+<span class="nc" id="L775">                  return -1;</span>
+                }
+<span class="pc bpc" id="L777" title="1 of 2 branches missed.">                if (val &gt; 0) {</span>
+<span class="fc" id="L778">                  return 1;</span>
+                } else {
+<span class="nc" id="L780">                  return 0;</span>
+                }
+              });
+          // (add in the PP node, if it exists)
+<span class="fc bfc" id="L784" title="All 2 branches covered.">          if (pp.isPresent()) {</span>
+<span class="fc" id="L785">            relationSpan.add(pp.get());</span>
+          }
+          // (success!)
+<span class="fc" id="L788">          RelationTriple.WithTree extraction = new RelationTriple.WithTree(</span>
+<span class="fc" id="L789">              subjectSpan.get().stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L790">              relationSpan.stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L791">              objectSpan.stream().map(IndexedWord::backingLabel).collect(Collectors.toList()),</span>
+<span class="fc" id="L792">              parse, confidence.orElse(1.0));</span>
+<span class="fc" id="L793">          return Optional.of(extraction);</span>
+        }
+<span class="fc" id="L795">      }</span>
+    }
+
+    // Nothing found; return
+<span class="fc" id="L799">    return Optional.empty();</span>
+  }
+
+  /**
+   * &lt;p&gt;
+   * Try to segment this sentence as a relation triple.
+   * This sentence must already match one of a few strict patterns for a valid OpenIE extraction.
+   * If it does not, then no relation triple is created.
+   * That is, this is &lt;b&gt;not&lt;/b&gt; a relation extractor; it is just a utility to segment what is already a
+   * (subject, relation, object) triple into these three parts.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   This method will attempt to use both the verb-centric patterns and the ACL-centric patterns.
+   * &lt;/p&gt;
+   *
+   * @param parse The sentence to process, as a dependency tree.
+   * @param confidence An optional confidence to pass on to the relation triple.
+   * @param consumeAll if true, force the entire parse to be consumed by the pattern.
+   * @return A relation triple, if this sentence matches one of the patterns of a valid relation triple.
+   */
+  public Optional&lt;RelationTriple&gt; segment(SemanticGraph parse, Optional&lt;Double&gt; confidence, boolean consumeAll) {
+    // Copy and clean the tree
+<span class="fc" id="L822">    parse = new SemanticGraph(parse);</span>
+
+    // Special case &quot;there is &lt;something&gt;&quot;. Arguably this is a job for the clause splitter, but the &lt;something&gt; is
+    // sometimes not _really_ its own clause
+<span class="fc" id="L826">    IndexedWord root = parse.getFirstRoot();</span>
+<span class="pc bpc" id="L827" title="1 of 4 branches missed.">    if ( (root.lemma() != null &amp;&amp; root.lemma().equalsIgnoreCase(&quot;be&quot;)) ||</span>
+<span class="pc bpc" id="L828" title="2 of 4 branches missed.">         (root.lemma() == null &amp;&amp; (&quot;is&quot;.equalsIgnoreCase(root.word()) ||</span>
+<span class="pc bpc" id="L829" title="1 of 2 branches missed.">                                   &quot;are&quot;.equalsIgnoreCase(root.word()) ||</span>
+<span class="pc bpc" id="L830" title="1 of 2 branches missed.">                                   &quot;were&quot;.equalsIgnoreCase(root.word()) ||</span>
+<span class="pc bpc" id="L831" title="1 of 2 branches missed.">                                   &quot;be&quot;.equalsIgnoreCase(root.word())))) {</span>
+      // Check for the &quot;there is&quot; construction
+<span class="fc" id="L833">      boolean foundThere = false;</span>
+<span class="fc" id="L834">      boolean tooMayArcs = false;  // an indicator for there being too much nonsense hanging off of the root</span>
+<span class="fc" id="L835">      Optional&lt;SemanticGraphEdge&gt; newRoot = Optional.empty();</span>
+<span class="fc bfc" id="L836" title="All 2 branches covered.">      for (SemanticGraphEdge edge : parse.outgoingEdgeIterable(root)) {</span>
+<span class="pc bpc" id="L837" title="1 of 4 branches missed.">        if (edge.getRelation().toString().equals(&quot;expl&quot;) &amp;&amp; edge.getDependent().word().equalsIgnoreCase(&quot;there&quot;)) {</span>
+<span class="fc" id="L838">          foundThere = true;</span>
+<span class="pc bpc" id="L839" title="1 of 2 branches missed.">        } else if (edge.getRelation().toString().equals(&quot;nsubj&quot;)) {</span>
+<span class="fc" id="L840">          newRoot = Optional.of(edge);</span>
+        } else {
+<span class="nc" id="L842">          tooMayArcs = true;</span>
+        }
+<span class="fc" id="L844">      }</span>
+      // Split off &quot;there is&quot;)
+<span class="pc bpc" id="L846" title="3 of 6 branches missed.">      if (foundThere &amp;&amp; newRoot.isPresent() &amp;&amp; !tooMayArcs) {</span>
+<span class="fc" id="L847">        ClauseSplitterSearchProblem.splitToChildOfEdge(parse, newRoot.get());</span>
+      }
+    }
+
+    // Run the patterns
+<span class="fc" id="L852">    Optional&lt;RelationTriple&gt; extraction = segmentVerb(parse, confidence, consumeAll);</span>
+<span class="fc bfc" id="L853" title="All 2 branches covered.">    if (!extraction.isPresent()) {</span>
+<span class="fc" id="L854">      extraction = segmentACL(parse, confidence, consumeAll);</span>
+    }
+
+    //
+    // Remove downward polarity extractions
+    //
+<span class="fc bfc" id="L860" title="All 2 branches covered.">    if (extraction.isPresent()) {</span>
+<span class="fc" id="L861">      boolean shouldRemove = true;</span>
+<span class="fc bfc" id="L862" title="All 2 branches covered.">      for (CoreLabel token : extraction.get()) {</span>
+<span class="pc bpc" id="L863" title="1 of 2 branches missed.">        if (token.get(NaturalLogicAnnotations.PolarityAnnotation.class) == null ||</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">            !token.get(NaturalLogicAnnotations.PolarityAnnotation.class).isDownwards()) {</span>
+<span class="fc" id="L865">          shouldRemove = false;</span>
+        }
+<span class="fc" id="L867">      }</span>
+<span class="pc bpc" id="L868" title="1 of 2 branches missed.">      if (shouldRemove) {</span>
+<span class="nc" id="L869">        return Optional.empty();</span>
+      }
+    }
+
+    // Return
+<span class="fc" id="L874">    return extraction;</span>
+  }
+
+  /**
+   * Segment the given parse tree, forcing all nodes to be consumed.
+   * @see RelationTripleSegmenter#segment(edu.stanford.nlp.semgraph.SemanticGraph, Optional)
+   */
+  public Optional&lt;RelationTriple&gt; segment(SemanticGraph parse, Optional&lt;Double&gt; confidence) {
+<span class="fc" id="L882">    return segment(parse, confidence, true);</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

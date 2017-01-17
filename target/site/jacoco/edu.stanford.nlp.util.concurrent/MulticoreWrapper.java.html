@@ -1,0 +1,304 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MulticoreWrapper.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.util.concurrent</a> &gt; <span class="el_source">MulticoreWrapper.java</span></div><h1>MulticoreWrapper.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.util.concurrent;
+
+import edu.stanford.nlp.util.RuntimeInterruptedException;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Provides convenient multicore processing for threadsafe objects. Objects that can
+ * be wrapped by MulticoreWrapper must implement the ThreadsafeProcessor interface.
+ *
+ * See edu.stanford.nlp.util.concurrent.MulticoreWrapperTest and
+ * edu.stanford.nlp.tagger.maxent.documentation.MulticoreWrapperDemo for examples of use.
+ *
+ * TODO(spenceg): This code does **not** support multiple consumers, i.e., multi-threaded calls
+ * to peek() and poll().
+ *
+ * @author Spence Green
+ *
+ * @param &lt;I&gt; input type
+ * @param &lt;O&gt; output type
+ */
+public class MulticoreWrapper&lt;I,O&gt; {
+
+  final int nThreads;
+<span class="fc" id="L36">  int submittedItemCounter = 0;</span>
+  // Which id was the last id returned.  Only meaningful in the case
+  // of a queue where output order matters.
+<span class="fc" id="L39">  private int returnedItemCounter = -1;</span>
+  private final boolean orderResults;
+
+  private final Map&lt;Integer,O&gt; outputQueue;
+  final ThreadPoolExecutor threadPool;
+//  private final ExecutorCompletionService&lt;Integer&gt; queue;
+  final BlockingQueue&lt;Integer&gt; idleProcessors;
+  private final List&lt;ThreadsafeProcessor&lt;I,O&gt;&gt; processorList;
+  private final JobCallback&lt;O&gt; callback;
+
+  /**
+   * Constructor.
+   *
+   * @param nThreads If less than or equal to 0, then automatically determine the number
+   *                    of threads. Otherwise, the size of the underlying threadpool.
+   * @param processor
+   */
+  public MulticoreWrapper(int nThreads, ThreadsafeProcessor&lt;I,O&gt; processor) {
+<span class="fc" id="L57">    this(nThreads, processor, true);</span>
+<span class="fc" id="L58">  }</span>
+
+  /**
+   * Constructor.
+   *
+   * @param numThreads -- if less than or equal to 0, then automatically determine the number
+   *                    of threads. Otherwise, the size of the underlying threadpool.
+   * @param processor
+   * @param orderResults -- If true, return results in the order submitted. Otherwise, return results
+   *                        as they become available.
+   */
+<span class="fc" id="L69">  public MulticoreWrapper(int numThreads, ThreadsafeProcessor&lt;I,O&gt; processor, boolean orderResults) {</span>
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">    nThreads = numThreads &lt;= 0 ? Runtime.getRuntime().availableProcessors() : numThreads;</span>
+<span class="fc" id="L71">    this.orderResults = orderResults;</span>
+<span class="fc" id="L72">    outputQueue = new ConcurrentHashMap&lt;&gt;(2 * nThreads);</span>
+<span class="fc" id="L73">    threadPool = buildThreadPool(nThreads);</span>
+    //    queue = new ExecutorCompletionService&lt;Integer&gt;(threadPool);
+<span class="fc" id="L75">    idleProcessors = new ArrayBlockingQueue&lt;&gt;(nThreads, false);</span>
+<span class="fc" id="L76">    callback = (result, processorId) -&gt; {</span>
+<span class="fc" id="L77">      outputQueue.put(result.id, result.item);</span>
+<span class="fc" id="L78">      idleProcessors.add(processorId);</span>
+<span class="fc" id="L79">    };</span>
+
+    // Sanity check: Fixed thread pool so prevent timeouts.
+    // Default should be false
+<span class="fc" id="L83">    threadPool.allowCoreThreadTimeOut(false);</span>
+<span class="fc" id="L84">    threadPool.prestartAllCoreThreads();</span>
+
+    // Setup the processors, one per thread
+<span class="fc" id="L87">    List&lt;ThreadsafeProcessor&lt;I,O&gt;&gt; procList = new ArrayList&lt;&gt;(nThreads);</span>
+<span class="fc" id="L88">    procList.add(processor);</span>
+<span class="fc" id="L89">    idleProcessors.add(0);</span>
+<span class="fc bfc" id="L90" title="All 2 branches covered.">    for (int i = 1; i &lt; nThreads; ++i) {</span>
+<span class="fc" id="L91">      procList.add(processor.newInstance());</span>
+<span class="fc" id="L92">      idleProcessors.add(i);</span>
+    }
+<span class="fc" id="L94">    processorList = Collections.unmodifiableList(procList);</span>
+<span class="fc" id="L95">  }</span>
+
+  protected ThreadPoolExecutor buildThreadPool(int nThreads) {
+<span class="fc" id="L98">    return (ThreadPoolExecutor) Executors.newFixedThreadPool(nThreads);</span>
+  }
+
+  public int nThreads() {
+<span class="nc" id="L102">    return nThreads;</span>
+  }
+
+  /**
+   * Return status information about the underlying threadpool.
+   */
+  @Override
+  public String toString() {
+<span class="nc" id="L110">    return String.format(&quot;active: %d/%d  submitted: %d  completed: %d  input_q: %d  output_q: %d  idle_q: %d&quot;,</span>
+<span class="nc" id="L111">        threadPool.getActiveCount(),</span>
+<span class="nc" id="L112">        threadPool.getPoolSize(),</span>
+<span class="nc" id="L113">        threadPool.getTaskCount(),</span>
+<span class="nc" id="L114">        threadPool.getCompletedTaskCount(),</span>
+<span class="nc" id="L115">        threadPool.getQueue().size(),</span>
+<span class="nc" id="L116">        outputQueue.size(),</span>
+<span class="nc" id="L117">        idleProcessors.size());</span>
+  }
+  
+  /**
+   * Allocate instance to a process and return. This call blocks until item
+   * can be assigned to a thread.
+   *
+   * @param item Input to a Processor
+   * @throws RejectedExecutionException -- A RuntimeException when there is an
+   * uncaught exception in the queue. Resolution is for the calling class to shutdown
+   * the wrapper and create a new threadpool.
+   * 
+   */
+  public synchronized void put(I item) throws RejectedExecutionException {
+<span class="fc" id="L131">    Integer procId = getProcessor();</span>
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">    if (procId == null) {</span>
+<span class="nc" id="L133">      throw new RejectedExecutionException(&quot;Couldn't submit item to threadpool: &quot; + item.toString());</span>
+    }
+<span class="fc" id="L135">    final int itemId = submittedItemCounter++;</span>
+<span class="fc" id="L136">    CallableJob&lt;I,O&gt; job = new CallableJob&lt;&gt;(item, itemId, processorList.get(procId), procId, callback);</span>
+<span class="fc" id="L137">    threadPool.submit(job);</span>
+<span class="fc" id="L138">  }</span>
+
+  /**
+   * Returns the next available thread id.  Subclasses may wish to
+   * override this, for example if they implement a timeout
+   */
+  Integer getProcessor() {
+    try {
+<span class="fc" id="L146">      return idleProcessors.take();</span>
+<span class="nc" id="L147">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L148">      throw new RuntimeInterruptedException(e);</span>
+    }
+  }
+  
+  /**
+   * Wait for all threads to finish, then destroy the pool of
+   * worker threads so that the main thread can shutdown.
+   */
+  public void join() {
+<span class="fc" id="L157">    join(true);</span>
+<span class="fc" id="L158">  }</span>
+
+  /**
+   * Wait for all threads to finish.
+   * 
+   * @param destroyThreadpool -- if true, then destroy the worker threads
+   * so that the main thread can shutdown.
+   */
+  public void join(boolean destroyThreadpool) {
+    // Make blocking calls to the last processes that are running
+<span class="pc bpc" id="L168" title="1 of 2 branches missed.">    if ( ! threadPool.isShutdown()) {</span>
+      try {
+<span class="fc bfc" id="L170" title="All 2 branches covered.">        for (int i = nThreads; i &gt; 0; --i) {</span>
+<span class="fc" id="L171">          idleProcessors.take();</span>
+        }
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (destroyThreadpool) {</span>
+<span class="fc" id="L174">          threadPool.shutdown();</span>
+          // Sanity check. The threadpool should be done after iterating over
+          // the processors.
+<span class="fc" id="L177">          threadPool.awaitTermination(10, TimeUnit.SECONDS);</span>
+        } else {
+          // Repopulate the list of processors
+<span class="nc bnc" id="L180" title="All 2 branches missed.">          for (int i = 0; i &lt; nThreads; ++i) {</span>
+<span class="nc" id="L181">            idleProcessors.put(i);</span>
+          }
+        }
+<span class="nc" id="L184">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L185">        throw new RuntimeException(e);</span>
+<span class="fc" id="L186">      }</span>
+    }
+<span class="fc" id="L188">  }</span>
+
+
+  /**
+   * Indicates whether or not a new result is available.
+   *
+   * @return true if a new result is available, false otherwise.
+   */
+  public boolean peek() {
+<span class="fc bfc" id="L197" title="All 2 branches covered.">    if (outputQueue.isEmpty()) {</span>
+<span class="fc" id="L198">      return false;</span>
+    } else {
+<span class="fc bfc" id="L200" title="All 2 branches covered.">       return orderResults ? outputQueue.containsKey(returnedItemCounter + 1) : true;</span>
+    }
+  }
+
+  /**
+   * Returns the next available result.
+   *
+   * @return the next completed result, or null if no result is available
+   */
+  public O poll() {
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">    if (!peek()) return null;</span>
+<span class="fc" id="L211">    returnedItemCounter++;</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">    int itemIndex = orderResults ? returnedItemCounter : </span>
+<span class="fc" id="L213">      outputQueue.keySet().iterator().next();</span>
+<span class="fc" id="L214">    return outputQueue.remove(itemIndex);</span>
+  }
+  
+  /**
+   * Internal class for a result when a CallableJob completes.
+   * 
+   * @author Spence Green
+   *
+   * @param &lt;O&gt;
+   */
+  private static interface JobCallback&lt;O&gt; {
+    public void call(QueueItem&lt;O&gt; result, int processorId);
+  }
+  
+  /**
+   * Internal class for adding a job to the thread pool.
+   *
+   * @author Spence Green
+   *
+   * @param &lt;I&gt;
+   * @param &lt;O&gt;
+   */
+  static class CallableJob&lt;I,O&gt; implements Callable&lt;Integer&gt; {
+    final I item;
+    private final int itemId;
+    private final ThreadsafeProcessor&lt;I,O&gt; processor;
+    private final int processorId;
+    private final JobCallback&lt;O&gt; callback;
+    
+    public CallableJob(I item, int itemId, ThreadsafeProcessor&lt;I,O&gt; processor, int processorId, 
+<span class="fc" id="L244">        JobCallback&lt;O&gt; callback) {</span>
+<span class="fc" id="L245">      this.item = item;</span>
+<span class="fc" id="L246">      this.itemId = itemId;</span>
+<span class="fc" id="L247">      this.processor = processor;</span>
+<span class="fc" id="L248">      this.processorId = processorId;</span>
+<span class="fc" id="L249">      this.callback = callback;</span>
+<span class="fc" id="L250">    }</span>
+
+    @Override
+    public Integer call() {
+      try {
+<span class="fc" id="L255">        O result = processor.process(item);</span>
+<span class="fc" id="L256">        QueueItem&lt;O&gt; output = new QueueItem&lt;&gt;(result, itemId);</span>
+<span class="fc" id="L257">        callback.call(output, processorId);</span>
+<span class="fc" id="L258">        return itemId;</span>
+      
+<span class="nc" id="L260">      } catch (Exception e) {</span>
+<span class="nc" id="L261">        e.printStackTrace();</span>
+        // Hope that the consumer knows how to handle null!
+<span class="nc" id="L263">        QueueItem&lt;O&gt; output = new QueueItem&lt;&gt;(null, itemId);</span>
+<span class="nc" id="L264">        callback.call(output, processorId);</span>
+<span class="nc" id="L265">        return itemId;</span>
+      }
+    }
+  }
+
+  /**
+   * Internal class for storing results of type O in a min queue.
+   *
+   * @author Spence Green
+   *
+   * @param &lt;O&gt;
+   */
+  private static class QueueItem&lt;O&gt; implements Comparable&lt;QueueItem&lt;O&gt;&gt; {
+    public final int id;
+    public final O item;
+
+<span class="fc" id="L281">    public QueueItem(O item, int id) {</span>
+<span class="fc" id="L282">      this.item = item;</span>
+<span class="fc" id="L283">      this.id = id;</span>
+<span class="fc" id="L284">    }</span>
+
+    @Override
+    public int compareTo(QueueItem&lt;O&gt; other) {
+<span class="nc" id="L288">      return this.id - other.id;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public boolean equals(Object other) {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">      if (other == this) return true;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">      if ( ! (other instanceof QueueItem)) return false;</span>
+<span class="nc" id="L295">      QueueItem&lt;O&gt; otherQueue = (QueueItem&lt;O&gt;) other;</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">      return this.id == otherQueue.id;</span>
+    }
+
+    public int hashCode() {
+<span class="nc" id="L300">      return id;</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

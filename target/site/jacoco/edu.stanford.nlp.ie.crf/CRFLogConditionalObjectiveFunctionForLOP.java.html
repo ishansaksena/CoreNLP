@@ -1,0 +1,456 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CRFLogConditionalObjectiveFunctionForLOP.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.crf</a> &gt; <span class="el_source">CRFLogConditionalObjectiveFunctionForLOP.java</span></div><h1>CRFLogConditionalObjectiveFunctionForLOP.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.crf; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.optimization.AbstractCachingDiffFunction;
+import edu.stanford.nlp.util.Index;
+
+import java.util.*;
+
+/**
+ * @author Mengqiu Wang
+ * TODO(mengqiu) currently only works with disjoint feature sets
+ * for non-disjoint feature sets, need to recompute EHat each iteration, and multiply in the scale
+ * in EHat and E calculations for each lopExpert
+ */
+
+<span class="nc bnc" id="L17" title="All 2 branches missed.">public class CRFLogConditionalObjectiveFunctionForLOP extends AbstractCachingDiffFunction implements HasCliquePotentialFunction  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L20">  private static Redwood.RedwoodChannels log = Redwood.channels(CRFLogConditionalObjectiveFunctionForLOP.class);</span>
+
+  /** label indices - for all possible label sequences - for each feature */
+  List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices;
+  Index&lt;String&gt; classIndex;  // didn't have &lt;String&gt; before. Added since that's what is assumed everywhere.
+  double[][][] Ehat; // empirical counts of all the features [lopIter][feature][class]
+  double[] sumOfObservedLogPotential; // empirical sum of all log potentials [lopIter]
+  double[][][][][] sumOfExpectedLogPotential; // sumOfExpectedLogPotential[m][i][j][lopIter][k] m-docNo;i-position;j-cliqueNo;k-label 
+  List&lt;Set&lt;Integer&gt;&gt; featureIndicesSetArray;
+  List&lt;List&lt;Integer&gt;&gt; featureIndicesListArray;
+  int window;
+  int numClasses;
+  int[] map;
+  int[][][][] data;  // data[docIndex][tokenIndex][][]
+  double[][] lopExpertWeights; // lopExpertWeights[expertIter][weightIndex]
+  double[][][] lopExpertWeights2D;
+  int[][] labels;    // labels[docIndex][tokenIndex]
+  int[][] learnedParamsMapping;
+  int numLopExpert;
+  boolean backpropTraining;
+<span class="nc" id="L40">  int domainDimension = -1;</span>
+
+<span class="nc" id="L42">  String crfType = &quot;maxent&quot;;</span>
+  String backgroundSymbol;
+
+<span class="nc" id="L45">  public static boolean VERBOSE = false;</span>
+
+  CRFLogConditionalObjectiveFunctionForLOP(int[][][][] data, int[][] labels, double[][] lopExpertWeights, int window,
+      Index&lt;String&gt; classIndex, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, String backgroundSymbol, int numLopExpert,
+<span class="nc" id="L49">      List&lt;Set&lt;Integer&gt;&gt; featureIndicesSetArray, List&lt;List&lt;Integer&gt;&gt; featureIndicesListArray, boolean backpropTraining) {</span>
+<span class="nc" id="L50">    this.window = window;</span>
+<span class="nc" id="L51">    this.classIndex = classIndex;</span>
+<span class="nc" id="L52">    this.numClasses = classIndex.size();</span>
+<span class="nc" id="L53">    this.labelIndices = labelIndices;</span>
+<span class="nc" id="L54">    this.map = map;</span>
+<span class="nc" id="L55">    this.data = data;</span>
+<span class="nc" id="L56">    this.lopExpertWeights = lopExpertWeights;</span>
+<span class="nc" id="L57">    this.labels = labels;</span>
+<span class="nc" id="L58">    this.backgroundSymbol = backgroundSymbol;</span>
+<span class="nc" id="L59">    this.numLopExpert = numLopExpert;</span>
+<span class="nc" id="L60">    this.featureIndicesSetArray = featureIndicesSetArray;</span>
+<span class="nc" id="L61">    this.featureIndicesListArray = featureIndicesListArray;</span>
+<span class="nc" id="L62">    this.backpropTraining = backpropTraining;</span>
+<span class="nc" id="L63">    initialize2DWeights();</span>
+<span class="nc bnc" id="L64" title="All 2 branches missed.">    if (backpropTraining) {</span>
+<span class="nc" id="L65">      computeEHat();</span>
+    } else {
+<span class="nc" id="L67">      logPotential(lopExpertWeights2D);</span>
+    }
+<span class="nc" id="L69">  }</span>
+
+  @Override
+  public int domainDimension() {
+<span class="nc bnc" id="L73" title="All 2 branches missed.">    if (domainDimension &lt; 0) {</span>
+<span class="nc" id="L74">      domainDimension = numLopExpert;</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">      if (backpropTraining) {</span>
+        // for (int i = 0; i &lt; map.length; i++) {
+        //   domainDimension += labelIndices[map[i]].size();
+        // }
+<span class="nc bnc" id="L79" title="All 2 branches missed.">        for (int i = 0; i &lt; numLopExpert; i++) {</span>
+<span class="nc" id="L80">          List&lt;Integer&gt; featureIndicesList = featureIndicesListArray.get(i);</span>
+<span class="nc" id="L81">          double[][] expertWeights2D = lopExpertWeights2D[i];</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">          for (int fIndex: featureIndicesList) {</span>
+<span class="nc" id="L83">            int len = expertWeights2D[fIndex].length;</span>
+<span class="nc" id="L84">            domainDimension += len;</span>
+<span class="nc" id="L85">          }</span>
+        }
+      }
+    }
+<span class="nc" id="L89">    return domainDimension;</span>
+  }
+
+  @Override 
+  public double[] initial() {
+<span class="nc" id="L94">    double[] initial = new double[domainDimension()];</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">    if (backpropTraining) {</span>
+<span class="nc" id="L96">      learnedParamsMapping = new int[domainDimension()][3];</span>
+<span class="nc" id="L97">      int index = 0;</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">      for (; index &lt; numLopExpert; index++) {</span>
+<span class="nc" id="L99">        initial[index] = 1.0;</span>
+      }
+<span class="nc bnc" id="L101" title="All 2 branches missed.">      for (int i = 0; i &lt; numLopExpert; i++) {</span>
+<span class="nc" id="L102">        List&lt;Integer&gt; featureIndicesList = featureIndicesListArray.get(i);</span>
+<span class="nc" id="L103">        double[][] expertWeights2D = lopExpertWeights2D[i];</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        for (int fIndex: featureIndicesList) {</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">          for (int j = 0; j &lt; expertWeights2D[fIndex].length; j++) {</span>
+<span class="nc" id="L106">            initial[index] = expertWeights2D[fIndex][j];</span>
+<span class="nc" id="L107">            learnedParamsMapping[index] = new int[]{i, fIndex, j};</span>
+<span class="nc" id="L108">            index++;</span>
+          }
+<span class="nc" id="L110">        }</span>
+      }
+<span class="nc" id="L112">    } else {</span>
+<span class="nc" id="L113">      Arrays.fill(initial, 1.0);</span>
+    }
+<span class="nc" id="L115">    return initial;</span>
+  }
+
+  public double[][][] empty2D() {
+<span class="nc" id="L119">    double[][][] d2 = new double[numLopExpert][][];</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">    for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L121">      double[][] d = new double[map.length][];</span>
+      // int index = 0;
+<span class="nc bnc" id="L123" title="All 2 branches missed.">      for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L124">        d[i] = new double[labelIndices.get(map[i]).size()];</span>
+        // cdm july 2005: below array initialization isn't necessary: JLS (3rd ed.) 4.12.5
+        // Arrays.fill(d[i], 0.0);
+        // index += labelIndices[map[i]].size();
+      }
+<span class="nc" id="L129">      d2[lopIter] = d;</span>
+    }
+<span class="nc" id="L131">    return d2;</span>
+  }
+
+  private void initialize2DWeights() {
+<span class="nc" id="L135">    lopExpertWeights2D = new double[numLopExpert][][];</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">    for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L137">      lopExpertWeights2D[lopIter] = to2D(lopExpertWeights[lopIter], labelIndices, map); </span>
+    }
+<span class="nc" id="L139">  }</span>
+
+  public double[][] to2D(double[] weights, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map) {
+<span class="nc" id="L142">    double[][] newWeights = new double[map.length][];</span>
+<span class="nc" id="L143">    int index = 0;</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">    for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L145">      newWeights[i] = new double[labelIndices.get(map[i]).size()];</span>
+<span class="nc" id="L146">      System.arraycopy(weights, index, newWeights[i], 0, labelIndices.get(map[i]).size());</span>
+<span class="nc" id="L147">      index += labelIndices.get(map[i]).size();</span>
+    }
+<span class="nc" id="L149">    return newWeights;</span>
+  }
+  
+
+  private void computeEHat() {
+<span class="nc" id="L154">    Ehat = empty2D();</span>
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">    for (int m = 0; m &lt; data.length; m++) {</span>
+<span class="nc" id="L157">      int[][][] docData = data[m];</span>
+<span class="nc" id="L158">      int[] docLabels = labels[m];</span>
+<span class="nc" id="L159">      int[] windowLabels = new int[window];</span>
+<span class="nc" id="L160">      Arrays.fill(windowLabels, classIndex.indexOf(backgroundSymbol));</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">      if (docLabels.length&gt;docData.length) { // only true for self-training</span>
+        // fill the windowLabel array with the extra docLabels
+<span class="nc" id="L164">        System.arraycopy(docLabels, 0, windowLabels, 0, windowLabels.length);</span>
+        // shift the docLabels array left
+<span class="nc" id="L166">        int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L167">        System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L168">        docLabels = newDocLabels;</span>
+      }
+<span class="nc bnc" id="L170" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L171">        System.arraycopy(windowLabels, 1, windowLabels, 0, window - 1);</span>
+<span class="nc" id="L172">        windowLabels[window - 1] = docLabels[i];</span>
+<span class="nc" id="L173">        int[][] docDataI = docData[i];</span>
+
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        for (int j = 0; j &lt; docDataI.length; j++) { // j iterates over cliques</span>
+<span class="nc" id="L176">          int[] docDataIJ = docDataI[j];</span>
+<span class="nc" id="L177">          int[] cliqueLabel = new int[j + 1];</span>
+<span class="nc" id="L178">          System.arraycopy(windowLabels, window - 1 - j, cliqueLabel, 0, j + 1);</span>
+<span class="nc" id="L179">          CRFLabel crfLabel = new CRFLabel(cliqueLabel);</span>
+<span class="nc" id="L180">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+
+<span class="nc" id="L182">          int observedLabelIndex = labelIndex.indexOf(crfLabel);</span>
+          //log.info(crfLabel + &quot; &quot; + observedLabelIndex);
+<span class="nc bnc" id="L184" title="All 2 branches missed.">          for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L185">            double[][] ehatOfIter = Ehat[lopIter];</span>
+<span class="nc" id="L186">            Set&lt;Integer&gt; indicesSet = featureIndicesSetArray.get(lopIter);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            for (int featureIdx : docDataIJ) { // k iterates over features</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">              if (indicesSet.contains(featureIdx)) {</span>
+<span class="nc" id="L189">                ehatOfIter[featureIdx][observedLabelIndex]++;</span>
+              }
+            }
+          }
+        }
+      }
+    }
+<span class="nc" id="L196">  }</span>
+
+  private void logPotential(double[][][] learnedLopExpertWeights2D) {
+<span class="nc" id="L199">    sumOfExpectedLogPotential = new double[data.length][][][][];</span>
+<span class="nc" id="L200">    sumOfObservedLogPotential = new double[numLopExpert];</span>
+
+<span class="nc bnc" id="L202" title="All 2 branches missed.">    for (int m = 0; m &lt; data.length; m++) {</span>
+<span class="nc" id="L203">      int[][][] docData = data[m];</span>
+<span class="nc" id="L204">      int[] docLabels = labels[m];</span>
+<span class="nc" id="L205">      int[] windowLabels = new int[window];</span>
+<span class="nc" id="L206">      Arrays.fill(windowLabels, classIndex.indexOf(backgroundSymbol));</span>
+
+<span class="nc" id="L208">      double[][][][] sumOfELPm = new double[docData.length][][][];</span>
+      
+<span class="nc bnc" id="L210" title="All 2 branches missed.">      if (docLabels.length&gt;docData.length) { // only true for self-training</span>
+        // fill the windowLabel array with the extra docLabels
+<span class="nc" id="L212">        System.arraycopy(docLabels, 0, windowLabels, 0, windowLabels.length);</span>
+        // shift the docLabels array left
+<span class="nc" id="L214">        int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L215">        System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L216">        docLabels = newDocLabels;</span>
+      }
+<span class="nc bnc" id="L218" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L219">        System.arraycopy(windowLabels, 1, windowLabels, 0, window - 1);</span>
+<span class="nc" id="L220">        windowLabels[window - 1] = docLabels[i];</span>
+
+<span class="nc" id="L222">        double[][][] sumOfELPmi = new double[docData[i].length][][]; </span>
+<span class="nc" id="L223">        int[][] docDataI = docData[i];</span>
+
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        for (int j = 0; j &lt; docDataI.length; j++) { // j iterates over cliques</span>
+<span class="nc" id="L226">          int[] docDataIJ = docDataI[j];</span>
+<span class="nc" id="L227">          int[] cliqueLabel = new int[j + 1];</span>
+<span class="nc" id="L228">          System.arraycopy(windowLabels, window - 1 - j, cliqueLabel, 0, j + 1);</span>
+<span class="nc" id="L229">          CRFLabel crfLabel = new CRFLabel(cliqueLabel);</span>
+<span class="nc" id="L230">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+
+<span class="nc" id="L232">          double[][] sumOfELPmij = new double[numLopExpert][];  </span>
+
+<span class="nc" id="L234">          int observedLabelIndex = labelIndex.indexOf(crfLabel);</span>
+          //log.info(crfLabel + &quot; &quot; + observedLabelIndex);
+<span class="nc bnc" id="L236" title="All 2 branches missed.">          for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L237">            double[] sumOfELPmijIter = new double[labelIndex.size()]; </span>
+<span class="nc" id="L238">            Set&lt;Integer&gt; indicesSet = featureIndicesSetArray.get(lopIter);</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            for (int featureIdx : docDataIJ) { // k iterates over features</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">              if (indicesSet.contains(featureIdx)) {</span>
+<span class="nc" id="L241">                sumOfObservedLogPotential[lopIter] += learnedLopExpertWeights2D[lopIter][featureIdx][observedLabelIndex];</span>
+                // sum over potential of this clique over all possible labels, used later in calculating expected counts
+<span class="nc bnc" id="L243" title="All 2 branches missed.">                for (int l = 0; l &lt; labelIndex.size(); l++) {</span>
+<span class="nc" id="L244">                  sumOfELPmijIter[l] += learnedLopExpertWeights2D[lopIter][featureIdx][l];</span>
+                }
+              }
+            }
+<span class="nc" id="L248">            sumOfELPmij[lopIter] = sumOfELPmijIter;</span>
+          }
+<span class="nc" id="L250">          sumOfELPmi[j] = sumOfELPmij;</span>
+        }
+<span class="nc" id="L252">        sumOfELPm[i] = sumOfELPmi;</span>
+      }
+<span class="nc" id="L254">      sumOfExpectedLogPotential[m] = sumOfELPm;</span>
+    }
+<span class="nc" id="L256">  }</span>
+
+  public static double[] combineAndScaleLopWeights(int numLopExpert, double[][] lopExpertWeights, double[] lopScales) {
+<span class="nc" id="L259">    double[] newWeights = new double[lopExpertWeights[0].length];</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">    for (int i = 0; i &lt; newWeights.length; i++) {</span>
+<span class="nc" id="L261">      double tempWeight = 0;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">      for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L263">        tempWeight += lopExpertWeights[lopIter][i] * lopScales[lopIter];</span>
+      }
+<span class="nc" id="L265">      newWeights[i] = tempWeight;</span>
+    }
+<span class="nc" id="L267">    return newWeights;</span>
+  }
+
+  public static double[][] combineAndScaleLopWeights2D(int numLopExpert, double[][][] lopExpertWeights2D, double[] lopScales) {
+<span class="nc" id="L271">    double[][] newWeights = new double[lopExpertWeights2D[0].length][];</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    for (int i = 0; i &lt; newWeights.length; i++) {</span>
+<span class="nc" id="L273">      int innerDim = lopExpertWeights2D[0][i].length;</span>
+<span class="nc" id="L274">      double[] innerWeights = new double[innerDim];</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">      for (int j = 0; j &lt; innerDim; j++) {</span>
+<span class="nc" id="L276">        double tempWeight = 0;</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L278">          tempWeight += lopExpertWeights2D[lopIter][i][j] * lopScales[lopIter];</span>
+        }
+<span class="nc" id="L280">        innerWeights[j] = tempWeight;</span>
+      }
+<span class="nc" id="L282">      newWeights[i] = innerWeights;</span>
+    }
+<span class="nc" id="L284">    return newWeights;</span>
+  }
+
+  public double[][][] separateLopExpertWeights2D(double[] learnedParams) {
+<span class="nc" id="L288">    double[][][] learnedWeights2D = empty2D();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    for (int paramIndex = numLopExpert; paramIndex &lt; learnedParams.length; paramIndex++) {</span>
+<span class="nc" id="L290">      int[] mapping = learnedParamsMapping[paramIndex];</span>
+<span class="nc" id="L291">      learnedWeights2D[mapping[0]][mapping[1]][mapping[2]] = learnedParams[paramIndex];</span>
+    }
+<span class="nc" id="L293">    return learnedWeights2D;</span>
+  }
+
+  public double[][] separateLopExpertWeights(double[] learnedParams) {
+<span class="nc" id="L297">    double[][] learnedWeights = new double[numLopExpert][];</span>
+<span class="nc" id="L298">    double[][][] learnedWeights2D = separateLopExpertWeights2D(learnedParams);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">    for (int i = 0; i &lt; numLopExpert; i++) {</span>
+<span class="nc" id="L300">      learnedWeights[i] = CRFLogConditionalObjectiveFunction.to1D(learnedWeights2D[i], lopExpertWeights[i].length);</span>
+    }
+<span class="nc" id="L302">    return learnedWeights;</span>
+  }
+
+  public double[] separateLopScales(double[] learnedParams) {
+<span class="nc" id="L306">    double[] rawScales = new double[numLopExpert];</span>
+<span class="nc" id="L307">    System.arraycopy(learnedParams, 0, rawScales, 0, numLopExpert);</span>
+<span class="nc" id="L308">    return rawScales;</span>
+  }
+
+  public CliquePotentialFunction getCliquePotentialFunction(double[] x) {
+<span class="nc" id="L312">    double[] rawScales = separateLopScales(x);</span>
+<span class="nc" id="L313">    double[] scales = ArrayMath.softmax(rawScales);</span>
+<span class="nc" id="L314">    double[][][] learnedLopExpertWeights2D = lopExpertWeights2D;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">    if (backpropTraining) {</span>
+<span class="nc" id="L316">      learnedLopExpertWeights2D = separateLopExpertWeights2D(x);</span>
+    }
+
+<span class="nc" id="L319">    double[][] combinedWeights2D = combineAndScaleLopWeights2D(numLopExpert, learnedLopExpertWeights2D, scales);</span>
+<span class="nc" id="L320">    return new LinearCliquePotentialFunction(combinedWeights2D);</span>
+  }
+
+  // todo [cdm]: Below data[m] --&gt; docData
+  /**
+   * Calculates both value and partial derivatives at the point x, and save them internally.
+   */
+  @Override
+  public void calculate(double[] x) {
+
+<span class="nc" id="L330">    double prob = 0.0; // the log prob of the sequence given the model, which is the negation of value at this point</span>
+<span class="nc" id="L331">    double[][][] E = empty2D();</span>
+<span class="nc" id="L332">    double[] eScales = new double[numLopExpert];</span>
+
+<span class="nc" id="L334">    double[] rawScales = separateLopScales(x);</span>
+<span class="nc" id="L335">    double[] scales = ArrayMath.softmax(rawScales);</span>
+<span class="nc" id="L336">    double[][][] learnedLopExpertWeights2D = lopExpertWeights2D;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">    if (backpropTraining) {</span>
+<span class="nc" id="L338">      learnedLopExpertWeights2D = separateLopExpertWeights2D(x);</span>
+<span class="nc" id="L339">      logPotential(learnedLopExpertWeights2D);</span>
+    }
+
+<span class="nc" id="L342">    double[][] combinedWeights2D = combineAndScaleLopWeights2D(numLopExpert, learnedLopExpertWeights2D, scales);</span>
+    // iterate over all the documents
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    for (int m = 0; m &lt; data.length; m++) {</span>
+<span class="nc" id="L345">      int[][][] docData = data[m];</span>
+<span class="nc" id="L346">      int[] docLabels = labels[m];</span>
+<span class="nc" id="L347">      double[][][][] sumOfELPm = sumOfExpectedLogPotential[m]; // sumOfExpectedLogPotential[m][i][j][lopIter][k] m-docNo;i-position;j-cliqueNo;k-label </span>
+
+      // make a clique tree for this document
+<span class="nc" id="L350">      CliquePotentialFunction cliquePotentialFunc = new LinearCliquePotentialFunction(combinedWeights2D);</span>
+<span class="nc" id="L351">      CRFCliqueTree cliqueTree = CRFCliqueTree.getCalibratedCliqueTree(docData, labelIndices, numClasses, classIndex, backgroundSymbol, cliquePotentialFunc, null);</span>
+
+      // compute the log probability of the document given the model with the parameters x
+<span class="nc" id="L354">      int[] given = new int[window - 1];</span>
+<span class="nc" id="L355">      Arrays.fill(given, classIndex.indexOf(backgroundSymbol));</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">      if (docLabels.length &gt; docData.length) { // only true for self-training</span>
+        // fill the given array with the extra docLabels
+<span class="nc" id="L358">        System.arraycopy(docLabels, 0, given, 0, given.length);</span>
+        // shift the docLabels array left
+<span class="nc" id="L360">        int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L361">        System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L362">        docLabels = newDocLabels;</span>
+      }
+      // iterate over the positions in this document
+<span class="nc bnc" id="L365" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L366">        int label = docLabels[i];</span>
+<span class="nc" id="L367">        double p = cliqueTree.condLogProbGivenPrevious(i, label, given);</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L369">          log.info(&quot;P(&quot; + label + &quot;|&quot; + ArrayMath.toString(given) + &quot;)=&quot; + p);</span>
+        }
+<span class="nc" id="L371">        prob += p;</span>
+<span class="nc" id="L372">        System.arraycopy(given, 1, given, 0, given.length - 1);</span>
+<span class="nc" id="L373">        given[given.length - 1] = label;</span>
+      }
+
+      // compute the expected counts for this document, which we will need to compute the derivative
+      // iterate over the positions in this document
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+        // for each possible clique at this position
+<span class="nc" id="L380">        double[][][] sumOfELPmi = sumOfELPm[i];</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        for (int j = 0; j &lt; docData[i].length; j++) {</span>
+<span class="nc" id="L382">          double[][] sumOfELPmij = sumOfELPmi[j];</span>
+<span class="nc" id="L383">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+          // for each possible labeling for that clique
+<span class="nc bnc" id="L385" title="All 2 branches missed.">          for (int l = 0; l &lt; labelIndex.size(); l++) {</span>
+<span class="nc" id="L386">            int[] label = labelIndex.get(l).getLabel();</span>
+<span class="nc" id="L387">            double p = cliqueTree.prob(i, label); // probability of these labels occurring in this clique with these features</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">            for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L389">              Set&lt;Integer&gt; indicesSet = featureIndicesSetArray.get(lopIter);</span>
+<span class="nc" id="L390">              double scale = scales[lopIter];</span>
+<span class="nc" id="L391">              double expected = sumOfELPmij[lopIter][l];</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">              for (int innerLopIter = 0; innerLopIter &lt; numLopExpert; innerLopIter++) {</span>
+<span class="nc" id="L393">                expected -= scales[innerLopIter] * sumOfELPmij[innerLopIter][l];</span>
+              }
+<span class="nc" id="L395">              expected *= scale;</span>
+<span class="nc" id="L396">              eScales[lopIter] += (p * expected);</span>
+
+<span class="nc" id="L398">              double[][] eOfIter = E[lopIter];</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">              if (backpropTraining) {</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                for (int k = 0; k &lt; docData[i][j].length; k++) { // k iterates over features</span>
+<span class="nc" id="L401">                  int featureIdx = docData[i][j][k];</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">                  if (indicesSet.contains(featureIdx)) {</span>
+<span class="nc" id="L403">                    eOfIter[featureIdx][l] += p;</span>
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+<span class="nc bnc" id="L413" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L414">      throw new RuntimeException(&quot;Got NaN for prob in CRFLogConditionalObjectiveFunctionForLOP.calculate()&quot;);</span>
+    }
+
+<span class="nc" id="L417">    value = -prob;</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">    if(VERBOSE){</span>
+<span class="nc" id="L419">      log.info(&quot;value is &quot; + value);</span>
+    }
+    // compute the partial derivative for each feature by comparing expected counts to empirical counts
+<span class="nc bnc" id="L422" title="All 2 branches missed.">    for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L423">      double scale = scales[lopIter];</span>
+<span class="nc" id="L424">      double observed = sumOfObservedLogPotential[lopIter];</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">      for (int j = 0; j &lt; numLopExpert; j++) {</span>
+<span class="nc" id="L426">        observed -= scales[j] * sumOfObservedLogPotential[j];</span>
+      }
+<span class="nc" id="L428">      observed *= scale;</span>
+<span class="nc" id="L429">      double expected = eScales[lopIter];</span>
+
+<span class="nc" id="L431">      derivative[lopIter] = (expected - observed);</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">      if (VERBOSE) {</span>
+<span class="nc" id="L433">        log.info(&quot;deriv(&quot; + lopIter + &quot;) = &quot; + expected + &quot; - &quot; + observed + &quot; = &quot; + derivative[lopIter]);</span>
+      }
+    }
+<span class="nc bnc" id="L436" title="All 2 branches missed.">    if (backpropTraining) {</span>
+<span class="nc" id="L437">      int dIndex = numLopExpert;</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      for (int lopIter = 0; lopIter &lt; numLopExpert; lopIter++) {</span>
+<span class="nc" id="L439">        double scale = scales[lopIter];</span>
+<span class="nc" id="L440">        double[][] eOfExpert = E[lopIter];</span>
+<span class="nc" id="L441">        double[][] ehatOfExpert = Ehat[lopIter];</span>
+<span class="nc" id="L442">        List&lt;Integer&gt; featureIndicesList = featureIndicesListArray.get(lopIter);</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        for (int fIndex: featureIndicesList) {</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">          for (int j = 0; j &lt; eOfExpert[fIndex].length; j++) {</span>
+<span class="nc" id="L445">            derivative[dIndex++] = scale * (eOfExpert[fIndex][j] - ehatOfExpert[fIndex][j]);</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            if (VERBOSE) {</span>
+<span class="nc" id="L447">              log.info(&quot;deriv[&quot; + lopIter+ &quot;](&quot; + fIndex + &quot;,&quot; + j + &quot;) = &quot; + scale + &quot; * (&quot; + eOfExpert[fIndex][j] + &quot; - &quot; + ehatOfExpert[fIndex][j] + &quot;) = &quot; + derivative[dIndex - 1]);</span>
+            }
+          }
+<span class="nc" id="L450">        }</span>
+      }
+<span class="nc bnc" id="L452" title="All 4 branches missed.">      assert(dIndex == domainDimension());</span>
+    }
+<span class="nc" id="L454">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,691 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SentimentModel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.sentiment</a> &gt; <span class="el_source">SentimentModel.java</span></div><h1>SentimentModel.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.sentiment; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.Serializable;
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+
+import org.ejml.simple.SimpleMatrix;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.neural.Embedding;
+import edu.stanford.nlp.neural.NeuralUtils;
+import edu.stanford.nlp.neural.SimpleTensor;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.TwoDimensionalMap;
+import edu.stanford.nlp.util.TwoDimensionalSet;
+
+public class SentimentModel implements Serializable  {
+
+  /** A logger for this class */
+<span class="nc" id="L27">  private static Redwood.RedwoodChannels log = Redwood.channels(SentimentModel.class);</span>
+  /**
+   * Nx2N+1, where N is the size of the word vectors
+   */
+  public final TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryTransform;
+
+  /**
+   * 2Nx2NxN, where N is the size of the word vectors
+   */
+  public final TwoDimensionalMap&lt;String, String, SimpleTensor&gt; binaryTensors;
+
+  /**
+   * CxN+1, where N = size of word vectors, C is the number of classes
+   */
+  public final TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryClassification;
+
+  /**
+   * CxN+1, where N = size of word vectors, C is the number of classes
+   */
+  public final Map&lt;String, SimpleMatrix&gt; unaryClassification;
+
+  /**
+   * Map from vocabulary words to word vectors.
+   *
+   * @see #getWordVector(String) 
+   */
+  public Map&lt;String, SimpleMatrix&gt; wordVectors;
+
+  /**
+   * How many classes the RNN is built to test against
+   */
+  public final int numClasses;
+
+  /**
+   * Dimension of hidden layers, size of word vectors, etc
+   */
+  public final int numHid;
+
+  /**
+   * Cached here for easy calculation of the model size;
+   * TwoDimensionalMap does not return that in O(1) time
+   */
+  public final int numBinaryMatrices;
+
+  /** How many elements a transformation matrix has */
+  public final int binaryTransformSize;
+  /** How many elements the binary transformation tensors have */
+  public final int binaryTensorSize;
+  /** How many elements a classification matrix has */
+  public final int binaryClassificationSize;
+
+  /**
+   * Cached here for easy calculation of the model size;
+   * TwoDimensionalMap does not return that in O(1) time
+   */
+  public final int numUnaryMatrices;
+
+  /** How many elements a classification matrix has */
+  public final int unaryClassificationSize;
+
+  /**
+   * we just keep this here for convenience
+   */
+  transient SimpleMatrix identity;
+
+  /**
+   * A random number generator - keeping it here lets us reproduce results
+   */
+  final Random rand;
+
+  static final String UNKNOWN_WORD = &quot;*UNK*&quot;;
+
+  /**
+   * Will store various options specific to this model
+   */
+  final RNNOptions op;
+
+  /*
+  // An example of how you could read in old models with readObject to fix the serialization
+  // You would first read in the old model, then reserialize it
+  private void readObject(ObjectInputStream in)
+    throws IOException, ClassNotFoundException
+  {
+    ObjectInputStream.GetField fields = in.readFields();
+    binaryTransform = ErasureUtils.uncheckedCast(fields.get(&quot;binaryTransform&quot;, null));
+
+    // transform binaryTensors
+    binaryTensors = TwoDimensionalMap.treeMap();
+    TwoDimensionalMap&lt;String, String, edu.stanford.nlp.rnn.SimpleTensor&gt; oldTensors = ErasureUtils.uncheckedCast(fields.get(&quot;binaryTensors&quot;, null));
+    for (String first : oldTensors.firstKeySet()) {
+      for (String second : oldTensors.get(first).keySet()) {
+        binaryTensors.put(first, second, new SimpleTensor(oldTensors.get(first, second).slices));
+      }
+    }
+
+    binaryClassification = ErasureUtils.uncheckedCast(fields.get(&quot;binaryClassification&quot;, null));
+    unaryClassification = ErasureUtils.uncheckedCast(fields.get(&quot;unaryClassification&quot;, null));
+    wordVectors = ErasureUtils.uncheckedCast(fields.get(&quot;wordVectors&quot;, null));
+
+    if (fields.defaulted(&quot;numClasses&quot;)) {
+      throw new RuntimeException();
+    }
+    numClasses = fields.get(&quot;numClasses&quot;, 0);
+
+    if (fields.defaulted(&quot;numHid&quot;)) {
+      throw new RuntimeException();
+    }
+    numHid = fields.get(&quot;numHid&quot;, 0);
+
+    if (fields.defaulted(&quot;numBinaryMatrices&quot;)) {
+      throw new RuntimeException();
+    }
+    numBinaryMatrices = fields.get(&quot;numBinaryMatrices&quot;, 0);
+
+    if (fields.defaulted(&quot;binaryTransformSize&quot;)) {
+      throw new RuntimeException();
+    }
+    binaryTransformSize = fields.get(&quot;binaryTransformSize&quot;, 0);
+
+    if (fields.defaulted(&quot;binaryTensorSize&quot;)) {
+      throw new RuntimeException();
+    }
+    binaryTensorSize = fields.get(&quot;binaryTensorSize&quot;, 0);
+
+    if (fields.defaulted(&quot;binaryClassificationSize&quot;)) {
+      throw new RuntimeException();
+    }
+    binaryClassificationSize = fields.get(&quot;binaryClassificationSize&quot;, 0);
+
+    if (fields.defaulted(&quot;numUnaryMatrices&quot;)) {
+      throw new RuntimeException();
+    }
+    numUnaryMatrices = fields.get(&quot;numUnaryMatrices&quot;, 0);
+
+    if (fields.defaulted(&quot;unaryClassificationSize&quot;)) {
+      throw new RuntimeException();
+    }
+    unaryClassificationSize = fields.get(&quot;unaryClassificationSize&quot;, 0);
+
+    rand = ErasureUtils.uncheckedCast(fields.get(&quot;rand&quot;, null));
+    op = ErasureUtils.uncheckedCast(fields.get(&quot;op&quot;, null));
+    op.classNames = op.DEFAULT_CLASS_NAMES;
+    op.equivalenceClasses = op.APPROXIMATE_EQUIVALENCE_CLASSES;
+    op.equivalenceClassNames = op.DEFAULT_EQUIVALENCE_CLASS_NAMES;
+  }
+  */
+
+  /**
+   * Given single matrices and sets of options, create the
+   * corresponding SentimentModel.  Useful for creating a Java version
+   * of a model trained in some other manner, such as using the
+   * original Matlab code.
+   */
+  static SentimentModel modelFromMatrices(SimpleMatrix W, SimpleMatrix Wcat, SimpleTensor Wt, Map&lt;String, SimpleMatrix&gt; wordVectors, RNNOptions op) {
+<span class="nc bnc" id="L181" title="All 4 branches missed.">    if (!op.combineClassification || !op.simplifiedModel) {</span>
+<span class="nc" id="L182">      throw new IllegalArgumentException(&quot;Can only create a model using this method if combineClassification and simplifiedModel are turned on&quot;);</span>
+    }
+<span class="nc" id="L184">    TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryTransform = TwoDimensionalMap.treeMap();</span>
+<span class="nc" id="L185">    binaryTransform.put(&quot;&quot;, &quot;&quot;, W);</span>
+
+<span class="nc" id="L187">    TwoDimensionalMap&lt;String, String, SimpleTensor&gt; binaryTensors = TwoDimensionalMap.treeMap();</span>
+<span class="nc" id="L188">    binaryTensors.put(&quot;&quot;, &quot;&quot;, Wt);</span>
+
+<span class="nc" id="L190">    TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryClassification = TwoDimensionalMap.treeMap();</span>
+
+<span class="nc" id="L192">    Map&lt;String, SimpleMatrix&gt; unaryClassification = Generics.newTreeMap();</span>
+<span class="nc" id="L193">    unaryClassification.put(&quot;&quot;, Wcat);</span>
+
+<span class="nc" id="L195">    return new SentimentModel(binaryTransform, binaryTensors, binaryClassification, unaryClassification, wordVectors, op);</span>
+  }
+
+  private SentimentModel(TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryTransform,
+                         TwoDimensionalMap&lt;String, String, SimpleTensor&gt; binaryTensors,
+                         TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryClassification,
+                         Map&lt;String, SimpleMatrix&gt; unaryClassification,
+                         Map&lt;String, SimpleMatrix&gt; wordVectors,
+<span class="nc" id="L203">                         RNNOptions op) {</span>
+<span class="nc" id="L204">    this.op = op;</span>
+
+<span class="nc" id="L206">    this.binaryTransform = binaryTransform;</span>
+<span class="nc" id="L207">    this.binaryTensors = binaryTensors;</span>
+<span class="nc" id="L208">    this.binaryClassification = binaryClassification;</span>
+<span class="nc" id="L209">    this.unaryClassification = unaryClassification;</span>
+<span class="nc" id="L210">    this.wordVectors = wordVectors;</span>
+<span class="nc" id="L211">    this.numClasses = op.numClasses;</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">    if (op.numHid &lt;= 0) {</span>
+<span class="nc" id="L213">      int nh = 0;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">      for (SimpleMatrix wv : wordVectors.values()) {</span>
+<span class="nc" id="L215">        nh = wv.getNumElements();</span>
+<span class="nc" id="L216">      }</span>
+<span class="nc" id="L217">      this.numHid = nh;</span>
+<span class="nc" id="L218">    } else {</span>
+<span class="nc" id="L219">      this.numHid = op.numHid;</span>
+    }
+<span class="nc" id="L221">    this.numBinaryMatrices = binaryTransform.size();</span>
+<span class="nc" id="L222">    binaryTransformSize = numHid * (2 * numHid + 1);</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    if (op.useTensors) {</span>
+<span class="nc" id="L224">      binaryTensorSize = numHid * numHid * numHid * 4;</span>
+    } else {
+<span class="nc" id="L226">      binaryTensorSize = 0;</span>
+    }
+<span class="nc bnc" id="L228" title="All 2 branches missed.">    binaryClassificationSize = (op.combineClassification) ? 0 : numClasses * (numHid + 1);</span>
+
+<span class="nc" id="L230">    numUnaryMatrices = unaryClassification.size();</span>
+<span class="nc" id="L231">    unaryClassificationSize = numClasses * (numHid + 1);</span>
+
+<span class="nc" id="L233">    rand = new Random(op.randomSeed);</span>
+
+<span class="nc" id="L235">    identity = SimpleMatrix.identity(numHid);</span>
+<span class="nc" id="L236">  }</span>
+
+  /**
+   * The traditional way of initializing an empty model suitable for training.
+   */
+<span class="nc" id="L241">  public SentimentModel(RNNOptions op, List&lt;Tree&gt; trainingTrees) {</span>
+<span class="nc" id="L242">    this.op = op;</span>
+<span class="nc" id="L243">    rand = new Random(op.randomSeed);</span>
+
+<span class="nc bnc" id="L245" title="All 2 branches missed.">    if (op.randomWordVectors) {</span>
+<span class="nc" id="L246">      initRandomWordVectors(trainingTrees);</span>
+    } else {
+<span class="nc" id="L248">      readWordVectors();</span>
+    }
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    if (op.numHid &gt; 0) {</span>
+<span class="nc" id="L251">      this.numHid = op.numHid;</span>
+    } else {
+<span class="nc" id="L253">      int size = 0;</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      for (SimpleMatrix vector : wordVectors.values()) {</span>
+<span class="nc" id="L255">        size = vector.getNumElements();</span>
+<span class="nc" id="L256">        break;</span>
+      }
+<span class="nc" id="L258">      this.numHid = size;</span>
+    }
+
+<span class="nc" id="L261">    TwoDimensionalSet&lt;String, String&gt; binaryProductions = TwoDimensionalSet.hashSet();</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    if (op.simplifiedModel) {</span>
+<span class="nc" id="L263">      binaryProductions.add(&quot;&quot;, &quot;&quot;);</span>
+    } else {
+      // TODO
+      // figure out what binary productions we have in these trees
+      // Note: the current sentiment training data does not actually
+      // have any constituent labels
+<span class="nc" id="L269">      throw new UnsupportedOperationException(&quot;Not yet implemented&quot;);</span>
+    }
+
+<span class="nc" id="L272">    Set&lt;String&gt; unaryProductions = Generics.newHashSet();</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    if (op.simplifiedModel) {</span>
+<span class="nc" id="L274">      unaryProductions.add(&quot;&quot;);</span>
+    } else {
+      // TODO
+      // figure out what unary productions we have in these trees (preterminals only, after the collapsing)
+<span class="nc" id="L278">      throw new UnsupportedOperationException(&quot;Not yet implemented&quot;);</span>
+    }
+
+<span class="nc" id="L281">    this.numClasses = op.numClasses;</span>
+
+<span class="nc" id="L283">    identity = SimpleMatrix.identity(numHid);</span>
+
+<span class="nc" id="L285">    binaryTransform = TwoDimensionalMap.treeMap();</span>
+<span class="nc" id="L286">    binaryTensors = TwoDimensionalMap.treeMap();</span>
+<span class="nc" id="L287">    binaryClassification = TwoDimensionalMap.treeMap();</span>
+
+    // When making a flat model (no symantic untying) the
+    // basicCategory function will return the same basic category for
+    // all labels, so all entries will map to the same matrix
+<span class="nc bnc" id="L292" title="All 2 branches missed.">    for (Pair&lt;String, String&gt; binary : binaryProductions) {</span>
+<span class="nc" id="L293">      String left = basicCategory(binary.first);</span>
+<span class="nc" id="L294">      String right = basicCategory(binary.second);</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">      if (binaryTransform.contains(left, right)) {</span>
+<span class="nc" id="L296">        continue;</span>
+      }
+<span class="nc" id="L298">      binaryTransform.put(left, right, randomTransformMatrix());</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      if (op.useTensors) {</span>
+<span class="nc" id="L300">        binaryTensors.put(left, right, randomBinaryTensor());</span>
+      }
+<span class="nc bnc" id="L302" title="All 2 branches missed.">      if (!op.combineClassification) {</span>
+<span class="nc" id="L303">        binaryClassification.put(left, right, randomClassificationMatrix());</span>
+      }
+<span class="nc" id="L305">    }</span>
+<span class="nc" id="L306">    numBinaryMatrices = binaryTransform.size();</span>
+<span class="nc" id="L307">    binaryTransformSize = numHid * (2 * numHid + 1);</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">    if (op.useTensors) {</span>
+<span class="nc" id="L309">      binaryTensorSize = numHid * numHid * numHid * 4;</span>
+    } else {
+<span class="nc" id="L311">      binaryTensorSize = 0;</span>
+    }
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    binaryClassificationSize = (op.combineClassification) ? 0 : numClasses * (numHid + 1);</span>
+
+<span class="nc" id="L315">    unaryClassification = Generics.newTreeMap();</span>
+
+    // When making a flat model (no symantic untying) the
+    // basicCategory function will return the same basic category for
+    // all labels, so all entries will map to the same matrix
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    for (String unary : unaryProductions) {</span>
+<span class="nc" id="L321">      unary = basicCategory(unary);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">      if (unaryClassification.containsKey(unary)) {</span>
+<span class="nc" id="L323">        continue;</span>
+      }
+<span class="nc" id="L325">      unaryClassification.put(unary, randomClassificationMatrix());</span>
+<span class="nc" id="L326">    }</span>
+<span class="nc" id="L327">    numUnaryMatrices = unaryClassification.size();</span>
+<span class="nc" id="L328">    unaryClassificationSize = numClasses * (numHid + 1);</span>
+
+    //log.info(this);
+<span class="nc" id="L331">  }</span>
+
+  /**
+   * Dumps *all* the matrices in a mostly readable format.
+   */
+  @Override
+  public String toString() {
+<span class="nc" id="L338">    StringBuilder output = new StringBuilder();</span>
+
+<span class="nc bnc" id="L340" title="All 2 branches missed.">    if (binaryTransform.size() &gt; 0) {</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">      if (binaryTransform.size() == 1) {</span>
+<span class="nc" id="L342">        output.append(&quot;Binary transform matrix\n&quot;);</span>
+      } else {
+<span class="nc" id="L344">        output.append(&quot;Binary transform matrices\n&quot;);</span>
+      }
+<span class="nc bnc" id="L346" title="All 2 branches missed.">      for (TwoDimensionalMap.Entry&lt;String, String, SimpleMatrix&gt; matrix : binaryTransform) {</span>
+<span class="nc bnc" id="L347" title="All 4 branches missed.">        if (!matrix.getFirstKey().equals(&quot;&quot;) || !matrix.getSecondKey().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L348">          output.append(matrix.getFirstKey() + &quot; &quot; + matrix.getSecondKey() + &quot;:\n&quot;);</span>
+        }
+<span class="nc" id="L350">        output.append(NeuralUtils.toString(matrix.getValue(), &quot;%.8f&quot;));</span>
+<span class="nc" id="L351">      }</span>
+    }
+
+<span class="nc bnc" id="L354" title="All 2 branches missed.">    if (binaryTensors.size() &gt; 0) {</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">      if (binaryTensors.size() == 1) {</span>
+<span class="nc" id="L356">        output.append(&quot;Binary transform tensor\n&quot;);</span>
+      } else {
+<span class="nc" id="L358">        output.append(&quot;Binary transform tensors\n&quot;);</span>
+      }
+<span class="nc bnc" id="L360" title="All 2 branches missed.">      for (TwoDimensionalMap.Entry&lt;String, String, SimpleTensor&gt; matrix : binaryTensors) {</span>
+<span class="nc bnc" id="L361" title="All 4 branches missed.">        if (!matrix.getFirstKey().equals(&quot;&quot;) || !matrix.getSecondKey().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L362">          output.append(matrix.getFirstKey() + &quot; &quot; + matrix.getSecondKey() + &quot;:\n&quot;);</span>
+        }
+<span class="nc" id="L364">        output.append(matrix.getValue().toString(&quot;%.8f&quot;));</span>
+<span class="nc" id="L365">      }</span>
+    }
+
+<span class="nc bnc" id="L368" title="All 2 branches missed.">    if (binaryClassification.size() &gt; 0) {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">      if (binaryClassification.size() == 1) {</span>
+<span class="nc" id="L370">        output.append(&quot;Binary classification matrix\n&quot;);</span>
+      } else {
+<span class="nc" id="L372">        output.append(&quot;Binary classification matrices\n&quot;);</span>
+      }
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      for (TwoDimensionalMap.Entry&lt;String, String, SimpleMatrix&gt; matrix : binaryClassification) {</span>
+<span class="nc bnc" id="L375" title="All 4 branches missed.">        if (!matrix.getFirstKey().equals(&quot;&quot;) || !matrix.getSecondKey().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L376">          output.append(matrix.getFirstKey() + &quot; &quot; + matrix.getSecondKey() + &quot;:\n&quot;);</span>
+        }
+<span class="nc" id="L378">        output.append(NeuralUtils.toString(matrix.getValue(), &quot;%.8f&quot;));</span>
+<span class="nc" id="L379">      }</span>
+    }
+
+<span class="nc bnc" id="L382" title="All 2 branches missed.">    if (unaryClassification.size() &gt; 0) {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">      if (unaryClassification.size() == 1) {</span>
+<span class="nc" id="L384">        output.append(&quot;Unary classification matrix\n&quot;);</span>
+      } else {
+<span class="nc" id="L386">        output.append(&quot;Unary classification matrices\n&quot;);</span>
+      }
+<span class="nc bnc" id="L388" title="All 2 branches missed.">      for (Map.Entry&lt;String, SimpleMatrix&gt; matrix : unaryClassification.entrySet()) {</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (!matrix.getKey().equals(&quot;&quot;)) {</span>
+<span class="nc" id="L390">          output.append(matrix.getKey() + &quot;:\n&quot;);</span>
+        }
+<span class="nc" id="L392">        output.append(NeuralUtils.toString(matrix.getValue(), &quot;%.8f&quot;));</span>
+<span class="nc" id="L393">      }</span>
+    }
+
+<span class="nc" id="L396">    output.append(&quot;Word vectors\n&quot;);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">    for (Map.Entry&lt;String, SimpleMatrix&gt; matrix : wordVectors.entrySet()) {</span>
+<span class="nc" id="L398">      output.append(&quot;'&quot; + matrix.getKey() + &quot;'&quot;);</span>
+<span class="nc" id="L399">      output.append(&quot;\n&quot;);</span>
+<span class="nc" id="L400">      output.append(NeuralUtils.toString(matrix.getValue(), &quot;%.8f&quot;));</span>
+<span class="nc" id="L401">      output.append(&quot;\n&quot;);</span>
+<span class="nc" id="L402">    }</span>
+
+<span class="nc" id="L404">    return output.toString();</span>
+  }
+
+  SimpleTensor randomBinaryTensor() {
+<span class="nc" id="L408">    double range = 1.0 / (4.0 * numHid);</span>
+<span class="nc" id="L409">    SimpleTensor tensor = SimpleTensor.random(numHid * 2, numHid * 2, numHid, -range, range, rand);</span>
+<span class="nc" id="L410">    return tensor.scale(op.trainOptions.scalingForInit);</span>
+  }
+
+  SimpleMatrix randomTransformMatrix() {
+<span class="nc" id="L414">    SimpleMatrix binary = new SimpleMatrix(numHid, numHid * 2 + 1);</span>
+    // bias column values are initialized zero
+<span class="nc" id="L416">    binary.insertIntoThis(0, 0, randomTransformBlock());</span>
+<span class="nc" id="L417">    binary.insertIntoThis(0, numHid, randomTransformBlock());</span>
+<span class="nc" id="L418">    return binary.scale(op.trainOptions.scalingForInit);</span>
+  }
+
+  SimpleMatrix randomTransformBlock() {
+<span class="nc" id="L422">    double range = 1.0 / (Math.sqrt((double) numHid) * 2.0);</span>
+<span class="nc" id="L423">    return SimpleMatrix.random(numHid,numHid,-range,range,rand).plus(identity);</span>
+  }
+
+  /**
+   * Returns matrices of the right size for either binary or unary (terminal) classification
+   */
+  SimpleMatrix randomClassificationMatrix() {
+<span class="nc" id="L430">    SimpleMatrix score = new SimpleMatrix(numClasses, numHid + 1);</span>
+<span class="nc" id="L431">    double range = 1.0 / (Math.sqrt((double) numHid));</span>
+<span class="nc" id="L432">    score.insertIntoThis(0, 0, SimpleMatrix.random(numClasses, numHid, -range, range, rand));</span>
+    // bias column goes from 0 to 1 initially
+<span class="nc" id="L434">    score.insertIntoThis(0, numHid, SimpleMatrix.random(numClasses, 1, 0.0, 1.0, rand));</span>
+<span class="nc" id="L435">    return score.scale(op.trainOptions.scalingForInit);</span>
+  }
+
+  SimpleMatrix randomWordVector() {
+<span class="nc" id="L439">    return randomWordVector(op.numHid, rand);</span>
+  }
+
+  static SimpleMatrix randomWordVector(int size, Random rand) {
+<span class="nc" id="L443">    return NeuralUtils.randomGaussian(size, 1, rand).scale(0.1);</span>
+  }
+
+  void initRandomWordVectors(List&lt;Tree&gt; trainingTrees) {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">    if (op.numHid == 0) {</span>
+<span class="nc" id="L448">      throw new RuntimeException(&quot;Cannot create random word vectors for an unknown numHid&quot;);</span>
+    }
+<span class="nc" id="L450">    Set&lt;String&gt; words = Generics.newHashSet();</span>
+<span class="nc" id="L451">    words.add(UNKNOWN_WORD);</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">    for (Tree tree : trainingTrees) {</span>
+<span class="nc" id="L453">      List&lt;Tree&gt; leaves = tree.getLeaves();</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">      for (Tree leaf : leaves) {</span>
+<span class="nc" id="L455">        String word = leaf.label().value();</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        if (op.lowercaseWordVectors) {</span>
+<span class="nc" id="L457">          word = word.toLowerCase();</span>
+        }
+<span class="nc" id="L459">        words.add(word);</span>
+<span class="nc" id="L460">      }</span>
+<span class="nc" id="L461">    }</span>
+<span class="nc" id="L462">    this.wordVectors = Generics.newTreeMap();</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">    for (String word : words) {</span>
+<span class="nc" id="L464">      SimpleMatrix vector = randomWordVector();</span>
+<span class="nc" id="L465">      wordVectors.put(word, vector);</span>
+<span class="nc" id="L466">    }</span>
+<span class="nc" id="L467">  }</span>
+
+  void readWordVectors() {
+<span class="nc" id="L470">    Embedding embedding = new Embedding(op.wordVectors, op.numHid);</span>
+<span class="nc" id="L471">    this.wordVectors = Generics.newTreeMap();</span>
+//    Map&lt;String, SimpleMatrix&gt; rawWordVectors = NeuralUtils.readRawWordVectors(op.wordVectors, op.numHid);
+//    for (String word : rawWordVectors.keySet()) {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">    for (String word : embedding.keySet()) {</span>
+      // TODO: factor out unknown word vector code from DVParser
+<span class="nc" id="L476">      wordVectors.put(word, embedding.get(word));</span>
+<span class="nc" id="L477">    }</span>
+
+<span class="nc" id="L479">    String unkWord = op.unkWord;</span>
+<span class="nc" id="L480">    SimpleMatrix unknownWordVector = wordVectors.get(unkWord);</span>
+<span class="nc" id="L481">    wordVectors.put(UNKNOWN_WORD, unknownWordVector);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">    if (unknownWordVector == null) {</span>
+<span class="nc" id="L483">      throw new RuntimeException(&quot;Unknown word vector not specified in the word vector file&quot;);</span>
+    }
+
+<span class="nc" id="L486">  }</span>
+
+  public int totalParamSize() {
+<span class="nc" id="L489">    int totalSize = 0;</span>
+    // binaryTensorSize was set to 0 if useTensors=false
+<span class="nc" id="L491">    totalSize = numBinaryMatrices * (binaryTransformSize + binaryClassificationSize + binaryTensorSize);</span>
+<span class="nc" id="L492">    totalSize += numUnaryMatrices * unaryClassificationSize;</span>
+<span class="nc" id="L493">    totalSize += wordVectors.size() * numHid;</span>
+<span class="nc" id="L494">    return totalSize;</span>
+  }
+
+  public double[] paramsToVector() {
+<span class="nc" id="L498">    int totalSize = totalParamSize();</span>
+<span class="nc" id="L499">    return NeuralUtils.paramsToVector(totalSize, binaryTransform.valueIterator(), binaryClassification.valueIterator(), SimpleTensor.iteratorSimpleMatrix(binaryTensors.valueIterator()), unaryClassification.values().iterator(), wordVectors.values().iterator());</span>
+  }
+
+  public void vectorToParams(double[] theta) {
+<span class="nc" id="L503">    NeuralUtils.vectorToParams(theta, binaryTransform.valueIterator(), binaryClassification.valueIterator(), SimpleTensor.iteratorSimpleMatrix(binaryTensors.valueIterator()), unaryClassification.values().iterator(), wordVectors.values().iterator());</span>
+<span class="nc" id="L504">  }</span>
+
+  // TODO: combine this and getClassWForNode?
+  public SimpleMatrix getWForNode(Tree node) {
+<span class="nc bnc" id="L508" title="All 2 branches missed.">    if (node.children().length == 2) {</span>
+<span class="nc" id="L509">      String leftLabel = node.children()[0].value();</span>
+<span class="nc" id="L510">      String leftBasic = basicCategory(leftLabel);</span>
+<span class="nc" id="L511">      String rightLabel = node.children()[1].value();</span>
+<span class="nc" id="L512">      String rightBasic = basicCategory(rightLabel);</span>
+<span class="nc" id="L513">      return binaryTransform.get(leftBasic, rightBasic);</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">    } else if (node.children().length == 1) {</span>
+<span class="nc" id="L515">      throw new AssertionError(&quot;No unary transform matrices, only unary classification&quot;);</span>
+    } else {
+<span class="nc" id="L517">      throw new AssertionError(&quot;Unexpected tree children size of &quot; + node.children().length);</span>
+    }
+  }
+
+  public SimpleTensor getTensorForNode(Tree node) {
+<span class="nc bnc" id="L522" title="All 2 branches missed.">    if (!op.useTensors) {</span>
+<span class="nc" id="L523">      throw new AssertionError(&quot;Not using tensors&quot;);</span>
+    }
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    if (node.children().length == 2) {</span>
+<span class="nc" id="L526">      String leftLabel = node.children()[0].value();</span>
+<span class="nc" id="L527">      String leftBasic = basicCategory(leftLabel);</span>
+<span class="nc" id="L528">      String rightLabel = node.children()[1].value();</span>
+<span class="nc" id="L529">      String rightBasic = basicCategory(rightLabel);</span>
+<span class="nc" id="L530">      return binaryTensors.get(leftBasic, rightBasic);</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">    } else if (node.children().length == 1) {</span>
+<span class="nc" id="L532">      throw new AssertionError(&quot;No unary transform matrices, only unary classification&quot;);</span>
+    } else {
+<span class="nc" id="L534">      throw new AssertionError(&quot;Unexpected tree children size of &quot; + node.children().length);</span>
+    }
+  }
+
+  public SimpleMatrix getClassWForNode(Tree node) {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">    if (op.combineClassification) {</span>
+<span class="nc" id="L540">      return unaryClassification.get(&quot;&quot;);</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">    } else if (node.children().length == 2) {</span>
+<span class="nc" id="L542">      String leftLabel = node.children()[0].value();</span>
+<span class="nc" id="L543">      String leftBasic = basicCategory(leftLabel);</span>
+<span class="nc" id="L544">      String rightLabel = node.children()[1].value();</span>
+<span class="nc" id="L545">      String rightBasic = basicCategory(rightLabel);</span>
+<span class="nc" id="L546">      return binaryClassification.get(leftBasic, rightBasic);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    } else if (node.children().length == 1) {</span>
+<span class="nc" id="L548">      String unaryLabel = node.children()[0].value();</span>
+<span class="nc" id="L549">      String unaryBasic = basicCategory(unaryLabel);</span>
+<span class="nc" id="L550">      return unaryClassification.get(unaryBasic);</span>
+    } else {
+<span class="nc" id="L552">      throw new AssertionError(&quot;Unexpected tree children size of &quot; + node.children().length);</span>
+    }
+  }
+
+  /**
+   * Retrieve a learned word vector for the given word.
+   *
+   * If the word is OOV, returns a vector associated with an
+   * {@code &lt;unk&gt;} term.
+   */
+  public SimpleMatrix getWordVector(String word) {
+<span class="nc" id="L563">    return wordVectors.get(getVocabWord(word));</span>
+  }
+
+  /**
+   * Get the known vocabulary word associated with the given word.
+   *
+   * @return The form of the given word known by the model, or
+   *         {@link #UNKNOWN_WORD} if this word has not been observed
+   */
+  public String getVocabWord(String word) {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">    if (op.lowercaseWordVectors) {</span>
+<span class="nc" id="L574">      word = word.toLowerCase();</span>
+    }
+<span class="nc bnc" id="L576" title="All 2 branches missed.">    if (wordVectors.containsKey(word)) {</span>
+<span class="nc" id="L577">      return word;</span>
+    }
+    // TODO: go through unknown words here
+<span class="nc" id="L580">    return UNKNOWN_WORD;</span>
+  }
+
+  public String basicCategory(String category) {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">    if (op.simplifiedModel) {</span>
+<span class="nc" id="L585">      return &quot;&quot;;</span>
+    }
+<span class="nc" id="L587">    String basic = op.langpack.basicCategory(category);</span>
+<span class="nc bnc" id="L588" title="All 4 branches missed.">    if (basic.length() &gt; 0 &amp;&amp; basic.charAt(0) == '@') {</span>
+<span class="nc" id="L589">      basic = basic.substring(1);</span>
+    }
+<span class="nc" id="L591">    return basic;</span>
+  }
+
+  public SimpleMatrix getUnaryClassification(String category) {
+<span class="nc" id="L595">    category = basicCategory(category);</span>
+<span class="nc" id="L596">    return unaryClassification.get(category);</span>
+  }
+
+  public SimpleMatrix getBinaryClassification(String left, String right) {
+<span class="nc bnc" id="L600" title="All 2 branches missed.">    if (op.combineClassification) {</span>
+<span class="nc" id="L601">      return unaryClassification.get(&quot;&quot;);</span>
+    } else {
+<span class="nc" id="L603">      left = basicCategory(left);</span>
+<span class="nc" id="L604">      right = basicCategory(right);</span>
+<span class="nc" id="L605">      return binaryClassification.get(left, right);</span>
+    }
+  }
+
+  public SimpleMatrix getBinaryTransform(String left, String right) {
+<span class="nc" id="L610">    left = basicCategory(left);</span>
+<span class="nc" id="L611">    right = basicCategory(right);</span>
+<span class="nc" id="L612">    return binaryTransform.get(left, right);</span>
+  }
+
+  public SimpleTensor getBinaryTensor(String left, String right) {
+<span class="nc" id="L616">    left = basicCategory(left);</span>
+<span class="nc" id="L617">    right = basicCategory(right);</span>
+<span class="nc" id="L618">    return binaryTensors.get(left, right);</span>
+  }
+
+  public void saveSerialized(String path) {
+    try {
+<span class="nc" id="L623">      IOUtils.writeObjectToFile(this, path);</span>
+<span class="nc" id="L624">    } catch (IOException e) {</span>
+<span class="nc" id="L625">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L626">    }</span>
+<span class="nc" id="L627">  }</span>
+
+  public static SentimentModel loadSerialized(String path) {
+    try {
+<span class="nc" id="L631">      return IOUtils.readObjectFromURLOrClasspathOrFileSystem(path);</span>
+<span class="nc" id="L632">    } catch (IOException e) {</span>
+<span class="nc" id="L633">      throw new RuntimeIOException(e);</span>
+<span class="nc" id="L634">    } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L635">      throw new RuntimeIOException(e);</span>
+    }
+  }
+
+  public void printParamInformation(int index) {
+<span class="nc" id="L640">    int curIndex = 0;</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">    for (TwoDimensionalMap.Entry&lt;String, String, SimpleMatrix&gt; entry : binaryTransform) {</span>
+<span class="nc bnc" id="L642" title="All 4 branches missed.">      if (curIndex &lt;= index &amp;&amp; curIndex + entry.getValue().getNumElements() &gt; index) {</span>
+<span class="nc" id="L643">        log.info(&quot;Index &quot; + index + &quot; is element &quot; + (index - curIndex) + &quot; of binaryTransform \&quot;&quot; + entry.getFirstKey() + &quot;,&quot; + entry.getSecondKey() + &quot;\&quot;&quot;);</span>
+<span class="nc" id="L644">        return;</span>
+      } else {
+<span class="nc" id="L646">        curIndex += entry.getValue().getNumElements();</span>
+      }
+<span class="nc" id="L648">    }</span>
+
+<span class="nc bnc" id="L650" title="All 2 branches missed.">    for (TwoDimensionalMap.Entry&lt;String, String, SimpleMatrix&gt; entry : binaryClassification) {</span>
+<span class="nc bnc" id="L651" title="All 4 branches missed.">      if (curIndex &lt;= index &amp;&amp; curIndex + entry.getValue().getNumElements() &gt; index) {</span>
+<span class="nc" id="L652">        log.info(&quot;Index &quot; + index + &quot; is element &quot; + (index - curIndex) + &quot; of binaryClassification \&quot;&quot; + entry.getFirstKey() + &quot;,&quot; + entry.getSecondKey() + &quot;\&quot;&quot;);</span>
+<span class="nc" id="L653">        return;</span>
+      } else {
+<span class="nc" id="L655">        curIndex += entry.getValue().getNumElements();</span>
+      }
+<span class="nc" id="L657">    }</span>
+
+<span class="nc bnc" id="L659" title="All 2 branches missed.">    for (TwoDimensionalMap.Entry&lt;String, String, SimpleTensor&gt; entry : binaryTensors) {</span>
+<span class="nc bnc" id="L660" title="All 4 branches missed.">      if (curIndex &lt;= index &amp;&amp; curIndex + entry.getValue().getNumElements() &gt; index) {</span>
+<span class="nc" id="L661">        log.info(&quot;Index &quot; + index + &quot; is element &quot; + (index - curIndex) + &quot; of binaryTensor \&quot;&quot; + entry.getFirstKey() + &quot;,&quot; + entry.getSecondKey() + &quot;\&quot;&quot;);</span>
+<span class="nc" id="L662">        return;</span>
+      } else {
+<span class="nc" id="L664">        curIndex += entry.getValue().getNumElements();</span>
+      }
+<span class="nc" id="L666">    }</span>
+
+<span class="nc bnc" id="L668" title="All 2 branches missed.">    for (Map.Entry&lt;String, SimpleMatrix&gt; entry : unaryClassification.entrySet()) {</span>
+<span class="nc bnc" id="L669" title="All 4 branches missed.">      if (curIndex &lt;= index &amp;&amp; curIndex + entry.getValue().getNumElements() &gt; index) {</span>
+<span class="nc" id="L670">        log.info(&quot;Index &quot; + index + &quot; is element &quot; + (index - curIndex) + &quot; of unaryClassification \&quot;&quot; + entry.getKey() + &quot;\&quot;&quot;);</span>
+<span class="nc" id="L671">        return;</span>
+      } else {
+<span class="nc" id="L673">        curIndex += entry.getValue().getNumElements();</span>
+      }
+<span class="nc" id="L675">    }</span>
+
+<span class="nc bnc" id="L677" title="All 2 branches missed.">    for (Map.Entry&lt;String, SimpleMatrix&gt; entry : wordVectors.entrySet()) {</span>
+<span class="nc bnc" id="L678" title="All 4 branches missed.">      if (curIndex &lt;= index &amp;&amp; curIndex + entry.getValue().getNumElements() &gt; index) {</span>
+<span class="nc" id="L679">        log.info(&quot;Index &quot; + index + &quot; is element &quot; + (index - curIndex) + &quot; of wordVector \&quot;&quot; + entry.getKey() + &quot;\&quot;&quot;);</span>
+<span class="nc" id="L680">        return;</span>
+      } else {
+<span class="nc" id="L682">        curIndex += entry.getValue().getNumElements();</span>
+      }
+<span class="nc" id="L684">    }</span>
+
+<span class="nc" id="L686">    log.info(&quot;Index &quot; + index + &quot; is beyond the length of the parameters; total parameter space was &quot; + totalParamSize());</span>
+<span class="nc" id="L687">  }</span>
+
+  private static final long serialVersionUID = 1;
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

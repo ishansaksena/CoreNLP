@@ -1,0 +1,758 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UniversalSemanticHeadFinder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees</a> &gt; <span class="el_source">UniversalSemanticHeadFinder.java</span></div><h1>UniversalSemanticHeadFinder.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.trees; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+
+import edu.stanford.nlp.ling.HasCategory;
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.util.ArrayUtils;
+import edu.stanford.nlp.util.Generics;
+
+
+/**
+ * Implements a 'semantic head' variant of the the HeadFinder found
+ * in Michael Collins' 1999 thesis.
+ * This version chooses the semantic head verb rather than the verb form
+ * for cases with verbs.  And it makes similar themed changes to other
+ * categories: e.g., in question phrases, like &quot;Which Brazilian game&quot;, the
+ * head is made &quot;game&quot; not &quot;Which&quot; as in common PTB head rules.&lt;p/&gt;
+ * &lt;p/&gt;
+ * By default the SemanticHeadFinder uses a treatment of copula where the
+ * complement of the copula is taken as the head.  That is, a sentence like
+ * &quot;Bill is big&quot; will be analyzed as &lt;p/&gt;
+ * &lt;p/&gt;
+ * &lt;code&gt;nsubj&lt;/code&gt;(big, Bill) &lt;br/&gt;
+ * &lt;code&gt;cop&lt;/code&gt;(big, is) &lt;p/&gt;
+ * &lt;p/&gt;
+ * This analysis is used for questions and declaratives for adjective
+ * complements and declarative nominal complements.  However Wh-sentences
+ * with nominal complements do not receive this treatment.
+ * &quot;Who is the president?&quot; is analyzed with &quot;the president&quot; as nsubj and &quot;who&quot;
+ * as &quot;attr&quot; of the copula:&lt;p/&gt;&lt;p&gt;
+ * &lt;code&gt;nsubj&lt;/code&gt;(is, president)&lt;br/&gt;
+ * &lt;code&gt;attr&lt;/code&gt;(is, Who) &lt;p/&gt;
+ * &lt;p/&gt;
+ * (Such nominal copula sentences are complex: arguably, depending on the
+ * circumstances, several analyses are possible, with either the overt NP able
+ * to be any of the subject, the predicate, or one of two referential entities
+ * connected by an equational copula.  These uses aren't differentiated.)
+ * &lt;p/&gt;
+ * Existential sentences are treated as follows:  &lt;br/&gt;
+ * &quot;There is a man&quot; &lt;br/&gt;
+ * &lt;code&gt;expl&lt;/code&gt;(is, There) &lt;br/&gt;
+ * &lt;code&gt;det&lt;/code&gt;(man-4, a-3) &lt;br/&gt;
+ * &lt;code&gt;nsubj&lt;/code&gt;(is-2, man-4)&lt;br/&gt;
+ *
+ * @author John Rappaport
+ * @author Marie-Catherine de Marneffe
+ * @author Anna Rafferty
+ * @author Sebastian Schuster
+ */
+public class UniversalSemanticHeadFinder extends ModCollinsHeadFinder  {
+
+  /** A logger for this class */
+<span class="fc" id="L61">  private static Redwood.RedwoodChannels log = Redwood.channels(UniversalSemanticHeadFinder.class);</span>
+
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">  private static final boolean DEBUG = System.getProperty(&quot;SemanticHeadFinder&quot;, null) != null;</span>
+
+  /* A few times the apostrophe is missing on &quot;'s&quot;, so we have &quot;s&quot; */
+  /* Tricky auxiliaries: &quot;a&quot;, &quot;na&quot; is from &quot;(gon|wan)na&quot;, &quot;ve&quot; from &quot;Weve&quot;, etc.  &quot;of&quot; as non-standard for &quot;have&quot; */
+  /* &quot;as&quot; is &quot;has&quot; with missing first letter. &quot;to&quot; is rendered &quot;the&quot; once in EWT. */
+<span class="fc" id="L68">  private static final String[] auxiliaries = {</span>
+          &quot;will&quot;, &quot;wo&quot;, &quot;shall&quot;, &quot;sha&quot;, &quot;may&quot;, &quot;might&quot;, &quot;should&quot;, &quot;would&quot;, &quot;can&quot;, &quot;could&quot;, &quot;ca&quot;, &quot;must&quot;, &quot;'ll&quot;, &quot;ll&quot;, &quot;-ll&quot;, &quot;cold&quot;,
+          &quot;has&quot;, &quot;have&quot;, &quot;had&quot;, &quot;having&quot;, &quot;'ve&quot;, &quot;ve&quot;, &quot;v&quot;, &quot;of&quot;, &quot;hav&quot;, &quot;hvae&quot;, &quot;as&quot;,
+          &quot;get&quot;, &quot;gets&quot;, &quot;getting&quot;, &quot;got&quot;, &quot;gotten&quot;, &quot;do&quot;, &quot;does&quot;, &quot;did&quot;, &quot;'d&quot;, &quot;d&quot;, &quot;du&quot;,
+          &quot;to&quot;, &quot;2&quot;, &quot;na&quot;, &quot;a&quot;, &quot;ot&quot;, &quot;ta&quot;, &quot;the&quot;, &quot;too&quot; };
+
+  // include Charniak tags (AUX, AUXG) so can do BLLIP right
+<span class="fc" id="L75">  private static final String[] verbTags = {&quot;TO&quot;, &quot;MD&quot;, &quot;VB&quot;, &quot;VBD&quot;, &quot;VBP&quot;, &quot;VBZ&quot;, &quot;VBG&quot;, &quot;VBN&quot;, &quot;AUX&quot;, &quot;AUXG&quot;};</span>
+  // These ones are always auxiliaries, even if the word is &quot;too&quot;, &quot;my&quot;, or whatever else appears in web text.
+<span class="fc" id="L77">  private static final String[] unambiguousAuxTags = {&quot;TO&quot;, &quot;MD&quot;, &quot;AUX&quot;, &quot;AUXG&quot;};</span>
+
+
+  private final Set&lt;String&gt; verbalAuxiliaries;
+  private final Set&lt;String&gt; copulars;
+  private final Set&lt;String&gt; passiveAuxiliaries;
+  private final Set&lt;String&gt; verbalTags;
+  private final Set&lt;String&gt; unambiguousAuxiliaryTags;
+
+  private final boolean makeCopulaHead;
+
+
+  public UniversalSemanticHeadFinder() {
+<span class="nc" id="L90">    this(new PennTreebankLanguagePack(), true);</span>
+<span class="nc" id="L91">  }</span>
+
+  public UniversalSemanticHeadFinder(boolean noCopulaHead) {
+<span class="fc" id="L94">    this(new PennTreebankLanguagePack(), noCopulaHead);</span>
+<span class="fc" id="L95">  }</span>
+
+
+  /** Create a SemanticHeadFinder.
+   *
+   * @param tlp The TreebankLanguagePack, used by the superclass to get basic
+   *     category of constituents.
+   * @param noCopulaHead If true, a copular verb (a form of be)
+   *     is not treated as head when it has an AdjP or NP complement.  If false,
+   *     a copula verb is still always treated as a head.  But it will still
+   *     be treated as an auxiliary in periphrastic tenses with a VP complement.
+   */
+  public UniversalSemanticHeadFinder(TreebankLanguagePack tlp, boolean noCopulaHead) {
+<span class="fc" id="L108">    super(tlp);</span>
+
+    // TODO: reverse the polarity of noCopulaHead
+<span class="fc bfc" id="L111" title="All 2 branches covered.">    this.makeCopulaHead = !noCopulaHead;</span>
+
+<span class="fc" id="L113">    ruleChanges();</span>
+
+    // make a distinction between auxiliaries and copula verbs to
+    // get the NP has semantic head in sentences like &quot;Bill is an honest man&quot;.  (Added &quot;sha&quot; for &quot;shan't&quot; May 2009
+<span class="fc" id="L117">    verbalAuxiliaries = Generics.newHashSet(Arrays.asList(auxiliaries));</span>
+
+<span class="fc" id="L119">    passiveAuxiliaries = Generics.newHashSet(Arrays.asList(EnglishPatterns.beGetVerbs));</span>
+
+    //copula verbs having an NP complement
+<span class="fc" id="L122">    copulars = Generics.newHashSet();</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">    if (noCopulaHead) {</span>
+<span class="fc" id="L124">      copulars.addAll(Arrays.asList(EnglishPatterns.copularVerbs));</span>
+    }
+
+<span class="fc" id="L127">    verbalTags = Generics.newHashSet(Arrays.asList(verbTags));</span>
+<span class="fc" id="L128">    unambiguousAuxiliaryTags = Generics.newHashSet(Arrays.asList(unambiguousAuxTags));</span>
+<span class="fc" id="L129">  }</span>
+
+  @Override
+  public boolean makesCopulaHead() {
+<span class="fc" id="L133">    return makeCopulaHead;</span>
+  }
+
+  //makes modifications of Collins' rules to better fit with semantic notions of heads
+  private void ruleChanges() {
+    //  NP: don't want a POS to be the head
+<span class="fc" id="L139">    nonTerminalInfo.put(&quot;NP&quot;, new String[][]{{&quot;rightdis&quot;, &quot;NN&quot;, &quot;NNP&quot;, &quot;NNPS&quot;, &quot;NNS&quot;, &quot;NX&quot;, &quot;NML&quot;, &quot;JJR&quot;, &quot;WP&quot; }, {&quot;left&quot;, &quot;NP&quot;, &quot;PRP&quot;}, {&quot;rightdis&quot;, &quot;$&quot;, &quot;ADJP&quot;, &quot;FW&quot;, &quot;CD&quot;, &quot;JJ&quot;, &quot;QP&quot;}, {&quot;rightdis&quot;, &quot;JJS&quot;, &quot;DT&quot;, &quot;WDT&quot;, &quot;NML&quot;, &quot;PRN&quot;, &quot;RB&quot;, &quot;RBR&quot;, &quot;ADVP&quot;}, {&quot;left&quot;, &quot;POS&quot;}});</span>
+<span class="fc" id="L140">    nonTerminalInfo.put(&quot;NX&quot;, nonTerminalInfo.get(&quot;NP&quot;));</span>
+<span class="fc" id="L141">    nonTerminalInfo.put(&quot;NML&quot;, nonTerminalInfo.get(&quot;NP&quot;));</span>
+    // WHNP clauses should have the same sort of head as an NP
+    // but it a WHNP has a NP and a WHNP under it, the WHNP should be the head.  E.g.,  (WHNP (WHNP (WP$ whose) (JJ chief) (JJ executive) (NN officer))(, ,) (NP (NNP James) (NNP Gatward))(, ,))
+<span class="fc" id="L144">    nonTerminalInfo.put(&quot;WHNP&quot;, new String[][]{{&quot;rightdis&quot;, &quot;NN&quot;, &quot;NNP&quot;, &quot;NNPS&quot;, &quot;NNS&quot;, &quot;NX&quot;, &quot;NML&quot;, &quot;JJR&quot;, &quot;WP&quot;}, {&quot;left&quot;, &quot;WHNP&quot;, &quot;NP&quot;}, {&quot;rightdis&quot;, &quot;$&quot;, &quot;ADJP&quot;, &quot;PRN&quot;, &quot;FW&quot;}, {&quot;right&quot;, &quot;CD&quot;}, {&quot;rightdis&quot;, &quot;JJ&quot;, &quot;JJS&quot;, &quot;RB&quot;, &quot;QP&quot;}, {&quot;left&quot;, &quot;WHPP&quot;, &quot;WHADJP&quot;, &quot;WP$&quot;, &quot;WDT&quot;}});</span>
+    //WHADJP
+<span class="fc" id="L146">    nonTerminalInfo.put(&quot;WHADJP&quot;, new String[][]{{&quot;left&quot;, &quot;ADJP&quot;, &quot;JJ&quot;, &quot;JJR&quot;, &quot;WP&quot;}, {&quot;right&quot;, &quot;RB&quot;}, {&quot;right&quot;}});</span>
+    //WHADJP
+<span class="fc" id="L148">    nonTerminalInfo.put(&quot;WHADVP&quot;, new String[][]{{&quot;rightdis&quot;, &quot;WRB&quot;, &quot;WHADVP&quot;, &quot;RB&quot;, &quot;JJ&quot;}}); // if not WRB or WHADVP, probably has flat NP structure, allow JJ for &quot;how long&quot; constructions</span>
+    // QP: we don't want the first CD to be the semantic head (e.g., &quot;three billion&quot;: head should be &quot;billion&quot;), so we go from right to left
+<span class="fc" id="L150">    nonTerminalInfo.put(&quot;QP&quot;, new String[][]{{&quot;right&quot;, &quot;$&quot;, &quot;NNS&quot;, &quot;NN&quot;, &quot;CD&quot;, &quot;JJ&quot;, &quot;PDT&quot;, &quot;DT&quot;, &quot;IN&quot;, &quot;RB&quot;, &quot;NCD&quot;, &quot;QP&quot;, &quot;JJR&quot;, &quot;JJS&quot;}});</span>
+
+    // S, SBAR and SQ clauses should prefer the main verb as the head
+    // S: &quot;He considered him a friend&quot; -&gt; we want a friend to be the head
+<span class="fc" id="L154">    nonTerminalInfo.put(&quot;S&quot;, new String[][]{{&quot;left&quot;, &quot;VP&quot;, &quot;S&quot;, &quot;FRAG&quot;, &quot;SBAR&quot;, &quot;ADJP&quot;, &quot;UCP&quot;, &quot;TO&quot;}, {&quot;right&quot;, &quot;NP&quot;}});</span>
+
+<span class="fc" id="L156">    nonTerminalInfo.put(&quot;SBAR&quot;, new String[][]{{&quot;left&quot;, &quot;S&quot;, &quot;SQ&quot;, &quot;SINV&quot;, &quot;SBAR&quot;, &quot;FRAG&quot;, &quot;VP&quot;, &quot;WHNP&quot;, &quot;WHPP&quot;, &quot;WHADVP&quot;, &quot;WHADJP&quot;, &quot;IN&quot;, &quot;DT&quot;}});</span>
+    // VP shouldn't be needed in SBAR, but occurs in one buggy tree in PTB3 wsj_1457 and otherwise does no harm
+
+<span class="fc bfc" id="L159" title="All 2 branches covered.">    if (makeCopulaHead) {</span>
+<span class="fc" id="L160">      nonTerminalInfo.put(&quot;SQ&quot;, new String[][]{{&quot;left&quot;, &quot;VP&quot;, &quot;SQ&quot;, &quot;VB&quot;, &quot;VBZ&quot;, &quot;VBD&quot;, &quot;VBP&quot;, &quot;MD&quot;, &quot;AUX&quot;, &quot;AUXG&quot;, &quot;ADJP&quot;}});</span>
+    } else {
+<span class="fc" id="L162">      nonTerminalInfo.put(&quot;SQ&quot;, new String[][]{{&quot;left&quot;, &quot;VP&quot;, &quot;SQ&quot;, &quot;ADJP&quot;, &quot;VB&quot;, &quot;VBZ&quot;, &quot;VBD&quot;, &quot;VBP&quot;, &quot;MD&quot;, &quot;AUX&quot;, &quot;AUXG&quot;}});</span>
+    }
+
+    // UCP take the first element as head
+<span class="fc" id="L166">    nonTerminalInfo.put(&quot;UCP&quot;, new String[][]{{&quot;left&quot;}});</span>
+
+    // CONJP: We generally want the rightmost particle or the leftmost conjunction as head
+    // JJ is for weird tagging of &quot;not only&quot; in PTB
+<span class="fc" id="L170">    nonTerminalInfo.put(&quot;CONJP&quot;, new String[][]{{&quot;right&quot;, &quot;JJ&quot;, &quot;RB&quot;}, {&quot;left&quot;, &quot;CC&quot;, &quot;IN&quot;}, {&quot;right&quot;, &quot;VB&quot;}});</span>
+
+    // FRAG: crap rule needs to be change if you want to parse
+    // glosses; but it is correct to have ADJP and ADVP before S
+    // because of weird parses of reduced sentences.
+<span class="fc" id="L175">    nonTerminalInfo.put(&quot;FRAG&quot;, new String[][]{{&quot;left&quot;, &quot;IN&quot;}, {&quot;right&quot;, &quot;RB&quot;}, {&quot;left&quot;, &quot;NP&quot;}, {&quot;left&quot;, &quot;ADJP&quot;, &quot;ADVP&quot;, &quot;FRAG&quot;, &quot;S&quot;, &quot;SBAR&quot;, &quot;VP&quot;}});</span>
+
+    // PRN: sentence first
+<span class="fc" id="L178">    nonTerminalInfo.put(&quot;PRN&quot;, new String[][]{{&quot;left&quot;, &quot;VP&quot;, &quot;SQ&quot;, &quot;S&quot;, &quot;SINV&quot;, &quot;SBAR&quot;, &quot;NP&quot;, &quot;ADJP&quot;, &quot;PP&quot;, &quot;ADVP&quot;, &quot;INTJ&quot;, &quot;WHNP&quot;, &quot;NAC&quot;, &quot;VBP&quot;, &quot;JJ&quot;, &quot;NN&quot;, &quot;NNP&quot;}});</span>
+
+    // add the constituent XS (special node to add a layer in a QP tree introduced in our QPTreeTransformer)
+<span class="fc" id="L181">    nonTerminalInfo.put(&quot;XS&quot;, new String[][]{{&quot;right&quot;, &quot;IN&quot;}});</span>
+
+    // add a rule to deal with the CoNLL data
+<span class="fc" id="L184">    nonTerminalInfo.put(&quot;EMBED&quot;, new String[][]{{&quot;right&quot;, &quot;INTJ&quot;}});</span>
+
+    // USD: NP is head of PP
+<span class="fc" id="L187">    nonTerminalInfo.put(&quot;PP&quot;, new String[][]{{&quot;left&quot;, &quot;NP&quot;, &quot;S&quot;, &quot;SBAR&quot;, &quot;SBARQ&quot;, &quot;ADVP&quot;, &quot;PP&quot;, &quot;VP&quot;, &quot;ADJP&quot;, &quot;FRAG&quot;, &quot;UCP&quot;, &quot;PRN&quot;}, {&quot;right&quot;}});</span>
+
+<span class="fc" id="L189">    nonTerminalInfo.put(&quot;WHPP&quot;, nonTerminalInfo.get(&quot;PP&quot;));</span>
+
+    // Special constituent for multi-word expressions
+<span class="fc" id="L192">    nonTerminalInfo.put(&quot;MWE&quot;, new String[][]{{&quot;left&quot;}});</span>
+
+<span class="fc" id="L194">    nonTerminalInfo.put(&quot;PCONJP&quot;, new String[][]{{&quot;left&quot;}});</span>
+
+<span class="fc" id="L196">    nonTerminalInfo.put(&quot;ADJP&quot;, new String[][]{{&quot;left&quot;, &quot;$&quot;}, {&quot;rightdis&quot;, &quot;NNS&quot;, &quot;NN&quot;, &quot;NNP&quot;, &quot;JJ&quot;, &quot;QP&quot;, &quot;VBN&quot;, &quot;VBG&quot;}, {&quot;left&quot;, &quot;ADJP&quot;}, {&quot;rightdis&quot;, &quot;JJP&quot;, &quot;JJR&quot;, &quot;JJS&quot;, &quot;DT&quot;, &quot;RB&quot;, &quot;RBR&quot;, &quot;CD&quot;, &quot;IN&quot;, &quot;VBD&quot;}, {&quot;left&quot;, &quot;ADVP&quot;, &quot;NP&quot;}});</span>
+
+<span class="fc" id="L198">    nonTerminalInfo.put(&quot;INTJ&quot;, new String[][]{{&quot;rightdis&quot;, &quot;NNS&quot;, &quot;NN&quot;, &quot;NNP&quot;}, {&quot;left&quot;}});</span>
+
+<span class="fc" id="L200">    nonTerminalInfo.put(&quot;ADVP&quot;, new String[][]{{&quot;rightdis&quot;, &quot;RB&quot;, &quot;RBR&quot;, &quot;RBS&quot;, &quot;JJ&quot;, &quot;JJR&quot;, &quot;JJS&quot;},</span>
+        {&quot;rightdis&quot;, &quot;RP&quot;, &quot;DT&quot;, &quot;NN&quot;, &quot;CD&quot;, &quot;NP&quot;, &quot;VBN&quot;, &quot;NNP&quot;, &quot;CC&quot;, &quot;FW&quot;, &quot;NNS&quot;, &quot;ADJP&quot;, &quot;NML&quot;}, {&quot;left&quot;}});
+
+
+<span class="fc" id="L204">  }</span>
+
+
+  private boolean shouldSkip(Tree t, boolean origWasInterjection) {
+<span class="pc bpc" id="L208" title="2 of 8 branches missed.">    return t.isPreTerminal() &amp;&amp; (tlp.isPunctuationTag(t.value()) || ! origWasInterjection &amp;&amp; &quot;UH&quot;.equals(t.value())) ||</span>
+<span class="pc bpc" id="L209" title="3 of 4 branches missed.">           &quot;INTJ&quot;.equals(t.value()) &amp;&amp; ! origWasInterjection;</span>
+  }
+
+  private int findPreviousHead(int headIdx, Tree[] daughterTrees, boolean origWasInterjection) {
+<span class="fc" id="L213">    boolean seenSeparator = false;</span>
+<span class="fc" id="L214">    int newHeadIdx = headIdx;</span>
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">    while (newHeadIdx &gt;= 0) {</span>
+<span class="fc" id="L216">      newHeadIdx = newHeadIdx - 1;</span>
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">      if (newHeadIdx &lt; 0) {</span>
+<span class="nc" id="L218">        return newHeadIdx;</span>
+      }
+<span class="fc" id="L220">      String label = tlp.basicCategory(daughterTrees[newHeadIdx].value());</span>
+<span class="fc bfc" id="L221" title="All 4 branches covered.">      if (&quot;,&quot;.equals(label) || &quot;:&quot;.equals(label)) {</span>
+<span class="fc" id="L222">        seenSeparator = true;</span>
+<span class="pc bpc" id="L223" title="3 of 8 branches missed.">      } else if (daughterTrees[newHeadIdx].isPreTerminal() &amp;&amp; (tlp.isPunctuationTag(label) || ! origWasInterjection &amp;&amp; &quot;UH&quot;.equals(label)) ||</span>
+<span class="pc bpc" id="L224" title="3 of 4 branches missed.">               &quot;INTJ&quot;.equals(label) &amp;&amp; ! origWasInterjection) {</span>
+        // keep looping
+      } else {
+<span class="fc bfc" id="L227" title="All 2 branches covered.">        if ( ! seenSeparator) {</span>
+<span class="fc" id="L228">          newHeadIdx = -1;</span>
+        }
+        break;
+      }
+<span class="fc" id="L232">    }</span>
+<span class="fc" id="L233">    return newHeadIdx;</span>
+  }
+
+  /**
+   * Overwrite the postOperationFix method.  For &quot;a, b and c&quot; or similar: we want &quot;a&quot; to be the head.
+   */
+  @Override
+  protected int postOperationFix(int headIdx, Tree[] daughterTrees) {
+<span class="fc bfc" id="L241" title="All 2 branches covered.">    if (headIdx &gt;= 2) {</span>
+<span class="fc" id="L242">      String prevLab = tlp.basicCategory(daughterTrees[headIdx - 1].value());</span>
+<span class="pc bpc" id="L243" title="1 of 4 branches missed.">      if (prevLab.equals(&quot;CC&quot;) || prevLab.equals(&quot;CONJP&quot;)) {</span>
+<span class="fc" id="L244">        boolean origWasInterjection = &quot;UH&quot;.equals(tlp.basicCategory(daughterTrees[headIdx].value()));</span>
+<span class="fc" id="L245">        int newHeadIdx = headIdx - 2;</span>
+        // newHeadIdx is now left of conjunction.  Now try going back over commas, etc. for 3+ conjuncts
+        // Don't allow INTJ unless conjoined with INTJ - important in informal genres &quot;Oh and don't forget to call!&quot;
+<span class="pc bpc" id="L248" title="1 of 4 branches missed.">        while (newHeadIdx &gt;= 0 &amp;&amp; shouldSkip(daughterTrees[newHeadIdx], origWasInterjection)) {</span>
+<span class="fc" id="L249">          newHeadIdx--;</span>
+        }
+        // We're now at newHeadIdx &lt; 0 or have found a left head
+        // Now consider going back some number of punct that includes a , or : tagged thing and then find non-punct
+<span class="fc bfc" id="L253" title="All 2 branches covered.">        while (newHeadIdx &gt;= 2) {</span>
+<span class="fc" id="L254">          int nextHead = findPreviousHead(newHeadIdx, daughterTrees, origWasInterjection);</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">          if (nextHead &lt; 0) {</span>
+<span class="fc" id="L256">            break;</span>
+          }
+<span class="fc" id="L258">          newHeadIdx = nextHead;</span>
+<span class="fc" id="L259">        }</span>
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">        if (newHeadIdx &gt;= 0) {</span>
+<span class="fc" id="L261">          headIdx = newHeadIdx;</span>
+        }
+      }
+    }
+<span class="fc" id="L265">    return headIdx;</span>
+  }
+
+  // Note: The first two SBARQ patterns only work when the SQ
+  // structure has already been removed in CoordinationTransformer.
+<span class="fc" id="L270">  static final TregexPattern[] headOfCopulaTregex = {</span>
+    // Matches phrases such as &quot;what is wrong&quot;
+<span class="fc" id="L272">    TregexPattern.compile(&quot;SBARQ &lt; (WHNP $++ (/^VB/ &lt; &quot; + EnglishPatterns.copularWordRegex + &quot; $++ ADJP=head))&quot;),</span>
+
+    // matches WHNP $+ VB&lt;copula $+ NP
+    // for example, &quot;Who am I to judge?&quot;
+    // !$++ ADJP matches against &quot;Why is the dog pink?&quot;
+<span class="fc" id="L277">    TregexPattern.compile(&quot;SBARQ &lt; (WHNP=head $++ (/^VB/ &lt; &quot; + EnglishPatterns.copularWordRegex + &quot; $+ NP !$++ ADJP))&quot;),</span>
+
+    // Actually somewhat limited in scope, this detects &quot;Tuesday it is&quot;,
+    // &quot;Such a great idea this was&quot;, etc
+<span class="fc" id="L281">    TregexPattern.compile(&quot;SINV &lt; (NP=head $++ (NP $++ (VP &lt; (/^(?:VB|AUX)/ &lt; &quot; + EnglishPatterns.copularWordRegex + &quot;))))&quot;),</span>
+  };
+
+<span class="fc" id="L284">  static final TregexPattern[] headOfConjpTregex = {</span>
+<span class="fc" id="L285">    TregexPattern.compile(&quot;CONJP &lt; (CC &lt;: /^(?i:but|and)$/ $+ (RB=head &lt;: /^(?i:not)$/))&quot;),</span>
+<span class="fc" id="L286">    TregexPattern.compile(&quot;CONJP &lt; (CC &lt;: /^(?i:but)$/ [ ($+ (RB=head &lt;: /^(?i:also|rather)$/)) | ($+ (ADVP=head &lt;: (RB &lt;: /^(?i:also|rather)$/))) ])&quot;),</span>
+<span class="fc" id="L287">    TregexPattern.compile(&quot;CONJP &lt; (CC &lt;: /^(?i:and)$/ [ ($+ (RB=head &lt;: /^(?i:yet)$/)) | ($+ (ADVP=head &lt;: (RB &lt;: /^(?i:yet)$/))) ])&quot;),</span>
+  };
+
+<span class="fc" id="L290">  static final TregexPattern noVerbOverTempTregex = TregexPattern.compile(&quot;/^VP/ &lt; NP-TMP !&lt; /^V/ !&lt; NNP|NN|NNPS|NNS|NP|JJ|ADJP|S&quot;);</span>
+
+  /**
+   * We use this to avoid making a -TMP or -ADV the head of a copular phrase.
+   * For example, in the sentence &quot;It is hands down the best dessert ...&quot;,
+   * we want to avoid using &quot;hands down&quot; as the head.
+   */
+<span class="fc" id="L297">  static final Predicate&lt;Tree&gt; REMOVE_TMP_AND_ADV = tree -&gt; {</span>
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">    if (tree == null)</span>
+<span class="nc" id="L299">      return false;</span>
+<span class="fc" id="L300">    Label label = tree.label();</span>
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">    if (label == null)</span>
+<span class="nc" id="L302">      return false;</span>
+<span class="pc bpc" id="L303" title="2 of 4 branches missed.">    if (label.value().contains(&quot;-TMP&quot;) || label.value().contains(&quot;-ADV&quot;))</span>
+<span class="nc" id="L304">      return false;</span>
+<span class="pc bpc" id="L305" title="1 of 4 branches missed.">    if (label.value().startsWith(&quot;VP&quot;) &amp;&amp; noVerbOverTempTregex.matcher(tree).matches()) {</span>
+<span class="nc" id="L306">      return false;</span>
+    }
+<span class="fc" id="L308">    return true;</span>
+  };
+
+  /**
+   * Determine which daughter of the current parse tree is the
+   * head.  It assumes that the daughters already have had their
+   * heads determined.  Uses special rule for VP heads
+   *
+   * @param t The parse tree to examine the daughters of.
+   *          This is assumed to never be a leaf
+   * @return The parse tree that is the head
+   */
+  @Override
+  protected Tree determineNonTrivialHead(Tree t, Tree parent) {
+<span class="fc" id="L322">    String motherCat = tlp.basicCategory(t.label().value());</span>
+
+<span class="pc bpc" id="L324" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L325">      log.info(&quot;At &quot; + motherCat + &quot;, my parent is &quot; + parent);</span>
+    }
+
+    // Some conj expressions seem to make more sense with the &quot;not&quot; or
+    // other key words as the head.  For example, &quot;and not&quot; means
+    // something completely different than &quot;and&quot;.  Furthermore,
+    // downstream code was written assuming &quot;not&quot; would be the head...
+<span class="fc bfc" id="L332" title="All 2 branches covered.">    if (motherCat.equals(&quot;CONJP&quot;)) {</span>
+<span class="fc bfc" id="L333" title="All 2 branches covered.">      for (TregexPattern pattern : headOfConjpTregex) {</span>
+<span class="fc" id="L334">        TregexMatcher matcher = pattern.matcher(t);</span>
+<span class="fc bfc" id="L335" title="All 2 branches covered.">        if (matcher.matchesAt(t)) {</span>
+<span class="fc" id="L336">          return matcher.getNode(&quot;head&quot;);</span>
+        }
+      }
+      // if none of the above patterns match, use the standard method
+    }
+
+<span class="fc bfc" id="L342" title="All 4 branches covered.">    if (motherCat.equals(&quot;SBARQ&quot;) || motherCat.equals(&quot;SINV&quot;)) {</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">      if (!makeCopulaHead) {</span>
+<span class="fc bfc" id="L344" title="All 2 branches covered.">        for (TregexPattern pattern : headOfCopulaTregex) {</span>
+<span class="fc" id="L345">          TregexMatcher matcher = pattern.matcher(t);</span>
+<span class="fc bfc" id="L346" title="All 2 branches covered.">          if (matcher.matchesAt(t)) {</span>
+<span class="fc" id="L347">            return matcher.getNode(&quot;head&quot;);</span>
+          }
+        }
+      }
+      // if none of the above patterns match, use the standard method
+    }
+
+    // do VPs with auxiliary as special case
+<span class="fc bfc" id="L355" title="All 6 branches covered.">    if ((motherCat.equals(&quot;VP&quot;) || motherCat.equals(&quot;SQ&quot;) || motherCat.equals(&quot;SINV&quot;))) {</span>
+<span class="fc" id="L356">      Tree[] kids = t.children();</span>
+      // try to find if there is an auxiliary verb
+
+<span class="pc bpc" id="L359" title="1 of 2 branches missed.">      if (DEBUG) {</span>
+<span class="nc" id="L360">        log.info(&quot;Semantic head finder: at VP&quot;);</span>
+<span class="nc" id="L361">        log.info(&quot;Class is &quot; + t.getClass().getName());</span>
+<span class="nc" id="L362">        t.pennPrint(System.err);</span>
+        //log.info(&quot;hasVerbalAuxiliary = &quot; + hasVerbalAuxiliary(kids, verbalAuxiliaries));
+      }
+
+      // looks for auxiliaries
+<span class="fc" id="L367">      Tree[] tmpFilteredChildren = null;</span>
+<span class="fc bfc" id="L368" title="All 4 branches covered.">      if (hasVerbalAuxiliary(kids, verbalAuxiliaries, true) || hasPassiveProgressiveAuxiliary(kids)) {</span>
+        // String[] how = new String[] {&quot;left&quot;, &quot;VP&quot;, &quot;ADJP&quot;, &quot;NP&quot;};
+        // Including NP etc seems okay for copular sentences but is
+        // problematic for other auxiliaries, like 'he has an answer'
+        String[] how ;
+<span class="fc bfc" id="L373" title="All 2 branches covered.">        if (hasVerbalAuxiliary(kids, copulars, true)) {</span>
+          // Only allow ADJP in copular constructions
+          // In constructions like &quot;It gets cold&quot;, &quot;get&quot; should be the head
+<span class="fc" id="L376">          how = new String[]{ &quot;left&quot;, &quot;VP&quot;, &quot;ADJP&quot; };</span>
+        } else {
+<span class="fc" id="L378">          how = new String[]{ &quot;left&quot;, &quot;VP&quot; };</span>
+        }
+
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">        if (tmpFilteredChildren == null) {</span>
+<span class="fc" id="L382">          tmpFilteredChildren = ArrayUtils.filter(kids, REMOVE_TMP_AND_ADV);</span>
+        }
+<span class="fc" id="L384">        Tree pti = traverseLocate(tmpFilteredChildren, how, false);</span>
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L386">          log.info(&quot;Determined head (case 1) for &quot; + t.value() + &quot; is: &quot; + pti);</span>
+        }
+<span class="fc bfc" id="L388" title="All 2 branches covered.">        if (pti != null) {</span>
+<span class="fc" id="L389">          return pti;</span>
+        // } else {
+          // log.info(&quot;------&quot;);
+          // log.info(&quot;SemanticHeadFinder failed to reassign head for&quot;);
+          // t.pennPrint(System.err);
+          // log.info(&quot;------&quot;);
+        }
+      }
+
+      // looks for copular verbs
+<span class="fc bfc" id="L399" title="All 6 branches covered.">      if (hasVerbalAuxiliary(kids, copulars, false) &amp;&amp; ! isExistential(t, parent) &amp;&amp; ! isWHQ(t, parent)) {</span>
+        String[][] how;
+        //TODO: also allow ADVP to be heads
+<span class="fc bfc" id="L402" title="All 2 branches covered.">        if (motherCat.equals(&quot;SQ&quot;)) {</span>
+<span class="fc" id="L403">          how = new String[][]{{&quot;right&quot;, &quot;VP&quot;, &quot;ADJP&quot;, &quot;NP&quot;, &quot;UCP&quot;, &quot;PP&quot;, &quot;WHADJP&quot;, &quot;WHNP&quot;}};</span>
+        } else {
+<span class="fc" id="L405">          how = new String[][]{{&quot;left&quot;, &quot;VP&quot;, &quot;ADJP&quot;, &quot;NP&quot;, &quot;UCP&quot;, &quot;PP&quot;, &quot;WHADJP&quot;, &quot;WHNP&quot;}};</span>
+        }
+        // Avoid undesirable heads by filtering them from the list of potential children
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">        if (tmpFilteredChildren == null) {</span>
+<span class="fc" id="L409">          tmpFilteredChildren = ArrayUtils.filter(kids, REMOVE_TMP_AND_ADV);</span>
+        }
+<span class="fc" id="L411">        Tree pti = null;</span>
+<span class="pc bpc" id="L412" title="1 of 4 branches missed.">        for (int i = 0; i &lt; how.length &amp;&amp; pti == null; i++) {</span>
+<span class="fc" id="L413">          pti = traverseLocate(tmpFilteredChildren, how[i], false);</span>
+        }
+        // In SQ, only allow an NP to become head if there is another one to the left (then it's probably predicative)
+<span class="pc bpc" id="L416" title="3 of 8 branches missed.">        if (motherCat.equals(&quot;SQ&quot;) &amp;&amp; pti != null &amp;&amp; pti.label() != null &amp;&amp; pti.label().value().startsWith(&quot;NP&quot;)) {</span>
+<span class="fc" id="L417">            boolean foundAnotherNp = false;</span>
+<span class="pc bpc" id="L418" title="1 of 2 branches missed.">            for (Tree kid : kids) {</span>
+<span class="fc bfc" id="L419" title="All 2 branches covered.">              if (kid == pti) {</span>
+<span class="fc" id="L420">                break;</span>
+<span class="pc bpc" id="L421" title="1 of 4 branches missed.">              } else if (kid.label() != null &amp;&amp; kid.label().value().startsWith(&quot;NP&quot;)) {</span>
+<span class="fc" id="L422">                foundAnotherNp = true;</span>
+<span class="fc" id="L423">                break;</span>
+              }
+            }
+<span class="fc bfc" id="L426" title="All 2 branches covered.">          if ( ! foundAnotherNp) {</span>
+<span class="fc" id="L427">            pti = null;</span>
+          }
+        }
+
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L432">          log.info(&quot;Determined head (case 2) for &quot; + t.value() + &quot; is: &quot; + pti);</span>
+        }
+<span class="fc bfc" id="L434" title="All 2 branches covered.">        if (pti != null) {</span>
+<span class="fc" id="L435">          return pti;</span>
+        } else {
+<span class="pc bpc" id="L437" title="1 of 2 branches missed.">          if (DEBUG) {</span>
+<span class="nc" id="L438">            log.info(&quot;------&quot;);</span>
+<span class="nc" id="L439">            log.info(&quot;SemanticHeadFinder failed to reassign head for&quot;);</span>
+<span class="nc" id="L440">            t.pennPrint(System.err);</span>
+<span class="nc" id="L441">            log.info(&quot;------&quot;);</span>
+          }
+        }
+      }
+    }
+
+<span class="fc" id="L447">    Tree hd = super.determineNonTrivialHead(t, parent);</span>
+
+    /* ----
+    // This should now be handled at the AbstractCollinsHeadFinder level, so see if we can comment this out
+    // Heuristically repair punctuation heads
+    Tree[] hdChildren = hd.children();
+    if (hdChildren != null &amp;&amp; hdChildren.length &gt; 0 &amp;&amp;
+        hdChildren[0].isLeaf()) {
+      if (tlp.isPunctuationWord(hdChildren[0].label().value())) {
+         Tree[] tChildren = t.children();
+         if (DEBUG) {
+           System.err.printf(&quot;head is punct: %s\n&quot;, hdChildren[0].label());
+         }
+         for (int i = tChildren.length - 1; i &gt;= 0; i--) {
+           if (!tlp.isPunctuationWord(tChildren[i].children()[0].label().value())) {
+             hd = tChildren[i];
+             if (DEBUG) {
+               System.err.printf(&quot;New head of %s is %s%n&quot;, hd.label(), hd.children()[0].label());
+             }
+             break;
+           }
+         }
+      }
+    }
+    */
+
+<span class="pc bpc" id="L473" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L474">      log.info(&quot;Determined head (case 3) for &quot; + t.value() + &quot; is: &quot; + hd);</span>
+    }
+<span class="fc" id="L476">    return hd;</span>
+  }
+
+  /* Checks whether the tree t is an existential constituent
+   * There are two cases:
+   * -- affirmative sentences in which &quot;there&quot; is a left sister of the VP
+   * -- questions in which &quot;there&quot; is a daughter of the SQ.
+   *
+   */
+  private boolean isExistential(Tree t, Tree parent) {
+<span class="pc bpc" id="L486" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L487">      log.info(&quot;isExistential: &quot; + t + ' ' + parent);</span>
+    }
+<span class="fc" id="L489">    boolean toReturn = false;</span>
+<span class="fc" id="L490">    String motherCat = tlp.basicCategory(t.label().value());</span>
+    // affirmative case
+<span class="fc bfc" id="L492" title="All 4 branches covered.">    if (motherCat.equals(&quot;VP&quot;) &amp;&amp; parent != null) {</span>
+      //take t and the sisters
+<span class="fc" id="L494">      Tree[] kids = parent.children();</span>
+      // iterate over the sisters before t and checks if existential
+<span class="pc bpc" id="L496" title="1 of 2 branches missed.">      for (Tree kid : kids) {</span>
+<span class="fc bfc" id="L497" title="All 2 branches covered.">        if (!kid.value().equals(&quot;VP&quot;)) {</span>
+<span class="fc" id="L498">          List&lt;Label&gt; tags = kid.preTerminalYield();</span>
+<span class="fc bfc" id="L499" title="All 2 branches covered.">          for (Label tag : tags) {</span>
+<span class="fc bfc" id="L500" title="All 2 branches covered.">            if (tag.value().equals(&quot;EX&quot;)) {</span>
+<span class="fc" id="L501">              toReturn = true;</span>
+            }
+<span class="fc" id="L503">          }</span>
+        } else {
+          break;
+        }
+      }
+<span class="fc" id="L508">    }</span>
+    // question case
+<span class="pc bpc" id="L510" title="1 of 4 branches missed.">    else if (motherCat.startsWith(&quot;SQ&quot;) &amp;&amp; parent != null) {</span>
+      //take the daughters
+<span class="fc" id="L512">      Tree[] kids = parent.children();</span>
+      // iterate over the daughters and checks if existential
+<span class="fc bfc" id="L514" title="All 2 branches covered.">      for (Tree kid : kids) {</span>
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">        if (!kid.value().startsWith(&quot;VB&quot;)) {//not necessary to look into the verb</span>
+<span class="fc" id="L516">          List&lt;Label&gt; tags = kid.preTerminalYield();</span>
+<span class="fc bfc" id="L517" title="All 2 branches covered.">          for (Label tag : tags) {</span>
+<span class="fc bfc" id="L518" title="All 2 branches covered.">            if (tag.value().equals(&quot;EX&quot;)) {</span>
+<span class="fc" id="L519">              toReturn = true;</span>
+            }
+<span class="fc" id="L521">          }</span>
+        }
+      }
+    }
+
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L527">      log.info(&quot;decision &quot; + toReturn);</span>
+    }
+
+<span class="fc" id="L530">    return toReturn;</span>
+  }
+
+
+  /* Is the tree t a WH-question?
+   *  At present this is only true if the tree t is a SQ having a WH.* sister
+   *  and headed by a SBARQ.
+   * (It was changed to looser definition in Feb 2006.)
+   *
+   */
+  private static boolean isWHQ(Tree t, Tree parent) {
+<span class="pc bpc" id="L541" title="1 of 2 branches missed.">    if (t == null) {</span>
+<span class="nc" id="L542">      return false;</span>
+    }
+<span class="fc" id="L544">    boolean toReturn = false;</span>
+<span class="fc bfc" id="L545" title="All 2 branches covered.">    if (t.value().startsWith(&quot;SQ&quot;)) {</span>
+<span class="pc bpc" id="L546" title="1 of 4 branches missed.">      if (parent != null &amp;&amp; parent.value().equals(&quot;SBARQ&quot;)) {</span>
+<span class="fc" id="L547">        Tree[] kids = parent.children();</span>
+<span class="fc bfc" id="L548" title="All 2 branches covered.">        for (Tree kid : kids) {</span>
+          // looks for a WH.*
+<span class="fc bfc" id="L550" title="All 2 branches covered.">          if (kid.value().startsWith(&quot;WH&quot;)) {</span>
+<span class="fc" id="L551">            toReturn = true;</span>
+          }
+        }
+      }
+    }
+
+<span class="pc bpc" id="L557" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L558">      log.info(&quot;in isWH, decision: &quot; + toReturn + &quot; for node &quot; + t);</span>
+    }
+
+<span class="fc" id="L561">    return toReturn;</span>
+  }
+
+  private boolean isVerbalAuxiliary(Tree preterminal, Set&lt;String&gt; verbalSet, boolean allowJustTagMatch) {
+<span class="fc bfc" id="L565" title="All 2 branches covered.">    if (preterminal.isPreTerminal()) {</span>
+<span class="fc" id="L566">      Label kidLabel = preterminal.label();</span>
+<span class="fc" id="L567">      String tag = null;</span>
+<span class="pc bpc" id="L568" title="1 of 2 branches missed.">      if (kidLabel instanceof HasTag) {</span>
+<span class="fc" id="L569">        tag = ((HasTag) kidLabel).tag();</span>
+      }
+<span class="pc bpc" id="L571" title="1 of 2 branches missed.">      if (tag == null) {</span>
+<span class="fc" id="L572">        tag = preterminal.value();</span>
+      }
+<span class="fc" id="L574">      Label wordLabel = preterminal.firstChild().label();</span>
+<span class="fc" id="L575">      String word = null;</span>
+<span class="pc bpc" id="L576" title="1 of 2 branches missed.">      if (wordLabel instanceof HasWord) {</span>
+<span class="fc" id="L577">        word = ((HasWord) wordLabel).word();</span>
+      }
+<span class="fc bfc" id="L579" title="All 2 branches covered.">      if (word == null) {</span>
+<span class="fc" id="L580">        word = wordLabel.value();</span>
+      }
+
+<span class="pc bpc" id="L583" title="1 of 2 branches missed.">      if (DEBUG) {</span>
+<span class="nc" id="L584">        log.info(&quot;Checking &quot; + preterminal.value() + &quot; head is &quot; + word + '/' + tag);</span>
+      }
+<span class="fc" id="L586">      String lcWord = word.toLowerCase();</span>
+<span class="fc bfc" id="L587" title="All 8 branches covered.">      if (allowJustTagMatch &amp;&amp; unambiguousAuxiliaryTags.contains(tag) || verbalTags.contains(tag) &amp;&amp; verbalSet.contains(lcWord)) {</span>
+<span class="pc bpc" id="L588" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L589">          log.info(&quot;isAuxiliary found desired type of aux&quot;);</span>
+        }
+<span class="fc" id="L591">        return true;</span>
+      }
+    }
+<span class="fc" id="L594">    return false;</span>
+  }
+
+  /**
+   * Returns true if this tree is a preterminal that is a verbal auxiliary.
+   *
+   * @param t A tree to examine for being an auxiliary.
+   * @return Whether it is a verbal auxiliary (be, do, have, get)
+   */
+  public boolean isVerbalAuxiliary(Tree t) {
+<span class="nc" id="L604">    return isVerbalAuxiliary(t, verbalAuxiliaries, true);</span>
+  }
+
+
+  // now overly complex so it deals with coordinations.  Maybe change this class to use tregrex?
+  private boolean hasPassiveProgressiveAuxiliary(Tree[] kids) {
+<span class="pc bpc" id="L610" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L611">      log.info(&quot;Checking for passive/progressive auxiliary&quot;);</span>
+    }
+<span class="fc" id="L613">    boolean foundPassiveVP = false;</span>
+<span class="fc" id="L614">    boolean foundPassiveAux = false;</span>
+<span class="fc bfc" id="L615" title="All 2 branches covered.">    for (Tree kid : kids) {</span>
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">      if (DEBUG) {</span>
+<span class="nc" id="L617">        log.info(&quot;  checking in &quot; + kid);</span>
+      }
+<span class="fc bfc" id="L619" title="All 2 branches covered.">      if (isVerbalAuxiliary(kid, passiveAuxiliaries, false)) {</span>
+<span class="fc" id="L620">          foundPassiveAux = true;</span>
+<span class="fc bfc" id="L621" title="All 2 branches covered.">      } else if (kid.isPhrasal()) {</span>
+<span class="fc" id="L622">        Label kidLabel = kid.label();</span>
+<span class="fc" id="L623">        String cat = null;</span>
+<span class="pc bpc" id="L624" title="1 of 2 branches missed.">        if (kidLabel instanceof HasCategory) {</span>
+<span class="fc" id="L625">          cat = ((HasCategory) kidLabel).category();</span>
+        }
+<span class="pc bpc" id="L627" title="1 of 2 branches missed.">        if (cat == null) {</span>
+<span class="fc" id="L628">          cat = kid.value();</span>
+        }
+<span class="fc bfc" id="L630" title="All 2 branches covered.">        if ( ! cat.startsWith(&quot;VP&quot;)) {</span>
+<span class="fc" id="L631">          continue;</span>
+        }
+<span class="pc bpc" id="L633" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L634">          log.info(&quot;hasPassiveProgressiveAuxiliary found VP&quot;);</span>
+        }
+<span class="fc" id="L636">        Tree[] kidkids = kid.children();</span>
+<span class="fc" id="L637">        boolean foundParticipleInVp = false;</span>
+<span class="fc bfc" id="L638" title="All 2 branches covered.">        for (Tree kidkid : kidkids) {</span>
+<span class="pc bpc" id="L639" title="1 of 2 branches missed.">          if (DEBUG) {</span>
+<span class="nc" id="L640">            log.info(&quot;  hasPassiveProgressiveAuxiliary examining &quot; + kidkid);</span>
+          }
+<span class="fc bfc" id="L642" title="All 2 branches covered.">          if (kidkid.isPreTerminal()) {</span>
+<span class="fc" id="L643">            Label kidkidLabel = kidkid.label();</span>
+<span class="fc" id="L644">            String tag = null;</span>
+<span class="pc bpc" id="L645" title="1 of 2 branches missed.">            if (kidkidLabel instanceof HasTag) {</span>
+<span class="fc" id="L646">              tag = ((HasTag) kidkidLabel).tag();</span>
+            }
+<span class="pc bpc" id="L648" title="1 of 2 branches missed.">            if (tag == null) {</span>
+<span class="fc" id="L649">              tag = kidkid.value();</span>
+            }
+            // we allow in VBD because of frequent tagging mistakes
+<span class="fc bfc" id="L652" title="All 6 branches covered.">            if (&quot;VBN&quot;.equals(tag) || &quot;VBG&quot;.equals(tag) || &quot;VBD&quot;.equals(tag)) {</span>
+<span class="fc" id="L653">              foundPassiveVP = true;</span>
+<span class="pc bpc" id="L654" title="1 of 2 branches missed.">              if (DEBUG) {</span>
+<span class="nc" id="L655">                log.info(&quot;hasPassiveAuxiliary found VBN/VBG/VBD VP&quot;);</span>
+              }
+              break;
+<span class="pc bpc" id="L658" title="3 of 4 branches missed.">            } else if (&quot;CC&quot;.equals(tag) &amp;&amp; foundParticipleInVp) {</span>
+<span class="nc" id="L659">              foundPassiveVP = true;</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">              if (DEBUG) {</span>
+<span class="nc" id="L661">                log.info(&quot;hasPassiveAuxiliary [coordination] found (VP (VP[VBN/VBG/VBD] CC&quot;);</span>
+              }
+              break;
+            }
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">          } else if (kidkid.isPhrasal()) {</span>
+<span class="fc" id="L666">            String catcat = null;</span>
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">            if (kidLabel instanceof HasCategory) {</span>
+<span class="fc" id="L668">              catcat = ((HasCategory) kidLabel).category();</span>
+            }
+<span class="pc bpc" id="L670" title="1 of 2 branches missed.">            if (catcat == null) {</span>
+<span class="fc" id="L671">              catcat = kid.value();</span>
+            }
+<span class="pc bpc" id="L673" title="1 of 2 branches missed.">            if (&quot;VP&quot;.equals(catcat)) {</span>
+<span class="pc bpc" id="L674" title="1 of 2 branches missed.">              if (DEBUG) {</span>
+<span class="nc" id="L675">                log.info(&quot;hasPassiveAuxiliary found (VP (VP)), recursing&quot;);</span>
+              }
+<span class="fc" id="L677">              foundParticipleInVp = vpContainsParticiple(kidkid);</span>
+<span class="nc bnc" id="L678" title="All 6 branches missed.">            } else if ((&quot;CONJP&quot;.equals(catcat) || &quot;PRN&quot;.equals(catcat)) &amp;&amp; foundParticipleInVp) { // occasionally get PRN in CONJ-like structures</span>
+<span class="nc" id="L679">              foundPassiveVP = true;</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">              if (DEBUG) {</span>
+<span class="nc" id="L681">                log.info(&quot;hasPassiveAuxiliary [coordination] found (VP (VP[VBN/VBG/VBD] CONJP&quot;);</span>
+              }
+              break;
+            }
+          }
+        }
+      }
+<span class="fc bfc" id="L688" title="All 4 branches covered.">      if (foundPassiveAux &amp;&amp; foundPassiveVP) {</span>
+<span class="fc" id="L689">        break;</span>
+      }
+    } // end for (Tree kid : kids)
+<span class="pc bpc" id="L692" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc bnc" id="L693" title="All 4 branches missed.">      log.info(&quot;hasPassiveProgressiveAuxiliary returns &quot; + (foundPassiveAux &amp;&amp; foundPassiveVP));</span>
+    }
+<span class="fc bfc" id="L695" title="All 4 branches covered.">    return foundPassiveAux &amp;&amp; foundPassiveVP;</span>
+  }
+
+  private static boolean vpContainsParticiple(Tree t) {
+<span class="fc bfc" id="L699" title="All 2 branches covered.">    for (Tree kid : t.children()) {</span>
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">      if (DEBUG) {</span>
+<span class="nc" id="L701">        log.info(&quot;vpContainsParticiple examining &quot; + kid);</span>
+      }
+<span class="fc bfc" id="L703" title="All 2 branches covered.">      if (kid.isPreTerminal()) {</span>
+<span class="fc" id="L704">        Label kidLabel = kid.label();</span>
+<span class="fc" id="L705">        String tag = null;</span>
+<span class="pc bpc" id="L706" title="1 of 2 branches missed.">        if (kidLabel instanceof HasTag) {</span>
+<span class="fc" id="L707">          tag = ((HasTag) kidLabel).tag();</span>
+        }
+<span class="pc bpc" id="L709" title="1 of 2 branches missed.">        if (tag == null) {</span>
+<span class="fc" id="L710">          tag = kid.value();</span>
+        }
+<span class="pc bpc" id="L712" title="2 of 6 branches missed.">        if (&quot;VBN&quot;.equals(tag) || &quot;VBG&quot;.equals(tag) || &quot;VBD&quot;.equals(tag)) {</span>
+<span class="pc bpc" id="L713" title="1 of 2 branches missed.">          if (DEBUG) {</span>
+<span class="nc" id="L714">            log.info(&quot;vpContainsParticiple found VBN/VBG/VBD VP&quot;);</span>
+          }
+<span class="fc" id="L716">          return true;</span>
+        }
+      }
+    }
+<span class="fc" id="L720">    return false;</span>
+  }
+
+
+  /** This looks to see whether any of the children is a preterminal headed by a word
+   *  which is within the set verbalSet (which in practice is either
+   *  auxiliary or copula verbs).  It only returns true if it's a preterminal head, since
+   *  you don't want to pick things up in phrasal daughters.  That is an error.
+   *
+   * @param kids The child trees
+   * @param verbalSet The set of words
+   * @param allowTagOnlyMatch If true, it's sufficient to match on an unambiguous auxiliary tag.
+   *                          Make true iff verbalSet is &quot;all auxiliaries&quot;
+   * @return Returns true if one of the child trees is a preterminal verb headed
+   *      by a word in verbalSet
+   */
+  private boolean hasVerbalAuxiliary(Tree[] kids, Set&lt;String&gt; verbalSet, boolean allowTagOnlyMatch) {
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L738">      log.info(&quot;Checking for verbal auxiliary&quot;);</span>
+    }
+<span class="fc bfc" id="L740" title="All 2 branches covered.">    for (Tree kid : kids) {</span>
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">      if (DEBUG) {</span>
+<span class="nc" id="L742">        log.info(&quot;  checking in &quot; + kid);</span>
+      }
+<span class="fc bfc" id="L744" title="All 2 branches covered.">      if (isVerbalAuxiliary(kid, verbalSet, allowTagOnlyMatch)) {</span>
+<span class="fc" id="L745">        return true;</span>
+      }
+    }
+<span class="pc bpc" id="L748" title="1 of 2 branches missed.">    if (DEBUG) {</span>
+<span class="nc" id="L749">      log.info(&quot;hasVerbalAuxiliary returns false&quot;);</span>
+    }
+<span class="fc" id="L751">    return false;</span>
+  }
+
+
+  private static final long serialVersionUID = 5721799188009249808L;
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

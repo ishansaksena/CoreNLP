@@ -1,0 +1,1327 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StanfordCoreNLP.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">StanfordCoreNLP.java</span></div><h1>StanfordCoreNLP.java</h1><pre class="source lang-java linenums">//
+// StanfordCoreNLP -- a suite of NLP tools.
+// Copyright (c) 2009-2011 The Board of Trustees of
+// The Leland Stanford Junior University. All Rights Reserved.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+//
+// For more information, bug reports, fixes, contact:
+//    Christopher Manning
+//    Dept of Computer Science, Gates 1A
+//    Stanford CA 94305-9010
+//    USA
+//
+
+package edu.stanford.nlp.pipeline;
+
+import edu.stanford.nlp.io.FileSequentialCollection;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.objectbank.ObjectBank;
+import edu.stanford.nlp.trees.TreePrint;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.util.logging.StanfordRedwoodConfiguration;
+// import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+import java.io.*;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.concurrent.Semaphore;
+import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.regex.Pattern;
+
+
+
+/**
+ * This is a pipeline that takes in a string and returns various analyzed
+ * linguistic forms.
+ * The String is tokenized via a tokenizer (using a TokenizerAnnotator), and
+ * then other sequence model style annotation can be used to add things like
+ * lemmas, POS tags, and named entities.  These are returned as a list of CoreLabels.
+ * Other analysis components build and store parse trees, dependency graphs, etc.
+ * &lt;p&gt;
+ * This class is designed to apply multiple Annotators
+ * to an Annotation.  The idea is that you first
+ * build up the pipeline by adding Annotators, and then
+ * you take the objects you wish to annotate and pass
+ * them in and get in return a fully annotated object.
+ * At the command-line level you can, e.g., tokenize text with StanfordCoreNLP with a command like:
+ * &lt;br/&gt;&lt;pre&gt;
+ * java edu.stanford.nlp.pipeline.StanfordCoreNLP -annotators tokenize,ssplit -file document.txt
+ * &lt;/pre&gt;&lt;br/&gt;
+ * Please see the package level javadoc for sample usage
+ * and a more complete description.
+ * &lt;p&gt;
+ * The main entry point for the API is StanfordCoreNLP.process() .
+ * &lt;p&gt;
+ * &lt;i&gt;Implementation note:&lt;/i&gt; There are other annotation pipelines, but they
+ * don't extend this one. Look for classes that implement Annotator and which
+ * have &quot;Pipeline&quot; in their name.
+ *
+ * @author Jenny Finkel
+ * @author Anna Rafferty
+ * @author Christopher Manning
+ * @author Mihai Surdeanu
+ * @author Steven Bethard
+ */
+
+public class StanfordCoreNLP extends AnnotationPipeline  {
+
+<span class="nc" id="L89">  enum OutputFormat { TEXT, XML, JSON, CONLL, CONLLU, SERIALIZED }</span>
+
+  // other constants
+  public static final String CUSTOM_ANNOTATOR_PREFIX = &quot;customAnnotatorClass.&quot;;
+  private static final String PROPS_SUFFIX = &quot;.properties&quot;;
+  public static final String NEWLINE_SPLITTER_PROPERTY = &quot;ssplit.eolonly&quot;;
+  public static final String NEWLINE_IS_SENTENCE_BREAK_PROPERTY = &quot;ssplit.newlineIsSentenceBreak&quot;;
+  public static final String DEFAULT_NEWLINE_IS_SENTENCE_BREAK = &quot;never&quot;;
+
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">  public static final String DEFAULT_OUTPUT_FORMAT = isXMLOutputPresent() ? &quot;xml&quot; : &quot;text&quot;;</span>
+
+  /** A logger for this class */
+<span class="fc" id="L101">  private static final Redwood.RedwoodChannels logger = Redwood.channels(StanfordCoreNLP.class);</span>
+
+  /** Formats the constituent parse trees for display. */
+  private TreePrint constituentTreePrinter;
+  /** Formats the dependency parse trees for human-readable display. */
+  private TreePrint dependencyTreePrinter;
+
+  /** Stores the overall number of words processed. */
+  private int numWords;
+
+  /** Stores the time (in milliseconds) required to construct the last pipeline. */
+  private long pipelineSetupTime;
+
+
+  /** Maintains the shared pool of annotators. */
+<span class="fc" id="L116">  protected static AnnotatorPool pool = null;</span>
+
+  private Properties properties;
+
+  private Semaphore availableProcessors;
+
+
+  /**
+   * Constructs a pipeline using as properties the properties file found in the classpath
+   */
+  public StanfordCoreNLP() {
+<span class="nc" id="L127">    this((Properties) null);</span>
+<span class="nc" id="L128">  }</span>
+
+  /**
+   * Construct a basic pipeline. The Properties will be used to determine
+   * which annotators to create, and a default AnnotatorPool will be used
+   * to create the annotators.
+   *
+   */
+  public StanfordCoreNLP(Properties props)  {
+<span class="pc bpc" id="L137" title="2 of 4 branches missed.">    this(props, (props == null || PropertiesUtils.getBool(props, &quot;enforceRequirements&quot;, true)));</span>
+<span class="fc" id="L138">  }</span>
+
+
+  /**
+   * Construct a CoreNLP with a custom Annotator Pool.
+   */
+  public StanfordCoreNLP(Properties props, AnnotatorPool annotatorPool)  {
+<span class="nc bnc" id="L145" title="All 4 branches missed.">    this(props, (props == null || PropertiesUtils.getBool(props, &quot;enforceRequirements&quot;, true)), annotatorPool);</span>
+<span class="nc" id="L146">  }</span>
+
+
+  public StanfordCoreNLP(Properties props, boolean enforceRequirements)  {
+<span class="fc" id="L150">    this(props, enforceRequirements, null);</span>
+<span class="fc" id="L151">  }</span>
+
+<span class="fc" id="L153">  public StanfordCoreNLP(Properties props, boolean enforceRequirements, AnnotatorPool annotatorPool)  {</span>
+<span class="fc" id="L154">    construct(props, enforceRequirements, getAnnotatorImplementations(), annotatorPool);</span>
+<span class="fc" id="L155">  }</span>
+
+  /**
+   * Constructs a pipeline with the properties read from this file, which must be found in the classpath
+   * @param propsFileNamePrefix Filename/resource name of properties file without extension
+   */
+  public StanfordCoreNLP(String propsFileNamePrefix) {
+<span class="nc" id="L162">    this(propsFileNamePrefix, true);</span>
+<span class="nc" id="L163">  }</span>
+
+<span class="nc" id="L165">  public StanfordCoreNLP(String propsFileNamePrefix, boolean enforceRequirements) {</span>
+<span class="nc" id="L166">    Properties props = loadProperties(propsFileNamePrefix);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">    if (props == null) {</span>
+<span class="nc" id="L168">      throw new RuntimeIOException(&quot;ERROR: cannot find properties file \&quot;&quot; + propsFileNamePrefix + &quot;\&quot; in the classpath!&quot;);</span>
+    }
+<span class="nc" id="L170">    construct(props, enforceRequirements, getAnnotatorImplementations(), null);</span>
+<span class="nc" id="L171">  }</span>
+
+  //
+  // @Override-able methods to change pipeline behavior
+  //
+
+  /**
+   * &lt;p&gt;
+   *   Get the implementation of each relevant annotator in the pipeline.
+   *   The primary use of this method is to be overwritten by subclasses of StanfordCoreNLP
+   *   to call different annotators that obey the exact same contract as the default
+   *   annotator.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   The canonical use case for this is as an implementation of the Curator server,
+   *   where the annotators make server calls rather than calling each annotator locally.
+   * &lt;/p&gt;
+   *
+   * @return A class which specifies the actual implementation of each of the annotators called
+   *         when creating the annotator pool. The canonical annotators are defaulted to in
+   *         {@link edu.stanford.nlp.pipeline.AnnotatorImplementations}.
+   */
+  protected AnnotatorImplementations getAnnotatorImplementations() {
+<span class="fc" id="L195">    return new AnnotatorImplementations();</span>
+  }
+
+  //
+  // property-specific methods
+  //
+
+  private static String getRequiredProperty(Properties props, String name) {
+<span class="fc" id="L203">    String val = props.getProperty(name);</span>
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">    if (val == null) {</span>
+<span class="nc" id="L205">      logger.error(&quot;Missing property \&quot;&quot; + name + &quot;\&quot;!&quot;);</span>
+<span class="nc" id="L206">      printRequiredProperties(System.err);</span>
+<span class="nc" id="L207">      throw new RuntimeException(&quot;Missing property: \&quot;&quot; + name + '\&quot;');</span>
+    }
+<span class="fc" id="L209">    return val;</span>
+  }
+
+  /**
+   * Finds the properties file in the classpath and loads the properties from there.
+   *
+   * @return The found properties object (must be not-null)
+   * @throws RuntimeException If no properties file can be found on the classpath
+   */
+  private static Properties loadPropertiesFromClasspath() {
+<span class="nc" id="L219">    List&lt;String&gt; validNames = Arrays.asList(&quot;StanfordCoreNLP&quot;, &quot;edu.stanford.nlp.pipeline.StanfordCoreNLP&quot;);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">    for (String name: validNames) {</span>
+<span class="nc" id="L221">      Properties props = loadProperties(name);</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">      if (props != null) return props;</span>
+<span class="nc" id="L223">    }</span>
+<span class="nc" id="L224">    throw new RuntimeException(&quot;ERROR: Could not find properties file in the classpath!&quot;);</span>
+  }
+
+  private static Properties loadProperties(String name) {
+<span class="nc" id="L228">    return loadProperties(name, Thread.currentThread().getContextClassLoader());</span>
+  }
+
+  private static Properties loadProperties(String name, ClassLoader loader) {
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    if(name.endsWith (PROPS_SUFFIX)) name = name.substring(0, name.length () - PROPS_SUFFIX.length ());</span>
+<span class="nc" id="L233">    name = name.replace('.', '/');</span>
+<span class="nc" id="L234">    name += PROPS_SUFFIX;</span>
+<span class="nc" id="L235">    Properties result = null;</span>
+
+    // Returns null on lookup failures
+<span class="nc" id="L238">    InputStream in = loader.getResourceAsStream (name);</span>
+    try {
+<span class="nc bnc" id="L240" title="All 2 branches missed.">      if (in != null) {</span>
+<span class="nc" id="L241">        InputStreamReader reader = new InputStreamReader(in, &quot;utf-8&quot;);</span>
+<span class="nc" id="L242">        result = new Properties ();</span>
+<span class="nc" id="L243">        result.load(reader); // Can throw IOException</span>
+      }
+<span class="nc" id="L245">    } catch (IOException e) {</span>
+<span class="nc" id="L246">      result = null;</span>
+    } finally {
+<span class="nc" id="L248">      IOUtils.closeIgnoringExceptions(in);</span>
+<span class="nc" id="L249">    }</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    if (result != null) {</span>
+<span class="nc" id="L251">      logger.info(&quot;Searching for resource: &quot; + name + &quot; ... found.&quot;);</span>
+    } else {
+<span class="nc" id="L253">      logger.info(&quot;Searching for resource: &quot; + name + &quot; ... not found.&quot;);</span>
+    }
+
+<span class="nc" id="L256">    return result;</span>
+  }
+
+  /** Fetches the Properties object used to construct this Annotator */
+<span class="nc" id="L260">  public Properties getProperties() { return properties; }</span>
+
+<span class="nc" id="L262">  public TreePrint getConstituentTreePrinter() { return constituentTreePrinter; }</span>
+
+<span class="nc" id="L264">  public TreePrint getDependencyTreePrinter() { return dependencyTreePrinter; }</span>
+
+  public double getBeamPrintingOption() {
+<span class="nc" id="L267">    return PropertiesUtils.getDouble(properties, &quot;printable.relation.beam&quot;, 0.0);</span>
+  }
+
+  /**
+   * If true, signal for outputters to pretty-print the output.
+   * If false, the outputter will try to minimize the size of the output.
+   */
+  public boolean getPrettyPrint() {
+<span class="nc" id="L275">    return PropertiesUtils.getBool(properties, &quot;prettyPrint&quot;, true);</span>
+  }
+
+  public String getEncoding() {
+<span class="nc" id="L279">    return properties.getProperty(&quot;encoding&quot;, &quot;UTF-8&quot;);</span>
+  }
+
+  public boolean getPrintSingletons() {
+<span class="nc" id="L283">    return PropertiesUtils.getBool(properties, &quot;output.printSingletonEntities&quot;, false);</span>
+  }
+
+  /**
+   * Take a collection of requested annotators, and produce a list of annotators such that all of the
+   * prerequisites for each of the annotators in the input is met.
+   * For example, if the user requests lemma, ensure that pos is also run because lemma depends on
+   * pos. As a side effect, this function orders the annotators in the proper order.
+   * Note that this is not guaranteed to return a valid set of annotators,
+   * as properties passed to the annotators can change their requirements.
+   *
+   * @param annotators The annotators the user has requested.
+   * @return A sanitized annotators string with all prerequisites met.
+   */
+  public static String ensurePrerequisiteAnnotators(String[] annotators, Properties props) {
+    // Get an unordered set of annotators
+<span class="fc" id="L299">    Set&lt;String&gt; unorderedAnnotators = new LinkedHashSet&lt;&gt;();  // linked to preserve order</span>
+<span class="fc" id="L300">    Collections.addAll(unorderedAnnotators, annotators);</span>
+<span class="fc bfc" id="L301" title="All 2 branches covered.">    for (String annotator : annotators) {</span>
+      // Add the annotator
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">      if (!getNamedAnnotators().containsKey(annotator.toLowerCase())) {</span>
+<span class="nc" id="L304">        throw new IllegalArgumentException(&quot;Unknown annotator: &quot; + annotator);</span>
+      }
+
+      // Add its transitive dependencies
+<span class="fc" id="L308">      unorderedAnnotators.add(annotator.toLowerCase());</span>
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">      if (!Annotator.DEFAULT_REQUIREMENTS.containsKey(annotator.toLowerCase())) {</span>
+<span class="nc" id="L310">        throw new IllegalArgumentException(&quot;Cannot infer requirements for annotator: &quot; + annotator);</span>
+      }
+<span class="fc" id="L312">      Queue&lt;String&gt; fringe = new LinkedList&lt;&gt;(Annotator.DEFAULT_REQUIREMENTS.get(annotator.toLowerCase()));</span>
+<span class="fc" id="L313">      int ticks = 0;</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">      while (!fringe.isEmpty()) {</span>
+<span class="fc" id="L315">        ticks += 1;</span>
+<span class="pc bpc" id="L316" title="1 of 2 branches missed.">        if (ticks == 1000000) {</span>
+<span class="nc" id="L317">          throw new IllegalStateException(&quot;[INTERNAL ERROR] Annotators have a circular dependency.&quot;);</span>
+        }
+<span class="fc" id="L319">        String prereq = fringe.poll();</span>
+<span class="fc" id="L320">        unorderedAnnotators.add(prereq);</span>
+<span class="fc" id="L321">        fringe.addAll(Annotator.DEFAULT_REQUIREMENTS.get(prereq.toLowerCase()));</span>
+<span class="fc" id="L322">      }</span>
+    }
+
+    // Order the annotators
+<span class="fc" id="L326">    List&lt;String&gt; orderedAnnotators = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L327" title="All 2 branches covered.">    while (!unorderedAnnotators.isEmpty()) {</span>
+<span class="fc" id="L328">      boolean somethingAdded = false;  // to make sure the dependencies are satisfiable</span>
+      // Loop over candidate annotators to add
+<span class="fc" id="L330">      Iterator&lt;String&gt; iter = unorderedAnnotators.iterator();</span>
+<span class="fc bfc" id="L331" title="All 2 branches covered.">      while (iter.hasNext()) {</span>
+<span class="fc" id="L332">        String candidate = iter.next();</span>
+        // Are the requirements satisfied?
+<span class="fc" id="L334">        boolean canAdd = true;</span>
+<span class="fc bfc" id="L335" title="All 2 branches covered.">        for (String prereq : Annotator.DEFAULT_REQUIREMENTS.get(candidate.toLowerCase())) {</span>
+<span class="fc bfc" id="L336" title="All 2 branches covered.">          if (!orderedAnnotators.contains(prereq)) {</span>
+<span class="fc" id="L337">            canAdd = false;</span>
+<span class="fc" id="L338">            break;</span>
+          }
+<span class="fc" id="L340">        }</span>
+        // If so, add the annotator
+<span class="fc bfc" id="L342" title="All 2 branches covered.">        if (canAdd) {</span>
+<span class="fc" id="L343">          orderedAnnotators.add(candidate);</span>
+<span class="fc" id="L344">          iter.remove();</span>
+<span class="fc" id="L345">          somethingAdded = true;</span>
+        }
+<span class="fc" id="L347">      }</span>
+      // Make sure we're making progress every iteration, to prevent an infinite loop
+<span class="pc bpc" id="L349" title="1 of 2 branches missed.">      if (!somethingAdded) {</span>
+<span class="nc" id="L350">        throw new IllegalArgumentException(&quot;Unsatisfiable annotator list: &quot; + StringUtils.join(annotators, &quot;,&quot;));</span>
+      }
+<span class="fc" id="L352">    }</span>
+
+    // Remove depparse + parse -- these are redundant
+<span class="pc bpc" id="L355" title="1 of 4 branches missed.">    if (orderedAnnotators.contains(STANFORD_PARSE) &amp;&amp; !ArrayUtils.contains(annotators, STANFORD_DEPENDENCIES)) {</span>
+<span class="fc" id="L356">      orderedAnnotators.remove(STANFORD_DEPENDENCIES);</span>
+    }
+
+    // Tweak the properties, if necessary
+    // (set the mention annotator to use dependency trees, if appropriate)
+<span class="fc bfc" id="L361" title="All 4 branches covered.">    if (orderedAnnotators.contains(Annotator.STANFORD_MENTION) &amp;&amp; !orderedAnnotators.contains(Annotator.STANFORD_PARSE) &amp;&amp;</span>
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">        !props.containsKey(&quot;coref.md.type&quot;)) {</span>
+<span class="fc" id="L363">      props.setProperty(&quot;coref.md.type&quot;, &quot;dep&quot;);</span>
+    }
+    // (ensure regexner is after ner)
+<span class="fc bfc" id="L366" title="All 4 branches covered.">    if (orderedAnnotators.contains(Annotator.STANFORD_NER) &amp;&amp; orderedAnnotators.contains(STANFORD_REGEXNER)) {</span>
+<span class="fc" id="L367">      orderedAnnotators.remove(STANFORD_REGEXNER);</span>
+<span class="fc" id="L368">      int nerIndex = orderedAnnotators.indexOf(Annotator.STANFORD_NER);</span>
+<span class="fc" id="L369">      orderedAnnotators.add(nerIndex + 1, STANFORD_REGEXNER);</span>
+    }
+    // (ensure coref is before openie)
+<span class="fc bfc" id="L372" title="All 4 branches covered.">    if (orderedAnnotators.contains(Annotator.STANFORD_COREF) &amp;&amp; orderedAnnotators.contains(STANFORD_OPENIE)) {</span>
+<span class="fc" id="L373">      int maxIndex = Math.max(</span>
+<span class="fc" id="L374">          orderedAnnotators.indexOf(STANFORD_OPENIE),</span>
+<span class="fc" id="L375">          orderedAnnotators.indexOf(STANFORD_COREF)</span>
+          );
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">      if (Objects.equals(orderedAnnotators.get(maxIndex), STANFORD_OPENIE)) {</span>
+<span class="nc" id="L378">        orderedAnnotators.add(maxIndex, STANFORD_COREF);</span>
+<span class="nc" id="L379">        orderedAnnotators.remove(STANFORD_COREF);</span>
+      } else {
+<span class="fc" id="L381">        orderedAnnotators.add(maxIndex + 1, STANFORD_OPENIE);</span>
+<span class="fc" id="L382">        orderedAnnotators.remove(STANFORD_OPENIE);</span>
+      }
+    }
+
+    // Return
+<span class="fc" id="L387">    return StringUtils.join(orderedAnnotators, &quot;,&quot;);</span>
+  }
+
+
+  /**
+   * Check if we can construct an XML outputter.
+   *
+   * @return Whether we can construct an XML outputter.
+   */
+  private static boolean isXMLOutputPresent() {
+    try {
+<span class="fc" id="L398">      Class.forName(&quot;edu.stanford.nlp.pipeline.XMLOutputter&quot;);</span>
+<span class="nc" id="L399">    } catch (ClassNotFoundException | NoClassDefFoundError ex) {</span>
+<span class="nc" id="L400">      return false;</span>
+<span class="fc" id="L401">    }</span>
+<span class="fc" id="L402">    return true;</span>
+  }
+
+  //
+  // AnnotatorPool construction support
+  //
+
+  private void construct(Properties props, boolean enforceRequirements, AnnotatorImplementations annotatorImplementations, AnnotatorPool pool) {
+<span class="fc" id="L410">    Timing tim = new Timing();</span>
+<span class="fc" id="L411">    this.numWords = 0;</span>
+<span class="fc" id="L412">    this.constituentTreePrinter = new TreePrint(&quot;penn&quot;);</span>
+<span class="fc" id="L413">    this.dependencyTreePrinter = new TreePrint(&quot;typedDependenciesCollapsed&quot;);</span>
+
+
+
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">    if (props == null) {</span>
+      // if undefined, find the properties file in the classpath
+<span class="nc" id="L419">      props = loadPropertiesFromClasspath();</span>
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">    } else if (props.getProperty(&quot;annotators&quot;) == null) {</span>
+      // this happens when some command line options are specified (e.g just &quot;-filelist&quot;) but no properties file is.
+      // we use the options that are given and let them override the default properties from the class path properties.
+<span class="nc" id="L423">      Properties fromClassPath = loadPropertiesFromClasspath();</span>
+<span class="nc" id="L424">      fromClassPath.putAll(props);</span>
+<span class="nc" id="L425">      props = fromClassPath;</span>
+    }
+<span class="fc" id="L427">    this.properties = props;</span>
+
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">    if (pool == null) {</span>
+      // if undefined, load the default annotator pool
+<span class="fc" id="L431">      pool = getDefaultAnnotatorPool(props, annotatorImplementations);</span>
+    }
+
+    // Set threading
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">    if (this.properties.containsKey(&quot;threads&quot;)) {</span>
+<span class="nc" id="L436">      ArgumentParser.threads = PropertiesUtils.getInt(this.properties, &quot;threads&quot;);</span>
+<span class="nc" id="L437">      this.availableProcessors = new Semaphore(ArgumentParser.threads);</span>
+    } else {
+<span class="fc" id="L439">      this.availableProcessors = new Semaphore(1);</span>
+    }
+
+    // now construct the annotators from the given properties in the given order
+<span class="fc" id="L443">    List&lt;String&gt; annoNames = Arrays.asList(getRequiredProperty(props, &quot;annotators&quot;).split(&quot;[, \t]+&quot;));</span>
+<span class="fc" id="L444">    Set&lt;String&gt; alreadyAddedAnnoNames = Generics.newHashSet();</span>
+<span class="fc" id="L445">    Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirementsSatisfied = Generics.newHashSet();</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">    for (String name : annoNames) {</span>
+<span class="fc" id="L447">      name = name.trim();</span>
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">      if (name.isEmpty()) { continue; }</span>
+<span class="fc" id="L449">      logger.info(&quot;Adding annotator &quot; + name);</span>
+
+<span class="fc" id="L451">      Annotator an = pool.get(name);</span>
+<span class="fc" id="L452">      this.addAnnotator(an);</span>
+
+<span class="pc bpc" id="L454" title="1 of 2 branches missed.">      if (enforceRequirements) {</span>
+<span class="fc" id="L455">        Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; allRequirements = an.requires();</span>
+<span class="fc bfc" id="L456" title="All 2 branches covered.">        for (Class&lt;? extends CoreAnnotation&gt; requirement : allRequirements) {</span>
+<span class="pc bpc" id="L457" title="1 of 2 branches missed.">          if (!requirementsSatisfied.contains(requirement)) {</span>
+<span class="nc" id="L458">            String fmt = &quot;annotator \&quot;%s\&quot; requires annotation \&quot;%s\&quot;. The usual requirements for this annotator are: %s&quot;;</span>
+<span class="nc" id="L459">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L460">                String.format(fmt, name, requirement.getSimpleName(),</span>
+<span class="nc" id="L461">                    StringUtils.join(Annotator.DEFAULT_REQUIREMENTS.getOrDefault(name, Collections.singleton(&quot;unknown&quot;)), &quot;,&quot;)</span>
+                ));
+          }
+<span class="fc" id="L464">        }</span>
+<span class="fc" id="L465">        requirementsSatisfied.addAll(an.requirementsSatisfied());</span>
+      }
+
+
+<span class="fc" id="L469">      alreadyAddedAnnoNames.add(name);</span>
+<span class="fc" id="L470">    }</span>
+
+    // Sanity check
+<span class="fc bfc" id="L473" title="All 2 branches covered.">    if (! alreadyAddedAnnoNames.contains(STANFORD_SSPLIT)) {</span>
+<span class="fc" id="L474">      System.setProperty(NEWLINE_SPLITTER_PROPERTY, &quot;false&quot;);</span>
+    }
+<span class="fc" id="L476">    this.pipelineSetupTime = tim.report();</span>
+<span class="fc" id="L477">  }</span>
+
+  /**
+   * Call this if you are no longer using StanfordCoreNLP and want to
+   * release the memory associated with the annotators.
+   */
+  public static synchronized void clearAnnotatorPool() {
+<span class="nc" id="L484">    pool = null;</span>
+<span class="nc" id="L485">  }</span>
+
+
+  /**
+   * This function defines the list of named annotators in CoreNLP, along with how to construct
+   * them.
+   * @return A map from annotator name, to the function which constructs that annotator.
+   */
+  private static Map&lt;String, BiFunction&lt;Properties, AnnotatorImplementations, AnnotatorFactory&gt;&gt; getNamedAnnotators() {
+<span class="fc" id="L494">    Map&lt;String, BiFunction&lt;Properties, AnnotatorImplementations, AnnotatorFactory&gt;&gt; pool = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L495">    pool.put(STANFORD_TOKENIZE, AnnotatorFactories::tokenize);</span>
+<span class="fc" id="L496">    pool.put(STANFORD_CLEAN_XML, AnnotatorFactories::cleanXML);</span>
+<span class="fc" id="L497">    pool.put(STANFORD_SSPLIT, AnnotatorFactories::sentenceSplit);</span>
+<span class="fc" id="L498">    pool.put(STANFORD_POS, AnnotatorFactories::posTag);</span>
+<span class="fc" id="L499">    pool.put(STANFORD_LEMMA, AnnotatorFactories::lemma);</span>
+<span class="fc" id="L500">    pool.put(STANFORD_NER, AnnotatorFactories::nerTag);</span>
+<span class="fc" id="L501">    pool.put(STANFORD_REGEXNER, AnnotatorFactories::regexNER);</span>
+<span class="fc" id="L502">    pool.put(STANFORD_ENTITY_MENTIONS, AnnotatorFactories::entityMentions);</span>
+<span class="fc" id="L503">    pool.put(STANFORD_GENDER, AnnotatorFactories::gender);</span>
+<span class="fc" id="L504">    pool.put(STANFORD_TRUECASE, AnnotatorFactories::truecase);</span>
+<span class="fc" id="L505">    pool.put(STANFORD_PARSE, AnnotatorFactories::parse);</span>
+<span class="fc" id="L506">    pool.put(STANFORD_MENTION, AnnotatorFactories::mention);</span>
+<span class="fc" id="L507">    pool.put(STANFORD_DETERMINISTIC_COREF, AnnotatorFactories::dcoref);</span>
+<span class="fc" id="L508">    pool.put(STANFORD_COREF, AnnotatorFactories::coref);</span>
+<span class="fc" id="L509">    pool.put(STANFORD_RELATION, AnnotatorFactories::relation);</span>
+<span class="fc" id="L510">    pool.put(STANFORD_SENTIMENT, AnnotatorFactories::sentiment);</span>
+<span class="fc" id="L511">    pool.put(STANFORD_COLUMN_DATA_CLASSIFIER, AnnotatorFactories::columnDataClassifier);</span>
+<span class="fc" id="L512">    pool.put(STANFORD_DEPENDENCIES, AnnotatorFactories::dependencies);</span>
+<span class="fc" id="L513">    pool.put(STANFORD_NATLOG, AnnotatorFactories::natlog);</span>
+<span class="fc" id="L514">    pool.put(STANFORD_OPENIE, AnnotatorFactories::openie);</span>
+<span class="fc" id="L515">    pool.put(STANFORD_QUOTE, AnnotatorFactories::quote);</span>
+<span class="fc" id="L516">    pool.put(STANFORD_UD_FEATURES, AnnotatorFactories::udfeats);</span>
+<span class="fc" id="L517">    pool.put(STANFORD_LINK, AnnotatorFactories::link);</span>
+<span class="fc" id="L518">    pool.put(STANFORD_KBP, AnnotatorFactories::kbp);</span>
+<span class="fc" id="L519">    return pool;</span>
+  }
+
+
+  /**
+   * Construct the default annotator pool, and save it as the static annotator pool
+   * for CoreNLP.
+   *
+   * @see StanfordCoreNLP#constructAnnotatorPool(Properties, AnnotatorImplementations)
+   */
+  public static synchronized AnnotatorPool getDefaultAnnotatorPool(final Properties inputProps, final AnnotatorImplementations annotatorImplementation) {
+    // if the pool already exists reuse!
+<span class="fc bfc" id="L531" title="All 2 branches covered.">    if (pool == null) {</span>
+<span class="fc" id="L532">      pool = new AnnotatorPool();</span>
+    }
+<span class="fc bfc" id="L534" title="All 2 branches covered.">    for (Map.Entry&lt;String, BiFunction&lt;Properties, AnnotatorImplementations, AnnotatorFactory&gt;&gt; entry : getNamedAnnotators().entrySet()) {</span>
+<span class="fc" id="L535">      pool.register(entry.getKey(), entry.getValue().apply(inputProps, annotatorImplementation));</span>
+<span class="fc" id="L536">    }</span>
+<span class="fc" id="L537">    registerCustomAnnotators(pool, annotatorImplementation, inputProps);</span>
+<span class="fc" id="L538">    return pool;</span>
+  }
+
+
+  /**
+   * register any custom annotators defined in the input properties, and add them to the pool.
+   *
+   * @param pool The annotator pool to add the new custom annotators to.
+   * @param annotatorImplementation The implementation thunk to use to create any new annotators.
+   * @param inputProps The properties to read new annotator definitions from.
+   */
+  private static void registerCustomAnnotators(AnnotatorPool pool, AnnotatorImplementations annotatorImplementation, Properties inputProps) {
+    // add annotators loaded via reflection from class names specified
+    // in the properties
+<span class="fc bfc" id="L552" title="All 2 branches covered.">    for (String property : inputProps.stringPropertyNames()) {</span>
+<span class="fc bfc" id="L553" title="All 2 branches covered.">      if (property.startsWith(CUSTOM_ANNOTATOR_PREFIX)) {</span>
+<span class="fc" id="L554">        final String customName =</span>
+<span class="fc" id="L555">            property.substring(CUSTOM_ANNOTATOR_PREFIX.length());</span>
+<span class="fc" id="L556">        final String customClassName = inputProps.getProperty(property);</span>
+<span class="fc" id="L557">        logger.info(&quot;Registering annotator &quot; + customName + &quot; with class &quot; + customClassName);</span>
+<span class="fc" id="L558">        pool.register(customName, new AnnotatorFactory(customName, customClassName, inputProps) {</span>
+          private static final long serialVersionUID = 1L;
+          @Override
+          public Annotator create() {
+<span class="fc" id="L562">            return annotatorImplementation.custom(properties, property);</span>
+          }
+        });
+      }
+<span class="fc" id="L566">    }</span>
+<span class="fc" id="L567">  }</span>
+
+
+
+  /**
+   * Construct the default annotator pool from the passed properties, and overwriting annotations which have changed
+   * since the last
+   * @param inputProps
+   * @param annotatorImplementation
+   * @return A populated AnnotatorPool
+   */
+  public static AnnotatorPool constructAnnotatorPool(final Properties inputProps, final AnnotatorImplementations annotatorImplementation) {
+<span class="nc" id="L579">    AnnotatorPool pool = new AnnotatorPool();</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">    for (Map.Entry&lt;String, BiFunction&lt;Properties, AnnotatorImplementations, AnnotatorFactory&gt;&gt; entry : getNamedAnnotators().entrySet()) {</span>
+<span class="nc" id="L581">      pool.register(entry.getKey(), entry.getValue().apply(inputProps, annotatorImplementation));</span>
+<span class="nc" id="L582">    }</span>
+<span class="nc" id="L583">    registerCustomAnnotators(pool, annotatorImplementation, inputProps);</span>
+<span class="nc" id="L584">    return pool;</span>
+  }
+
+
+
+  public static synchronized Annotator getExistingAnnotator(String name) {
+<span class="nc bnc" id="L590" title="All 2 branches missed.">    if(pool == null){</span>
+<span class="nc" id="L591">      logger.error(&quot;Attempted to fetch annotator \&quot;&quot; + name + &quot;\&quot; before the annotator pool was created!&quot;);</span>
+<span class="nc" id="L592">      return null;</span>
+    }
+    try {
+<span class="nc" id="L595">      return pool.get(name);</span>
+<span class="nc" id="L596">    } catch(IllegalArgumentException e) {</span>
+<span class="nc" id="L597">      logger.error(&quot;Attempted to fetch annotator \&quot;&quot; + name +</span>
+        &quot;\&quot; but the annotator pool does not store any such type!&quot;);
+<span class="nc" id="L599">      return null;</span>
+    }
+  }
+
+  @Override
+  public void annotate(Annotation annotation) {
+<span class="fc" id="L605">    super.annotate(annotation);</span>
+<span class="fc" id="L606">    List&lt;CoreLabel&gt; words = annotation.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="pc bpc" id="L607" title="1 of 2 branches missed.">    if (words != null) {</span>
+<span class="fc" id="L608">      numWords += words.size();</span>
+    }
+<span class="fc" id="L610">  }</span>
+
+
+  public void annotate(final Annotation annotation, final Consumer&lt;Annotation&gt; callback){
+<span class="nc bnc" id="L614" title="All 2 branches missed.">    if (PropertiesUtils.getInt(properties, &quot;threads&quot;, 1) == 1) {</span>
+<span class="nc" id="L615">      annotate(annotation);</span>
+<span class="nc" id="L616">      callback.accept(annotation);</span>
+    } else {
+      try {
+<span class="nc" id="L619">        availableProcessors.acquire();</span>
+<span class="nc" id="L620">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L621">        throw new RuntimeInterruptedException(e);</span>
+<span class="nc" id="L622">      }</span>
+<span class="nc" id="L623">      new Thread(() -&gt; {</span>
+        try {
+<span class="nc" id="L625">          annotate(annotation);</span>
+<span class="nc" id="L626">        } catch (Throwable t) {</span>
+<span class="nc" id="L627">          annotation.set(CoreAnnotations.ExceptionAnnotation.class, t);</span>
+<span class="nc" id="L628">        }</span>
+<span class="nc" id="L629">        callback.accept(annotation);</span>
+<span class="nc" id="L630">        availableProcessors.release();</span>
+<span class="nc" id="L631">      }).start();</span>
+    }
+<span class="nc" id="L633">  }</span>
+
+
+
+  /**
+   * Determines whether the parser annotator should default to
+   * producing binary trees.  Currently there is only one condition
+   * under which this is true: the sentiment annotator is used.
+   */
+  public static boolean usesBinaryTrees(Properties props) {
+<span class="fc" id="L643">    Set&lt;String&gt; annoNames = Generics.newHashSet(Arrays.asList(props.getProperty(&quot;annotators&quot;,&quot;&quot;).split(&quot;[, \t]+&quot;)));</span>
+<span class="fc" id="L644">    return annoNames.contains(STANFORD_SENTIMENT);</span>
+  }
+
+  /**
+   * Runs the entire pipeline on the content of the given text passed in.
+   * @param text The text to process
+   * @return An Annotation object containing the output of all annotators
+   */
+  public Annotation process(String text) {
+<span class="nc" id="L653">    Annotation annotation = new Annotation(text);</span>
+<span class="nc" id="L654">    annotate(annotation);</span>
+<span class="nc" id="L655">    return annotation;</span>
+  }
+
+  //
+  // output and formatting methods (including XML-specific methods)
+  //
+
+  /**
+   * Displays the output of all annotators in a format easily readable by people.
+   * @param annotation Contains the output of all annotators
+   * @param os The output stream
+   */
+  public void prettyPrint(Annotation annotation, OutputStream os) {
+<span class="nc" id="L668">    TextOutputter.prettyPrint(annotation, os, this);</span>
+<span class="nc" id="L669">  }</span>
+
+  /**
+   * Displays the output of all annotators in a format easily readable by people.
+   * @param annotation Contains the output of all annotators
+   * @param os The output stream
+   */
+  public void prettyPrint(Annotation annotation, PrintWriter os) {
+<span class="nc" id="L677">    TextOutputter.prettyPrint(annotation, os, this);</span>
+<span class="nc" id="L678">  }</span>
+
+  /**
+   * Wrapper around xmlPrint(Annotation, OutputStream).
+   * Added for backward compatibility.
+   * @param annotation The Annotation to print
+   * @param w The Writer to send the output to
+   * @throws IOException
+   */
+  public void xmlPrint(Annotation annotation, Writer w) throws IOException {
+<span class="nc" id="L688">    ByteArrayOutputStream os = new ByteArrayOutputStream();</span>
+<span class="nc" id="L689">    xmlPrint(annotation, os); // this builds it as the encoding specified in the properties</span>
+<span class="nc" id="L690">    w.write(new String(os.toByteArray(), getEncoding()));</span>
+<span class="nc" id="L691">    w.flush();</span>
+<span class="nc" id="L692">  }</span>
+
+  /**
+   * Displays the output of all annotators in JSON format.
+   * @param annotation Contains the output of all annotators
+   * @param w The Writer to send the output to
+   * @throws IOException
+   */
+  public void jsonPrint(Annotation annotation, Writer w) throws IOException {
+<span class="nc" id="L701">    ByteArrayOutputStream os = new ByteArrayOutputStream();</span>
+<span class="nc" id="L702">    JSONOutputter.jsonPrint(annotation, os, this);</span>
+<span class="nc" id="L703">    w.write(new String(os.toByteArray(), getEncoding()));</span>
+<span class="nc" id="L704">    w.flush();</span>
+<span class="nc" id="L705">  }</span>
+
+  /**
+   * Displays the output of many annotators in CoNLL format.
+   * @param annotation Contains the output of all annotators
+   * @param w The Writer to send the output to
+   * @throws IOException
+   */
+  public void conllPrint(Annotation annotation, Writer w) throws IOException {
+<span class="nc" id="L714">    ByteArrayOutputStream os = new ByteArrayOutputStream();</span>
+<span class="nc" id="L715">    CoNLLOutputter.conllPrint(annotation, os, this);</span>
+<span class="nc" id="L716">    w.write(new String(os.toByteArray(), getEncoding()));</span>
+<span class="nc" id="L717">    w.flush();</span>
+<span class="nc" id="L718">  }</span>
+
+  /**
+   * Displays the output of all annotators in XML format.
+   * @param annotation Contains the output of all annotators
+   * @param os The output stream
+   * @throws IOException
+   */
+  public void xmlPrint(Annotation annotation, OutputStream os) throws IOException {
+    try {
+<span class="nc" id="L728">      Class clazz = Class.forName(&quot;edu.stanford.nlp.pipeline.XMLOutputter&quot;);</span>
+<span class="nc" id="L729">      Method method = clazz.getMethod(&quot;xmlPrint&quot;, Annotation.class, OutputStream.class, StanfordCoreNLP.class);</span>
+<span class="nc" id="L730">      method.invoke(null, annotation, os, this);</span>
+<span class="nc" id="L731">    } catch (NoSuchMethodException | IllegalAccessException | ClassNotFoundException | InvocationTargetException e) {</span>
+<span class="nc" id="L732">      throw new RuntimeException(e);</span>
+<span class="nc" id="L733">    }</span>
+<span class="nc" id="L734">  }</span>
+
+  //
+  // runtime, shell-specific, and help menu methods
+  //
+
+  /**
+   * Prints the list of properties required to run the pipeline
+   * @param os PrintStream to print usage to
+   * @param helpTopic a topic to print help about (or null for general options)
+   */
+  protected static void printHelp(PrintStream os, String helpTopic) {
+<span class="nc bnc" id="L746" title="All 2 branches missed.">    if (helpTopic.toLowerCase().startsWith(&quot;pars&quot;)) {</span>
+<span class="nc" id="L747">      os.println(&quot;StanfordCoreNLP currently supports the following parsers:&quot;);</span>
+<span class="nc" id="L748">      os.println(&quot;\tstanford - Stanford lexicalized parser (default)&quot;);</span>
+<span class="nc" id="L749">      os.println(&quot;\tcharniak - Charniak and Johnson reranking parser (sold separately)&quot;);</span>
+<span class="nc" id="L750">      os.println();</span>
+<span class="nc" id="L751">      os.println(&quot;General options: (all parsers)&quot;);</span>
+<span class="nc" id="L752">      os.println(&quot;\tparse.type - selects the parser to use&quot;);</span>
+<span class="nc" id="L753">      os.println(&quot;\tparse.model - path to model file for parser&quot;);</span>
+<span class="nc" id="L754">      os.println(&quot;\tparse.maxlen - maximum sentence length&quot;);</span>
+<span class="nc" id="L755">      os.println();</span>
+<span class="nc" id="L756">      os.println(&quot;Stanford Parser-specific options:&quot;);</span>
+<span class="nc" id="L757">      os.println(&quot;(In general, you shouldn't need to set this flags)&quot;);</span>
+<span class="nc" id="L758">      os.println(&quot;\tparse.flags - extra flags to the parser (default: -retainTmpSubcategories)&quot;);</span>
+<span class="nc" id="L759">      os.println(&quot;\tparse.debug - set to true to make the parser slightly more verbose&quot;);</span>
+<span class="nc" id="L760">      os.println();</span>
+<span class="nc" id="L761">      os.println(&quot;Charniak and Johnson parser-specific options:&quot;);</span>
+<span class="nc" id="L762">      os.println(&quot;\tparse.executable - path to the parseIt binary or parse.sh script&quot;);</span>
+    } else {
+      // argsToProperties will set the value of a -h or -help to &quot;true&quot; if no arguments are given
+<span class="nc bnc" id="L765" title="All 2 branches missed.">      if ( ! helpTopic.equalsIgnoreCase(&quot;true&quot;)) {</span>
+<span class="nc" id="L766">        os.println(&quot;Unknown help topic: &quot; + helpTopic);</span>
+<span class="nc" id="L767">        os.println(&quot;See -help for a list of all help topics.&quot;);</span>
+      } else {
+<span class="nc" id="L769">        printRequiredProperties(os);</span>
+      }
+    }
+<span class="nc" id="L772">  }</span>
+
+  /**
+   * Prints the list of properties required to run the pipeline
+   * @param os PrintStream to print usage to
+   */
+  private static void printRequiredProperties(PrintStream os) {
+    // TODO some annotators (ssplit, regexner, gender, some parser options, dcoref?) are not documented
+<span class="nc" id="L780">    os.println(&quot;The following properties can be defined:&quot;);</span>
+<span class="nc" id="L781">    os.println(&quot;(if -props or -annotators is not passed in, default properties will be loaded via the classpath)&quot;);</span>
+<span class="nc" id="L782">    os.println(&quot;\t\&quot;props\&quot; - path to file with configuration properties&quot;);</span>
+<span class="nc" id="L783">    os.println(&quot;\t\&quot;annotators\&quot; - comma separated list of annotators&quot;);</span>
+<span class="nc" id="L784">    os.println(&quot;\tThe following annotators are supported: cleanxml, tokenize, quote, ssplit, pos, lemma, ner, truecase, parse, hcoref, relation&quot;);</span>
+
+<span class="nc" id="L786">    os.println();</span>
+<span class="nc" id="L787">    os.println(&quot;\tIf annotator \&quot;tokenize\&quot; is defined:&quot;);</span>
+<span class="nc" id="L788">    os.println(&quot;\t\&quot;tokenize.options\&quot; - PTBTokenizer options (see edu.stanford.nlp.process.PTBTokenizer for details)&quot;);</span>
+<span class="nc" id="L789">    os.println(&quot;\t\&quot;tokenize.whitespace\&quot; - If true, just use whitespace tokenization&quot;);</span>
+
+<span class="nc" id="L791">    os.println();</span>
+<span class="nc" id="L792">    os.println(&quot;\tIf annotator \&quot;cleanxml\&quot; is defined:&quot;);</span>
+<span class="nc" id="L793">    os.println(&quot;\t\&quot;clean.xmltags\&quot; - regex of tags to extract text from&quot;);</span>
+<span class="nc" id="L794">    os.println(&quot;\t\&quot;clean.sentenceendingtags\&quot; - regex of tags which mark sentence endings&quot;);</span>
+<span class="nc" id="L795">    os.println(&quot;\t\&quot;clean.allowflawedxml\&quot; - if set to true, don't complain about XML errors&quot;);</span>
+
+<span class="nc" id="L797">    os.println();</span>
+<span class="nc" id="L798">    os.println(&quot;\tIf annotator \&quot;pos\&quot; is defined:&quot;);</span>
+<span class="nc" id="L799">    os.println(&quot;\t\&quot;pos.maxlen\&quot; - maximum length of sentence to POS tag&quot;);</span>
+<span class="nc" id="L800">    os.println(&quot;\t\&quot;pos.model\&quot; - path towards the POS tagger model&quot;);</span>
+
+<span class="nc" id="L802">    os.println();</span>
+<span class="nc" id="L803">    os.println(&quot;\tIf annotator \&quot;ner\&quot; is defined:&quot;);</span>
+<span class="nc" id="L804">    os.println(&quot;\t\&quot;ner.model\&quot; - paths for the ner models.  By default, the English 3 class, 7 class, and 4 class models are used.&quot;);</span>
+<span class="nc" id="L805">    os.println(&quot;\t\&quot;ner.useSUTime\&quot; - Whether or not to use sutime (English specific)&quot;);</span>
+<span class="nc" id="L806">    os.println(&quot;\t\&quot;ner.applyNumericClassifiers\&quot; - whether or not to use any numeric classifiers (English specific)&quot;);</span>
+
+<span class="nc" id="L808">    os.println();</span>
+<span class="nc" id="L809">    os.println(&quot;\tIf annotator \&quot;truecase\&quot; is defined:&quot;);</span>
+<span class="nc" id="L810">    os.println(&quot;\t\&quot;truecase.model\&quot; - path towards the true-casing model; default: &quot; + DefaultPaths.DEFAULT_TRUECASE_MODEL);</span>
+<span class="nc" id="L811">    os.println(&quot;\t\&quot;truecase.bias\&quot; - class bias of the true case model; default: &quot; + TrueCaseAnnotator.DEFAULT_MODEL_BIAS);</span>
+<span class="nc" id="L812">    os.println(&quot;\t\&quot;truecase.mixedcasefile\&quot; - path towards the mixed case file; default: &quot; + DefaultPaths.DEFAULT_TRUECASE_DISAMBIGUATION_LIST);</span>
+
+<span class="nc" id="L814">    os.println();</span>
+<span class="nc" id="L815">    os.println(&quot;\tIf annotator \&quot;relation\&quot; is defined:&quot;);</span>
+<span class="nc" id="L816">    os.println(&quot;\t\&quot;sup.relation.verbose\&quot; - whether verbose or not&quot;);</span>
+<span class="nc" id="L817">    os.println(&quot;\t\&quot;sup.relation.model\&quot; - path towards the relation extraction model&quot;);</span>
+
+<span class="nc" id="L819">    os.println();</span>
+<span class="nc" id="L820">    os.println(&quot;\tIf annotator \&quot;parse\&quot; is defined:&quot;);</span>
+<span class="nc" id="L821">    os.println(&quot;\t\&quot;parse.model\&quot; - path towards the PCFG parser model&quot;);</span>
+
+    /* XXX: unstable, do not use for now
+    os.println();
+    os.println(&quot;\tIf annotator \&quot;srl\&quot; is defined:&quot;);
+    os.println(&quot;\t\&quot;srl.verb.args\&quot; - path to the file listing verbs and their core arguments (\&quot;verbs.core_args\&quot;)&quot;);
+    os.println(&quot;\t\&quot;srl.model.id\&quot; - path prefix for the role identification model (adds \&quot;.model.gz\&quot; and \&quot;.fe\&quot; to this prefix)&quot;);
+    os.println(&quot;\t\&quot;srl.model.cls\&quot; - path prefix for the role classification model (adds \&quot;.model.gz\&quot; and \&quot;.fe\&quot; to this prefix)&quot;);
+    os.println(&quot;\t\&quot;srl.model.jic\&quot; - path to the directory containing the joint model's \&quot;model.gz\&quot;, \&quot;fe\&quot; and \&quot;je\&quot; files&quot;);
+    os.println(&quot;\t                  (if not specified, the joint model will not be used)&quot;);
+    */
+
+<span class="nc" id="L833">    os.println();</span>
+<span class="nc" id="L834">    os.println(&quot;Command line properties:&quot;);</span>
+<span class="nc" id="L835">    os.println(&quot;\t\&quot;file\&quot; - run the pipeline on the content of this file, or on the content of the files in this directory&quot;);</span>
+<span class="nc" id="L836">    os.println(&quot;\t         XML output is generated for every input file \&quot;file\&quot; as file.xml&quot;);</span>
+<span class="nc" id="L837">    os.println(&quot;\t\&quot;extension\&quot; - if -file used with a directory, process only the files with this extension&quot;);</span>
+<span class="nc" id="L838">    os.println(&quot;\t\&quot;filelist\&quot; - run the pipeline on the list of files given in this file&quot;);</span>
+<span class="nc" id="L839">    os.println(&quot;\t             output is generated for every input file as file.outputExtension&quot;);</span>
+<span class="nc" id="L840">    os.println(&quot;\t\&quot;outputDirectory\&quot; - where to put output (defaults to the current directory)&quot;);</span>
+<span class="nc" id="L841">    os.println(&quot;\t\&quot;outputExtension\&quot; - extension to use for the output file (defaults to \&quot;.xml\&quot; for XML, \&quot;.ser.gz\&quot; for serialized).  Don't forget the dot!&quot;);</span>
+<span class="nc" id="L842">    os.println(&quot;\t\&quot;outputFormat\&quot; - \&quot;xml\&quot; (usual default), \&quot;text\&quot; (default for REPL or if no XML), \&quot;json\&quot;, \&quot;conll\&quot;, \&quot;conllu\&quot;, or \&quot;serialized\&quot;&quot;);</span>
+<span class="nc" id="L843">    os.println(&quot;\t\&quot;serializer\&quot; - Class of annotation serializer to use when outputFormat is \&quot;serialized\&quot;.  By default, uses Java serialization.&quot;);</span>
+<span class="nc" id="L844">    os.println(&quot;\t\&quot;replaceExtension\&quot; - flag to chop off the last extension before adding outputExtension to file&quot;);</span>
+<span class="nc" id="L845">    os.println(&quot;\t\&quot;noClobber\&quot; - don't automatically override (clobber) output files that already exist&quot;);</span>
+<span class="nc" id="L846">		os.println(&quot;\t\&quot;threads\&quot; - multithread on this number of threads&quot;);</span>
+<span class="nc" id="L847">    os.println();</span>
+<span class="nc" id="L848">    os.println(&quot;If none of the above are present, run the pipeline in an interactive shell (default properties will be loaded from the classpath).&quot;);</span>
+<span class="nc" id="L849">    os.println(&quot;The shell accepts input from stdin and displays the output at stdout.&quot;);</span>
+
+<span class="nc" id="L851">    os.println();</span>
+<span class="nc" id="L852">    os.println(&quot;Run with -help [topic] for more help on a specific topic.&quot;);</span>
+<span class="nc" id="L853">    os.println(&quot;Current topics include: parser&quot;);</span>
+
+<span class="nc" id="L855">    os.println();</span>
+<span class="nc" id="L856">  }</span>
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public String timingInformation() {
+<span class="nc" id="L863">    StringBuilder sb = new StringBuilder(super.timingInformation());</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">    if (TIME &amp;&amp; numWords &gt;= 0) {</span>
+<span class="nc" id="L865">      long total = this.getTotalTime();</span>
+<span class="nc" id="L866">      sb.append(&quot; for &quot;).append(this.numWords).append(&quot; tokens at &quot;);</span>
+<span class="nc" id="L867">      sb.append(String.format(&quot;%.1f&quot;, numWords / (((double) total)/1000)));</span>
+<span class="nc" id="L868">      sb.append( &quot; tokens/sec.&quot;);</span>
+    }
+<span class="nc" id="L870">    return sb.toString();</span>
+  }
+
+  /**
+   * Runs an interactive shell where input text is processed with the given pipeline.
+   *
+   * @param pipeline The pipeline to be used
+   * @throws IOException If IO problem with stdin
+   */
+  private static void shell(StanfordCoreNLP pipeline) throws IOException {
+<span class="nc" id="L880">    String encoding = pipeline.getEncoding();</span>
+<span class="nc" id="L881">    BufferedReader r = new BufferedReader(IOUtils.encodedInputStreamReader(System.in, encoding));</span>
+<span class="nc" id="L882">    System.err.println(&quot;Entering interactive shell. Type q RETURN or EOF to quit.&quot;);</span>
+<span class="nc" id="L883">    final OutputFormat outputFormat = OutputFormat.valueOf(pipeline.properties.getProperty(&quot;outputFormat&quot;, &quot;text&quot;).toUpperCase());</span>
+    while (true) {
+<span class="nc" id="L885">      System.err.print(&quot;NLP&gt; &quot;);</span>
+<span class="nc" id="L886">      String line = r.readLine();</span>
+<span class="nc bnc" id="L887" title="All 4 branches missed.">      if (line == null || line.equalsIgnoreCase(&quot;q&quot;)) {</span>
+<span class="nc" id="L888">        break;</span>
+      }
+<span class="nc bnc" id="L890" title="All 2 branches missed.">      if (line.length() &gt; 0) {</span>
+<span class="nc" id="L891">        Annotation anno = pipeline.process(line);</span>
+<span class="nc bnc" id="L892" title="All 6 branches missed.">        switch (outputFormat) {</span>
+        case XML:
+<span class="nc" id="L894">          pipeline.xmlPrint(anno, System.out);</span>
+<span class="nc" id="L895">          break;</span>
+        case JSON:
+<span class="nc" id="L897">          new JSONOutputter().print(anno, System.out, pipeline);</span>
+<span class="nc" id="L898">          System.out.println();</span>
+<span class="nc" id="L899">          break;</span>
+        case CONLL:
+<span class="nc" id="L901">          new CoNLLOutputter().print(anno, System.out, pipeline);</span>
+<span class="nc" id="L902">          System.out.println();</span>
+<span class="nc" id="L903">          break;</span>
+        case CONLLU:
+<span class="nc" id="L905">          new CoNLLUOutputter().print(anno, System.out, pipeline);</span>
+<span class="nc" id="L906">          break;</span>
+        case TEXT:
+<span class="nc" id="L908">          pipeline.prettyPrint(anno, System.out);</span>
+<span class="nc" id="L909">          break;</span>
+        default:
+<span class="nc" id="L911">          throw new IllegalArgumentException(&quot;Cannot output in format &quot; + outputFormat + &quot; from the interactive shell&quot;);</span>
+        }
+      }
+<span class="nc" id="L914">    }</span>
+<span class="nc" id="L915">  }</span>
+
+  protected static Collection&lt;File&gt; readFileList(String fileName) throws IOException {
+<span class="nc" id="L918">    return ObjectBank.getLineIterator(fileName, new ObjectBank.PathToFileFunction());</span>
+  }
+
+  private static AnnotationSerializer loadSerializer(String serializerClass, String name, Properties properties) {
+    AnnotationSerializer serializer; // initialized below
+    try {
+      // Try loading with properties
+<span class="nc" id="L925">      serializer = ReflectionLoading.loadByReflection(serializerClass, name, properties);</span>
+<span class="nc" id="L926">    } catch (ReflectionLoading.ReflectionLoadingException ex) {</span>
+      // Try loading with just default constructor
+<span class="nc" id="L928">      serializer = ReflectionLoading.loadByReflection(serializerClass);</span>
+<span class="nc" id="L929">    }</span>
+<span class="nc" id="L930">    return serializer;</span>
+  }
+
+  /**
+   * Process a collection of files.
+   *
+   * @param base The base input directory to process from.
+   * @param files The files to process.
+   * @param numThreads The number of threads to annotate on.
+   *
+   * @throws IOException
+   */
+  public void processFiles(String base, final Collection&lt;File&gt; files, int numThreads) throws IOException {
+<span class="nc" id="L943">    AnnotationOutputter.Options options = AnnotationOutputter.getOptions(this);</span>
+<span class="nc" id="L944">    StanfordCoreNLP.OutputFormat outputFormat = StanfordCoreNLP.OutputFormat.valueOf(properties.getProperty(&quot;outputFormat&quot;, DEFAULT_OUTPUT_FORMAT).toUpperCase());</span>
+<span class="nc" id="L945">    processFiles(base, files, numThreads, properties, this::annotate, createOutputter(properties, options), outputFormat);</span>
+<span class="nc" id="L946">  }</span>
+
+
+  /**
+   * Create an outputter to be passed into {@link StanfordCoreNLP#processFiles(String, Collection, int, Properties, BiConsumer, BiConsumer, OutputFormat)}.
+   *
+   * @param properties The properties file to use.
+   * @param outputOptions The means of creating output options
+   *
+   * @return A consumer that can be passed into the processFiles method.
+   */
+  protected static BiConsumer&lt;Annotation, OutputStream&gt; createOutputter(Properties properties, AnnotationOutputter.Options outputOptions) {
+<span class="nc" id="L958">    final OutputFormat outputFormat =</span>
+<span class="nc" id="L959">        OutputFormat.valueOf(properties.getProperty(&quot;outputFormat&quot;, DEFAULT_OUTPUT_FORMAT).toUpperCase());</span>
+
+<span class="nc" id="L961">    final String serializerClass = properties.getProperty(&quot;serializer&quot;, GenericAnnotationSerializer.class.getName());</span>
+<span class="nc" id="L962">    final String outputSerializerClass = properties.getProperty(&quot;outputSerializer&quot;, serializerClass);</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">    final String outputSerializerName = (serializerClass.equals(outputSerializerClass))? &quot;serializer&quot;:&quot;outputSerializer&quot;;</span>
+
+<span class="nc" id="L965">    return (Annotation annotation, OutputStream fos) -&gt; {</span>
+      try {
+<span class="nc bnc" id="L967" title="All 7 branches missed.">        switch (outputFormat) {</span>
+          case XML: {
+<span class="nc" id="L969">            AnnotationOutputter outputter = MetaClass.create(&quot;edu.stanford.nlp.pipeline.XMLOutputter&quot;).createInstance();</span>
+<span class="nc" id="L970">            outputter.print(annotation, fos, outputOptions);</span>
+<span class="nc" id="L971">            break;</span>
+          }
+          case JSON: {
+<span class="nc" id="L974">            new JSONOutputter().print(annotation, fos, outputOptions);</span>
+<span class="nc" id="L975">            break;</span>
+          }
+          case CONLL: {
+<span class="nc" id="L978">            new CoNLLOutputter().print(annotation, fos, outputOptions);</span>
+<span class="nc" id="L979">            break;</span>
+          }
+          case TEXT: {
+<span class="nc" id="L982">            new TextOutputter().print(annotation, fos, outputOptions);</span>
+<span class="nc" id="L983">            break;</span>
+          }
+          case SERIALIZED: {
+<span class="nc bnc" id="L986" title="All 2 branches missed.">            if (outputSerializerClass != null) {</span>
+<span class="nc" id="L987">              AnnotationSerializer outputSerializer = loadSerializer(outputSerializerClass, outputSerializerName, properties);</span>
+<span class="nc" id="L988">              outputSerializer.write(annotation, fos);</span>
+<span class="nc" id="L989">            }</span>
+            break;
+          }
+          case CONLLU:
+<span class="nc" id="L993">            new CoNLLUOutputter().print(annotation, fos, outputOptions);</span>
+<span class="nc" id="L994">            break;</span>
+          default:
+<span class="nc" id="L996">            throw new IllegalArgumentException(&quot;Unknown output format &quot; + outputFormat);</span>
+        }
+<span class="nc" id="L998">      } catch (IOException e) {</span>
+<span class="nc" id="L999">        throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1000">      }</span>
+<span class="nc" id="L1001">    };</span>
+  }
+
+  /**
+   * A common method for processing a set of files, used in both {@link StanfordCoreNLP} as well as
+   * {@link StanfordCoreNLPClient}.
+   *
+   * @param base The base input directory to process from.
+   * @param files The files to process.
+   * @param numThreads The number of threads to annotate on.
+   * @param properties The properties file to use during annotation.
+   *                   This should match the properties file used in the implementation of the annotate function.
+   * @param annotate The function used to annotate a document.
+   * @param print The function used to print a document.
+   * @throws IOException
+   */
+  protected static void processFiles(String base, final Collection&lt;File&gt; files, int numThreads,
+                                     Properties properties, BiConsumer&lt;Annotation, Consumer&lt;Annotation&gt;&gt; annotate,
+                                     BiConsumer&lt;Annotation, OutputStream&gt; print,
+                                     OutputFormat outputFormat) throws IOException {
+    // List&lt;Runnable&gt; toRun = new LinkedList&lt;&gt;();
+
+    // Process properties here
+<span class="nc" id="L1024">    final String baseOutputDir = properties.getProperty(&quot;outputDirectory&quot;, &quot;.&quot;);</span>
+<span class="nc" id="L1025">    final String baseInputDir = properties.getProperty(&quot;inputDirectory&quot;, base);</span>
+
+    // Set of files to exclude
+<span class="nc" id="L1028">    final String excludeFilesParam = properties.getProperty(&quot;excludeFiles&quot;);</span>
+<span class="nc" id="L1029">    final Set&lt;String&gt; excludeFiles = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">    if (excludeFilesParam != null) {</span>
+<span class="nc" id="L1031">      Iterable&lt;String&gt; lines = IOUtils.readLines(excludeFilesParam);</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">      for (String line:lines) {</span>
+<span class="nc" id="L1033">        String name = line.trim();</span>
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">        if (!name.isEmpty()) excludeFiles.add(name);</span>
+<span class="nc" id="L1035">      }</span>
+    }
+
+    //(file info)
+<span class="nc" id="L1039">    final String serializerClass = properties.getProperty(&quot;serializer&quot;, GenericAnnotationSerializer.class.getName());</span>
+<span class="nc" id="L1040">    final String inputSerializerClass = properties.getProperty(&quot;inputSerializer&quot;, serializerClass);</span>
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">    final String inputSerializerName = (serializerClass.equals(inputSerializerClass))? &quot;serializer&quot;:&quot;inputSerializer&quot;;</span>
+
+    String defaultExtension;
+<span class="nc bnc" id="L1044" title="All 7 branches missed.">    switch (outputFormat) {</span>
+<span class="nc" id="L1045">      case XML: defaultExtension = &quot;.xml&quot;; break;</span>
+<span class="nc" id="L1046">      case JSON: defaultExtension = &quot;.json&quot;; break;</span>
+<span class="nc" id="L1047">      case CONLL: defaultExtension = &quot;.conll&quot;; break;</span>
+<span class="nc" id="L1048">      case CONLLU: defaultExtension = &quot;.conllu&quot;; break;</span>
+<span class="nc" id="L1049">      case TEXT: defaultExtension = &quot;.out&quot;; break;</span>
+<span class="nc" id="L1050">      case SERIALIZED: defaultExtension = &quot;.ser.gz&quot;; break;</span>
+<span class="nc" id="L1051">      default: throw new IllegalArgumentException(&quot;Unknown output format &quot; + outputFormat);</span>
+    }
+
+<span class="nc" id="L1054">    final String extension = properties.getProperty(&quot;outputExtension&quot;, defaultExtension);</span>
+<span class="nc" id="L1055">    final boolean replaceExtension = Boolean.parseBoolean(properties.getProperty(&quot;replaceExtension&quot;, &quot;false&quot;));</span>
+<span class="nc" id="L1056">    final boolean continueOnAnnotateError = Boolean.parseBoolean(properties.getProperty(&quot;continueOnAnnotateError&quot;, &quot;false&quot;));</span>
+
+<span class="nc" id="L1058">    final boolean noClobber = Boolean.parseBoolean(properties.getProperty(&quot;noClobber&quot;, &quot;false&quot;));</span>
+    // final boolean randomize = Boolean.parseBoolean(properties.getProperty(&quot;randomize&quot;, &quot;false&quot;));
+
+<span class="nc" id="L1061">    final MutableInteger totalProcessed = new MutableInteger(0);</span>
+<span class="nc" id="L1062">    final MutableInteger totalSkipped = new MutableInteger(0);</span>
+<span class="nc" id="L1063">    final MutableInteger totalErrorAnnotating = new MutableInteger(0);</span>
+
+    //for each file...
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">    for (final File file : files) {</span>
+      // Determine if there is anything to be done....
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">      if (excludeFiles.contains(file.getName())) {</span>
+<span class="nc" id="L1069">        logger.err(&quot;Skipping excluded file &quot; + file.getName());</span>
+<span class="nc" id="L1070">        totalSkipped.incValue(1);</span>
+<span class="nc" id="L1071">        continue;</span>
+      }
+
+      //--Get Output File Info
+      //(filename)
+<span class="nc" id="L1076">      String outputDir = baseOutputDir;</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">      if (baseInputDir != null) {</span>
+        // Get input file name relative to base
+<span class="nc" id="L1079">        String relDir = file.getParent().replaceFirst(Pattern.quote(baseInputDir), &quot;&quot;);</span>
+<span class="nc" id="L1080">        outputDir = outputDir + File.separator + relDir;</span>
+      }
+      // Make sure output directory exists
+<span class="nc" id="L1083">      new File(outputDir).mkdirs();</span>
+<span class="nc" id="L1084">      String outputFilename = new File(outputDir, file.getName()).getPath();</span>
+<span class="nc bnc" id="L1085" title="All 2 branches missed.">      if (replaceExtension) {</span>
+<span class="nc" id="L1086">        int lastDot = outputFilename.lastIndexOf('.');</span>
+        // for paths like &quot;./zzz&quot;, lastDot will be 0
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">        if (lastDot &gt; 0) {</span>
+<span class="nc" id="L1089">          outputFilename = outputFilename.substring(0, lastDot);</span>
+        }
+      }
+      // ensure we don't make filenames with doubled extensions like .xml.xml
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">      if (!outputFilename.endsWith(extension)) {</span>
+<span class="nc" id="L1094">        outputFilename += extension;</span>
+      }
+      // normalize filename for the upcoming comparison
+<span class="nc" id="L1097">      outputFilename = new File(outputFilename).getCanonicalPath();</span>
+
+      //--Conditions For Skipping The File
+      // TODO this could fail if there are softlinks, etc. -- need some sort of sameFile tester
+      //      Java 7 will have a Files.isSymbolicLink(file) method
+<span class="nc bnc" id="L1102" title="All 2 branches missed.">      if (outputFilename.equals(file.getCanonicalPath())) {</span>
+<span class="nc" id="L1103">        logger.err(&quot;Skipping &quot; + file.getName() + &quot;: output file &quot; + outputFilename + &quot; has the same filename as the input file -- assuming you don't actually want to do this.&quot;);</span>
+<span class="nc" id="L1104">        totalSkipped.incValue(1);</span>
+<span class="nc" id="L1105">        continue;</span>
+      }
+<span class="nc bnc" id="L1107" title="All 4 branches missed.">      if (noClobber &amp;&amp; new File(outputFilename).exists()) {</span>
+<span class="nc" id="L1108">        logger.err(&quot;Skipping &quot; + file.getName() + &quot;: output file &quot; + outputFilename + &quot; as it already exists.  Don't use the noClobber option to override this.&quot;);</span>
+<span class="nc" id="L1109">        totalSkipped.incValue(1);</span>
+<span class="nc" id="L1110">        continue;</span>
+      }
+
+<span class="nc" id="L1113">      final String finalOutputFilename = outputFilename;</span>
+
+      //register a task...
+      //catching exceptions...
+      try {
+        // Check whether this file should be skipped again
+<span class="nc bnc" id="L1119" title="All 4 branches missed.">        if (noClobber &amp;&amp; new File(finalOutputFilename).exists()) {</span>
+<span class="nc" id="L1120">          logger.err(&quot;Skipping &quot; + file.getName() + &quot;: output file &quot; + finalOutputFilename + &quot; as it already exists.  Don't use the noClobber option to override this.&quot;);</span>
+<span class="nc" id="L1121">          synchronized (totalSkipped) {</span>
+<span class="nc" id="L1122">            totalSkipped.incValue(1);</span>
+<span class="nc" id="L1123">          }</span>
+<span class="nc" id="L1124">          return;</span>
+        }
+
+<span class="nc" id="L1127">        logger.info(&quot;Processing file &quot; + file.getAbsolutePath() + &quot; ... writing to &quot; + finalOutputFilename);</span>
+
+        //--Process File
+<span class="nc" id="L1130">        Annotation annotation = null;</span>
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">        if (file.getAbsolutePath().endsWith(&quot;.ser.gz&quot;)) {</span>
+          // maybe they want to continue processing a partially processed annotation
+          try {
+            // Create serializers
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">            if (inputSerializerClass != null) {</span>
+<span class="nc" id="L1136">              AnnotationSerializer inputSerializer = loadSerializer(inputSerializerClass, inputSerializerName, properties);</span>
+<span class="nc" id="L1137">              InputStream is = new BufferedInputStream(new FileInputStream(file));</span>
+<span class="nc" id="L1138">              Pair&lt;Annotation, InputStream&gt; pair = inputSerializer.read(is);</span>
+<span class="nc" id="L1139">              pair.second.close();</span>
+<span class="nc" id="L1140">              annotation = pair.first;</span>
+<span class="nc" id="L1141">              IOUtils.closeIgnoringExceptions(is);</span>
+<span class="nc" id="L1142">            } else {</span>
+<span class="nc" id="L1143">              annotation = IOUtils.readObjectFromFile(file);</span>
+            }
+<span class="nc" id="L1145">          } catch (IOException e) {</span>
+            // guess that's not what they wanted
+            // We hide IOExceptions because ones such as file not
+            // found will be thrown again in a moment.  Note that
+            // we are intentionally letting class cast exceptions
+            // and class not found exceptions go through.
+<span class="nc" id="L1151">          } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L1152">            throw new RuntimeException(e);</span>
+<span class="nc" id="L1153">          }</span>
+        }
+
+        //(read file)
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">        if (annotation == null) {</span>
+<span class="nc" id="L1158">          String encoding = properties.getProperty(&quot;encoding&quot;, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L1159">          String text = IOUtils.slurpFile(file.getAbsoluteFile(), encoding);</span>
+<span class="nc" id="L1160">          annotation = new Annotation(text);</span>
+        }
+
+<span class="nc" id="L1163">        Timing timing = new Timing();</span>
+<span class="nc" id="L1164">        annotate.accept(annotation, finishedAnnotation -&gt; {</span>
+<span class="nc" id="L1165">          timing.done(logger, &quot;Annotating file &quot; + file.getAbsoluteFile());</span>
+<span class="nc" id="L1166">          Throwable ex = finishedAnnotation.get(CoreAnnotations.ExceptionAnnotation.class);</span>
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">          if (ex == null) {</span>
+            //--Output File
+            try {
+<span class="nc" id="L1170">              OutputStream fos = new BufferedOutputStream(new FileOutputStream(finalOutputFilename));</span>
+<span class="nc" id="L1171">              print.accept(finishedAnnotation, fos);</span>
+<span class="nc" id="L1172">              fos.close();</span>
+<span class="nc" id="L1173">            } catch(IOException e) {</span>
+<span class="nc" id="L1174">              throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1175">            }</span>
+
+<span class="nc" id="L1177">            synchronized (totalProcessed) {</span>
+<span class="nc" id="L1178">              totalProcessed.incValue(1);</span>
+<span class="nc bnc" id="L1179" title="All 2 branches missed.">              if (totalProcessed.intValue() % 1000 == 0) {</span>
+<span class="nc" id="L1180">                logger.info(&quot;Processed &quot; + totalProcessed + &quot; documents&quot;);</span>
+              }
+<span class="nc" id="L1182">            }</span>
+<span class="nc bnc" id="L1183" title="All 2 branches missed.">          } else if (continueOnAnnotateError) {</span>
+            // Error annotating but still wanna continue
+            // (maybe in the middle of long job and maybe next one will be okay)
+<span class="nc" id="L1186">            logger.err(&quot;Error annotating &quot; + file.getAbsoluteFile() + &quot;: &quot; + ex);</span>
+<span class="nc" id="L1187">            synchronized (totalErrorAnnotating) {</span>
+<span class="nc" id="L1188">              totalErrorAnnotating.incValue(1);</span>
+<span class="nc" id="L1189">            }</span>
+
+          } else {
+<span class="nc" id="L1192">            throw new RuntimeException(&quot;Error annotating &quot; + file.getAbsoluteFile(), ex);</span>
+          }
+<span class="nc" id="L1194">        });</span>
+
+<span class="nc" id="L1196">      } catch (IOException e) {</span>
+<span class="nc" id="L1197">        throw new RuntimeIOException(e);</span>
+<span class="nc" id="L1198">      }</span>
+<span class="nc" id="L1199">    }</span>
+
+    /*
+    if (randomize) {
+      log(&quot;Randomly shuffling input&quot;);
+      Collections.shuffle(toRun);
+    }
+    log(&quot;Ready to process: &quot; + toRun.size() + &quot; files, skipped &quot; + totalSkipped + &quot;, total &quot; + nFiles);
+    //--Run Jobs
+    if(numThreads == 1){
+      for(Runnable r : toRun){ r.run(); }
+    } else {
+      Redwood.Util.threadAndRun(&quot;StanfordCoreNLP &lt;&quot; + numThreads + &quot; threads&gt;&quot;, toRun, numThreads);
+    }
+    log(&quot;Processed &quot; + totalProcessed + &quot; documents&quot;);
+    log(&quot;Skipped &quot; + totalSkipped + &quot; documents, error annotating &quot; + totalErrorAnnotating + &quot; documents&quot;);
+    */
+<span class="nc" id="L1216">  }</span>
+
+  public void processFiles(final Collection&lt;File&gt; files, int numThreads) throws IOException {
+<span class="nc" id="L1219">    processFiles(null, files, numThreads);</span>
+<span class="nc" id="L1220">  }</span>
+
+  public void processFiles(final Collection&lt;File&gt; files) throws IOException {
+<span class="nc" id="L1223">    processFiles(files, 1);</span>
+<span class="nc" id="L1224">  }</span>
+
+  public void run() throws IOException {
+<span class="nc" id="L1227">    Timing tim = new Timing();</span>
+<span class="nc" id="L1228">    StanfordRedwoodConfiguration.minimalSetup();</span>
+
+    // multithreading thread count
+<span class="nc bnc" id="L1231" title="All 2 branches missed.">    String numThreadsString = (this.properties == null) ? null : this.properties.getProperty(&quot;threads&quot;);</span>
+<span class="nc" id="L1232">    int numThreads = 1;</span>
+    try{
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">      if (numThreadsString != null) {</span>
+<span class="nc" id="L1235">        numThreads = Integer.parseInt(numThreadsString);</span>
+      }
+<span class="nc" id="L1237">    } catch(NumberFormatException e) {</span>
+<span class="nc" id="L1238">      logger.err(&quot;-threads [number]: was not given a valid number: &quot; + numThreadsString);</span>
+<span class="nc" id="L1239">    }</span>
+
+    // blank line after all the loading statements to make output more readable
+<span class="nc" id="L1242">    logger.info(&quot;&quot;);</span>
+
+    //
+    // Process one file or a directory of files
+    //
+<span class="nc bnc" id="L1247" title="All 4 branches missed.">    if (properties.containsKey(&quot;file&quot;) || properties.containsKey(&quot;textFile&quot;)) {</span>
+<span class="nc" id="L1248">      String fileName = properties.getProperty(&quot;file&quot;);</span>
+<span class="nc bnc" id="L1249" title="All 2 branches missed.">      if (fileName == null) {</span>
+<span class="nc" id="L1250">        fileName = properties.getProperty(&quot;textFile&quot;);</span>
+      }
+<span class="nc" id="L1252">      Collection&lt;File&gt; files = new FileSequentialCollection(new File(fileName), properties.getProperty(&quot;extension&quot;), true);</span>
+<span class="nc" id="L1253">      this.processFiles(null, files, numThreads);</span>
+<span class="nc" id="L1254">    }</span>
+
+    //
+    // Process a list of files
+    //
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">    else if (properties.containsKey(&quot;filelist&quot;)){</span>
+<span class="nc" id="L1260">      String fileName = properties.getProperty(&quot;filelist&quot;);</span>
+<span class="nc" id="L1261">      Collection&lt;File&gt; inputFiles = readFileList(fileName);</span>
+<span class="nc" id="L1262">      Collection&lt;File&gt; files = new ArrayList&lt;&gt;(inputFiles.size());</span>
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">      for (File file : inputFiles) {</span>
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">        if (file.isDirectory()) {</span>
+<span class="nc" id="L1265">          files.addAll(new FileSequentialCollection(new File(fileName), properties.getProperty(&quot;extension&quot;), true));</span>
+        } else {
+<span class="nc" id="L1267">          files.add(file);</span>
+        }
+<span class="nc" id="L1269">      }</span>
+<span class="nc" id="L1270">      this.processFiles(null, files, numThreads);</span>
+<span class="nc" id="L1271">    }</span>
+
+    //
+    // Run the interactive shell
+    //
+    else {
+<span class="nc" id="L1277">      shell(this);</span>
+    }
+
+    if (TIME) {
+<span class="nc" id="L1281">      logger.info(&quot;&quot;); // puts blank line in logging output</span>
+<span class="nc" id="L1282">      logger.info(this.timingInformation());</span>
+<span class="nc" id="L1283">      logger.info(&quot;Pipeline setup: &quot; +</span>
+<span class="nc" id="L1284">          Timing.toSecondsString(pipelineSetupTime) + &quot; sec.&quot;);</span>
+<span class="nc" id="L1285">      logger.info(&quot;Total time for StanfordCoreNLP pipeline: &quot; +</span>
+<span class="nc" id="L1286">          Timing.toSecondsString(pipelineSetupTime + tim.report()) + &quot; sec.&quot;);</span>
+    }
+
+<span class="nc" id="L1289">  }</span>
+
+  /**
+   * This can be used just for testing or for command-line text processing.
+   * This runs the pipeline you specify on the
+   * text in the file that you specify and sends some results to stdout.
+   * The current code in this main method assumes that each line of the file
+   * is to be processed separately as a single sentence.
+   * &lt;p&gt;
+   * Example usage:&lt;br&gt;
+   * java -mx6g edu.stanford.nlp.pipeline.StanfordCoreNLP properties
+   *
+   * @param args List of required properties
+   * @throws java.io.IOException If IO problem
+   * @throws ClassNotFoundException If class loading problem
+   */
+  public static void main(String[] args) throws IOException, ClassNotFoundException {
+    //
+    // process the arguments
+    //
+    // Extract all the properties from the command line.
+    // As well as command-line properties, the processor will search for the properties file in the classpath
+<span class="nc" id="L1311">    Properties props = new Properties();</span>
+<span class="nc bnc" id="L1312" title="All 2 branches missed.">    if (args.length &gt; 0) {</span>
+<span class="nc" id="L1313">      props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L1314">      boolean hasH = props.containsKey(&quot;h&quot;);</span>
+<span class="nc" id="L1315">      boolean hasHelp = props.containsKey(&quot;help&quot;);</span>
+<span class="nc bnc" id="L1316" title="All 4 branches missed.">      if (hasH || hasHelp) {</span>
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">        String helpValue = hasH ? props.getProperty(&quot;h&quot;) : props.getProperty(&quot;help&quot;);</span>
+<span class="nc" id="L1318">        printHelp(System.err, helpValue);</span>
+<span class="nc" id="L1319">        return;</span>
+      }
+    }
+    // Run the pipeline
+<span class="nc" id="L1323">    new StanfordCoreNLP(props).run();</span>
+<span class="nc" id="L1324">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

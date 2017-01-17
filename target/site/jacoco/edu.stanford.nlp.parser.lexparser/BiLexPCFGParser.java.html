@@ -1,0 +1,980 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BiLexPCFGParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">BiLexPCFGParser.java</span></div><h1>BiLexPCFGParser.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.*;
+
+import edu.stanford.nlp.ling.CategoryWordTag;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasContext;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.math.SloppyMath;
+import edu.stanford.nlp.parser.KBestViterbiParser;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeFactory;
+import edu.stanford.nlp.trees.LabeledScoredTreeFactory;
+import edu.stanford.nlp.util.*;
+
+
+/** Implements Eisner and Satta style algorithms for bilexical
+ *  PCFG parsing.  The basic class provides O(n&lt;sup&gt;4&lt;/sup&gt;)
+ *  parsing, with the passed in PCFG and dependency parsers
+ *  providing outside scores in an efficient A* search.
+ *
+ *  @author Dan Klein
+ */
+public class BiLexPCFGParser implements KBestViterbiParser  {
+
+  /** A logger for this class */
+<span class="nc" id="L29">  private static Redwood.RedwoodChannels log = Redwood.channels(BiLexPCFGParser.class);</span>
+
+  protected static final boolean VERBOSE = false;
+  protected static final boolean VERY_VERBOSE = false;
+
+  protected HookChart chart;
+  protected Heap&lt;Item&gt; agenda;
+  protected int length;
+  protected int[] words;
+  protected Edge goal;
+  protected Interner interner;
+  protected Scorer scorer;
+  protected ExhaustivePCFGParser fscorer;
+  protected ExhaustiveDependencyParser dparser;
+  protected GrammarProjection projection;
+  //pair dep scores
+
+  protected BinaryGrammar bg;
+  protected UnaryGrammar ug;
+  protected DependencyGrammar dg;
+  protected Lexicon lex;
+  protected Options op;
+  protected List&lt;IntTaggedWord&gt;[] taggedWordList;
+
+  protected final Index&lt;String&gt; wordIndex;
+  protected final Index&lt;String&gt; tagIndex;
+  protected final Index&lt;String&gt; stateIndex;
+  protected CoreLabel[] originalLabels;
+
+<span class="nc" id="L58">  protected TreeFactory tf = new LabeledScoredTreeFactory();</span>
+
+  // temp
+<span class="nc" id="L61">  protected long relaxHook1 = 0;</span>
+<span class="nc" id="L62">  protected long relaxHook2 = 0;</span>
+<span class="nc" id="L63">  protected long relaxHook3 = 0;</span>
+<span class="nc" id="L64">  protected long relaxHook4 = 0;</span>
+
+<span class="nc" id="L66">  protected long builtHooks = 0;</span>
+<span class="nc" id="L67">  protected long builtEdges = 0;</span>
+<span class="nc" id="L68">  protected long extractedHooks = 0;</span>
+<span class="nc" id="L69">  protected long extractedEdges = 0;</span>
+
+
+  private static final double TOL = 1e-10;
+
+  protected static boolean better(double x, double y) {
+<span class="nc bnc" id="L75" title="All 2 branches missed.">    return ((x - y) / (Math.abs(x) + Math.abs(y) + 1e-100) &gt; TOL);</span>
+  }
+
+
+  public double getBestScore() {
+<span class="nc bnc" id="L80" title="All 2 branches missed.">    if (goal == null) {</span>
+<span class="nc" id="L81">      return Double.NEGATIVE_INFINITY;</span>
+    } else {
+<span class="nc" id="L83">      return goal.score();</span>
+    }
+  }
+
+
+  protected Tree extractParse(Edge edge) {
+<span class="nc" id="L89">    String head = wordIndex.get(words[edge.head]);</span>
+<span class="nc" id="L90">    String tag = tagIndex.get(edge.tag);</span>
+<span class="nc" id="L91">    String state = stateIndex.get(edge.state);</span>
+<span class="nc" id="L92">    Label label = new CategoryWordTag(state, head, tag);</span>
+<span class="nc bnc" id="L93" title="All 4 branches missed.">    if (edge.backEdge == null &amp;&amp; edge.backHook == null) {</span>
+      // leaf, but needs word terminal
+      Tree leaf;
+<span class="nc bnc" id="L96" title="All 2 branches missed.">      if (originalLabels[edge.head] != null) {</span>
+<span class="nc" id="L97">        leaf = tf.newLeaf(originalLabels[edge.head]);</span>
+      } else {
+<span class="nc" id="L99">        leaf = tf.newLeaf(head);</span>
+      }
+<span class="nc" id="L101">      List&lt;Tree&gt; childList = Collections.singletonList(leaf);</span>
+<span class="nc" id="L102">      return tf.newTreeNode(label, childList);</span>
+    }
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    if (edge.backHook == null) {</span>
+      // unary
+<span class="nc" id="L106">      List&lt;Tree&gt; childList = Collections.singletonList(extractParse(edge.backEdge));</span>
+<span class="nc" id="L107">      return tf.newTreeNode(label, childList);</span>
+    }
+    // binary
+<span class="nc" id="L110">    List&lt;Tree&gt; children = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    if (edge.backHook.isPreHook()) {</span>
+<span class="nc" id="L112">      children.add(extractParse(edge.backEdge));</span>
+<span class="nc" id="L113">      children.add(extractParse(edge.backHook.backEdge));</span>
+    } else {
+<span class="nc" id="L115">      children.add(extractParse(edge.backHook.backEdge));</span>
+<span class="nc" id="L116">      children.add(extractParse(edge.backEdge));</span>
+    }
+<span class="nc" id="L118">    return tf.newTreeNode(label, children);</span>
+  }
+
+  /**
+   * Return the best parse of the sentence most recently parsed.
+   *
+   * @return The best (highest score) tree
+   */
+  public Tree getBestParse() {
+<span class="nc" id="L127">    return extractParse(goal);</span>
+  }
+
+
+  public boolean hasParse() {
+<span class="nc bnc" id="L132" title="All 4 branches missed.">    return goal != null &amp;&amp; goal.iScore != Double.NEGATIVE_INFINITY;</span>
+  }
+
+
+  // Added by Dan Zeman to store the list of N best trees.
+<span class="nc" id="L137">  protected List&lt;Edge&gt; nGoodTrees = new LinkedList&lt;&gt;();</span>
+
+
+
+  /**
+   * Return the list of k &quot;good&quot; parses of the sentence most recently parsed.
+   * (The first is guaranteed to be the best, but later ones are only
+   * guaranteed the best subject to the possibilities that disappear because
+   * the PCFG/Dep charts only store the best over each span.)
+   *
+   * @return The list of k best trees
+   */
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKGoodParses(int k) {
+<span class="nc" id="L150">    List&lt;ScoredObject&lt;Tree&gt;&gt; nGoodTreesList = new ArrayList&lt;&gt;(op.testOptions.printFactoredKGood);</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">    for (Edge e : nGoodTrees) {</span>
+<span class="nc" id="L152">      nGoodTreesList.add(new ScoredObject&lt;&gt;(extractParse(e), e.iScore));</span>
+<span class="nc" id="L153">    }</span>
+<span class="nc" id="L154">    return nGoodTreesList;</span>
+  }
+
+  /** Get the exact k best parses for the sentence.
+   *
+   *  @param k The number of best parses to return
+   *  @return The exact k best parses for the sentence, with
+   *         each accompanied by its score (typically a
+   *         negative log probability).
+   */
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKBestParses(int k) {
+<span class="nc" id="L165">    throw new UnsupportedOperationException(&quot;BiLexPCFGParser doesn't support k best parses&quot;);</span>
+  }
+
+
+  /** Get a complete set of the maximally scoring parses for a sentence,
+   *  rather than one chosen at random.  This set may be of size 1 or larger.
+   *
+   *  @return All the equal best parses for a sentence, with each
+   *         accompanied by its score
+   */
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getBestParses() {
+<span class="nc" id="L176">    throw new UnsupportedOperationException(&quot;BiLexPCFGParser doesn't support best parses&quot;);</span>
+  }
+
+  /** Get k parse samples for the sentence.  It is expected that the
+   *  parses are sampled based on their relative probability.
+   *
+   *  @param k The number of sampled parses to return
+   *  @return A list of k parse samples for the sentence, with
+   *         each accompanied by its score
+   */
+  public List&lt;ScoredObject&lt;Tree&gt;&gt; getKSampledParses(int k) {
+<span class="nc" id="L187">    throw new UnsupportedOperationException(&quot;BiLexPCFGParser doesn't support k sampled parses&quot;);</span>
+  }
+
+  protected Edge tempEdge;
+
+  protected void combine(Edge edge, Hook hook) {
+    if (VERBOSE) {
+      log.info(&quot;Combining: &quot; + edge + &quot; and &quot; + hook);
+    }
+    // make result edge
+<span class="nc bnc" id="L197" title="All 2 branches missed.">    if (hook.isPreHook()) {</span>
+<span class="nc" id="L198">      tempEdge.start = edge.start;</span>
+<span class="nc" id="L199">      tempEdge.end = hook.end;</span>
+    } else {
+<span class="nc" id="L201">      tempEdge.start = hook.start;</span>
+<span class="nc" id="L202">      tempEdge.end = edge.end;</span>
+    }
+<span class="nc" id="L204">    tempEdge.state = hook.state;</span>
+<span class="nc" id="L205">    tempEdge.head = hook.head;</span>
+<span class="nc" id="L206">    tempEdge.tag = hook.tag;</span>
+<span class="nc" id="L207">    tempEdge.iScore = hook.iScore + edge.iScore;</span>
+<span class="nc" id="L208">    tempEdge.backEdge = edge;</span>
+<span class="nc" id="L209">    tempEdge.backHook = hook;</span>
+<span class="nc" id="L210">    relaxTempEdge();</span>
+<span class="nc" id="L211">  }</span>
+
+  protected void relaxTempEdge() {
+    // if (tempEdge.iScore &gt; scorer.iScore(tempEdge)+1e-4) {
+    //   log.info(tempEdge+&quot; has i &quot;+tempEdge.iScore+&quot; iE &quot;+scorer.iScore(tempEdge));
+    // }
+<span class="nc" id="L217">    Edge resultEdge = (Edge) interner.intern(tempEdge);</span>
+    if (VERBOSE) {
+      System.err.printf(&quot;Formed %s %s %.2f was %.2f better? %b\n&quot;, (resultEdge == tempEdge ? &quot;new&quot; : &quot;pre-existing&quot;), resultEdge, tempEdge.iScore, resultEdge.iScore, better(tempEdge.iScore, resultEdge.iScore));
+    }
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    if (resultEdge == tempEdge) {</span>
+<span class="nc" id="L222">      tempEdge = new Edge(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L223">      discoverEdge(resultEdge);</span>
+    } else {
+<span class="nc bnc" id="L225" title="All 4 branches missed.">      if (better(tempEdge.iScore, resultEdge.iScore) &amp;&amp; resultEdge.oScore &gt; Double.NEGATIVE_INFINITY) {</span>
+        // we've found a better way of making an edge that may make a parse
+<span class="nc" id="L227">        double back = resultEdge.iScore;</span>
+<span class="nc" id="L228">        Edge backE = resultEdge.backEdge;</span>
+<span class="nc" id="L229">        Hook backH = resultEdge.backHook;</span>
+<span class="nc" id="L230">        resultEdge.iScore = tempEdge.iScore;</span>
+<span class="nc" id="L231">        resultEdge.backEdge = tempEdge.backEdge;</span>
+<span class="nc" id="L232">        resultEdge.backHook = tempEdge.backHook;</span>
+        try {
+<span class="nc" id="L234">          agenda.decreaseKey(resultEdge);</span>
+<span class="nc" id="L235">        } catch (NullPointerException e) {</span>
+          if (false) {
+            log.info(&quot;&quot;);
+            log.info(&quot;Old backEdge: &quot; + backE + &quot; i &quot; + backE.iScore + &quot; o &quot; + backE.oScore + &quot; s &quot; + backE.score());
+            log.info(&quot;Old backEdge: &quot; + backE + &quot; iE &quot; + scorer.iScore(backE));
+            log.info(&quot;Old backHook: &quot; + backH + &quot; i &quot; + backH.iScore + &quot; o &quot; + backH.oScore + &quot; s &quot; + backH.score());
+            log.info(&quot;New backEdge: &quot; + tempEdge.backEdge + &quot; i &quot; + tempEdge.backEdge.iScore + &quot; o &quot; + tempEdge.backEdge.oScore + &quot; s &quot; + tempEdge.backEdge.score());
+            log.info(&quot;New backEdge: &quot; + tempEdge.backEdge + &quot; iE &quot; + scorer.iScore(tempEdge.backEdge));
+            log.info(&quot;New backHook: &quot; + tempEdge.backHook + &quot; i &quot; + tempEdge.backHook.iScore + &quot; o &quot; + tempEdge.backHook.oScore + &quot; s &quot; + tempEdge.backHook.score());
+            log.error(&quot;Formed &quot; + resultEdge + &quot; i &quot; + tempEdge.iScore + &quot; o &quot; + resultEdge.oScore + &quot; s &quot; + resultEdge.score());
+            log.error(&quot;Formed &quot; + resultEdge + &quot; &quot; + (resultEdge == tempEdge ? &quot;new&quot; : &quot;old&quot;) + &quot; &quot; + tempEdge.iScore + &quot; was &quot; + back + &quot; better? &quot; + better(tempEdge.iScore, back));
+          }
+<span class="nc" id="L247">        }</span>
+      }
+    }
+<span class="nc" id="L250">  }</span>
+
+  protected void discoverEdge(Edge edge) {
+    // create new edge
+<span class="nc" id="L254">    edge.oScore = scorer.oScore(edge);</span>
+<span class="nc" id="L255">    agenda.add(edge);</span>
+<span class="nc" id="L256">    builtEdges++;</span>
+<span class="nc" id="L257">  }</span>
+
+  protected void discoverHook(Hook hook) {
+<span class="nc" id="L260">    hook.oScore = buildOScore(hook);</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">    if (hook.oScore == Double.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L262">      relaxHook4++;</span>
+    }
+<span class="nc" id="L264">    builtHooks++;</span>
+<span class="nc" id="L265">    agenda.add(hook);</span>
+<span class="nc" id="L266">  }</span>
+
+  protected double buildOScore(Hook hook) {
+<span class="nc" id="L269">    double bestOScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L270">    Edge iTemp = new Edge(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L271">    Edge oTemp = new Edge(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L272">    iTemp.head = hook.head;</span>
+<span class="nc" id="L273">    iTemp.tag = hook.tag;</span>
+<span class="nc" id="L274">    iTemp.state = hook.subState;</span>
+<span class="nc" id="L275">    oTemp.head = hook.head;</span>
+<span class="nc" id="L276">    oTemp.tag = hook.tag;</span>
+<span class="nc" id="L277">    oTemp.state = hook.state;</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    if (hook.isPreHook()) {</span>
+<span class="nc" id="L279">      iTemp.end = hook.start;</span>
+<span class="nc" id="L280">      oTemp.end = hook.end;</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">      for (int start = 0; start &lt;= hook.head; start++) {</span>
+<span class="nc" id="L282">        iTemp.start = start;</span>
+<span class="nc" id="L283">        oTemp.start = start;</span>
+<span class="nc" id="L284">        double oScore = scorer.oScore(oTemp) + scorer.iScore(iTemp);</span>
+        //log.info(&quot;Score for &quot;+hook+&quot; is i &quot;+iTemp+&quot; (&quot;+scorer.iScore(iTemp)+&quot;) o &quot;+oTemp+&quot; (&quot;+scorer.oScore(oTemp)+&quot;)&quot;);
+<span class="nc" id="L286">        bestOScore = SloppyMath.max(bestOScore, oScore);</span>
+      }
+    } else {
+<span class="nc" id="L289">      iTemp.start = hook.end;</span>
+<span class="nc" id="L290">      oTemp.start = hook.start;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      for (int end = hook.head + 1; end &lt;= length; end++) {</span>
+<span class="nc" id="L292">        iTemp.end = end;</span>
+<span class="nc" id="L293">        oTemp.end = end;</span>
+<span class="nc" id="L294">        double oScore = scorer.oScore(oTemp) + scorer.iScore(iTemp);</span>
+<span class="nc" id="L295">        bestOScore = SloppyMath.max(bestOScore, oScore);</span>
+      }
+    }
+<span class="nc" id="L298">    return bestOScore;</span>
+  }
+
+  protected Hook tempHook;
+
+  protected void projectHooks(Edge edge) {
+    // form hooks
+    // POST HOOKS
+    //for (Iterator rI = bg.ruleIteratorByLeftChild(edge.state);
+    //      rI.hasNext(); ) {
+<span class="nc" id="L308">    List&lt;BinaryRule&gt; ruleList = bg.ruleListByLeftChild(edge.state);</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">    for (BinaryRule br : ruleList) {</span>
+      //BinaryRule br = rI.next();
+<span class="nc bnc" id="L311" title="All 2 branches missed.">      if (scorer instanceof LatticeScorer) {</span>
+<span class="nc" id="L312">        LatticeScorer lscorer = (LatticeScorer) scorer;</span>
+<span class="nc" id="L313">        Edge latEdge = (Edge) lscorer.convertItemSpan(new Edge(edge));</span>
+<span class="nc bnc" id="L314" title="All 4 branches missed.">        if (!fscorer.oPossibleL(project(br.parent), latEdge.start) || !fscorer.iPossibleL(project(br.rightChild), latEdge.end)) {</span>
+<span class="nc" id="L315">          if (!op.testOptions.exhaustiveTest) {</span>
+<span class="nc" id="L316">            continue;</span>
+          }
+        }
+<span class="nc" id="L319">      } else {</span>
+<span class="nc bnc" id="L320" title="All 4 branches missed.">        if (!fscorer.oPossibleL(project(br.parent), edge.start) || !fscorer.iPossibleL(project(br.rightChild), edge.end)) {</span>
+<span class="nc" id="L321">          if (!op.testOptions.exhaustiveTest) {</span>
+<span class="nc" id="L322">            continue;</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L326" title="All 2 branches missed.">      for (int head = edge.end; head &lt; length; head++) {</span>
+        // cdm Apr 2006: avoid Iterator allocation
+        // for (Iterator iTWI = taggedWordList[head].iterator(); iTWI.hasNext();) {
+        // IntTaggedWord iTW = (IntTaggedWord) iTWI.next();
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        for (int hdi = 0, sz = taggedWordList[head].size(); hdi &lt; sz; hdi++) {</span>
+<span class="nc" id="L331">          IntTaggedWord iTW = taggedWordList[head].get(hdi);</span>
+<span class="nc" id="L332">          int tag = iTW.tag;</span>
+<span class="nc" id="L333">          tempHook.start = edge.start;</span>
+<span class="nc" id="L334">          tempHook.end = edge.end;</span>
+<span class="nc" id="L335">          tempHook.head = head;</span>
+<span class="nc" id="L336">          tempHook.tag = tag;</span>
+<span class="nc" id="L337">          tempHook.state = br.parent;</span>
+<span class="nc" id="L338">          tempHook.subState = br.rightChild;</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">          if (!chart.isBuiltL(tempHook.subState, tempHook.end, tempHook.head, tempHook.tag)) {</span>
+<span class="nc" id="L340">            continue;</span>
+          }
+<span class="nc" id="L342">          tempHook.iScore = edge.iScore + br.score + dparser.headScore[dparser.binDistance[head][edge.end]][head][dg.tagBin(tag)][edge.head][dg.tagBin(edge.tag)] + dparser.headStop[edge.head][dg.tagBin(edge.tag)][edge.start] + dparser.headStop[edge.head][dg.tagBin(edge.tag)][edge.end];</span>
+<span class="nc" id="L343">          tempHook.backEdge = edge;</span>
+<span class="nc" id="L344">          relaxTempHook();</span>
+        }
+      }
+<span class="nc" id="L347">    }</span>
+    // PRE HOOKS
+    //for (Iterator&lt;BinaryRule&gt; rI = bg.ruleIteratorByRightChild(edge.state);
+    //     rI.hasNext(); ) {
+<span class="nc" id="L351">    ruleList = bg.ruleListByRightChild(edge.state);</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">    for (BinaryRule br : ruleList) {</span>
+      //BinaryRule br = rI.next();
+<span class="nc bnc" id="L354" title="All 2 branches missed.">      if (scorer instanceof LatticeScorer) {</span>
+<span class="nc" id="L355">        LatticeScorer lscorer = (LatticeScorer) scorer;</span>
+<span class="nc" id="L356">        Edge latEdge = (Edge) lscorer.convertItemSpan(new Edge(edge));</span>
+<span class="nc bnc" id="L357" title="All 4 branches missed.">        if (!fscorer.oPossibleR(project(br.parent), latEdge.end) || !fscorer.iPossibleR(project(br.leftChild), latEdge.start)) {</span>
+<span class="nc" id="L358">          if (!op.testOptions.exhaustiveTest) {</span>
+<span class="nc" id="L359">            continue;</span>
+          }
+        }
+<span class="nc" id="L362">      } else {</span>
+<span class="nc bnc" id="L363" title="All 4 branches missed.">        if (!fscorer.oPossibleR(project(br.parent), edge.end) || !fscorer.iPossibleR(project(br.leftChild), edge.start)) {</span>
+<span class="nc" id="L364">          if (!op.testOptions.exhaustiveTest) {</span>
+<span class="nc" id="L365">            continue;</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L369" title="All 2 branches missed.">      for (int head = 0; head &lt; edge.start; head++) {</span>
+        // cdm Apr 2006: avoid Iterator allocation
+        // for (Iterator iTWI = taggedWordList[head].iterator(); iTWI.hasNext();) {
+        //IntTaggedWord iTW = (IntTaggedWord) iTWI.next();
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        for (int hdi = 0, sz = taggedWordList[head].size(); hdi &lt; sz; hdi++) {</span>
+<span class="nc" id="L374">          IntTaggedWord iTW = taggedWordList[head].get(hdi);</span>
+<span class="nc" id="L375">          int tag = iTW.tag;</span>
+<span class="nc" id="L376">          tempHook.start = edge.start;</span>
+<span class="nc" id="L377">          tempHook.end = edge.end;</span>
+<span class="nc" id="L378">          tempHook.head = head;</span>
+<span class="nc" id="L379">          tempHook.tag = tag;</span>
+<span class="nc" id="L380">          tempHook.state = br.parent;</span>
+<span class="nc" id="L381">          tempHook.subState = br.leftChild;</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">          if (!chart.isBuiltR(tempHook.subState, tempHook.start, tempHook.head, tempHook.tag)) {</span>
+<span class="nc" id="L383">            continue;</span>
+          }
+<span class="nc" id="L385">          tempHook.iScore = edge.iScore + br.score + dparser.headScore[dparser.binDistance[head][edge.start]][head][dg.tagBin(tag)][edge.head][dg.tagBin(edge.tag)] + dparser.headStop[edge.head][dg.tagBin(edge.tag)][edge.start] + dparser.headStop[edge.head][dg.tagBin(edge.tag)][edge.end];</span>
+<span class="nc" id="L386">          tempHook.backEdge = edge;</span>
+<span class="nc" id="L387">          relaxTempHook();</span>
+        }
+      }
+<span class="nc" id="L390">    }</span>
+<span class="nc" id="L391">  }</span>
+
+  protected void registerReal(Edge real) {
+<span class="nc" id="L394">    chart.registerRealEdge(real);</span>
+<span class="nc" id="L395">  }</span>
+
+  protected void triggerHooks(Edge edge) {
+    // we might have built a synth edge, enabling some old real edges to project hooks (the difference between this method and triggerAllHooks is that here we look only at realEdges)
+<span class="nc bnc" id="L399" title="All 2 branches missed.">    boolean newL = !chart.isBuiltL(edge.state, edge.start, edge.head, edge.tag);</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">    boolean newR = !chart.isBuiltR(edge.state, edge.end, edge.head, edge.tag);</span>
+    if (VERY_VERBOSE) {
+      if (newL) {
+        log.info(&quot;Triggering on L: &quot; + edge);
+      }
+      if (newR) {
+        log.info(&quot;Triggering on R: &quot; + edge);
+      }
+    }
+<span class="nc" id="L409">    chart.registerEdgeIndexes(edge);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">    if (newR) {</span>
+      // PRE HOOKS
+<span class="nc" id="L412">      BinaryRule[] rules = bg.splitRulesWithLC(edge.state);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">      for (BinaryRule br : rules) {</span>
+<span class="nc" id="L414">        Collection&lt;Edge&gt; realEdges = chart.getRealEdgesWithL(br.rightChild, edge.end);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        for (Edge real : realEdges) {</span>
+<span class="nc" id="L416">          tempHook.start = real.start;</span>
+<span class="nc" id="L417">          tempHook.end = real.end;</span>
+<span class="nc" id="L418">          tempHook.state = br.parent;</span>
+<span class="nc" id="L419">          tempHook.subState = br.leftChild;</span>
+<span class="nc" id="L420">          tempHook.head = edge.head;</span>
+<span class="nc" id="L421">          tempHook.tag = edge.tag;</span>
+<span class="nc" id="L422">          tempHook.backEdge = real;</span>
+<span class="nc" id="L423">          tempHook.iScore = real.iScore + br.score + dparser.headScore[dparser.binDistance[edge.head][edge.end]][edge.head][dg.tagBin(edge.tag)][real.head][dg.tagBin(real.tag)] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.start] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.end];</span>
+<span class="nc" id="L424">          relaxTempHook();</span>
+<span class="nc" id="L425">        }</span>
+      }
+    }
+<span class="nc bnc" id="L428" title="All 2 branches missed.">    if (newL) {</span>
+      // POST HOOKS
+<span class="nc" id="L430">      BinaryRule[] rules = bg.splitRulesWithRC(edge.state);</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">      for (BinaryRule br : rules) {</span>
+<span class="nc" id="L432">        Collection&lt;Edge&gt; realEdges = chart.getRealEdgesWithR(br.leftChild, edge.start);</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        for (Edge real : realEdges) {</span>
+<span class="nc" id="L434">          tempHook.start = real.start;</span>
+<span class="nc" id="L435">          tempHook.end = real.end;</span>
+<span class="nc" id="L436">          tempHook.state = br.parent;</span>
+<span class="nc" id="L437">          tempHook.subState = br.rightChild;</span>
+<span class="nc" id="L438">          tempHook.head = edge.head;</span>
+<span class="nc" id="L439">          tempHook.tag = edge.tag;</span>
+<span class="nc" id="L440">          tempHook.backEdge = real;</span>
+<span class="nc" id="L441">          tempHook.iScore = real.iScore + br.score + dparser.headScore[dparser.binDistance[edge.head][edge.start]][edge.head][dg.tagBin(edge.tag)][real.head][dg.tagBin(real.tag)] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.start] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.end];</span>
+<span class="nc" id="L442">          relaxTempHook();</span>
+<span class="nc" id="L443">        }</span>
+      }
+    }
+<span class="nc" id="L446">  }</span>
+
+  protected void triggerAllHooks(Edge edge) {
+    // we might have built a new edge, enabling some old edges to project hooks
+<span class="nc bnc" id="L450" title="All 2 branches missed.">    boolean newL = !chart.isBuiltL(edge.state, edge.start, edge.head, edge.tag);</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">    boolean newR = !chart.isBuiltR(edge.state, edge.end, edge.head, edge.tag);</span>
+    if (VERY_VERBOSE) {
+      if (newL) {
+        log.info(&quot;Triggering on L: &quot; + edge);
+      }
+      if (newR) {
+        log.info(&quot;Triggering on R: &quot; + edge);
+      }
+    }
+<span class="nc" id="L460">    chart.registerEdgeIndexes(edge);</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">    if (newR) {</span>
+      // PRE HOOKS
+<span class="nc bnc" id="L463" title="All 2 branches missed.">      for (Iterator&lt;BinaryRule&gt; rI = bg.ruleIteratorByLeftChild(edge.state); rI.hasNext();) {</span>
+<span class="nc" id="L464">        BinaryRule br = rI.next();</span>
+<span class="nc" id="L465">        Collection&lt;Edge&gt; edges = chart.getRealEdgesWithL(br.rightChild, edge.end);</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        for (Edge real : edges) {</span>
+<span class="nc" id="L467">          tempHook.start = real.start;</span>
+<span class="nc" id="L468">          tempHook.end = real.end;</span>
+<span class="nc" id="L469">          tempHook.state = br.parent;</span>
+<span class="nc" id="L470">          tempHook.subState = br.leftChild;</span>
+<span class="nc" id="L471">          tempHook.head = edge.head;</span>
+<span class="nc" id="L472">          tempHook.tag = edge.tag;</span>
+<span class="nc" id="L473">          tempHook.backEdge = real;</span>
+<span class="nc" id="L474">          tempHook.iScore = real.iScore + br.score + dparser.headScore[dparser.binDistance[edge.head][edge.end]][edge.head][dg.tagBin(edge.tag)][real.head][dg.tagBin(real.tag)] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.start] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.end];</span>
+<span class="nc" id="L475">          relaxTempHook();</span>
+<span class="nc" id="L476">        }</span>
+<span class="nc" id="L477">      }</span>
+    }
+<span class="nc bnc" id="L479" title="All 2 branches missed.">    if (newL) {</span>
+      // POST HOOKS
+<span class="nc bnc" id="L481" title="All 2 branches missed.">      for (Iterator rI = bg.ruleIteratorByRightChild(edge.state); rI.hasNext();) {</span>
+<span class="nc" id="L482">        BinaryRule br = (BinaryRule) rI.next();</span>
+<span class="nc" id="L483">        Collection&lt;Edge&gt; edges = chart.getRealEdgesWithR(br.leftChild, edge.start);</span>
+        if (VERBOSE) {
+          log.info(&quot;Looking for: &quot; + stateIndex.get(br.leftChild) + &quot; ending at &quot; + edge.start);
+          log.info(&quot;Found: &quot; + edges);
+        }
+<span class="nc bnc" id="L488" title="All 2 branches missed.">        for (Edge real : edges) {</span>
+<span class="nc" id="L489">          tempHook.start = real.start;</span>
+<span class="nc" id="L490">          tempHook.end = real.end;</span>
+<span class="nc" id="L491">          tempHook.state = br.parent;</span>
+<span class="nc" id="L492">          tempHook.subState = br.rightChild;</span>
+<span class="nc" id="L493">          tempHook.head = edge.head;</span>
+<span class="nc" id="L494">          tempHook.tag = edge.tag;</span>
+<span class="nc" id="L495">          tempHook.backEdge = real;</span>
+<span class="nc" id="L496">          tempHook.iScore = real.iScore + br.score + dparser.headScore[dparser.binDistance[edge.head][edge.start]][edge.head][dg.tagBin(edge.tag)][real.head][dg.tagBin(real.tag)] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.start] + dparser.headStop[real.head][dg.tagBin(real.tag)][real.end];</span>
+<span class="nc" id="L497">          relaxTempHook();</span>
+<span class="nc" id="L498">        }</span>
+<span class="nc" id="L499">      }</span>
+    }
+<span class="nc" id="L501">  }</span>
+
+
+  protected void relaxTempHook() {
+<span class="nc" id="L505">    relaxHook1++;</span>
+    if (VERBOSE) {
+      log.info(&quot;Considering: &quot; + tempHook + &quot; iP: &quot; + scorer.iPossible(tempHook) + &quot; oP: &quot; + scorer.oPossible(tempHook));
+    }
+<span class="nc" id="L509">    if (!op.testOptions.exhaustiveTest) {</span>
+<span class="nc bnc" id="L510" title="All 4 branches missed.">      if (!scorer.oPossible(tempHook) || !scorer.iPossible(tempHook)) {</span>
+<span class="nc" id="L511">        return;</span>
+      }
+    }
+<span class="nc" id="L514">    relaxHook2++;</span>
+<span class="nc" id="L515">    Hook resultHook = (Hook) interner.intern(tempHook);</span>
+    if (VERBOSE) {
+      System.err.printf(&quot;Formed %s %s %f was %f\n&quot;, resultHook, (resultHook == tempHook ? &quot;new&quot; : &quot;old&quot;), tempHook.iScore, resultHook.iScore);
+      if (resultHook.backEdge != null) {
+        log.info(&quot;  Backtrace: &quot; + resultHook.backEdge);
+      }
+    }
+<span class="nc bnc" id="L522" title="All 2 branches missed.">    if (resultHook == tempHook) {</span>
+<span class="nc" id="L523">      relaxHook3++;</span>
+<span class="nc" id="L524">      tempHook = new Hook(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L525">      discoverHook(resultHook);</span>
+    }
+<span class="nc bnc" id="L527" title="All 2 branches missed.">    if (better(tempHook.iScore, resultHook.iScore)) {</span>
+<span class="nc" id="L528">      resultHook.iScore = tempHook.iScore;</span>
+<span class="nc" id="L529">      resultHook.backEdge = tempHook.backEdge;</span>
+      try {
+<span class="nc" id="L531">        agenda.decreaseKey(resultHook);</span>
+<span class="nc" id="L532">      } catch (NullPointerException e) {</span>
+<span class="nc" id="L533">      }</span>
+    }
+<span class="nc" id="L535">  }</span>
+
+  protected void projectUnaries(Edge edge) {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">    for (Iterator rI = ug.ruleIteratorByChild(edge.state); rI.hasNext();) {</span>
+<span class="nc" id="L539">      UnaryRule ur = (UnaryRule) rI.next();</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">      if (ur.child == ur.parent) {</span>
+<span class="nc" id="L541">        continue;</span>
+      }
+<span class="nc" id="L543">      tempEdge.start = edge.start;</span>
+<span class="nc" id="L544">      tempEdge.end = edge.end;</span>
+<span class="nc" id="L545">      tempEdge.head = edge.head;</span>
+<span class="nc" id="L546">      tempEdge.tag = edge.tag;</span>
+<span class="nc" id="L547">      tempEdge.state = ur.parent;</span>
+<span class="nc" id="L548">      tempEdge.backEdge = edge;</span>
+<span class="nc" id="L549">      tempEdge.backHook = null;</span>
+<span class="nc" id="L550">      tempEdge.iScore = edge.iScore + ur.score;</span>
+<span class="nc" id="L551">      relaxTempEdge();</span>
+<span class="nc" id="L552">    }</span>
+<span class="nc" id="L553">  }</span>
+
+  protected void processEdge(Edge edge) {
+    // add to chart
+    if (VERBOSE) {
+      log.info(&quot;Adding to chart: &quot; + edge);
+    }
+<span class="nc" id="L560">    chart.addEdge(edge);</span>
+    // fetch existing hooks that can combine with it and combine them
+<span class="nc bnc" id="L562" title="All 2 branches missed.">    for (Hook hook : chart.getPreHooks(edge)) {</span>
+<span class="nc" id="L563">      combine(edge, hook);</span>
+<span class="nc" id="L564">    }</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">    for (Hook hook : chart.getPostHooks(edge)) {</span>
+<span class="nc" id="L566">      combine(edge, hook);</span>
+<span class="nc" id="L567">    }</span>
+    // do projections
+    //if (VERBOSE) log.info(&quot;Projecting: &quot;+edge);
+<span class="nc" id="L570">    projectUnaries(edge);</span>
+<span class="nc bnc" id="L571" title="All 4 branches missed.">    if (!bg.isSynthetic(edge.state) &amp;&amp; !op.freeDependencies) {</span>
+<span class="nc" id="L572">      projectHooks(edge);</span>
+<span class="nc" id="L573">      registerReal(edge);</span>
+    }
+<span class="nc bnc" id="L575" title="All 2 branches missed.">    if (op.freeDependencies) {</span>
+<span class="nc" id="L576">      projectHooks(edge);</span>
+<span class="nc" id="L577">      registerReal(edge);</span>
+<span class="nc" id="L578">      triggerAllHooks(edge);</span>
+    } else {
+<span class="nc" id="L580">      triggerHooks(edge);</span>
+    }
+<span class="nc" id="L582">  }</span>
+
+  protected void processHook(Hook hook) {
+    // add to chart
+    //if (VERBOSE) log.info(&quot;Adding to chart: &quot;+hook);
+<span class="nc" id="L587">    chart.addHook(hook);</span>
+<span class="nc" id="L588">    Collection&lt;Edge&gt; edges = chart.getEdges(hook);</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">    for (Edge edge : edges) {</span>
+<span class="nc" id="L590">      combine(edge, hook);</span>
+<span class="nc" id="L591">    }</span>
+<span class="nc" id="L592">  }</span>
+
+  protected void processItem(Item item) {
+<span class="nc bnc" id="L595" title="All 2 branches missed.">    if (item.isEdge()) {</span>
+<span class="nc" id="L596">      processEdge((Edge) item);</span>
+    } else {
+<span class="nc" id="L598">      processHook((Hook) item);</span>
+    }
+<span class="nc" id="L600">  }</span>
+
+  protected void discoverItem(Item item) {
+<span class="nc bnc" id="L603" title="All 2 branches missed.">    if (item.isEdge()) {</span>
+<span class="nc" id="L604">      discoverEdge((Edge) item);</span>
+    } else {
+<span class="nc" id="L606">      discoverHook((Hook) item);</span>
+    }
+<span class="nc" id="L608">  }</span>
+
+  protected Item makeInitialItem(int pos, int tag, int state, double iScore) {
+<span class="nc" id="L611">    Edge edge = new Edge(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L612">    edge.start = pos;</span>
+<span class="nc" id="L613">    edge.end = pos + 1;</span>
+<span class="nc" id="L614">    edge.state = state;</span>
+<span class="nc" id="L615">    edge.head = pos;</span>
+<span class="nc" id="L616">    edge.tag = tag;</span>
+<span class="nc" id="L617">    edge.iScore = iScore;</span>
+<span class="nc" id="L618">    return edge;</span>
+  }
+
+  protected List&lt;Item&gt; makeInitialItems(List&lt;? extends HasWord&gt; wordList) {
+<span class="nc" id="L622">    List&lt;Item&gt; itemList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L623">    int length = wordList.size();</span>
+<span class="nc" id="L624">    int numTags = tagIndex.size();</span>
+<span class="nc" id="L625">    words = new int[length];</span>
+<span class="nc" id="L626">    taggedWordList = new List[length];</span>
+<span class="nc" id="L627">    int terminalCount = 0;</span>
+<span class="nc" id="L628">    originalLabels = new CoreLabel[wordList.size()];</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">    for (int i = 0; i &lt; length; i++) {</span>
+<span class="nc" id="L630">      taggedWordList[i] = new ArrayList&lt;&gt;(numTags);</span>
+<span class="nc" id="L631">      HasWord wordObject = wordList.get(i);</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">      if (wordObject instanceof CoreLabel) {</span>
+<span class="nc" id="L633">        originalLabels[i] = (CoreLabel) wordObject;</span>
+      }
+<span class="nc" id="L635">      String wordStr = wordObject.word();</span>
+
+      //Word context (e.g., morphosyntactic info)
+<span class="nc" id="L638">      String wordContextStr = null;</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">      if(wordObject instanceof HasContext) {</span>
+<span class="nc" id="L640">        wordContextStr = ((HasContext) wordObject).originalText();</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        if(&quot;&quot;.equals(wordContextStr))</span>
+<span class="nc" id="L642">          wordContextStr = null;</span>
+      }
+
+<span class="nc bnc" id="L645" title="All 2 branches missed.">      if (!wordIndex.contains(wordStr)) {</span>
+<span class="nc" id="L646">        wordStr = Lexicon.UNKNOWN_WORD;</span>
+      }
+<span class="nc" id="L648">      int word = wordIndex.indexOf(wordStr);</span>
+<span class="nc" id="L649">      words[i] = word;</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">      for (Iterator&lt;IntTaggedWord&gt; tagI = lex.ruleIteratorByWord(word, i, wordContextStr); tagI.hasNext(); ) {</span>
+<span class="nc" id="L651">        IntTaggedWord tagging = tagI.next();</span>
+<span class="nc" id="L652">        int tag = tagging.tag;</span>
+        //String curTagStr = tagIndex.get(tag);
+        //if (!tagStr.equals(&quot;&quot;) &amp;&amp; !tagStr.equals(curTagStr))
+        //  continue;
+<span class="nc" id="L656">        int state = stateIndex.indexOf(tagIndex.get(tag));</span>
+        //itemList.add(makeInitialItem(i,tag,state,1.0*tagging.score));
+        // THIS WILL CAUSE BUGS!!!  Don't use with another A* scorer
+<span class="nc" id="L659">        tempEdge.state = state;</span>
+<span class="nc" id="L660">        tempEdge.head = i;</span>
+<span class="nc" id="L661">        tempEdge.start = i;</span>
+<span class="nc" id="L662">        tempEdge.end = i + 1;</span>
+<span class="nc" id="L663">        tempEdge.tag = tag;</span>
+<span class="nc" id="L664">        itemList.add(makeInitialItem(i, tag, state, scorer.iScore(tempEdge)));</span>
+<span class="nc" id="L665">        terminalCount++;</span>
+<span class="nc" id="L666">        taggedWordList[i].add(new IntTaggedWord(word, tag));</span>
+<span class="nc" id="L667">      }</span>
+    }
+<span class="nc bnc" id="L669" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L670">      log.info(&quot;Terminals (# of tag edges in chart): &quot; +</span>
+                         terminalCount);
+    }
+<span class="nc" id="L673">    return itemList;</span>
+  }
+
+  protected void scoreDependencies() {
+    // just leach it off the dparser for now...
+    /*
+    IntDependency dependency = new IntDependency();
+    for (int head = 0; head &lt; words.length; head++) {
+      for (int hTag = 0; hTag &lt; tagIndex.size(); hTag++) {
+        for (int arg = 0; arg &lt; words.length; arg++) {
+          for (int aTag = 0; aTag &lt; tagIndex.size(); aTag++) {
+            Arrays.fill(depScore[head][hTag][arg][aTag],Float.NEGATIVE_INFINITY);
+          }
+        }
+      }
+    }
+    for (int head = 0; head &lt; words.length; head++) {
+      for (int arg = 0; arg &lt; words.length; arg++) {
+        if (head == arg)
+          continue;
+        for (Iterator&lt;IntTaggedWord&gt; headTWI=taggedWordList[head].iterator(); headTWI.hasNext();) {
+          IntTaggedWord headTW = headTWI.next();
+          for (Iterator&lt;IntTaggedWord&gt; argTWI=taggedWordList[arg].iterator(); argTWI.hasNext();) {
+            IntTaggedWord argTW = argTWI.next();
+            dependency.head = headTW;
+            dependency.arg = argTW;
+            dependency.leftHeaded = (head &lt; arg);
+            dependency.distance = Math.abs(head-arg);
+            depScore[head][headTW.tag][arg][argTW.tag] =
+              dg.score(dependency);
+            if (false &amp;&amp; depScore[head][headTW.tag][arg][argTW.tag] &gt; -100)
+              log.info(wordIndex.get(headTW.word)+&quot;/&quot;+tagIndex.get(headTW.tag)+&quot; -&gt; &quot;+wordIndex.get(argTW.word)+&quot;/&quot;+tagIndex.get(argTW.tag)+&quot; score &quot;+depScore[head][headTW.tag][arg][argTW.tag]);
+          }
+        }
+      }
+    }
+    */
+<span class="nc" id="L710">  }</span>
+
+  protected void setGoal(int length) {
+<span class="nc" id="L713">    goal = new Edge(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L714">    goal.start = 0;</span>
+<span class="nc" id="L715">    goal.end = length;</span>
+<span class="nc" id="L716">    goal.state = stateIndex.indexOf(op.langpack().startSymbol());</span>
+<span class="nc" id="L717">    goal.tag = tagIndex.indexOf(Lexicon.BOUNDARY_TAG);</span>
+<span class="nc" id="L718">    goal.head = length - 1;</span>
+    //goal = (Edge)interner.intern(goal);
+<span class="nc" id="L720">  }</span>
+
+  protected void initialize(List&lt;? extends HasWord&gt; words) {
+<span class="nc" id="L723">    length = words.size();</span>
+<span class="nc" id="L724">    interner = new Interner();</span>
+<span class="nc" id="L725">    agenda = new ArrayHeap&lt;&gt;(ScoredComparator.DESCENDING_COMPARATOR);</span>
+<span class="nc" id="L726">    chart = new HookChart();</span>
+<span class="nc" id="L727">    setGoal(length);</span>
+<span class="nc" id="L728">    List&lt;Item&gt; initialItems = makeInitialItems(words);</span>
+//    scoreDependencies();
+<span class="nc bnc" id="L730" title="All 2 branches missed.">    for (Item item : initialItems) {</span>
+<span class="nc" id="L731">      item = (Item) interner.intern(item);</span>
+      //if (VERBOSE) log.info(&quot;Initial: &quot;+item);
+<span class="nc" id="L733">      discoverItem(item);</span>
+<span class="nc" id="L734">    }</span>
+<span class="nc" id="L735">  }</span>
+
+  /**
+   * Parse a Sentence.
+   *
+   * @return true iff it could be parsed
+   */
+  public boolean parse(List&lt;? extends HasWord&gt; words) {
+<span class="nc" id="L743">    int nGoodRemaining = 0;</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">    if (op.testOptions.printFactoredKGood &gt; 0) {</span>
+<span class="nc" id="L745">      nGoodRemaining = op.testOptions.printFactoredKGood;</span>
+<span class="nc" id="L746">      nGoodTrees.clear();</span>
+    }
+
+<span class="nc" id="L749">    int spanFound = 0;</span>
+<span class="nc" id="L750">    long last = 0;</span>
+<span class="nc" id="L751">    int exHook = 0;</span>
+<span class="nc" id="L752">    relaxHook1 = 0;</span>
+<span class="nc" id="L753">    relaxHook2 = 0;</span>
+<span class="nc" id="L754">    relaxHook3 = 0;</span>
+<span class="nc" id="L755">    relaxHook4 = 0;</span>
+<span class="nc" id="L756">    builtHooks = 0;</span>
+<span class="nc" id="L757">    builtEdges = 0;</span>
+<span class="nc" id="L758">    extractedHooks = 0;</span>
+<span class="nc" id="L759">    extractedEdges = 0;</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L761">      Timing.tick(&quot;Starting combined parse.&quot;);</span>
+    }
+<span class="nc" id="L763">    dparser.binDistance = dparser.binDistance; // THIS IS TERRIBLE, BUT SAVES MEMORY</span>
+<span class="nc" id="L764">    initialize(words);</span>
+<span class="nc bnc" id="L765" title="All 2 branches missed.">    while (!agenda.isEmpty()) {</span>
+<span class="nc" id="L766">      Item item = agenda.extractMin();</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">      if (!item.isEdge()) {</span>
+<span class="nc" id="L768">        exHook++;</span>
+<span class="nc" id="L769">        extractedHooks++;</span>
+      } else {
+<span class="nc" id="L771">        extractedEdges++;</span>
+      }
+<span class="nc bnc" id="L773" title="All 2 branches missed.">      if (relaxHook1 &gt; last + 1000000) {</span>
+<span class="nc" id="L774">        last = relaxHook1;</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        if (op.testOptions.verbose) {</span>
+<span class="nc" id="L776">          log.info(&quot;Proposed hooks:   &quot; + relaxHook1);</span>
+<span class="nc" id="L777">          log.info(&quot;Unfiltered hooks: &quot; + relaxHook2);</span>
+<span class="nc" id="L778">          log.info(&quot;Built hooks:      &quot; + relaxHook3);</span>
+<span class="nc" id="L779">          log.info(&quot;Waste hooks:      &quot; + relaxHook4);</span>
+<span class="nc" id="L780">          log.info(&quot;Extracted hooks:  &quot; + exHook);</span>
+        }
+      }
+<span class="nc bnc" id="L783" title="All 2 branches missed.">      if (item.end - item.start &gt; spanFound) {</span>
+<span class="nc" id="L784">        spanFound = item.end - item.start;</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">        if (op.testOptions.verbose) {</span>
+<span class="nc" id="L786">          log.info(spanFound + &quot; &quot;);</span>
+        }
+      }
+      //if (item.end &lt; 5) log.info(&quot;Extracted: &quot;+item+&quot; iScore &quot;+item.iScore+&quot; oScore &quot;+item.oScore+&quot; score &quot;+item.score());
+<span class="nc bnc" id="L790" title="All 2 branches missed.">      if (item.equals(goal)) {</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">        if (op.testOptions.verbose) {</span>
+<span class="nc" id="L792">          log.info(&quot;Found goal!&quot;);</span>
+<span class="nc" id="L793">          log.info(&quot;Comb iScore &quot; + item.iScore); // was goal.iScore</span>
+<span class="nc" id="L794">          Timing.tick(&quot;Done, parse found.&quot;);</span>
+<span class="nc" id="L795">          log.info(&quot;Built items:      &quot; + (builtEdges + builtHooks));</span>
+<span class="nc" id="L796">          log.info(&quot;Built hooks:      &quot; + builtHooks);</span>
+<span class="nc" id="L797">          log.info(&quot;Built edges:      &quot; + builtEdges);</span>
+<span class="nc" id="L798">          log.info(&quot;Extracted items:  &quot; + (extractedEdges + extractedHooks));</span>
+<span class="nc" id="L799">          log.info(&quot;Extracted hooks:  &quot; + extractedHooks);</span>
+<span class="nc" id="L800">          log.info(&quot;Extracted edges:  &quot; + extractedEdges);</span>
+          //postMortem();
+        }
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        if (op.testOptions.printFactoredKGood &lt;= 0) {</span>
+<span class="nc" id="L804">          goal = (Edge) item;</span>
+<span class="nc" id="L805">          interner = null;</span>
+<span class="nc" id="L806">          agenda = null;</span>
+<span class="nc" id="L807">          return true;</span>
+        } else {
+          // Store the parse
+<span class="nc" id="L810">          goal = (Edge) item;</span>
+<span class="nc" id="L811">          nGoodTrees.add(goal);</span>
+<span class="nc" id="L812">          nGoodRemaining--;</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">          if (nGoodRemaining &gt; 0) {</span>
+            if (VERBOSE) {
+              log.info(&quot;Found parse! Number of remaining trees to find = &quot; + nGoodRemaining);
+            }
+          } else {
+            if (VERBOSE) {
+              log.info(&quot;Found last parse!&quot;);
+            }
+<span class="nc" id="L821">            interner = null;</span>
+<span class="nc" id="L822">            agenda = null;</span>
+<span class="nc" id="L823">            return true;</span>
+          }
+        }
+      }
+      // Is the currently best item acceptable at all?
+<span class="nc bnc" id="L828" title="All 2 branches missed.">      if (item.score() == Double.NEGATIVE_INFINITY) {</span>
+        // Do not report failure in nGood mode if we found something earlier.
+<span class="nc bnc" id="L830" title="All 2 branches missed.">        if (nGoodTrees.size() &gt; 0) {</span>
+          if (VERBOSE) {
+            log.info(&quot;Aborting kGood search because of an unacceptable (-Inf) item: &quot; + item);
+          }
+<span class="nc" id="L834">          goal = nGoodTrees.get(0);</span>
+<span class="nc" id="L835">          interner = null;</span>
+<span class="nc" id="L836">          agenda = null;</span>
+<span class="nc" id="L837">          return true;</span>
+        }
+<span class="nc" id="L839">        log.info(&quot;FactoredParser: no consistent parse [hit A*-blocked edges, aborting].&quot;);</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        if (op.testOptions.verbose) {</span>
+<span class="nc" id="L841">          Timing.tick(&quot;FactoredParser: no consistent parse [hit A*-blocked edges, aborting].&quot;);</span>
+        }
+<span class="nc" id="L843">        return false;</span>
+      }
+      // Keep the number of items from getting too large
+<span class="nc bnc" id="L846" title="All 4 branches missed.">      if (op.testOptions.MAX_ITEMS &gt; 0 &amp;&amp; (builtEdges + builtHooks) &gt;= op.testOptions.MAX_ITEMS) {</span>
+        // Do not report failure in kGood mode if we found something earlier.
+<span class="nc bnc" id="L848" title="All 2 branches missed.">        if (nGoodTrees.size() &gt; 0) {</span>
+<span class="nc" id="L849">          log.info(&quot;DEBUG: aborting search because of reaching the MAX_ITEMS work limit [&quot; +</span>
+                             op.testOptions.MAX_ITEMS + &quot; items]&quot;);
+<span class="nc" id="L851">          goal = nGoodTrees.get(0);</span>
+<span class="nc" id="L852">          interner = null;</span>
+<span class="nc" id="L853">          agenda = null;</span>
+<span class="nc" id="L854">          return true;</span>
+        }
+<span class="nc" id="L856">        log.info(&quot;FactoredParser: exceeded MAX_ITEMS work limit [&quot; +</span>
+                           op.testOptions.MAX_ITEMS + &quot; items]; aborting.&quot;);
+<span class="nc bnc" id="L858" title="All 2 branches missed.">        if (op.testOptions.verbose) {</span>
+<span class="nc" id="L859">          Timing.tick(&quot;FactoredParser: exceeded MAX_ITEMS work limit [&quot; +</span>
+                      op.testOptions.MAX_ITEMS + &quot; items]; aborting.&quot;);
+        }
+<span class="nc" id="L862">        return false;</span>
+      }
+      if (VERBOSE &amp;&amp; item.score() != Double.NEGATIVE_INFINITY) {
+        System.err.printf(&quot;Removing from agenda: %s score i %.2f + o %.2f = %.2f\n&quot;, item, item.iScore, item.oScore, item.score());
+        if (item.backEdge != null) {
+          log.info(&quot;  Backtrace: &quot; + item.backEdge.toString() + &quot; &quot; + (item.isEdge() ? (((Edge) item).backHook != null ? ((Edge) item).backHook.toString() : &quot;&quot;) : &quot;&quot;));
+        }
+      }
+<span class="nc" id="L870">      processItem(item);</span>
+<span class="nc" id="L871">    } // end while agenda is not empty</span>
+    // If we are here, the agenda is empty.
+    // Do not report failure if we found something earlier.
+<span class="nc bnc" id="L874" title="All 2 branches missed.">    if (nGoodTrees.size() &gt; 0) {</span>
+<span class="nc" id="L875">      log.info(&quot;DEBUG: aborting search because of empty agenda&quot;);</span>
+<span class="nc" id="L876">      goal = nGoodTrees.get(0);</span>
+<span class="nc" id="L877">      interner = null;</span>
+<span class="nc" id="L878">      agenda = null;</span>
+<span class="nc" id="L879">      return true;</span>
+    }
+<span class="nc" id="L881">    log.info(&quot;FactoredParser: emptied agenda, no parse found!&quot;);</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">    if (op.testOptions.verbose) {</span>
+<span class="nc" id="L883">      Timing.tick(&quot;FactoredParser: emptied agenda, no parse found!&quot;);</span>
+    }
+<span class="nc" id="L885">    return false;</span>
+  }
+
+
+  protected void postMortem() {
+<span class="nc" id="L890">    int numHooks = 0;</span>
+<span class="nc" id="L891">    int numEdges = 0;</span>
+<span class="nc" id="L892">    int numUnmatchedHooks = 0;</span>
+<span class="nc" id="L893">    int total = agenda.size();</span>
+<span class="nc" id="L894">    int done = 0;</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">    while (!agenda.isEmpty()) {</span>
+<span class="nc" id="L896">      Item item = agenda.extractMin();</span>
+<span class="nc" id="L897">      done++;</span>
+      //if(done % (total/10) == 0)
+      //        log.info(&quot;Scanning: &quot;+100*done/total);
+<span class="nc bnc" id="L900" title="All 2 branches missed.">      if (item.isEdge()) {</span>
+<span class="nc" id="L901">        numEdges++;</span>
+      } else {
+<span class="nc" id="L903">        numHooks++;</span>
+<span class="nc" id="L904">        Collection edges = chart.getEdges((Hook) item);</span>
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        if (edges.size() == 0) {</span>
+<span class="nc" id="L906">          numUnmatchedHooks++;</span>
+        }
+      }
+<span class="nc" id="L909">    }</span>
+<span class="nc" id="L910">    log.info(&quot;--- Agenda Post-Mortem ---&quot;);</span>
+<span class="nc" id="L911">    log.info(&quot;Edges:           &quot; + numEdges);</span>
+<span class="nc" id="L912">    log.info(&quot;Hooks:           &quot; + numHooks);</span>
+<span class="nc" id="L913">    log.info(&quot;Unmatched Hooks: &quot; + numUnmatchedHooks);</span>
+<span class="nc" id="L914">  }</span>
+
+  protected int project(int state) {
+<span class="nc" id="L917">    return projection.project(state);</span>
+  }
+
+  public BiLexPCFGParser(Scorer scorer, ExhaustivePCFGParser fscorer, ExhaustiveDependencyParser dparser, BinaryGrammar bg, UnaryGrammar ug, DependencyGrammar dg, Lexicon lex, Options op, Index&lt;String&gt; stateIndex, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L921">    this(scorer, fscorer, dparser, bg, ug, dg, lex, op, new NullGrammarProjection(bg, ug), stateIndex, wordIndex, tagIndex);</span>
+<span class="nc" id="L922">  }</span>
+
+<span class="nc" id="L924">  BiLexPCFGParser(Scorer scorer, ExhaustivePCFGParser fscorer, ExhaustiveDependencyParser dparser, BinaryGrammar bg, UnaryGrammar ug, DependencyGrammar dg, Lexicon lex, Options op, GrammarProjection projection, Index&lt;String&gt; stateIndex, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {</span>
+<span class="nc" id="L925">    this.fscorer = fscorer;</span>
+<span class="nc" id="L926">    this.projection = projection;</span>
+<span class="nc" id="L927">    this.dparser = dparser;</span>
+<span class="nc" id="L928">    this.scorer = scorer;</span>
+<span class="nc" id="L929">    this.bg = bg;</span>
+<span class="nc" id="L930">    this.ug = ug;</span>
+<span class="nc" id="L931">    this.dg = dg;</span>
+<span class="nc" id="L932">    this.lex = lex;</span>
+<span class="nc" id="L933">    this.op = op;</span>
+<span class="nc" id="L934">    this.stateIndex = stateIndex;</span>
+<span class="nc" id="L935">    this.wordIndex = wordIndex;</span>
+<span class="nc" id="L936">    this.tagIndex = tagIndex;</span>
+
+<span class="nc" id="L938">    tempEdge = new Edge(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L939">    tempHook = new Hook(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L940">  }</span>
+
+  public static class N5BiLexPCFGParser extends BiLexPCFGParser {
+
+    @Override
+    protected void relaxTempHook() {
+<span class="nc" id="L946">      relaxHook1++;</span>
+      if (VERBOSE) {
+        log.info(&quot;Considering: &quot; + tempHook + &quot; iP: &quot; + scorer.iPossible(tempHook) + &quot; oP: &quot; + scorer.oPossible(tempHook));
+      }
+<span class="nc" id="L950">      if (!op.testOptions.exhaustiveTest) {</span>
+<span class="nc bnc" id="L951" title="All 4 branches missed.">        if (!scorer.oPossible(tempHook) || !scorer.iPossible(tempHook)) {</span>
+<span class="nc" id="L952">          return;</span>
+        }
+      }
+<span class="nc" id="L955">      relaxHook2++;</span>
+<span class="nc" id="L956">      Hook resultHook = tempHook;</span>
+      //Hook resultHook = (Hook)interner.intern(tempHook);
+      if (VERBOSE) {
+        log.info(&quot;Formed &quot; + resultHook + &quot; &quot; + (resultHook == tempHook ? &quot;new&quot; : &quot;old&quot;) + &quot; &quot; + tempHook.iScore + &quot; was &quot; + resultHook.iScore);
+      }
+<span class="nc bnc" id="L961" title="All 2 branches missed.">      if (resultHook == tempHook) {</span>
+<span class="nc" id="L962">        relaxHook3++;</span>
+<span class="nc" id="L963">        tempHook = new Hook(op.testOptions.exhaustiveTest);</span>
+<span class="nc" id="L964">        processHook(resultHook);</span>
+<span class="nc" id="L965">        builtHooks++;</span>
+      }
+<span class="nc" id="L967">    }</span>
+
+    N5BiLexPCFGParser(Scorer scorer, ExhaustivePCFGParser fscorer, ExhaustiveDependencyParser leach, BinaryGrammar bg, UnaryGrammar ug, DependencyGrammar dg, Lexicon lex, Options op, Index&lt;String&gt; stateIndex, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L970">      super(scorer, fscorer, leach, bg, ug, dg, lex, op, new NullGrammarProjection(bg, ug), stateIndex, wordIndex, tagIndex);</span>
+<span class="nc" id="L971">    }</span>
+
+    N5BiLexPCFGParser(Scorer scorer, ExhaustivePCFGParser fscorer, ExhaustiveDependencyParser leach, BinaryGrammar bg, UnaryGrammar ug, DependencyGrammar dg, Lexicon lex, Options op, GrammarProjection proj, Index&lt;String&gt; stateIndex, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L974">      super(scorer, fscorer, leach, bg, ug, dg, lex, op, proj, stateIndex, wordIndex, tagIndex);</span>
+<span class="nc" id="L975">    }</span>
+
+  } // end class N5BiLexPCFGParser
+
+} // end class BiLexPCFGParser
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

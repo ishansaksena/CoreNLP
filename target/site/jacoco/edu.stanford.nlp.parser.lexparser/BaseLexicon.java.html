@@ -1,0 +1,1034 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BaseLexicon.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">BaseLexicon.java</span></div><h1>BaseLexicon.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.io.NumberRangesFileFilter;
+import edu.stanford.nlp.io.EncodingPrintWriter;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.Treebank;
+import edu.stanford.nlp.trees.DiskTreebank;
+import edu.stanford.nlp.trees.TreebankLanguagePack;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.Counters;
+import edu.stanford.nlp.util.*;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.io.Writer;
+import java.text.NumberFormat;
+import java.util.*;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+
+/**
+ * This is the default concrete instantiation of the Lexicon interface. It was
+ * originally built for Penn Treebank English.
+ *
+ * @author Dan Klein
+ * @author Galen Andrew
+ * @author Christopher Manning
+ */
+public class BaseLexicon implements Lexicon  {
+
+  /** A logger for this class */
+<span class="fc" id="L40">  private static Redwood.RedwoodChannels log = Redwood.channels(BaseLexicon.class);</span>
+
+  protected UnknownWordModel uwModel;
+  protected final String uwModelTrainerClass;
+  protected transient UnknownWordModelTrainer uwModelTrainer;
+
+  protected static final boolean DEBUG_LEXICON = false;
+  protected static final boolean DEBUG_LEXICON_SCORE = false;
+
+  protected static final int nullWord = -1;
+
+  protected static final short nullTag = -1;
+
+<span class="fc" id="L53">  protected static final IntTaggedWord NULL_ITW = new IntTaggedWord(nullWord, nullTag);</span>
+
+  protected final TrainOptions trainOptions;
+  protected final TestOptions testOptions;
+
+  protected final Options op;
+
+  /**
+   * If a word has been seen more than this many times, then relative
+   * frequencies of tags are used for POS assignment; if not, they are smoothed
+   * with tag priors.
+   */
+  protected int smoothInUnknownsThreshold;
+
+  /**
+   * Have tags changeable based on statistics on word types having various
+   * taggings.
+   */
+  protected boolean smartMutation;
+
+  protected final Index&lt;String&gt; wordIndex;
+
+  protected final Index&lt;String&gt; tagIndex;
+
+
+  /** An array of Lists of rules (IntTaggedWord), indexed by word. */
+  public transient List&lt;IntTaggedWord&gt;[] rulesWithWord;
+
+  // protected transient Set&lt;IntTaggedWord&gt; rules = new
+  // HashSet&lt;IntTaggedWord&gt;();
+  // When it existed, rules somehow held a few less things than rulesWithWord
+  // I never figured out why [cdm, Dec 2004]
+
+  /** Set of all tags as IntTaggedWord. Alive in both train and runtime
+   *  phases, but transient.
+   */
+<span class="fc" id="L89">  protected transient Set&lt;IntTaggedWord&gt; tags = Generics.newHashSet();</span>
+
+<span class="fc" id="L91">  protected transient Set&lt;IntTaggedWord&gt; words = Generics.newHashSet();</span>
+
+  // protected transient Set&lt;IntTaggedWord&gt; sigs=Generics.newHashSet();
+
+  /** Records the number of times word/tag pair was seen in training data.
+   *  Includes word/tag pairs where one is a wildcard not a real word/tag.
+   */
+<span class="fc" id="L98">  public ClassicCounter&lt;IntTaggedWord&gt; seenCounter = new ClassicCounter&lt;&gt;();</span>
+
+<span class="fc" id="L100">  double[] smooth = { 1.0, 1.0 };</span>
+
+  // these next two are used for smartMutation calculation
+  transient double[][] m_TT; // = null;
+
+  transient double[] m_T; // = null;
+
+  protected boolean flexiTag;
+
+  protected boolean useSignatureForKnownSmoothing;
+
+  /**
+   * Only used when training, specifically when training on sentences
+   * that weren't part of annotated (e.g., markovized, etc.) data.
+   */
+<span class="fc" id="L115">  private Map&lt;String, Counter&lt;String&gt;&gt; baseTagCounts = Generics.newHashMap();</span>
+
+  public BaseLexicon(Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L118">    this(new Options(), wordIndex, tagIndex);</span>
+<span class="nc" id="L119">  }</span>
+
+<span class="fc" id="L121">  public BaseLexicon(Options op, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {</span>
+<span class="fc" id="L122">    this.wordIndex = wordIndex;</span>
+<span class="fc" id="L123">    this.tagIndex = tagIndex;</span>
+
+<span class="fc" id="L125">    flexiTag = op.lexOptions.flexiTag;</span>
+<span class="fc" id="L126">    useSignatureForKnownSmoothing = op.lexOptions.useSignatureForKnownSmoothing;</span>
+<span class="fc" id="L127">    this.smoothInUnknownsThreshold = op.lexOptions.smoothInUnknownsThreshold;</span>
+<span class="fc" id="L128">    this.smartMutation = op.lexOptions.smartMutation;</span>
+<span class="fc" id="L129">    this.trainOptions = op.trainOptions;</span>
+<span class="fc" id="L130">    this.testOptions = op.testOptions;</span>
+<span class="fc" id="L131">    this.op = op;</span>
+
+    // Construct UnknownWordModel by reflection -- a right pain
+    // Lexicons and UnknownWordModels aren't very well encapsulated
+    // from each other!
+
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">    if (op.lexOptions.uwModelTrainer == null) {</span>
+<span class="fc" id="L138">      this.uwModelTrainerClass = &quot;edu.stanford.nlp.parser.lexparser.BaseUnknownWordModelTrainer&quot;;</span>
+    } else {
+<span class="nc" id="L140">      this.uwModelTrainerClass = op.lexOptions.uwModelTrainer;</span>
+    }
+<span class="fc" id="L142">  }</span>
+
+  /**
+   * Checks whether a word is in the lexicon. This version will compile the
+   * lexicon into the rulesWithWord array, if that hasn't already happened
+   *
+   * @param word The word as an int index to an Index
+   * @return Whether the word is in the lexicon
+   */
+  @Override
+  public boolean isKnown(int word) {
+<span class="nc bnc" id="L153" title="All 6 branches missed.">    return (word &lt; rulesWithWord.length &amp;&amp; word &gt;= 0 &amp;&amp; !rulesWithWord[word].isEmpty());</span>
+  }
+
+  /**
+   * Checks whether a word is in the lexicon. This version works even while
+   * compiling lexicon with current counters (rather than using the compiled
+   * rulesWithWord array).
+   *
+   * TODO: The previous version would insert rules into the
+   * wordNumberer.  Is that the desired behavior?  Why not test in
+   * some way that doesn't affect the index?  For example, start by
+   * testing wordIndex.contains(word).
+   *
+   * @param word The word as a String
+   * @return Whether the word is in the lexicon
+   */
+  @Override
+  public boolean isKnown(String word) {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    if (!wordIndex.contains(word))</span>
+<span class="nc" id="L172">      return false;</span>
+<span class="nc" id="L173">    IntTaggedWord iW = new IntTaggedWord(wordIndex.indexOf(word), nullTag);</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">    return seenCounter.getCount(iW) &gt; 0.0;</span>
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public Set&lt;String&gt; tagSet(Function&lt;String,String&gt; basicCategoryFunction) {
+<span class="nc" id="L180">    Set&lt;String&gt; tagSet = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">    for (String tag : tagIndex.objectsList()) {</span>
+<span class="nc" id="L182">      tagSet.add(basicCategoryFunction.apply(tag));</span>
+<span class="nc" id="L183">    }</span>
+<span class="nc" id="L184">    return tagSet;</span>
+  }
+
+
+  /**
+   * Returns the possible POS taggings for a word.
+   *
+   * @param word The word, represented as an integer in wordIndex
+   * @param loc  The position of the word in the sentence (counting from 0).
+   *          &lt;i&gt;Implementation note: The BaseLexicon class doesn't actually
+   *          make use of this position information.&lt;/i&gt;
+   * @return An Iterator over a List ofIntTaggedWords, which pair the word with
+   *         possible taggings as integer pairs. (Each can be thought of as a
+   *         &lt;code&gt;tag -&amp;gt; word&lt;code&gt; rule.)
+   */
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(String word, int loc) {
+<span class="nc" id="L200">    return ruleIteratorByWord(wordIndex.addToIndex(word), loc, null);</span>
+  }
+
+  /** Generate the possible taggings for a word at a sentence position.
+   *  This may either be based on a strict lexicon or an expanded generous
+   *  set of possible taggings. &lt;p&gt;
+   *  &lt;i&gt;Implementation note:&lt;/i&gt; Expanded sets of possible taggings are
+   *  calculated dynamically at runtime, so as to reduce the memory used by
+   *  the lexicon (a space/time tradeoff).
+   *
+   *  @param word The word (as an int)
+   * @param loc  Its index in the sentence (usually only relevant for unknown words)
+   *  @return A list of possible taggings
+   */
+  @Override
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(int word, int loc, String featureSpec) {
+    // if (rulesWithWord == null) { // tested in isKnown already
+    // initRulesWithWord();
+    // }
+    List&lt;IntTaggedWord&gt; wordTaggings;
+<span class="nc bnc" id="L220" title="All 2 branches missed.">    if (isKnown(word)) {</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      if ( ! flexiTag) {</span>
+        // Strict lexical tagging for seen items
+<span class="nc" id="L223">        wordTaggings = rulesWithWord[word];</span>
+      } else {
+        /* Allow all tags with same basicCategory */
+        /* Allow all scored taggings, unless very common */
+<span class="nc" id="L227">        IntTaggedWord iW = new IntTaggedWord(word, nullTag);</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (seenCounter.getCount(iW) &gt; smoothInUnknownsThreshold) {</span>
+<span class="nc" id="L229">          return rulesWithWord[word].iterator();</span>
+        } else {
+          // give it flexible tagging not just lexicon
+<span class="nc" id="L232">          wordTaggings = new ArrayList&lt;&gt;(40);</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">          for (IntTaggedWord iTW2 : tags) {</span>
+<span class="nc" id="L234">            IntTaggedWord iTW = new IntTaggedWord(word, iTW2.tag);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (score(iTW, loc, wordIndex.get(word), null) &gt; Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L236">              wordTaggings.add(iTW);</span>
+            }
+<span class="nc" id="L238">          }</span>
+        }
+<span class="nc" id="L240">      }</span>
+    } else {
+      // we copy list so we can insert correct word in each item
+<span class="nc" id="L243">      wordTaggings = new ArrayList&lt;&gt;(40);</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">      for (IntTaggedWord iTW : rulesWithWord[wordIndex.indexOf(UNKNOWN_WORD)]) {</span>
+<span class="nc" id="L245">        wordTaggings.add(new IntTaggedWord(word, iTW.tag));</span>
+<span class="nc" id="L246">      }</span>
+    }
+    if (DEBUG_LEXICON) {
+      EncodingPrintWriter.err.println(&quot;Lexicon: &quot; + wordIndex.get(word) + &quot; (&quot; +
+              (isKnown(word) ? &quot;known&quot;: &quot;unknown&quot;) + &quot;, loc=&quot; + loc + &quot;, n=&quot; +
+              (isKnown(word) ? word: wordIndex.indexOf(UNKNOWN_WORD)) + &quot;) &quot; +
+              (flexiTag ? &quot;flexi&quot;: &quot;lexicon&quot;) + &quot; taggings: &quot; + wordTaggings, &quot;UTF-8&quot;);
+    }
+<span class="nc" id="L254">    return wordTaggings.iterator();</span>
+ }
+
+  @Override
+  public Iterator&lt;IntTaggedWord&gt; ruleIteratorByWord(String word, int loc, String featureSpec) {
+<span class="nc" id="L259">    return ruleIteratorByWord(wordIndex.addToIndex(word), loc, featureSpec);</span>
+  }
+
+  protected void initRulesWithWord() {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    if (testOptions.verbose || DEBUG_LEXICON) {</span>
+<span class="nc" id="L264">      log.info(&quot;Initializing lexicon scores ... &quot;);</span>
+    }
+    // int numWords = words.size()+sigs.size()+1;
+<span class="nc" id="L267">    int unkWord = wordIndex.addToIndex(UNKNOWN_WORD);</span>
+<span class="nc" id="L268">    int numWords = wordIndex.size();</span>
+<span class="nc" id="L269">    rulesWithWord = new List[numWords];</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    for (int w = 0; w &lt; numWords; w++) {</span>
+<span class="nc" id="L271">      rulesWithWord[w] = new ArrayList&lt;&gt;(1); // most have 1 or 2</span>
+                                                          // items in them
+    }
+    // for (Iterator ruleI = rules.iterator(); ruleI.hasNext();) {
+<span class="nc" id="L275">    tags = Generics.newHashSet();</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">    for (IntTaggedWord iTW : seenCounter.keySet()) {</span>
+<span class="nc bnc" id="L277" title="All 4 branches missed.">      if (iTW.word() == nullWord &amp;&amp; iTW.tag() != nullTag) {</span>
+<span class="nc" id="L278">        tags.add(iTW);</span>
+      }
+<span class="nc" id="L280">    }</span>
+
+    // tags for unknown words
+    if (DEBUG_LEXICON) {
+      log.info(&quot;Lexicon initializing tags for UNKNOWN WORD (&quot; +
+                         Lexicon.UNKNOWN_WORD + &quot;, &quot; + unkWord + ')');
+    }
+    if (DEBUG_LEXICON) log.info(&quot;unSeenCounter is: &quot; + uwModel.unSeenCounter());
+    if (DEBUG_LEXICON) log.info(&quot;Train.openClassTypesThreshold is &quot; + trainOptions.openClassTypesThreshold);
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    for (IntTaggedWord iT : tags) {</span>
+      if (DEBUG_LEXICON) log.info(&quot;Entry for &quot; + iT + &quot; is &quot; + uwModel.unSeenCounter().getCount(iT));
+<span class="nc" id="L291">      double types = uwModel.unSeenCounter().getCount(iT);</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">      if (types &gt; trainOptions.openClassTypesThreshold) {</span>
+        // Number of types before it's treated as open class
+<span class="nc" id="L294">        IntTaggedWord iTW = new IntTaggedWord(unkWord, iT.tag);</span>
+<span class="nc" id="L295">        rulesWithWord[iTW.word].add(iTW);</span>
+      }
+<span class="nc" id="L297">    }</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">    if (testOptions.verbose || DEBUG_LEXICON) {</span>
+<span class="nc" id="L299">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L300">      sb.append(&quot;The &quot;).append(rulesWithWord[unkWord].size()).append(&quot; open class tags are: [&quot;);</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">      for (IntTaggedWord item : rulesWithWord[unkWord]) {</span>
+<span class="nc" id="L302">        sb.append(' ').append(tagIndex.get(item.tag()));</span>
+        if (DEBUG_LEXICON) {
+          IntTaggedWord iTprint = new IntTaggedWord(nullWord, item.tag);
+          sb.append(&quot; (tag &quot;).append(item.tag()).append(&quot;, type count is &quot;);
+          sb.append(uwModel.unSeenCounter().getCount(iTprint)).append(')');
+        }
+<span class="nc" id="L308">      }</span>
+<span class="nc" id="L309">      sb.append(&quot; ]&quot;);</span>
+<span class="nc" id="L310">      log.info(sb.toString());</span>
+    }
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    for (IntTaggedWord iTW : seenCounter.keySet()) {</span>
+<span class="nc bnc" id="L314" title="All 4 branches missed.">      if (iTW.tag() != nullTag &amp;&amp; iTW.word() != nullWord) {</span>
+<span class="nc" id="L315">        rulesWithWord[iTW.word].add(iTW);</span>
+      }
+<span class="nc" id="L317">    }</span>
+<span class="nc" id="L318">  }</span>
+
+
+  protected List&lt;IntTaggedWord&gt; treeToEvents(Tree tree) {
+<span class="nc" id="L322">    List&lt;TaggedWord&gt; taggedWords = tree.taggedYield();</span>
+<span class="nc" id="L323">    return listToEvents(taggedWords);</span>
+  }
+
+  protected List&lt;IntTaggedWord&gt; listToEvents(List&lt;TaggedWord&gt; taggedWords) {
+<span class="nc" id="L327">    List&lt;IntTaggedWord&gt; itwList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    for (TaggedWord tw : taggedWords) {</span>
+<span class="nc" id="L329">      IntTaggedWord iTW = new IntTaggedWord(tw.word(), tw.tag(), wordIndex, tagIndex);</span>
+<span class="nc" id="L330">      itwList.add(iTW);</span>
+<span class="nc" id="L331">    }</span>
+<span class="nc" id="L332">    return itwList;</span>
+  }
+
+  /** Not yet implemented. */
+  public void addAll(List&lt;TaggedWord&gt; tagWords) {
+<span class="nc" id="L337">    addAll(tagWords, 1.0);</span>
+<span class="nc" id="L338">  }</span>
+
+  /** Not yet implemented. */
+  public void addAll(List&lt;TaggedWord&gt; taggedWords, double weight) {
+<span class="nc" id="L342">    List&lt;IntTaggedWord&gt; tagWords = listToEvents(taggedWords);</span>
+<span class="nc" id="L343">  }</span>
+
+  /** Not yet implemented. */
+  public void trainWithExpansion(Collection&lt;TaggedWord&gt; taggedWords) {
+<span class="nc" id="L347">  }</span>
+
+  @Override
+  public void initializeTraining(double numTrees) {
+<span class="nc" id="L351">    this.uwModelTrainer =</span>
+<span class="nc" id="L352">      ReflectionLoading.loadByReflection(uwModelTrainerClass);</span>
+<span class="nc" id="L353">    uwModelTrainer.initializeTraining(op, this, wordIndex, tagIndex,</span>
+                                      numTrees);
+<span class="nc" id="L355">  }</span>
+
+  /**
+   * Trains this lexicon on the Collection of trees.
+   */
+  @Override
+  public void train(Collection&lt;Tree&gt; trees) {
+<span class="nc" id="L362">    train(trees, 1.0);</span>
+<span class="nc" id="L363">  }</span>
+
+  /**
+   * Trains this lexicon on the Collection of trees.
+   * Also trains the unknown word model pointed to by this lexicon.
+   */
+  @Override
+  public void train(Collection&lt;Tree&gt; trees, double weight) {
+    // scan data
+<span class="nc bnc" id="L372" title="All 2 branches missed.">    for (Tree tree : trees) {</span>
+<span class="nc" id="L373">      train(tree, weight);</span>
+<span class="nc" id="L374">    }</span>
+<span class="nc" id="L375">  }</span>
+
+  @Override
+  public void train(Tree tree, double weight) {
+<span class="nc" id="L379">    train(tree.taggedYield(), weight);</span>
+<span class="nc" id="L380">  }</span>
+
+  @Override
+  public final void train(List&lt;TaggedWord&gt; sentence, double weight) {
+<span class="nc" id="L384">    uwModelTrainer.incrementTreesRead(weight);</span>
+<span class="nc" id="L385">    int loc = 0;</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">    for (TaggedWord tw : sentence) {</span>
+<span class="nc" id="L387">      train(tw, loc, weight);</span>
+<span class="nc" id="L388">      ++loc;</span>
+<span class="nc" id="L389">    }</span>
+<span class="nc" id="L390">  }</span>
+
+  @Override
+  public final void incrementTreesRead(double weight) {
+<span class="nc" id="L394">    uwModelTrainer.incrementTreesRead(weight);</span>
+<span class="nc" id="L395">  }</span>
+
+  @Override
+  public final void trainUnannotated(List&lt;TaggedWord&gt; sentence,
+                                     double weight) {
+<span class="nc" id="L400">    uwModelTrainer.incrementTreesRead(weight);</span>
+<span class="nc" id="L401">    int loc = 0;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">    for (TaggedWord tw : sentence) {</span>
+<span class="nc" id="L403">      String baseTag = op.langpack().basicCategory(tw.tag());</span>
+<span class="nc" id="L404">      Counter&lt;String&gt; counts = baseTagCounts.get(baseTag);</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">      if (counts == null) {</span>
+<span class="nc" id="L406">        ++loc;</span>
+<span class="nc" id="L407">        continue;</span>
+      }
+<span class="nc" id="L409">      double totalCount = counts.totalCount();</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">      if (totalCount == 0) {</span>
+<span class="nc" id="L411">        ++loc;</span>
+<span class="nc" id="L412">        continue;</span>
+      }
+<span class="nc bnc" id="L414" title="All 2 branches missed.">      for (String tag : counts.keySet()) {</span>
+<span class="nc" id="L415">        TaggedWord newTW = new TaggedWord(tw.word(), tag);</span>
+<span class="nc" id="L416">        train(newTW, loc, weight * counts.getCount(tag) / totalCount);</span>
+<span class="nc" id="L417">      }</span>
+<span class="nc" id="L418">      ++loc;</span>
+<span class="nc" id="L419">    }</span>
+<span class="nc" id="L420">  }</span>
+
+  @Override
+  public void train(TaggedWord tw, int loc, double weight) {
+<span class="nc" id="L424">    uwModelTrainer.train(tw, loc, weight);</span>
+
+<span class="nc" id="L426">    IntTaggedWord iTW =</span>
+<span class="nc" id="L427">      new IntTaggedWord(tw.word(), tw.tag(), wordIndex, tagIndex);</span>
+<span class="nc" id="L428">    seenCounter.incrementCount(iTW, weight);</span>
+<span class="nc" id="L429">    IntTaggedWord iT = new IntTaggedWord(nullWord, iTW.tag);</span>
+<span class="nc" id="L430">    seenCounter.incrementCount(iT, weight);</span>
+<span class="nc" id="L431">    IntTaggedWord iW = new IntTaggedWord(iTW.word, nullTag);</span>
+<span class="nc" id="L432">    seenCounter.incrementCount(iW, weight);</span>
+<span class="nc" id="L433">    IntTaggedWord i = new IntTaggedWord(nullWord, nullTag);</span>
+<span class="nc" id="L434">    seenCounter.incrementCount(i, weight);</span>
+    // rules.add(iTW);
+<span class="nc" id="L436">    tags.add(iT);</span>
+<span class="nc" id="L437">    words.add(iW);</span>
+
+<span class="nc" id="L439">    String tag = tw.tag();</span>
+<span class="nc" id="L440">    String baseTag = op.langpack().basicCategory(tag);</span>
+
+<span class="nc" id="L442">    Counter&lt;String&gt; counts = baseTagCounts.get(baseTag);</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">    if (counts == null) {</span>
+<span class="nc" id="L444">      counts = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L445">      baseTagCounts.put(baseTag, counts);</span>
+    }
+<span class="nc" id="L447">    counts.incrementCount(tag, weight);</span>
+<span class="nc" id="L448">  }</span>
+
+  @Override
+  public void finishTraining() {
+<span class="nc" id="L452">    uwModel = uwModelTrainer.finishTraining();</span>
+
+<span class="nc" id="L454">    tune();</span>
+
+    // index the possible tags for each word
+<span class="nc" id="L457">    initRulesWithWord();</span>
+
+    if (DEBUG_LEXICON) {
+      printLexStats();
+    }
+<span class="nc" id="L462">  }</span>
+
+  /**
+   * Adds the tagging with count to the data structures in this Lexicon.
+   */
+  protected void addTagging(boolean seen, IntTaggedWord itw, double count) {
+<span class="nc bnc" id="L468" title="All 2 branches missed.">    if (seen) {</span>
+<span class="nc" id="L469">      seenCounter.incrementCount(itw, count);</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">      if (itw.tag() == nullTag) {</span>
+<span class="nc" id="L471">        words.add(itw);</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">      } else if (itw.word() == nullWord) {</span>
+<span class="nc" id="L473">        tags.add(itw);</span>
+      } else {
+        // rules.add(itw);
+      }
+    } else {
+<span class="nc" id="L478">      uwModel.addTagging(seen, itw, count);</span>
+      // if (itw.tag() == nullTag) {
+      // sigs.add(itw);
+      // }
+    }
+<span class="nc" id="L483">  }</span>
+
+
+
+  /**
+   * This records how likely it is for a word with one tag to also have another
+   * tag. This won't work after serialization/deserialization, but that is how
+   * it is currently called....
+   */
+  void buildPT_T() {
+<span class="nc" id="L493">    int numTags = tagIndex.size();</span>
+<span class="nc" id="L494">    m_TT = new double[numTags][numTags];</span>
+<span class="nc" id="L495">    m_T = new double[numTags];</span>
+<span class="nc" id="L496">    double[] tmp = new double[numTags];</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">    for (IntTaggedWord word : words) {</span>
+<span class="nc" id="L498">      double tot = 0.0;</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">      for (int t = 0; t &lt; numTags; t++) {</span>
+<span class="nc" id="L500">        IntTaggedWord iTW = new IntTaggedWord(word.word, t);</span>
+<span class="nc" id="L501">        tmp[t] = seenCounter.getCount(iTW);</span>
+<span class="nc" id="L502">        tot += tmp[t];</span>
+      }
+<span class="nc bnc" id="L504" title="All 2 branches missed.">      if (tot &lt; 10) {</span>
+<span class="nc" id="L505">        continue;</span>
+      }
+<span class="nc bnc" id="L507" title="All 2 branches missed.">      for (int t = 0; t &lt; numTags; t++) {</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">        for (int t2 = 0; t2 &lt; numTags; t2++) {</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">          if (tmp[t2] &gt; 0.0) {</span>
+<span class="nc" id="L510">            double c = tmp[t] / tot;</span>
+<span class="nc" id="L511">            m_T[t] += c;</span>
+<span class="nc" id="L512">            m_TT[t2][t] += c;</span>
+          }
+        }
+      }
+<span class="nc" id="L516">    }</span>
+<span class="nc" id="L517">  }</span>
+
+
+  /**
+   * Get the score of this word with this tag (as an IntTaggedWord) at this
+   * location. (Presumably an estimate of P(word | tag).)
+   * &lt;p&gt;
+   * &lt;i&gt;Implementation documentation:&lt;/i&gt;
+   * Seen:
+   * c_W = count(W)      c_TW = count(T,W)
+   * c_T = count(T)      c_Tunseen = count(T) among new words in 2nd half
+   * total = count(seen words)   totalUnseen = count(&quot;unseen&quot; words)
+   * p_T_U = Pmle(T|&quot;unseen&quot;)
+   * pb_T_W = P(T|W). If (c_W &amp;gt; smoothInUnknownsThreshold) = c_TW/c_W
+   * Else (if not smart mutation) pb_T_W = bayes prior smooth[1] with p_T_U
+   * p_T= Pmle(T)          p_W = Pmle(W)
+   * pb_W_T = log(pb_T_W * p_W / p_T) [Bayes rule]
+   * Note that this doesn't really properly reserve mass to unknowns.
+   *
+   * Unseen:
+   * c_TS = count(T,Sig|Unseen)      c_S = count(Sig)   c_T = count(T|Unseen)
+   * c_U = totalUnseen above
+   * p_T_U = Pmle(T|Unseen)
+   * pb_T_S = Bayes smooth of Pmle(T|S) with P(T|Unseen) [smooth[0]]
+   * pb_W_T = log(P(W|T)) inverted
+   *
+   * @param iTW An IntTaggedWord pairing a word and POS tag
+   * @param loc The position in the sentence. &lt;i&gt;In the default implementation
+   *          this is used only for unknown words to change their probability
+   *          distribution when sentence initial&lt;/i&gt;
+   * @return A float score, usually, log P(word|tag)
+   */
+  @Override
+  public float score(IntTaggedWord iTW, int loc, String word, String featureSpec) {
+    // both actual
+<span class="nc" id="L552">    double c_TW = seenCounter.getCount(iTW);</span>
+    // double x_TW = xferCounter.getCount(iTW);
+
+<span class="nc" id="L555">    IntTaggedWord temp = new IntTaggedWord(iTW.word, nullTag);</span>
+    // word counts
+<span class="nc" id="L557">    double c_W = seenCounter.getCount(temp);</span>
+    // double x_W = xferCounter.getCount(temp);
+
+    // totals
+<span class="nc" id="L561">    double total = seenCounter.getCount(NULL_ITW);</span>
+<span class="nc" id="L562">    double totalUnseen = uwModel.unSeenCounter().getCount(NULL_ITW);</span>
+
+<span class="nc" id="L564">    temp = new IntTaggedWord(nullWord, iTW.tag);</span>
+    // tag counts
+<span class="nc" id="L566">    double c_T = seenCounter.getCount(temp);</span>
+<span class="nc" id="L567">    double c_Tunseen = uwModel.unSeenCounter().getCount(temp);</span>
+
+    double pb_W_T; // always set below
+
+    if (DEBUG_LEXICON) {
+      // dump info about last word
+      if (iTW.word != debugLastWord) {
+        if (debugLastWord &gt;= 0 &amp;&amp; debugPrefix != null) {
+          // the 2nd conjunct in test above handles older serialized files
+          EncodingPrintWriter.err.println(debugPrefix + debugProbs + debugNoProbs, &quot;UTF-8&quot;);
+        }
+      }
+    }
+
+<span class="nc bnc" id="L581" title="All 2 branches missed.">    boolean seen = (c_W &gt; 0.0);</span>
+
+<span class="nc bnc" id="L583" title="All 2 branches missed.">    if (seen) {</span>
+
+      // known word model for P(T|W)
+      if (DEBUG_LEXICON_SCORE) {
+        log.info(&quot;Lexicon.score &quot; + wordIndex.get(iTW.word) + &quot;/&quot; + tagIndex.get(iTW.tag) + &quot; as known word.&quot;);
+      }
+
+      // c_TW = Math.sqrt(c_TW); [cdm: funny math scaling? dunno who played with this]
+      // c_TW += 0.5;
+
+      double p_T_U;
+<span class="nc bnc" id="L594" title="All 2 branches missed.">      if (useSignatureForKnownSmoothing) { // only works for English currently</span>
+<span class="nc" id="L595">        p_T_U = getUnknownWordModel().scoreProbTagGivenWordSignature(iTW, loc, smooth[0], word);</span>
+        if (DEBUG_LEXICON_SCORE) log.info(&quot;With useSignatureForKnownSmoothing, P(T|U) is &quot; + p_T_U + &quot; rather than &quot; + (c_Tunseen / totalUnseen));
+      } else {
+<span class="nc" id="L598">        p_T_U = c_Tunseen / totalUnseen;</span>
+      }
+      double pb_T_W; // always set below
+
+      if (DEBUG_LEXICON_SCORE) {
+        log.info(&quot;c_W is &quot; + c_W  + &quot; mle = &quot; + (c_TW/c_W)+ &quot; smoothInUnknownsThresh is &quot; +
+                smoothInUnknownsThreshold + &quot; base p_T_U is &quot; + c_Tunseen + &quot;/&quot; + totalUnseen + &quot; = &quot; + p_T_U);
+      }
+<span class="nc bnc" id="L606" title="All 6 branches missed.">      if (c_W &gt; smoothInUnknownsThreshold &amp;&amp; c_TW &gt; 0.0 &amp;&amp; c_W &gt; 0.0) {</span>
+        // we've seen the word enough times to have confidence in its tagging
+<span class="nc" id="L608">        pb_T_W = c_TW / c_W;</span>
+      } else {
+        // we haven't seen the word enough times to have confidence in its
+        // tagging
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (smartMutation) {</span>
+<span class="nc" id="L613">          int numTags = tagIndex.size();</span>
+<span class="nc bnc" id="L614" title="All 4 branches missed.">          if (m_TT == null || numTags != m_T.length) {</span>
+<span class="nc" id="L615">            buildPT_T();</span>
+          }
+<span class="nc" id="L617">          p_T_U *= 0.1;</span>
+          // System.out.println(&quot;Checking &quot;+iTW);
+<span class="nc bnc" id="L619" title="All 2 branches missed.">          for (int t = 0; t &lt; numTags; t++) {</span>
+<span class="nc" id="L620">            IntTaggedWord iTW2 = new IntTaggedWord(iTW.word, t);</span>
+<span class="nc" id="L621">            double p_T_W2 = seenCounter.getCount(iTW2) / c_W;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            if (p_T_W2 &gt; 0) {</span>
+              // System.out.println(&quot; Observation of &quot;+tagIndex.get(t)+&quot;
+              // (&quot;+seenCounter.getCount(iTW2)+&quot;) mutated to
+              // &quot;+tagIndex.get(iTW.tag)+&quot; at rate
+              // &quot;+(m_TT[tag][t]/m_T[t]));
+<span class="nc" id="L627">              p_T_U += p_T_W2 * m_TT[iTW.tag][t] / m_T[t] * 0.9;</span>
+            }
+          }
+        }
+        if (DEBUG_LEXICON_SCORE) {
+          log.info(&quot;c_TW = &quot; + c_TW + &quot; c_W = &quot; + c_W +
+                             &quot; p_T_U = &quot; + p_T_U);
+        }
+        // double pb_T_W = (c_TW+smooth[1]*x_TW)/(c_W+smooth[1]*x_W);
+<span class="nc" id="L636">        pb_T_W = (c_TW + smooth[1] * p_T_U) / (c_W + smooth[1]);</span>
+      }
+<span class="nc" id="L638">      double p_T = (c_T / total);</span>
+<span class="nc" id="L639">      double p_W = (c_W / total);</span>
+<span class="nc" id="L640">      pb_W_T = Math.log(pb_T_W * p_W / p_T);</span>
+
+      if (DEBUG_LEXICON) {
+        if (iTW.word != debugLastWord) {
+          debugLastWord = iTW.word;
+          debugLoc = loc;
+          debugProbs = new StringBuilder();
+          debugNoProbs = new StringBuilder(&quot;impossible: &quot;);
+          debugPrefix = &quot;Lexicon: &quot; + wordIndex.get(debugLastWord) + &quot; (known): &quot;;
+        }
+        if (pb_W_T &gt; Double.NEGATIVE_INFINITY) {
+          NumberFormat nf = NumberFormat.getNumberInstance();
+          nf.setMaximumFractionDigits(3);
+          debugProbs.append(tagIndex.get(iTW.tag) + &quot;: cTW=&quot; + c_TW + &quot; c_T=&quot; + c_T
+                  + &quot; pb_T_W=&quot; + nf.format(pb_T_W) + &quot; log pb_W_T=&quot; + nf.format(pb_W_T)
+                  + &quot;, &quot;);
+          // debugProbs.append(&quot;\n&quot; + &quot;smartMutation=&quot; + smartMutation + &quot;
+          // smoothInUnknownsThreshold=&quot; + smoothInUnknownsThreshold + &quot;
+          // smooth0=&quot; + smooth[0] + &quot;smooth1=&quot; + smooth[1] + &quot; p_T_U=&quot; + p_T_U
+          // + &quot; c_W=&quot; + c_W);
+        } else {
+          debugNoProbs.append(tagIndex.get(iTW.tag)).append(' ');
+        }
+      } // end if (DEBUG_LEXICON)
+
+<span class="nc" id="L665">    } else { // when unseen</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">      if (loc &gt;= 0) {</span>
+<span class="nc" id="L667">        pb_W_T = getUnknownWordModel().score(iTW, loc, c_T, total, smooth[0], word);</span>
+      } else {
+        // For negative we now do a weighted average for the dependency grammar :-)
+<span class="nc" id="L670">        double pb_W0_T = getUnknownWordModel().score(iTW, 0, c_T, total, smooth[0], word);</span>
+<span class="nc" id="L671">        double pb_W1_T = getUnknownWordModel().score(iTW, 1, c_T, total, smooth[0], word);</span>
+<span class="nc" id="L672">        pb_W_T = Math.log((Math.exp(pb_W0_T) + 2 * Math.exp(pb_W1_T))/3);</span>
+      }
+    }
+
+<span class="nc" id="L676">    String tag = tagIndex.get(iTW.tag());</span>
+
+    // Categorical cutoff if score is too low
+<span class="nc bnc" id="L679" title="All 2 branches missed.">    if (pb_W_T &gt; -100.0) {</span>
+<span class="nc" id="L680">      return (float) pb_W_T;</span>
+    }
+<span class="nc" id="L682">    return Float.NEGATIVE_INFINITY;</span>
+  } // end score()
+
+
+<span class="fc" id="L686">  private transient int debugLastWord = -1;</span>
+
+<span class="fc" id="L688">  private transient int debugLoc = -1;</span>
+
+  private transient StringBuilder debugProbs;
+
+  private transient StringBuilder debugNoProbs;
+
+  private transient String debugPrefix;
+
+  /**
+   * TODO: this used to actually score things based on the original trees
+   */
+  public final void tune() {
+<span class="nc" id="L700">    double bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L701">    double[] bestSmooth = { 0.0, 0.0 };</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">    for (smooth[0] = 1; smooth[0] &lt;= 1; smooth[0] *= 2.0) {// 64</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">      for (smooth[1] = 0.2; smooth[1] &lt;= 0.2; smooth[1] *= 2.0) {// 3</span>
+        // for (smooth[0]=0.5; smooth[0]&lt;=64; smooth[0] *= 2.0) {//64
+        // for (smooth[1]=0.1; smooth[1]&lt;=12.8; smooth[1] *= 2.0) {//3
+<span class="nc" id="L706">        double score = 0.0;</span>
+        // score = scoreAll(trees);
+<span class="nc bnc" id="L708" title="All 2 branches missed.">        if (testOptions.verbose) {</span>
+<span class="nc" id="L709">          log.info(&quot;Tuning lexicon: s0 &quot; + smooth[0] +</span>
+                             &quot; s1 &quot; + smooth[1] + &quot; is &quot; + score);
+        }
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if (score &gt; bestScore) {</span>
+<span class="nc" id="L713">          System.arraycopy(smooth, 0, bestSmooth, 0, smooth.length);</span>
+<span class="nc" id="L714">          bestScore = score;</span>
+        }
+      }
+    }
+<span class="nc" id="L718">    System.arraycopy(bestSmooth, 0, smooth, 0, bestSmooth.length);</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">    if (smartMutation) {</span>
+<span class="nc" id="L720">      smooth[0] = 8.0;</span>
+      // smooth[1] = 1.6;
+      // smooth[0] = 0.5;
+<span class="nc" id="L723">      smooth[1] = 0.1;</span>
+    }
+<span class="nc bnc" id="L725" title="All 2 branches missed.">    if (testOptions.unseenSmooth &gt; 0.0) {</span>
+<span class="nc" id="L726">      smooth[0] = testOptions.unseenSmooth;</span>
+    }
+<span class="nc bnc" id="L728" title="All 2 branches missed.">    if (testOptions.verbose) {</span>
+<span class="nc" id="L729">      log.info(&quot;Tuning selected smoothUnseen &quot; + smooth[0] + &quot; smoothSeen &quot; + smooth[1]</span>
+                         + &quot; at &quot; + bestScore);
+    }
+<span class="nc" id="L732">  }</span>
+
+  private void readObject(ObjectInputStream ois)
+    throws IOException, ClassNotFoundException
+  {
+<span class="nc" id="L737">    ois.defaultReadObject();</span>
+    // Reinitialize the transient objects.  This must be done here
+    // rather than lazily so that there is no race condition to
+    // reinitialize them later.
+<span class="nc" id="L741">    initRulesWithWord();</span>
+<span class="nc" id="L742">  }</span>
+
+  /**
+   * Populates data in this Lexicon from the character stream given by the
+   * Reader r.
+   * TODO: this doesn't appear to correctly read in the
+   * UnknownWordModel in the case of a model more complicated than the
+   * unSeenCounter
+   */
+  @Override
+  public void readData(BufferedReader in) throws IOException {
+<span class="nc" id="L753">    final String SEEN = &quot;SEEN&quot;;</span>
+    String line;
+<span class="nc" id="L755">    int lineNum = 1;</span>
+    // all lines have one tagging with raw count per line
+<span class="nc" id="L757">    line = in.readLine();</span>
+<span class="nc" id="L758">    Pattern p = Pattern.compile(&quot;^smooth\\[([0-9])\\] = (.*)$&quot;);</span>
+<span class="nc bnc" id="L759" title="All 4 branches missed.">    while (line != null &amp;&amp; line.length() &gt; 0) {</span>
+      try {
+<span class="nc" id="L761">        Matcher m = p.matcher(line);</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">        if (m.matches()) {</span>
+<span class="nc" id="L763">          int i = Integer.parseInt(m.group(1));</span>
+<span class="nc" id="L764">          smooth[i] = Double.parseDouble(m.group(2));</span>
+<span class="nc" id="L765">        } else {</span>
+          // split on spaces, quote with doublequote, and escape with backslash
+<span class="nc" id="L767">          String[] fields = StringUtils.splitOnCharWithQuoting(line, ' ', '\&quot;', '\\');</span>
+          // System.out.println(&quot;fields:\n&quot; + fields[0] + &quot;\n&quot; + fields[1] +
+          // &quot;\n&quot; + fields[2] + &quot;\n&quot; + fields[3] + &quot;\n&quot; + fields[4]);
+<span class="nc" id="L770">          boolean seen = fields[3].equals(SEEN);</span>
+<span class="nc" id="L771">          addTagging(seen, new IntTaggedWord(fields[2], fields[0], wordIndex, tagIndex), Double.parseDouble(fields[4]));</span>
+        }
+<span class="nc" id="L773">      } catch (RuntimeException e) {</span>
+<span class="nc" id="L774">        throw new IOException(&quot;Error on line &quot; + lineNum + &quot;: &quot; + line, e);</span>
+<span class="nc" id="L775">      }</span>
+<span class="nc" id="L776">      lineNum++;</span>
+<span class="nc" id="L777">      line = in.readLine();</span>
+    }
+<span class="nc" id="L779">    initRulesWithWord();</span>
+<span class="nc" id="L780">  }</span>
+
+  /**
+   * Writes out data from this Object to the Writer w. Rules are separated by
+   * newline, and rule elements are delimited by \t.
+   */
+  @Override
+  public void writeData(Writer w) throws IOException {
+<span class="nc" id="L788">    PrintWriter out = new PrintWriter(w);</span>
+
+<span class="nc bnc" id="L790" title="All 2 branches missed.">    for (IntTaggedWord itw : seenCounter.keySet()) {</span>
+<span class="nc" id="L791">      out.println(itw.toLexicalEntry(wordIndex, tagIndex) + &quot; SEEN &quot; + seenCounter.getCount(itw));</span>
+<span class="nc" id="L792">    }</span>
+<span class="nc bnc" id="L793" title="All 2 branches missed.">    for (IntTaggedWord itw : getUnknownWordModel().unSeenCounter().keySet()) {</span>
+<span class="nc" id="L794">      out.println(itw.toLexicalEntry(wordIndex, tagIndex) + &quot; UNSEEN &quot; + getUnknownWordModel().unSeenCounter().getCount(itw));</span>
+<span class="nc" id="L795">    }</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">    for (int i = 0; i &lt; smooth.length; i++) {</span>
+<span class="nc" id="L797">      out.println(&quot;smooth[&quot; + i + &quot;] = &quot; + smooth[i]);</span>
+    }
+<span class="nc" id="L799">    out.flush();</span>
+<span class="nc" id="L800">  }</span>
+
+  /** Returns the number of rules (tag rewrites as word) in the Lexicon.
+   *  This method assumes that the lexicon has been initialized.
+   */
+  @Override
+  public int numRules() {
+<span class="nc" id="L807">    int accumulated = 0;</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">    for (List&lt;IntTaggedWord&gt; lis : rulesWithWord) {</span>
+<span class="nc" id="L809">      accumulated += lis.size();</span>
+    }
+<span class="nc" id="L811">    return accumulated;</span>
+  }
+
+
+  private static final int STATS_BINS = 15;
+
+
+  protected static void examineIntersection(Set&lt;String&gt; s1, Set&lt;String&gt; s2) {
+<span class="nc" id="L819">    Set&lt;String&gt; knownTypes = Generics.newHashSet(s1);</span>
+<span class="nc" id="L820">    knownTypes.retainAll(s2);</span>
+<span class="nc bnc" id="L821" title="All 2 branches missed.">    if (knownTypes.size() != 0) {</span>
+<span class="nc" id="L822">      System.err.printf(&quot;|intersect|: %d%n&quot;, knownTypes.size());</span>
+<span class="nc bnc" id="L823" title="All 2 branches missed.">      for (String word : knownTypes) {</span>
+<span class="nc" id="L824">        log.info(word + &quot; &quot;);</span>
+<span class="nc" id="L825">      }</span>
+<span class="nc" id="L826">      log.info();</span>
+    }
+<span class="nc" id="L828">  }</span>
+
+  /** Print some statistics about this lexicon. */
+  public void printLexStats() {
+<span class="nc" id="L832">    System.out.println(&quot;BaseLexicon statistics&quot;);</span>
+<span class="nc" id="L833">    System.out.println(&quot;unknownLevel is &quot; + getUnknownWordModel().getUnknownLevel());</span>
+    // System.out.println(&quot;Rules size: &quot; + rules.size());
+<span class="nc" id="L835">    System.out.println(&quot;Sum of rulesWithWord: &quot; + numRules());</span>
+<span class="nc" id="L836">    System.out.println(&quot;Tags size: &quot; + tags.size());</span>
+<span class="nc" id="L837">    int wsize = words.size();</span>
+<span class="nc" id="L838">    System.out.println(&quot;Words size: &quot; + wsize);</span>
+    // System.out.println(&quot;Unseen Sigs size: &quot; + sigs.size() +
+    // &quot; [number of unknown equivalence classes]&quot;);
+<span class="nc" id="L841">    System.out.println(&quot;rulesWithWord length: &quot; + rulesWithWord.length</span>
+                       + &quot; [should be sum of words + unknown sigs]&quot;);
+<span class="nc" id="L843">    int[] lengths = new int[STATS_BINS];</span>
+<span class="nc" id="L844">    ArrayList&lt;String&gt;[] wArr = new ArrayList[STATS_BINS];</span>
+<span class="nc bnc" id="L845" title="All 2 branches missed.">    for (int j = 0; j &lt; STATS_BINS; j++) {</span>
+<span class="nc" id="L846">      wArr[j] = new ArrayList&lt;&gt;();</span>
+    }
+<span class="nc bnc" id="L848" title="All 2 branches missed.">    for (int i = 0; i &lt; rulesWithWord.length; i++) {</span>
+<span class="nc" id="L849">      int num = rulesWithWord[i].size();</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">      if (num &gt; STATS_BINS - 1) {</span>
+<span class="nc" id="L851">        num = STATS_BINS - 1;</span>
+      }
+<span class="nc" id="L853">      lengths[num]++;</span>
+<span class="nc bnc" id="L854" title="All 4 branches missed.">      if (wsize &lt;= 20 || num &gt;= STATS_BINS / 2) {</span>
+<span class="nc" id="L855">        wArr[num].add(wordIndex.get(i));</span>
+      }
+    }
+<span class="nc" id="L858">    System.out.println(&quot;Stats on how many taggings for how many words&quot;);</span>
+<span class="nc bnc" id="L859" title="All 2 branches missed.">    for (int j = 0; j &lt; STATS_BINS; j++) {</span>
+<span class="nc" id="L860">      System.out.print(j + &quot; taggings: &quot; + lengths[j] + &quot; words &quot;);</span>
+<span class="nc bnc" id="L861" title="All 4 branches missed.">      if (wsize &lt;= 20 || j &gt;= STATS_BINS / 2) {</span>
+<span class="nc" id="L862">        System.out.print(wArr[j]);</span>
+      }
+<span class="nc" id="L864">      System.out.println();</span>
+    }
+<span class="nc" id="L866">    NumberFormat nf = NumberFormat.getNumberInstance();</span>
+<span class="nc" id="L867">    nf.setMaximumFractionDigits(0);</span>
+<span class="nc" id="L868">    System.out.println(&quot;Unseen counter: &quot; + Counters.toString(uwModel.unSeenCounter(), nf));</span>
+
+<span class="nc bnc" id="L870" title="All 4 branches missed.">    if (wsize &lt; 50 &amp;&amp; tags.size() &lt; 10) {</span>
+<span class="nc" id="L871">      nf.setMaximumFractionDigits(3);</span>
+<span class="nc" id="L872">      StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L873">      PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc" id="L874">      pw.println(&quot;Tagging probabilities log P(word|tag)&quot;);</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">      for (int t = 0; t &lt; tags.size(); t++) {</span>
+<span class="nc" id="L876">        pw.print('\t');</span>
+<span class="nc" id="L877">        pw.print(tagIndex.get(t));</span>
+      }
+<span class="nc" id="L879">      pw.println();</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">      for (int w = 0; w &lt; wsize; w++) {</span>
+<span class="nc" id="L881">        pw.print(wordIndex.get(w));</span>
+<span class="nc" id="L882">        pw.print('\t');</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">        for (int t = 0; t &lt; tags.size(); t++) {</span>
+<span class="nc" id="L884">          IntTaggedWord iTW = new IntTaggedWord(w, t);</span>
+<span class="nc" id="L885">          pw.print(nf.format(score(iTW, 1, wordIndex.get(w), null)));</span>
+<span class="nc bnc" id="L886" title="All 2 branches missed.">          if (t == tags.size() -1) {</span>
+<span class="nc" id="L887">            pw.println();</span>
+          } else
+<span class="nc" id="L889">            pw.print('\t');</span>
+        }
+      }
+<span class="nc" id="L892">      pw.close();</span>
+<span class="nc" id="L893">      System.out.println(sw.toString());</span>
+    }
+<span class="nc" id="L895">  }</span>
+
+  /**
+   * Evaluates how many words (= terminals) in a collection of trees are
+   * covered by the lexicon. First arg is the collection of trees; second
+   * through fourth args get the results. Currently unused; this probably
+   * only works if train and test at same time so tags and words variables
+   * are initialized.
+   */
+  public double evaluateCoverage(Collection&lt;Tree&gt; trees, Set&lt;String&gt; missingWords,
+                                 Set&lt;String&gt; missingTags, Set&lt;IntTaggedWord&gt; missingTW) {
+
+<span class="nc" id="L907">    List&lt;IntTaggedWord&gt; iTW1 = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L908" title="All 2 branches missed.">    for (Tree t : trees) {</span>
+<span class="nc" id="L909">      iTW1.addAll(treeToEvents(t));</span>
+<span class="nc" id="L910">    }</span>
+
+<span class="nc" id="L912">    int total = 0;</span>
+<span class="nc" id="L913">    int unseen = 0;</span>
+
+<span class="nc bnc" id="L915" title="All 2 branches missed.">    for (IntTaggedWord itw : iTW1) {</span>
+<span class="nc" id="L916">      total++;</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">      if (!words.contains(new IntTaggedWord(itw.word(), nullTag))) {</span>
+<span class="nc" id="L918">        missingWords.add(wordIndex.get(itw.word()));</span>
+      }
+<span class="nc bnc" id="L920" title="All 2 branches missed.">      if (!tags.contains(new IntTaggedWord(nullWord, itw.tag()))) {</span>
+<span class="nc" id="L921">        missingTags.add(tagIndex.get(itw.tag()));</span>
+      }
+      // if (!rules.contains(itw)) {
+<span class="nc bnc" id="L924" title="All 2 branches missed.">      if (seenCounter.getCount(itw) == 0.0) {</span>
+<span class="nc" id="L925">        unseen++;</span>
+<span class="nc" id="L926">        missingTW.add(itw);</span>
+      }
+<span class="nc" id="L928">    }</span>
+<span class="nc" id="L929">    return (double) unseen / total;</span>
+  }
+
+<span class="fc" id="L932">  int[] tagsToBaseTags = null;</span>
+
+  public int getBaseTag(int tag, TreebankLanguagePack tlp) {
+<span class="nc bnc" id="L935" title="All 2 branches missed.">    if (tagsToBaseTags == null) {</span>
+<span class="nc" id="L936">      populateTagsToBaseTags(tlp);</span>
+    }
+<span class="nc" id="L938">    return tagsToBaseTags[tag];</span>
+  }
+
+  private void populateTagsToBaseTags(TreebankLanguagePack tlp) {
+<span class="nc" id="L942">    int total = tagIndex.size();</span>
+<span class="nc" id="L943">    tagsToBaseTags = new int[total];</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">    for (int i = 0; i &lt; total; i++) {</span>
+<span class="nc" id="L945">      String tag = tagIndex.get(i);</span>
+<span class="nc" id="L946">      String baseTag = tlp.basicCategory(tag);</span>
+<span class="nc" id="L947">      int j = tagIndex.addToIndex(baseTag);</span>
+<span class="nc" id="L948">      tagsToBaseTags[i] = j;</span>
+    }
+<span class="nc" id="L950">  }</span>
+
+  /** Provides some testing and opportunities for exploration of the
+   *  probabilities of a BaseLexicon.  What's here currently probably
+   *  only works for the English Penn Treeebank, as it uses default
+   *  constructors.  Of the words given to test on,
+   *  the first is treated as sentence initial, and the rest as not
+   *  sentence initial.
+   *
+   *  @param args The command line arguments:
+   *     java BaseLexicon treebankPath fileRange unknownWordModel words*
+   */
+  public static void main(String[] args) {
+<span class="nc bnc" id="L963" title="All 2 branches missed.">    if (args.length &lt; 3) {</span>
+<span class="nc" id="L964">      log.info(&quot;java BaseLexicon treebankPath fileRange unknownWordModel words*&quot;);</span>
+<span class="nc" id="L965">      return;</span>
+    }
+<span class="nc" id="L967">    System.out.print(&quot;Training BaseLexicon from &quot; + args[0] + ' ' + args[1] + &quot; ... &quot;);</span>
+<span class="nc" id="L968">    Treebank tb = new DiskTreebank();</span>
+<span class="nc" id="L969">    tb.loadPath(args[0], new NumberRangesFileFilter(args[1], true));</span>
+    // TODO: change this interface so the lexicon creates its own indices?
+<span class="nc" id="L971">    Index&lt;String&gt; wordIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L972">    Index&lt;String&gt; tagIndex = new HashIndex&lt;&gt;();</span>
+<span class="nc" id="L973">    Options op = new Options();</span>
+<span class="nc" id="L974">    op.lexOptions.useUnknownWordSignatures = Integer.parseInt(args[2]);</span>
+<span class="nc" id="L975">    BaseLexicon lex = new BaseLexicon(op, wordIndex, tagIndex);</span>
+<span class="nc" id="L976">    lex.initializeTraining(tb.size());</span>
+<span class="nc" id="L977">    lex.train(tb);</span>
+<span class="nc" id="L978">    lex.finishTraining();</span>
+<span class="nc" id="L979">    System.out.println(&quot;done.&quot;);</span>
+<span class="nc" id="L980">    System.out.println();</span>
+<span class="nc" id="L981">    NumberFormat nf = NumberFormat.getNumberInstance();</span>
+<span class="nc" id="L982">    nf.setMaximumFractionDigits(4);</span>
+<span class="nc" id="L983">    List&lt;String&gt; impos = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L984" title="All 2 branches missed.">    for (int i = 3; i &lt; args.length; i++) {</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">      if (lex.isKnown(args[i])) {</span>
+<span class="nc" id="L986">        System.out.println(args[i] + &quot; is a known word.  Log probabilities [log P(w|t)] for its taggings are:&quot;);</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">        for (Iterator&lt;IntTaggedWord&gt; it = lex.ruleIteratorByWord(wordIndex.addToIndex(args[i]), i - 3, null); it.hasNext(); ) {</span>
+<span class="nc" id="L988">          IntTaggedWord iTW = it.next();</span>
+<span class="nc" id="L989">          System.out.println(StringUtils.pad(iTW, 24) + nf.format(lex.score(iTW, i - 3, wordIndex.get(iTW.word), null)));</span>
+<span class="nc" id="L990">        }</span>
+      } else {
+<span class="nc" id="L992">        String sig = lex.getUnknownWordModel().getSignature(args[i], i-3);</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        System.out.println(args[i] + &quot; is an unknown word.  Signature with uwm &quot; + lex.getUnknownWordModel().getUnknownLevel() + ((i == 3) ? &quot; init&quot;: &quot;non-init&quot;) + &quot; is: &quot; + sig);</span>
+<span class="nc" id="L994">        impos.clear();</span>
+<span class="nc" id="L995">        List&lt;String&gt; lis = new ArrayList&lt;&gt;(tagIndex.objectsList());</span>
+<span class="nc" id="L996">        Collections.sort(lis);</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">        for (String tStr : lis) {</span>
+<span class="nc" id="L998">          IntTaggedWord iTW = new IntTaggedWord(args[i], tStr, wordIndex, tagIndex);</span>
+<span class="nc" id="L999">          double score = lex.score(iTW, 1, args[i], null);</span>
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">          if (score == Float.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L1001">            impos.add(tStr);</span>
+          } else {
+<span class="nc" id="L1003">            System.out.println(StringUtils.pad(iTW, 24) + nf.format(score));</span>
+          }
+<span class="nc" id="L1005">        }</span>
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">        if (impos.size() &gt; 0) {</span>
+<span class="nc" id="L1007">          System.out.println(args[i] + &quot; impossible tags: &quot; + impos);</span>
+        }
+      }
+<span class="nc" id="L1010">      System.out.println();</span>
+    }
+<span class="nc" id="L1012">  }</span>
+
+  @Override
+  public UnknownWordModel getUnknownWordModel() {
+<span class="nc" id="L1016">    return uwModel;</span>
+  }
+
+  @Override
+  public final void setUnknownWordModel(UnknownWordModel uwm) {
+<span class="nc" id="L1021">    this.uwModel = uwm;</span>
+<span class="nc" id="L1022">  }</span>
+
+  // TODO(spenceg): Debug method for getting a treebank with CoreLabels. This is for training
+  // the FactoredLexicon.
+  @Override
+  public void train(Collection&lt;Tree&gt; trees, Collection&lt;Tree&gt; rawTrees) {
+<span class="nc" id="L1028">    train(trees);</span>
+<span class="nc" id="L1029">  }</span>
+
+  private static final long serialVersionUID = 40L;
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

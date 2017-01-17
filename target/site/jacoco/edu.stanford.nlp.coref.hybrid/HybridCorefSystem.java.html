@@ -1,0 +1,338 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HybridCorefSystem.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.coref.hybrid</a> &gt; <span class="el_source">HybridCorefSystem.java</span></div><h1>HybridCorefSystem.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.coref.hybrid;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.PrintWriter;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.logging.Logger;
+
+import edu.stanford.nlp.coref.CorefAlgorithm;
+import edu.stanford.nlp.coref.CorefPrinter;
+import edu.stanford.nlp.coref.CorefProperties;
+import edu.stanford.nlp.coref.CorefScorer;
+import edu.stanford.nlp.coref.CorefUtils;
+import edu.stanford.nlp.coref.data.CorefChain;
+import edu.stanford.nlp.coref.data.CorefCluster;
+import edu.stanford.nlp.coref.data.Dictionaries;
+import edu.stanford.nlp.coref.data.Document;
+import edu.stanford.nlp.coref.data.DocumentMaker;
+import edu.stanford.nlp.coref.data.Mention;
+import edu.stanford.nlp.coref.hybrid.sieve.Sieve;
+import edu.stanford.nlp.coref.hybrid.sieve.Sieve.ClassifierType;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.pipeline.Annotation;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.util.logging.RedwoodConfiguration;
+
+public class HybridCorefSystem implements CorefAlgorithm {
+
+  /** A logger for this class */
+<span class="nc" id="L40">  private static Redwood.RedwoodChannels log = Redwood.channels(HybridCorefSystem.class);</span>
+
+  public Properties props;
+  public List&lt;Sieve&gt; sieves;
+  public Dictionaries dictionaries;
+<span class="nc" id="L45">  public DocumentMaker docMaker = null;</span>
+
+<span class="nc" id="L47">  public HybridCorefSystem(Properties props, Dictionaries dictionaries) throws Exception {</span>
+<span class="nc" id="L48">    this.props = props;</span>
+<span class="nc" id="L49">    this.dictionaries = dictionaries;</span>
+<span class="nc" id="L50">    sieves = Sieve.loadSieves(props);</span>
+
+    // set semantics loading
+<span class="nc bnc" id="L53" title="All 2 branches missed.">    for(Sieve sieve : sieves) {</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">      if(sieve.classifierType == ClassifierType.RULE) continue;</span>
+<span class="nc bnc" id="L55" title="All 2 branches missed.">      if(HybridCorefProperties.useWordEmbedding(props, sieve.sievename)) {</span>
+<span class="nc" id="L56">        props.setProperty(HybridCorefProperties.LOAD_WORD_EMBEDDING_PROP, &quot;true&quot;);</span>
+      }
+<span class="nc" id="L58">    }</span>
+<span class="nc" id="L59">  }</span>
+
+<span class="nc" id="L61">  public HybridCorefSystem(Properties props) throws Exception {</span>
+<span class="nc" id="L62">    this.props = props;</span>
+<span class="nc" id="L63">    sieves = Sieve.loadSieves(props);</span>
+
+    // set semantics loading
+<span class="nc bnc" id="L66" title="All 2 branches missed.">    for(Sieve sieve : sieves) {</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">      if(sieve.classifierType == ClassifierType.RULE) continue;</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">      if(HybridCorefProperties.useWordEmbedding(props, sieve.sievename)) {</span>
+<span class="nc" id="L69">        props.setProperty(HybridCorefProperties.LOAD_WORD_EMBEDDING_PROP, &quot;true&quot;);</span>
+      }
+<span class="nc" id="L71">    }</span>
+<span class="nc" id="L72">    dictionaries = new Dictionaries(props);</span>
+
+<span class="nc" id="L74">    docMaker = new DocumentMaker(props, dictionaries);</span>
+<span class="nc" id="L75">  }</span>
+
+<span class="nc" id="L77">  public Dictionaries dictionaries() { return dictionaries; }</span>
+
+
+  public static void runCoref(String[] args) throws Exception {
+<span class="nc" id="L81">      runCoref(StringUtils.argsToProperties(args));</span>
+<span class="nc" id="L82">  }</span>
+
+  public static void runCoref(Properties props) throws Exception {
+   /*
+    * property, environment setting
+    */
+<span class="nc" id="L88">    Redwood.hideChannelsEverywhere(</span>
+            &quot;debug-cluster&quot;, &quot;debug-mention&quot;, &quot;debug-preprocessor&quot;, &quot;debug-docreader&quot;, &quot;debug-mergethres&quot;,
+            &quot;debug-featureselection&quot;, &quot;debug-md&quot;
+            );
+<span class="nc" id="L92">    int nThreads = HybridCorefProperties.getThreadCounts(props);</span>
+<span class="nc" id="L93">    String timeStamp = Calendar.getInstance().getTime().toString().replaceAll(&quot;\\s&quot;, &quot;-&quot;).replaceAll(&quot;:&quot;, &quot;-&quot;);</span>
+
+<span class="nc" id="L95">    Logger logger = Logger.getLogger(HybridCorefSystem.class.getName());</span>
+
+    // set log file path
+<span class="nc bnc" id="L98" title="All 2 branches missed.">    if(props.containsKey(HybridCorefProperties.LOG_PROP)){</span>
+<span class="nc" id="L99">      File logFile = new File(props.getProperty(HybridCorefProperties.LOG_PROP));</span>
+<span class="nc" id="L100">      RedwoodConfiguration.current().handlers(</span>
+<span class="nc" id="L101">      RedwoodConfiguration.Handlers.file(logFile)).apply();</span>
+<span class="nc" id="L102">      Redwood.log(&quot;Starting coref log&quot;);</span>
+    }
+
+<span class="nc" id="L105">    log.info(props.toString());</span>
+
+<span class="nc bnc" id="L107" title="All 2 branches missed.">    if(HybridCorefProperties.checkMemory(props)) checkMemoryUsage();</span>
+
+<span class="nc" id="L109">    HybridCorefSystem cs = new HybridCorefSystem(props);</span>
+
+    /*
+       output setting
+    */
+    // prepare conll output
+<span class="nc" id="L115">    String goldOutput = null;</span>
+<span class="nc" id="L116">    String beforeCorefOutput = null;</span>
+<span class="nc" id="L117">    String afterCorefOutput = null;</span>
+<span class="nc" id="L118">    PrintWriter writerGold = null;</span>
+<span class="nc" id="L119">    PrintWriter writerBeforeCoref = null;</span>
+<span class="nc" id="L120">    PrintWriter writerAfterCoref = null;</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">    if (HybridCorefProperties.doScore(props)) {</span>
+<span class="nc" id="L122">      String pathOutput = CorefProperties.conllOutputPath(props);</span>
+<span class="nc" id="L123">      (new File(pathOutput)).mkdir();</span>
+<span class="nc" id="L124">      goldOutput = pathOutput + &quot;output-&quot; + timeStamp + &quot;.gold.txt&quot;;</span>
+<span class="nc" id="L125">      beforeCorefOutput = pathOutput + &quot;output-&quot; + timeStamp + &quot;.predicted.txt&quot;;</span>
+<span class="nc" id="L126">      afterCorefOutput = pathOutput + &quot;output-&quot; + timeStamp + &quot;.coref.predicted.txt&quot;;</span>
+<span class="nc" id="L127">      writerGold = new PrintWriter(new FileOutputStream(goldOutput));</span>
+<span class="nc" id="L128">      writerBeforeCoref = new PrintWriter(new FileOutputStream(beforeCorefOutput));</span>
+<span class="nc" id="L129">      writerAfterCoref = new PrintWriter(new FileOutputStream(afterCorefOutput));</span>
+    }
+
+    // run coref
+<span class="nc" id="L133">    MulticoreWrapper&lt;Pair&lt;Document, HybridCorefSystem&gt;, StringBuilder[]&gt; wrapper = new MulticoreWrapper&lt;&gt;(</span>
+<span class="nc" id="L134">            nThreads, new ThreadsafeProcessor&lt;Pair&lt;Document, HybridCorefSystem&gt;, StringBuilder[]&gt;() {</span>
+      @Override
+      public StringBuilder[] process(Pair&lt;Document, HybridCorefSystem&gt; input) {
+        try {
+<span class="nc" id="L138">          Document document = input.first;</span>
+<span class="nc" id="L139">          HybridCorefSystem cs = input.second;</span>
+
+<span class="nc" id="L141">          StringBuilder[] outputs = new StringBuilder[4];    // conll output and logs</span>
+
+<span class="nc" id="L143">          cs.coref(document, outputs);</span>
+
+<span class="nc" id="L145">          return outputs;</span>
+
+<span class="nc" id="L147">        } catch (Exception e) {</span>
+<span class="nc" id="L148">          throw new RuntimeException(e);</span>
+        }
+      }
+
+      @Override
+      public ThreadsafeProcessor&lt;Pair&lt;Document, HybridCorefSystem&gt;, StringBuilder[]&gt; newInstance() {
+<span class="nc" id="L154">        return this;</span>
+      }
+    });
+
+<span class="nc" id="L158">    Date startTime = null;</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    if(HybridCorefProperties.checkTime(props)) {</span>
+<span class="nc" id="L160">      startTime = new Date();</span>
+<span class="nc" id="L161">      System.err.printf(&quot;END-TO-END COREF Start time: %s\n&quot;, startTime);</span>
+    }
+
+    // run processes
+<span class="nc" id="L165">    int docCnt = 0;</span>
+    while (true) {
+<span class="nc" id="L167">      Document document = cs.docMaker.nextDoc();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      if (document == null) break;</span>
+<span class="nc" id="L169">      wrapper.put(Pair.makePair(document, cs));</span>
+<span class="nc" id="L170">      docCnt = logOutput(wrapper, writerGold, writerBeforeCoref, writerAfterCoref, docCnt);</span>
+<span class="nc" id="L171">    }</span>
+
+    // Finished reading the input. Wait for jobs to finish
+<span class="nc" id="L174">    wrapper.join();</span>
+<span class="nc" id="L175">    docCnt = logOutput(wrapper, writerGold, writerBeforeCoref, writerAfterCoref, docCnt);</span>
+<span class="nc" id="L176">    IOUtils.closeIgnoringExceptions(writerGold);</span>
+<span class="nc" id="L177">    IOUtils.closeIgnoringExceptions(writerBeforeCoref);</span>
+<span class="nc" id="L178">    IOUtils.closeIgnoringExceptions(writerAfterCoref);</span>
+
+<span class="nc bnc" id="L180" title="All 2 branches missed.">    if(HybridCorefProperties.checkTime(props)) {</span>
+<span class="nc" id="L181">      System.err.printf(&quot;END-TO-END COREF Elapsed time: %.3f seconds\n&quot;, (((new Date()).getTime() - startTime.getTime()) / 1000F));</span>
+//      System.err.printf(&quot;CORENLP PROCESS TIME TOTAL: %.3f seconds\n&quot;, cs.mentionExtractor.corenlpProcessTime);
+    }
+<span class="nc bnc" id="L184" title="All 2 branches missed.">    if(HybridCorefProperties.checkMemory(props)) checkMemoryUsage();</span>
+
+    // scoring
+<span class="nc bnc" id="L187" title="All 2 branches missed.">    if (HybridCorefProperties.doScore(props)) {</span>
+<span class="nc" id="L188">      String summary = CorefScorer.getEvalSummary(CorefProperties.getScorerPath(props), goldOutput, beforeCorefOutput);</span>
+<span class="nc" id="L189">      CorefScorer.printScoreSummary(summary, logger, false);</span>
+
+<span class="nc" id="L191">      summary = CorefScorer.getEvalSummary(CorefProperties.getScorerPath(props), goldOutput, afterCorefOutput);</span>
+<span class="nc" id="L192">      CorefScorer.printScoreSummary(summary, logger, true);</span>
+<span class="nc" id="L193">      CorefScorer.printFinalConllScore(summary);</span>
+    }
+<span class="nc" id="L195">  }</span>
+
+  /**
+   *  Write output of coref system in conll format, and log.
+   */
+  private static int logOutput(MulticoreWrapper&lt;Pair&lt;Document, HybridCorefSystem&gt;, StringBuilder[]&gt; wrapper,
+                               PrintWriter writerGold,
+                               PrintWriter writerBeforeCoref,
+                               PrintWriter writerAfterCoref,
+                               int docCnt) {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">    while (wrapper.peek()) {</span>
+<span class="nc" id="L206">      StringBuilder[] output = wrapper.poll();</span>
+<span class="nc" id="L207">      writerGold.print(output[0]);</span>
+<span class="nc" id="L208">      writerBeforeCoref.print(output[1]);</span>
+<span class="nc" id="L209">      writerAfterCoref.print(output[2]);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">      if (output[3].length() &gt; 0) {</span>
+<span class="nc" id="L211">        log.info(output[3]);</span>
+      }
+<span class="nc bnc" id="L213" title="All 2 branches missed.">      if ((++docCnt) % 10 == 0) log.info(docCnt + &quot; document(s) processed&quot;);</span>
+<span class="nc" id="L214">    }</span>
+<span class="nc" id="L215">    return docCnt;</span>
+  }
+
+  @Override
+  public void runCoref(Document document) {
+    try {
+<span class="nc" id="L221">      coref(document);</span>
+<span class="nc" id="L222">    } catch (Exception e) {</span>
+<span class="nc" id="L223">      throw new RuntimeException(&quot;Error running hybrid coref system&quot;, e);</span>
+<span class="nc" id="L224">    }</span>
+<span class="nc" id="L225">  }</span>
+
+  /**
+   * main entry of coreference system.
+   *
+   * @param document Input document for coref format (Annotation and optional information)
+   * @param output For output of coref system (conll format and log. list size should be 4.)
+   * @return Map of coref chain ID and corresponding chain
+   * @throws Exception
+   */
+  public Map&lt;Integer, CorefChain&gt; coref(Document document, StringBuilder[] output) throws Exception {
+<span class="nc bnc" id="L236" title="All 2 branches missed.">    if(HybridCorefProperties.printMDLog(props)) {</span>
+<span class="nc" id="L237">      Redwood.log(HybridCorefPrinter.printMentionDetectionLog(document));</span>
+    }
+
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    if(HybridCorefProperties.doScore(props)) {</span>
+<span class="nc" id="L241">      output[0] = (new StringBuilder()).append(CorefPrinter.printConllOutput(document, true));  // gold</span>
+<span class="nc" id="L242">      output[1] = (new StringBuilder()).append(CorefPrinter.printConllOutput(document, false)); // before coref</span>
+    }
+<span class="nc" id="L244">    output[3] = new StringBuilder();  // log from sieves</span>
+
+<span class="nc bnc" id="L246" title="All 2 branches missed.">    for(Sieve sieve : sieves){</span>
+<span class="nc" id="L247">      CorefUtils.checkForInterrupt();</span>
+<span class="nc" id="L248">      output[3].append(sieve.resolveMention(document, dictionaries, props));</span>
+<span class="nc" id="L249">    }</span>
+
+    // post processing
+<span class="nc bnc" id="L252" title="All 2 branches missed.">    if(HybridCorefProperties.doPostProcessing(props)) postProcessing(document);</span>
+
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    if(HybridCorefProperties.doScore(props)) {</span>
+
+<span class="nc" id="L256">      output[2] = (new StringBuilder()).append(CorefPrinter.printConllOutput(document, false, true)); // after coref</span>
+    }
+
+<span class="nc" id="L259">    return makeCorefOutput(document);</span>
+  }
+
+  /**
+   * main entry of coreference system.
+   *
+   * @param document Input document for coref format (Annotation and optional information)
+   * @return Map of coref chain ID and corresponding chain
+   * @throws Exception
+   */
+  public Map&lt;Integer, CorefChain&gt; coref(Document document) throws Exception {
+<span class="nc" id="L270">    return coref(document, new StringBuilder[4]);</span>
+  }
+
+  /**
+   * main entry of coreference system.
+   *
+   * @param anno Input annotation.
+   * @return Map of coref chain ID and corresponding chain
+   * @throws Exception
+   */
+  public Map&lt;Integer, CorefChain&gt; coref(Annotation anno) throws Exception {
+<span class="nc" id="L281">    return coref(docMaker.makeDocument(anno));</span>
+  }
+
+  /** Extract final coreference output from coreference document format. */
+  private static Map&lt;Integer, CorefChain&gt; makeCorefOutput(Document document) {
+<span class="nc" id="L286">    Map&lt;Integer, CorefChain&gt; result = Generics.newHashMap();</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">    for(CorefCluster c : document.corefClusters.values()) {</span>
+<span class="nc" id="L288">      result.put(c.clusterID, new CorefChain(c, document.positions));</span>
+<span class="nc" id="L289">    }</span>
+<span class="nc" id="L290">    return result;</span>
+  }
+
+  /** Remove singletons, appositive, predicate nominatives, relative pronouns. */
+  private static void postProcessing(Document document) {
+<span class="nc" id="L295">    Set&lt;Mention&gt; removeSet = Generics.newHashSet();</span>
+<span class="nc" id="L296">    Set&lt;Integer&gt; removeClusterSet = Generics.newHashSet();</span>
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">    for(CorefCluster c : document.corefClusters.values()){</span>
+<span class="nc" id="L299">      Set&lt;Mention&gt; removeMentions = Generics.newHashSet();</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">      for(Mention m : c.getCorefMentions()) {</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if(HybridCorefProperties.REMOVE_APPOSITION_PREDICATENOMINATIVES</span>
+<span class="nc bnc" id="L302" title="All 4 branches missed.">            &amp;&amp; ((m.appositions!=null &amp;&amp; m.appositions.size() &gt; 0)</span>
+<span class="nc bnc" id="L303" title="All 4 branches missed.">                || (m.predicateNominatives!=null &amp;&amp; m.predicateNominatives.size() &gt; 0)</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">                || (m.relativePronouns!=null &amp;&amp; m.relativePronouns.size() &gt; 0))){</span>
+<span class="nc" id="L305">          removeMentions.add(m);</span>
+<span class="nc" id="L306">          removeSet.add(m);</span>
+<span class="nc" id="L307">          m.corefClusterID = m.mentionID;</span>
+        }
+<span class="nc" id="L309">      }</span>
+
+<span class="nc" id="L311">      c.corefMentions.removeAll(removeMentions);</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">      if(HybridCorefProperties.REMOVE_SINGLETONS &amp;&amp; c.getCorefMentions().size()==1) {</span>
+<span class="nc" id="L313">        removeClusterSet.add(c.clusterID);</span>
+      }
+<span class="nc" id="L315">    }</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    for (int removeId : removeClusterSet){</span>
+<span class="nc" id="L317">      document.corefClusters.remove(removeId);</span>
+<span class="nc" id="L318">    }</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    for(Mention m : removeSet){</span>
+<span class="nc" id="L320">      document.positions.remove(m);</span>
+<span class="nc" id="L321">    }</span>
+<span class="nc" id="L322">  }</span>
+
+  private static void checkMemoryUsage() {
+<span class="nc" id="L325">    Runtime runtime = Runtime.getRuntime();</span>
+<span class="nc" id="L326">    runtime.gc();</span>
+<span class="nc" id="L327">    long memory = runtime.totalMemory() - runtime.freeMemory();</span>
+<span class="nc" id="L328">    log.info(&quot;USED MEMORY (bytes): &quot; + memory);</span>
+<span class="nc" id="L329">  }</span>
+
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L332">    Date startTime = new Date();</span>
+<span class="nc" id="L333">    System.err.printf(&quot;Start time: %s\n&quot;, startTime);</span>
+<span class="nc" id="L334">    runCoref(args);</span>
+<span class="nc" id="L335">    System.err.printf(&quot;Elapsed time: %.3f seconds\n&quot;, (((new Date()).getTime() - startTime.getTime()) / 1000F));</span>
+<span class="nc" id="L336">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

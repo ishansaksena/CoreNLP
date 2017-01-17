@@ -1,0 +1,692 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QuoteAnnotator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">QuoteAnnotator.java</span></div><h1>QuoteAnnotator.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.CoreAnnotation;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.Timing;
+
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * An annotator which picks quotations out of the given text. Allows
+ * for embedded quotations so long as they are either directed unicode quotes or are
+ * of a different type of quote than the outer quotations
+ * (e.g. &quot;'Gadzooks' is what he said to me&quot; is legal whereas
+ * &quot;They called me &quot;Danger&quot; when I was...&quot; is illegal).
+ * Uses regular-expression-like rules to find quotes and does not
+ * depend on the tokenizer, which allows quotes like ''Tis true!' to be
+ * correctly identified.
+ *
+ * Considers regular ascii (&quot;&quot;, '', ``'', and `') as well as &quot;smart&quot; and
+ * international quotation marks as follows:
+ * “”,‘’, «», ‹›, 「」, 『』, „”, and ‚’.
+ *
+ * Note: extracts everything within these pairs as a whole quote segment, which may or may
+ * not be the desired behaviour for texts that use different formatting styles than
+ * standard english ones.
+ *
+ * There are a number of options that can be passed to the quote annotator to
+ * customize its' behaviour:
+ * &lt;ul&gt;
+ *   &lt;li&gt;singleQuotes: &quot;true&quot; or &quot;false&quot;, indicating whether or not to consider ' tokens
+ *    to be quotation marks (default=false).&lt;/li&gt;
+ *   &lt;li&gt;maxLength: maximum character length of quotes to consider (default=-1).&lt;/li&gt;
+ *   &lt;li&gt;asciiQuotes: &quot;true&quot; or &quot;false&quot;, indicating whether or not to convert all quotes
+ *   to ascii quotes before processing (can help when there are errors in quote directionality)
+ *   (default=false).&lt;/li&gt;
+ *   &lt;li&gt;allowEmbeddedSame: &quot;true&quot; or &quot;false&quot; indicating whether or not to allow smart/directed
+ *   (everything except &quot; and ') quotes of the same kind to be embedded within one another
+ *   (default=false).&lt;/li&gt;
+ *   &lt;li&gt;extractUnclosedQuotes: &quot;true&quot; or &quot;false&quot; indicating whether or not to extract unclosed
+ *   quotes. If &quot;true&quot;, an UnclosedQuotationsAnnotation that is structured exactly the same as
+ *   the QuotationsAnnotation will be added to the document. Any nested unclosed quotations will be
+ *   contained in nested UnclosedQuotationsAnnotation on the target unclosed quotation
+ *   (default=false).&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * The annotator adds a QuotationsAnnotation to the Annotation
+ * which returns a List&lt;CoreMap&gt; that
+ * contain the following information:
+ * &lt;ul&gt;
+ *  &lt;li&gt;CharacterOffsetBeginAnnotation&lt;/li&gt;
+ *  &lt;li&gt;CharacterOffsetEndAnnotation&lt;/li&gt;
+ *  &lt;li&gt;QuotationIndexAnnotation&lt;/li&gt;
+ *  &lt;li&gt;QuotationsAnnotation (if there are embedded quotes)&lt;/li&gt;
+ *  &lt;li&gt;TokensAnnotation (if the tokenizer is run before the quote annotator)&lt;/li&gt;
+ *  &lt;li&gt;TokenBeginAnnotation (if the tokenizer is run before the quote annotator)&lt;/li&gt;
+ *  &lt;li&gt;TokenEndAnnotation (if the tokenizer is run before the quote annotator)&lt;/li&gt;
+ *  &lt;li&gt;SentenceBeginAnnotation (if the sentence splitter has bee run before the quote annotator)&lt;/li&gt;
+ *  &lt;li&gt;SentenceEndAnnotation (if the sentence splitter has bee run before the quote annotator)&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ *
+ *
+ * @author Grace Muzny
+ */
+public class QuoteAnnotator implements Annotator  {
+
+  /** A logger for this class */
+<span class="fc" id="L75">  private static Redwood.RedwoodChannels log = Redwood.channels(QuoteAnnotator.class);</span>
+
+  private final boolean VERBOSE;
+<span class="fc" id="L78">  private final boolean DEBUG = false;</span>
+
+  // whether or not to consider single single quotes as quote-marking
+<span class="fc" id="L81">  public boolean USE_SINGLE = false;</span>
+  // max length to consider for quotes
+<span class="fc" id="L83">  public int MAX_LENGTH = -1;</span>
+  // whether to convert unicode quotes to non-unicode &quot; and '
+  // before processing
+<span class="fc" id="L86">  public boolean ASCII_QUOTES = false;</span>
+  // Whether or not to allow quotes of the same type embedded inside of each other
+<span class="fc" id="L88">  public boolean ALLOW_EMBEDDED_SAME = false;</span>
+
+  // Whether or not to allow quotes of the same type embedded inside of each other
+<span class="fc" id="L91">  public boolean SMART_QUOTES = false;</span>
+
+  // Whether or not to extract unclosed quotes
+<span class="fc" id="L94">  public boolean EXTRACT_UNCLOSED = false;</span>
+
+  //TODO: add directed quote/unicode quote understanding capabilities.
+  // will need substantial logic, probably, as quotation mark conventions
+  // vary widely.
+  public static final Map&lt;String, String&gt; DIRECTED_QUOTES;
+  static {
+<span class="fc" id="L101">    Map&lt;String, String&gt; tmp = Generics.newHashMap();</span>
+<span class="fc" id="L102">    tmp.put(&quot;“&quot;, &quot;”&quot;);  // directed double inward</span>
+<span class="fc" id="L103">    tmp.put(&quot;‘&quot;, &quot;’&quot;);  // directed single inward</span>
+<span class="fc" id="L104">    tmp.put(&quot;«&quot;, &quot;»&quot;);  // guillemets</span>
+<span class="fc" id="L105">    tmp.put(&quot;‹&quot;,&quot;›&quot;);  // single guillemets</span>
+<span class="fc" id="L106">    tmp.put(&quot;「&quot;, &quot;」&quot;);  // cjk brackets</span>
+<span class="fc" id="L107">    tmp.put(&quot;『&quot;, &quot;』&quot;);  // cjk brackets</span>
+<span class="fc" id="L108">    tmp.put(&quot;„&quot;,&quot;”&quot;);  // directed double down/up left pointing</span>
+<span class="fc" id="L109">    tmp.put(&quot;‚&quot;,&quot;’&quot;);  // directed single down/up left pointing</span>
+<span class="fc" id="L110">    tmp.put(&quot;``&quot;,&quot;''&quot;);  // double latex -- single latex quotes don't belong here!</span>
+<span class="fc" id="L111">    DIRECTED_QUOTES = Collections.unmodifiableMap(tmp);</span>
+  }
+
+  /** Return a QuoteAnnotator that isolates quotes denoted by the
+   * ASCII characters &quot; and '. If an unclosed quote appears, by default,
+   * this quote will not be counted as a quote.
+   *
+   *  @param s String that is ignored but allows for creation of the
+   *           QuoteAnnotator via a customAnnotatorClass
+   *
+   *  @param  props Properties object that contains the customizable properties
+   *                 attributes.
+   *  @return A QuoteAnnotator.
+   */
+  public QuoteAnnotator(String s, Properties props) {
+<span class="fc" id="L126">    this(props, false);</span>
+<span class="fc" id="L127">  }</span>
+
+  /** Return a QuoteAnnotator that isolates quotes denoted by the
+   * ASCII characters &quot; and ' as well as a variety of smart and international quotes.
+   * If an unclosed quote appears, by default, this quote will not be counted as a quote.
+   *
+   *  @param  props Properties object that contains the customizable properties
+   *                 attributes.
+   *  @return A QuoteAnnotator.
+   */
+  public QuoteAnnotator(Properties props) {
+<span class="nc" id="L138">    this(props, false);</span>
+<span class="nc" id="L139">  }</span>
+
+  /** Return a QuoteAnnotator that isolates quotes denoted by the
+   * ASCII characters &quot; and '. If an unclosed quote appears, by default,
+   * this quote will not be counted as a quote.
+   *
+   *  @param props Properties object that contains the customizable properties
+   *                 attributes.
+   *  @param verbose whether or not to output verbose information.
+   *  @return A QuoteAnnotator.
+   */
+<span class="fc" id="L150">  public QuoteAnnotator(Properties props, boolean verbose) {</span>
+<span class="fc" id="L151">    USE_SINGLE = Boolean.parseBoolean(props.getProperty(&quot;singleQuotes&quot;, &quot;false&quot;));</span>
+<span class="fc" id="L152">    MAX_LENGTH = Integer.parseInt(props.getProperty(&quot;maxLength&quot;, &quot;-1&quot;));</span>
+<span class="fc" id="L153">    ASCII_QUOTES = Boolean.parseBoolean(props.getProperty(&quot;asciiQuotes&quot;, &quot;false&quot;));</span>
+<span class="fc" id="L154">    ALLOW_EMBEDDED_SAME = Boolean.parseBoolean(props.getProperty(&quot;allowEmbeddedSame&quot;, &quot;false&quot;));</span>
+<span class="fc" id="L155">    SMART_QUOTES = Boolean.parseBoolean(props.getProperty(&quot;smartQuotes&quot;, &quot;false&quot;));</span>
+<span class="fc" id="L156">    EXTRACT_UNCLOSED = Boolean.parseBoolean(props.getProperty(&quot;extractUnclosedQuotes&quot;, &quot;false&quot;));</span>
+
+<span class="fc" id="L158">    VERBOSE = verbose;</span>
+<span class="fc" id="L159">    Timing timer = null;</span>
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L161">      timer = new Timing();</span>
+<span class="nc" id="L162">      log.info(&quot;Preparing quote annotator...&quot;);</span>
+    }
+
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L166">      timer.stop(&quot;done.&quot;);</span>
+    }
+<span class="fc" id="L168">  }</span>
+
+  @Override
+  public void annotate(Annotation annotation) {
+<span class="fc" id="L172">    String text = annotation.get(CoreAnnotations.TextAnnotation.class);</span>
+
+    // TODO: the following, if you want the quote annotator to get these truly correct
+    // Pre-process to make word terminal apostrophes specially encoded (Jones' dog)
+<span class="fc" id="L176">    List&lt;CoreLabel&gt; tokens = annotation.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="fc" id="L177">    List&lt;CoreMap&gt; sentences = annotation.get(CoreAnnotations.SentencesAnnotation.class);</span>
+
+<span class="fc" id="L179">    String quotesFrom = text;</span>
+
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">    if (SMART_QUOTES) {</span>
+      // we're just going to try a bunch of different things and pick
+      // whichever results in the most total quotes
+
+      // try unicode
+<span class="nc" id="L186">      Pair&lt;List&lt;Pair&lt;Integer, Integer&gt;&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; overall = getQuotes(quotesFrom);</span>
+<span class="nc" id="L187">      String docID = annotation.get(CoreAnnotations.DocIDAnnotation.class);</span>
+<span class="nc" id="L188">      List&lt;CoreMap&gt; cmQuotesUnicode =</span>
+<span class="nc" id="L189">          getCoreMapQuotes(overall.first(), tokens, sentences, text, docID, false);</span>
+<span class="nc" id="L190">      List&lt;CoreMap&gt; cmUnclosedUnicode = null;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      if (EXTRACT_UNCLOSED) {</span>
+<span class="nc" id="L192">        cmUnclosedUnicode = getCoreMapQuotes(overall.second(), tokens, sentences, text, docID, true);</span>
+      }
+<span class="nc" id="L194">      int numUnicode = countQuotes(cmQuotesUnicode);</span>
+
+      // try ascii
+<span class="nc bnc" id="L197" title="All 2 branches missed.">      if (ASCII_QUOTES) {</span>
+<span class="nc" id="L198">        quotesFrom = replaceUnicode(text);</span>
+      }
+<span class="nc" id="L200">      overall = getQuotes(quotesFrom);</span>
+<span class="nc" id="L201">      docID = annotation.get(CoreAnnotations.DocIDAnnotation.class);</span>
+<span class="nc" id="L202">      List&lt;CoreMap&gt; cmQuotesAscii = getCoreMapQuotes(overall.first(), tokens, sentences, text, docID, false);</span>
+<span class="nc" id="L203">      List&lt;CoreMap&gt; cmUnclosedAscii = null;</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">      if (EXTRACT_UNCLOSED) {</span>
+<span class="nc" id="L205">        cmUnclosedAscii = getCoreMapQuotes(overall.second(), tokens, sentences, text, docID, true);</span>
+      }
+<span class="nc" id="L207">      int numAsciiSingle = countQuotes(cmQuotesAscii);</span>
+
+      // don't allow single quotes
+<span class="nc" id="L210">      USE_SINGLE = false;</span>
+<span class="nc" id="L211">      overall = getQuotes(quotesFrom);</span>
+<span class="nc" id="L212">      docID = annotation.get(CoreAnnotations.DocIDAnnotation.class);</span>
+<span class="nc" id="L213">      List&lt;CoreMap&gt; cmQuotesAsciiNoSingle =</span>
+<span class="nc" id="L214">          getCoreMapQuotes(overall.first(), tokens, sentences, text, docID, false);</span>
+<span class="nc" id="L215">      List&lt;CoreMap&gt; cmUnclosedAsciiNoSingle = null;</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">      if (EXTRACT_UNCLOSED) {</span>
+<span class="nc" id="L217">        cmUnclosedAsciiNoSingle = getCoreMapQuotes(overall.second(), tokens, sentences, text, docID, true);</span>
+      }
+<span class="nc" id="L219">      int numAsciiNoSingle = countQuotes(cmQuotesAsciiNoSingle);</span>
+
+<span class="nc" id="L221">      log.info(&quot;Number of quotes + unicode - single : &quot; + numUnicode);</span>
+<span class="nc" id="L222">      log.info(&quot;Number of quotes + ascii - single : &quot; + numAsciiNoSingle);</span>
+<span class="nc" id="L223">      log.info(&quot;Number of quotes + ascii + single : &quot; + numAsciiSingle);</span>
+<span class="nc bnc" id="L224" title="All 4 branches missed.">      if (numUnicode &gt;= numAsciiNoSingle &amp;&amp; numUnicode &gt; (numAsciiSingle / 2)) {</span>
+<span class="nc" id="L225">        setAnnotations(annotation, cmQuotesUnicode, cmUnclosedUnicode, &quot;Using unicode quotes.&quot;);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">      } else if (numAsciiSingle &gt; (numAsciiNoSingle / 2)) {</span>
+<span class="nc" id="L227">        setAnnotations(annotation, cmQuotesAscii, cmUnclosedAscii, &quot;Using ascii quotes.&quot;);</span>
+      } else {
+<span class="nc" id="L229">        setAnnotations(annotation, cmQuotesAsciiNoSingle,</span>
+            cmUnclosedAsciiNoSingle, &quot;Using ascii quotes with no single quotes.&quot;);
+      }
+<span class="nc" id="L232">    } else {</span>
+<span class="fc bfc" id="L233" title="All 2 branches covered.">      if (ASCII_QUOTES) {</span>
+<span class="fc" id="L234">        quotesFrom = replaceUnicode(text);</span>
+      }
+<span class="fc" id="L236">      Pair&lt;List&lt;Pair&lt;Integer, Integer&gt;&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; overall =</span>
+<span class="fc" id="L237">          getQuotes(quotesFrom);</span>
+
+<span class="fc" id="L239">      String docID = annotation.get(CoreAnnotations.DocIDAnnotation.class);</span>
+<span class="fc" id="L240">      List&lt;CoreMap&gt; cmQuotes = getCoreMapQuotes(overall.first(), tokens, sentences, text, docID, false);</span>
+<span class="fc" id="L241">      List&lt;CoreMap&gt; cmQuotesUnclosed = getCoreMapQuotes(overall.second(), tokens, sentences, text, docID, true);</span>
+
+      // add quotes to document
+<span class="fc" id="L244">      setAnnotations(annotation, cmQuotes, cmQuotesUnclosed, &quot;Setting quotes.&quot;);</span>
+    }
+<span class="fc" id="L246">  }</span>
+
+  private void setAnnotations(Annotation annotation,
+                              List&lt;CoreMap&gt; quotes,
+                              List&lt;CoreMap&gt; unclosed,
+                              String message) {
+<span class="fc" id="L252">    annotation.set(CoreAnnotations.QuotationsAnnotation.class, quotes);</span>
+<span class="fc" id="L253">    log.info(message);</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">    if (EXTRACT_UNCLOSED) {</span>
+<span class="fc" id="L255">      annotation.set(CoreAnnotations.UnclosedQuotationsAnnotation.class, unclosed);</span>
+    }
+<span class="fc" id="L257">  }</span>
+
+  //TODO: update this so that it goes more than 1 layer deep
+  private int countQuotes(List&lt;CoreMap&gt; quotes) {
+<span class="nc" id="L261">    int total = quotes.size();</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    for (CoreMap quote : quotes) {</span>
+<span class="nc" id="L263">      List&lt;CoreMap&gt; innerQuotes = quote.get(CoreAnnotations.QuotationsAnnotation.class);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      if (innerQuotes != null) {</span>
+<span class="nc" id="L265">        total += innerQuotes.size();</span>
+      }
+<span class="nc" id="L267">    }</span>
+<span class="nc" id="L268">    return total;</span>
+  }
+
+  // Stolen from PTBLexer
+<span class="fc" id="L272">  private static final Pattern asciiSingleQuote = Pattern.compile(&quot;&amp;apos;|[\u0091\u2018\u0092\u2019\u201A\u201B\u2039\u203A']&quot;);</span>
+<span class="fc" id="L273">  private static final Pattern asciiDoubleQuote = Pattern.compile(&quot;&amp;quot;|[\u0093\u201C\u0094\u201D\u201E\u00AB\u00BB\&quot;]&quot;);</span>
+
+  private static String asciiQuotes(String in) {
+<span class="fc" id="L276">    String s1 = in;</span>
+<span class="fc" id="L277">    s1 = asciiSingleQuote.matcher(s1).replaceAll(&quot;'&quot;);</span>
+<span class="fc" id="L278">    s1 = asciiDoubleQuote.matcher(s1).replaceAll(&quot;\&quot;&quot;);</span>
+<span class="fc" id="L279">    return s1;</span>
+  }
+
+  public static String replaceUnicode(String text) {
+<span class="fc" id="L283">    return asciiQuotes(text);</span>
+  }
+
+  public static Comparator&lt;CoreMap&gt; getQuoteComparator() {
+<span class="fc" id="L287">   return new Comparator&lt;CoreMap&gt;() {</span>
+     @Override
+     public int compare(CoreMap o1, CoreMap o2) {
+<span class="fc" id="L290">       int s1 = o1.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class);</span>
+<span class="fc" id="L291">       int s2 = o2.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class);</span>
+<span class="fc" id="L292">       return s1 - s2;</span>
+     }
+   };
+  }
+
+  public static List&lt;CoreMap&gt; getCoreMapQuotes(List&lt;Pair&lt;Integer, Integer&gt;&gt; quotes,
+                                               List&lt;CoreLabel&gt; tokens,
+                                               List&lt;CoreMap&gt; sentences,
+                                               String text, String docID,
+                                               boolean unclosed) {
+<span class="fc" id="L302">    List&lt;CoreMap&gt; cmQuotes = Generics.newArrayList();</span>
+<span class="fc bfc" id="L303" title="All 2 branches covered.">    for (Pair&lt;Integer, Integer&gt; p : quotes) {</span>
+<span class="fc" id="L304">      int begin = p.first();</span>
+<span class="fc" id="L305">      int end = p.second();</span>
+
+      // find the tokens for this quote
+<span class="fc" id="L308">      List&lt;CoreLabel&gt; quoteTokens = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L309">      int tokenOffset = -1;</span>
+<span class="fc" id="L310">      int currTok = 0;</span>
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">      if (tokens != null) {</span>
+<span class="pc bpc" id="L312" title="1 of 4 branches missed.">        while (currTok &lt; tokens.size() &amp;&amp; tokens.get(currTok).beginPosition() &lt; begin) {</span>
+<span class="fc" id="L313">          currTok++;</span>
+        }
+<span class="fc" id="L315">        int i = currTok;</span>
+<span class="fc" id="L316">        tokenOffset = i;</span>
+<span class="fc bfc" id="L317" title="All 4 branches covered.">        while (i &lt; tokens.size() &amp;&amp; tokens.get(i).endPosition() &lt;= end) {</span>
+<span class="fc" id="L318">          quoteTokens.add(tokens.get(i));</span>
+<span class="fc" id="L319">          i++;</span>
+        }
+      }
+
+      // find the sentences for this quote
+<span class="fc" id="L324">      int beginSentence = -1;</span>
+<span class="fc" id="L325">      int endSentence = -1;</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">      if (sentences != null) {</span>
+<span class="fc bfc" id="L327" title="All 2 branches covered.">        for (CoreMap sentence : sentences) {</span>
+<span class="fc" id="L328">          int sentBegin = sentence.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class);</span>
+<span class="fc" id="L329">          int sentEnd = sentence.get(CoreAnnotations.CharacterOffsetEndAnnotation.class);</span>
+<span class="fc" id="L330">          int sentIndex = sentence.get(CoreAnnotations.SentenceIndexAnnotation.class);</span>
+<span class="fc bfc" id="L331" title="All 2 branches covered.">          if (sentBegin &lt;= begin) {</span>
+<span class="fc" id="L332">            beginSentence = sentIndex;</span>
+          }
+<span class="fc bfc" id="L334" title="All 4 branches covered.">          if (sentEnd &gt;= end &amp;&amp; endSentence &lt; 0) {</span>
+<span class="fc" id="L335">            endSentence = sentIndex;</span>
+          }
+<span class="fc" id="L337">        }</span>
+      }
+
+      // create a quote annotation with text and token offsets
+<span class="fc" id="L341">      Annotation quote = makeQuote(text.substring(begin, end), begin, end, quoteTokens,</span>
+          tokenOffset, beginSentence, endSentence, docID);
+
+      // add quote in
+<span class="fc" id="L345">      cmQuotes.add(quote);</span>
+<span class="fc" id="L346">    }</span>
+
+    // sort quotes by beginning index
+<span class="fc" id="L349">    Comparator&lt;CoreMap&gt; quoteComparator = getQuoteComparator();</span>
+<span class="fc" id="L350">    Collections.sort(cmQuotes, quoteComparator);</span>
+
+    // embed quotes
+<span class="fc" id="L353">    List&lt;CoreMap&gt; toRemove = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L354" title="All 2 branches covered.">    for (CoreMap cmQuote : cmQuotes) {</span>
+<span class="fc" id="L355">      int start = cmQuote.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class);</span>
+<span class="fc" id="L356">      int end = cmQuote.get(CoreAnnotations.CharacterOffsetEndAnnotation.class);</span>
+      // See if we need to embed a quote
+<span class="fc" id="L358">      List&lt;CoreMap&gt; embeddedQuotes = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L359" title="All 2 branches covered.">      for (CoreMap cmQuoteComp : cmQuotes) {</span>
+<span class="fc" id="L360">        int startComp = cmQuoteComp.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class);</span>
+<span class="fc" id="L361">        int endComp = cmQuoteComp.get(CoreAnnotations.CharacterOffsetEndAnnotation.class);</span>
+<span class="fc bfc" id="L362" title="All 4 branches covered.">        if (start &lt; startComp &amp;&amp; end &gt;= endComp) {</span>
+          // p contains comp
+<span class="fc" id="L364">          embeddedQuotes.add(cmQuoteComp);</span>
+          // now we want to remove it from the top-level quote list
+<span class="fc" id="L366">          toRemove.add(cmQuoteComp);</span>
+        }
+<span class="fc" id="L368">      }</span>
+<span class="fc bfc" id="L369" title="All 2 branches covered.">      if (!unclosed) {</span>
+<span class="fc" id="L370">        cmQuote.set(CoreAnnotations.QuotationsAnnotation.class, embeddedQuotes);</span>
+      } else {
+<span class="fc" id="L372">        cmQuote.set(CoreAnnotations.UnclosedQuotationsAnnotation.class, embeddedQuotes);</span>
+      }
+<span class="fc" id="L374">    }</span>
+
+    // Remove all the quotes that we want to.
+<span class="fc bfc" id="L377" title="All 2 branches covered.">    for (CoreMap r : toRemove) {</span>
+      // remove that quote from the overall list
+<span class="fc" id="L379">      cmQuotes.remove(r);</span>
+<span class="fc" id="L380">    }</span>
+
+    // Set the quote index annotations properly
+<span class="fc" id="L383">    setQuoteIndices(cmQuotes, unclosed);</span>
+<span class="fc" id="L384">    return cmQuotes;</span>
+  }
+
+  private static void setQuoteIndices(List&lt;CoreMap&gt; topLevel, boolean unclosed) {
+<span class="fc" id="L388">    List&lt;CoreMap&gt; level = topLevel;</span>
+<span class="fc" id="L389">    int index = 0;</span>
+<span class="fc bfc" id="L390" title="All 2 branches covered.">    while (!level.isEmpty()) {</span>
+<span class="fc" id="L391">      List&lt;CoreMap&gt; nextLevel = Generics.newArrayList();</span>
+<span class="fc bfc" id="L392" title="All 2 branches covered.">      for (CoreMap quote : level) {</span>
+<span class="fc" id="L393">        quote.set(CoreAnnotations.QuotationIndexAnnotation.class, index);</span>
+<span class="fc" id="L394">        List&lt;CoreLabel&gt; quoteTokens = quote.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">        if (quoteTokens != null) {</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">          for (CoreLabel qt : quoteTokens) {</span>
+<span class="fc" id="L397">            qt.set(CoreAnnotations.QuotationIndexAnnotation.class, index);</span>
+<span class="fc" id="L398">          }</span>
+        }
+<span class="fc" id="L400">        index++;</span>
+<span class="fc" id="L401">        List&lt;CoreMap&gt; key = quote.get(CoreAnnotations.QuotationsAnnotation.class);</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">        if (unclosed) {</span>
+<span class="fc" id="L403">          key = quote.get(CoreAnnotations.UnclosedQuotationsAnnotation.class);</span>
+        }
+<span class="pc bpc" id="L405" title="1 of 2 branches missed.">        if (key != null) {</span>
+<span class="fc bfc" id="L406" title="All 2 branches covered.">          if (!unclosed) {</span>
+<span class="fc" id="L407">            nextLevel.addAll(quote.get(CoreAnnotations.QuotationsAnnotation.class));</span>
+          } else {
+<span class="fc" id="L409">            nextLevel.addAll(quote.get(CoreAnnotations.UnclosedQuotationsAnnotation.class));</span>
+          }
+        }
+<span class="fc" id="L412">      }</span>
+<span class="fc" id="L413">      level = nextLevel;</span>
+<span class="fc" id="L414">    }</span>
+<span class="fc" id="L415">  }</span>
+
+  public static Annotation makeQuote(String surfaceForm, int begin, int end,
+                                     List&lt;CoreLabel&gt; quoteTokens,
+                                     int tokenOffset,
+                                     int sentenceBeginIndex,
+                                     int sentenceEndIndex,
+                                     String docID) {
+<span class="fc" id="L423">    Annotation quote = new Annotation(surfaceForm);</span>
+    // create a quote annotation with text and token offsets
+<span class="fc" id="L425">    quote.set(CoreAnnotations.CharacterOffsetBeginAnnotation.class, begin);</span>
+<span class="fc" id="L426">    quote.set(CoreAnnotations.CharacterOffsetEndAnnotation.class, end);</span>
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">    if (docID != null) {</span>
+<span class="nc" id="L428">      quote.set(CoreAnnotations.DocIDAnnotation.class, docID);</span>
+    }
+
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">    if (quoteTokens != null) {</span>
+<span class="fc" id="L432">      quote.set(CoreAnnotations.TokensAnnotation.class, quoteTokens);</span>
+<span class="fc" id="L433">      quote.set(CoreAnnotations.TokenBeginAnnotation.class, tokenOffset);</span>
+<span class="fc" id="L434">      quote.set(CoreAnnotations.TokenEndAnnotation.class, tokenOffset + quoteTokens.size() - 1);</span>
+    }
+<span class="fc" id="L436">    quote.set(CoreAnnotations.SentenceBeginAnnotation.class, sentenceBeginIndex);</span>
+<span class="fc" id="L437">    quote.set(CoreAnnotations.SentenceEndAnnotation.class, sentenceEndIndex);</span>
+
+<span class="fc" id="L439">    return quote;</span>
+  }
+
+  public Pair&lt;List&lt;Pair&lt;Integer, Integer&gt;&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; getQuotes(String text) {
+<span class="fc" id="L443">    return recursiveQuotes(text, 0, null);</span>
+  }
+
+  public Pair&lt;List&lt;Pair&lt;Integer, Integer&gt;&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt;  recursiveQuotes(String text, int offset, String prevQuote) {
+<span class="fc" id="L447">    Map&lt;String, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; quotesMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L448">    int start = -1;</span>
+<span class="fc" id="L449">    int end = -1;</span>
+<span class="fc" id="L450">    String quote = null;</span>
+<span class="fc" id="L451">    int directed = 0;</span>
+<span class="fc bfc" id="L452" title="All 2 branches covered.">    for (int i = 0 ; i &lt; text.length(); i++) {</span>
+      // Either I'm not in any quote or this one matches
+      // the kind that I am.
+<span class="fc" id="L455">      String c = text.substring(i, i + 1);</span>
+
+<span class="pc bpc" id="L457" title="1 of 4 branches missed.">      if (c.equals(&quot;`&quot;) &amp;&amp; i &lt; text.length() - 1 &amp;&amp;</span>
+<span class="fc bfc" id="L458" title="All 2 branches covered.">          text.charAt(i + 1) == '`') {</span>
+<span class="fc" id="L459">        c += text.charAt(i + 1);</span>
+<span class="fc bfc" id="L460" title="All 8 branches covered.">      } else if (c.equals(&quot;'&quot;) &amp;&amp; (quote != null &amp;&amp; (quote.equals(&quot;``&quot;) || quote.equals(&quot;`&quot;)))) {</span>
+        // we want to ignore it if unless is is the beginning of the
+        // last set of ' of the proper length
+<span class="fc" id="L463">        int curr = i;</span>
+<span class="fc bfc" id="L464" title="All 4 branches covered.">        while (curr &lt; text.length() &amp;&amp; text.charAt(curr) == '\'') {</span>
+<span class="fc" id="L465">          curr++;</span>
+        }
+<span class="fc bfc" id="L467" title="All 4 branches covered.">        if (i == curr - quote.length() ||</span>
+<span class="fc bfc" id="L468" title="All 2 branches covered.">            (directed &gt; 0 &amp;&amp; i == curr - (directed * quote.length()))) {</span>
+<span class="fc bfc" id="L469" title="All 2 branches covered.">          for (int a = i + 1; a &lt; i + quote.length(); a++) {</span>
+<span class="fc" id="L470">            c += text.charAt(a);</span>
+          }
+        } else {
+          continue;
+        }
+      }
+
+<span class="fc bfc" id="L477" title="All 2 branches covered.">      if (DIRECTED_QUOTES.containsKey(quote) &amp;&amp;</span>
+<span class="fc bfc" id="L478" title="All 2 branches covered.">          DIRECTED_QUOTES.get(quote).equals(c)) {</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">        if (c.equals(&quot;’&quot;)) {</span>
+<span class="pc bpc" id="L480" title="2 of 4 branches missed.">          if ((i == text.length() - 1 || isSingleQuoteEnd(text, i))) {</span>
+            // check to make sure that this isn't an apostrophe..
+<span class="fc" id="L482">            directed--;</span>
+          }
+        } else {
+          // closing
+<span class="fc" id="L486">          directed--;</span>
+        }
+      }
+
+      // opening
+<span class="fc bfc" id="L491" title="All 4 branches covered.">      if ((start &lt; 0) &amp;&amp; !matchesPrevQuote(c, prevQuote) &amp;&amp;</span>
+<span class="fc bfc" id="L492" title="All 6 branches covered.">          (((isSingleQuoteWithUse(c) || c.equals(&quot;`&quot;)) &amp;&amp; isSingleQuoteStart(text, i)) ||</span>
+<span class="fc bfc" id="L493" title="All 4 branches covered.">            (c.equals(&quot;\&quot;&quot;) || DIRECTED_QUOTES.containsKey(c)))) {</span>
+<span class="fc" id="L494">        start = i;</span>
+<span class="fc" id="L495">        quote = c;</span>
+      // closing
+<span class="pc bpc" id="L497" title="1 of 4 branches missed.">      } else if ((start &gt;= 0 &amp;&amp; end &lt; 0) &amp;&amp;</span>
+<span class="fc bfc" id="L498" title="All 2 branches covered.">          ((c.equals(quote) &amp;&amp;</span>
+<span class="fc bfc" id="L499" title="All 6 branches covered.">           (((c.equals(&quot;'&quot;) || c.equals(&quot;`&quot;)) &amp;&amp; isSingleQuoteEnd(text, i)) ||</span>
+<span class="fc bfc" id="L500" title="All 4 branches covered.">            (c.equals(&quot;\&quot;&quot;) &amp;&amp; isDoubleQuoteEnd(text, i)))) ||</span>
+<span class="pc bpc" id="L501" title="1 of 6 branches missed.">           (c.equals(&quot;'&quot;) &amp;&amp; quote.equals(&quot;`&quot;) &amp;&amp; isSingleQuoteEnd(text, i)) ||  // latex quotes are kind of problematic</span>
+<span class="fc bfc" id="L502" title="All 2 branches covered.">           (DIRECTED_QUOTES.containsKey(quote) &amp;&amp;</span>
+<span class="fc bfc" id="L503" title="All 4 branches covered.">               DIRECTED_QUOTES.get(quote).equals(c) &amp;&amp;</span>
+           directed == 0))) {
+<span class="fc" id="L505">        end = i + c.length();</span>
+      }
+
+<span class="fc bfc" id="L508" title="All 2 branches covered.">      if (DIRECTED_QUOTES.containsKey(c) &amp;&amp;</span>
+<span class="fc bfc" id="L509" title="All 2 branches covered.">          c.equals(quote)) {</span>
+        // opening of this kind of directed quote
+<span class="fc" id="L511">        directed++;</span>
+      }
+
+<span class="fc bfc" id="L514" title="All 4 branches covered.">      if (start &gt;= 0 &amp;&amp; end &gt; 0) {</span>
+<span class="fc bfc" id="L515" title="All 2 branches covered.">        if (!quotesMap.containsKey(quote)) {</span>
+<span class="fc" id="L516">          quotesMap.put(quote, new ArrayList&lt;&gt;());</span>
+        }
+<span class="fc" id="L518">        quotesMap.get(quote).add(new Pair(start, end));</span>
+<span class="fc" id="L519">        start = -1;</span>
+<span class="fc" id="L520">        end = -1;</span>
+<span class="fc" id="L521">        quote = null;</span>
+      }
+
+<span class="fc bfc" id="L524" title="All 2 branches covered.">      if (c.length() &gt; 1) {</span>
+<span class="fc" id="L525">        i += c.length() - 1;</span>
+      }
+
+      // forget about this quote
+<span class="fc bfc" id="L529" title="All 6 branches covered.">      if (MAX_LENGTH &gt; 0 &amp;&amp; start &gt;= 0 &amp;&amp;</span>
+          i - start &gt; MAX_LENGTH) {
+        // go back to the right index after start
+<span class="fc" id="L532">        i = start + quote.length();</span>
+
+<span class="fc" id="L534">        start = -1;</span>
+<span class="fc" id="L535">        end = -1;</span>
+<span class="fc" id="L536">        quote = null;</span>
+      }
+    }
+
+    // TODO: determine if we want to be more strict w/ single quotes than double
+    // answer: we do want to.
+<span class="fc bfc" id="L542" title="All 4 branches covered.">    if (start &gt;= 0 &amp;&amp; start &lt; text.length() - 3) {</span>
+<span class="fc" id="L543">      String warning = text;</span>
+<span class="fc bfc" id="L544" title="All 2 branches covered.">      if (text.length() &gt; 150) {</span>
+<span class="fc" id="L545">        warning = text.substring(0, 150) + &quot;...&quot;;</span>
+      }
+<span class="fc" id="L547">      log.info(&quot;WARNING: unmatched quote of type &quot; +</span>
+          quote + &quot; found at index &quot; + start + &quot; in text segment: &quot; + warning);
+    }
+
+    // recursively look for embedded quotes in these ones
+<span class="fc" id="L552">    List&lt;Pair&lt;Integer, Integer&gt;&gt; quotes = Generics.newArrayList();</span>
+<span class="fc" id="L553">    List&lt;Pair&lt;Integer, Integer&gt;&gt; unclosedQuotes = Generics.newArrayList();</span>
+    // If I didn't find any quotes, but did find a quote-beginning, try again,
+    // but without the part of the text before the single quote
+    // really this test should be whether or not start is mapped to in quotesMap
+<span class="pc bpc" id="L557" title="1 of 6 branches missed.">    if (!isAQuoteMapStarter(start, quotesMap) &amp;&amp; start &gt;= 0 &amp;&amp; start &lt; text.length() - 3) {</span>
+<span class="fc bfc" id="L558" title="All 2 branches covered.">      if (EXTRACT_UNCLOSED) {</span>
+<span class="fc" id="L559">        unclosedQuotes.add(new Pair(start, text.length()));</span>
+      }
+<span class="fc" id="L561">      String toPass = text.substring(start + quote.length(), text.length());</span>
+<span class="fc" id="L562">      Pair&lt;List&lt;Pair&lt;Integer, Integer&gt;&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; embedded = recursiveQuotes(toPass, offset, null);</span>
+      // these are the good quotes
+<span class="fc bfc" id="L564" title="All 2 branches covered.">      for (Pair&lt;Integer, Integer&gt; e : embedded.first()) {</span>
+<span class="fc" id="L565">        quotes.add(new Pair(e.first() + start + quote.length(),</span>
+<span class="fc" id="L566">            e.second() + start + 1));</span>
+<span class="fc" id="L567">      }</span>
+<span class="fc bfc" id="L568" title="All 2 branches covered.">      if (EXTRACT_UNCLOSED) {</span>
+        // these are the unclosed quotes
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">        for (Pair&lt;Integer, Integer&gt; e : embedded.second()) {</span>
+<span class="nc" id="L571">          unclosedQuotes.add(new Pair(e.first() + start + quote.length(),</span>
+<span class="nc" id="L572">              e.second() + start + 1));</span>
+<span class="nc" id="L573">        }</span>
+      }
+    }
+
+    // Now take care of the good quotes that we found
+<span class="fc bfc" id="L578" title="All 2 branches covered.">    for (String qKind : quotesMap.keySet()) {</span>
+<span class="fc bfc" id="L579" title="All 2 branches covered.">      for (Pair&lt;Integer, Integer&gt; q : quotesMap.get(qKind)) {</span>
+<span class="pc bpc" id="L580" title="1 of 2 branches missed.">        if (q.second() - q.first() &gt;= qKind.length() * 2) {</span>
+<span class="fc" id="L581">          String toPass = text.substring(q.first() + qKind.length(),</span>
+<span class="fc" id="L582">              q.second() - qKind.length());</span>
+<span class="fc" id="L583">          String qKindToPass = null;</span>
+<span class="fc bfc" id="L584" title="All 6 branches covered.">          if (!(DIRECTED_QUOTES.containsKey(qKind) || qKind.equals(&quot;`&quot;))</span>
+                  || !ALLOW_EMBEDDED_SAME) {
+<span class="fc" id="L586">            qKindToPass = qKind;</span>
+          }
+<span class="fc" id="L588">          Pair&lt;List&lt;Pair&lt;Integer, Integer&gt;&gt;, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; embedded =</span>
+<span class="fc" id="L589">              recursiveQuotes(toPass, q.first() + qKind.length() + offset, qKindToPass);</span>
+          // good quotes
+<span class="fc bfc" id="L591" title="All 2 branches covered.">          for (Pair&lt;Integer, Integer&gt; e : embedded.first()) {</span>
+            // don't add offset here because the
+            // recursive method already added it
+<span class="fc bfc" id="L594" title="All 2 branches covered.">            if (e.second() - e.first() &gt; 2) {</span>
+<span class="fc" id="L595">              quotes.add(new Pair(e.first(), e.second()));</span>
+            }
+<span class="fc" id="L597">          }</span>
+          // unclosed quotes
+<span class="fc bfc" id="L599" title="All 2 branches covered.">          if (EXTRACT_UNCLOSED) {</span>
+            // these are the unclosed quotes
+<span class="pc bpc" id="L601" title="1 of 2 branches missed.">            for (Pair&lt;Integer, Integer&gt; e : embedded.second()) {</span>
+<span class="nc" id="L602">              unclosedQuotes.add(new Pair(e.first(), e.second()));</span>
+<span class="nc" id="L603">            }</span>
+          }
+        }
+<span class="fc" id="L606">        quotes.add(new Pair(q.first() + offset, q.second() + offset));</span>
+<span class="fc" id="L607">      }</span>
+<span class="fc" id="L608">    }</span>
+
+<span class="fc" id="L610">    return new Pair(quotes, unclosedQuotes);</span>
+  }
+
+  private boolean isAQuoteMapStarter(int target, Map&lt;String, List&lt;Pair&lt;Integer, Integer&gt;&gt;&gt; quotesMap) {
+<span class="fc bfc" id="L614" title="All 2 branches covered.">    for (String k : quotesMap.keySet()) {</span>
+<span class="fc bfc" id="L615" title="All 2 branches covered.">      for (Pair&lt;Integer, Integer&gt; pair : quotesMap.get(k)) {</span>
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">        if (pair.first() == target) {</span>
+<span class="nc" id="L617">          return true;</span>
+        }
+<span class="fc" id="L619">      }</span>
+<span class="fc" id="L620">    }</span>
+<span class="fc" id="L621">    return false;</span>
+  }
+
+  private boolean isSingleQuoteWithUse(String c) {
+<span class="fc bfc" id="L625" title="All 4 branches covered.">    return c.equals(&quot;'&quot;) &amp;&amp; USE_SINGLE;</span>
+  }
+
+  private static boolean matchesPrevQuote(String c, String prev) {
+<span class="fc bfc" id="L629" title="All 4 branches covered.">    return prev != null &amp;&amp; prev.equals(c);</span>
+  }
+
+  private static boolean isSingleQuoteStart(String text, int i) {
+<span class="fc bfc" id="L633" title="All 2 branches covered.">    if (i == 0) return true;</span>
+<span class="fc" id="L634">    String prev = text.substring(i - 1, i);</span>
+<span class="fc" id="L635">    return isWhitespaceOrPunct(prev);</span>
+  }
+
+  private static boolean isSingleQuoteEnd(String text, int i) {
+<span class="fc bfc" id="L639" title="All 2 branches covered.">    if (i == text.length() - 1) return true;</span>
+<span class="fc" id="L640">    String next = text.substring(i + 1, i + 2);</span>
+<span class="fc" id="L641">    return isWhitespaceOrPunct(next);</span>
+  }
+
+  private static boolean isDoubleQuoteEnd(String text, int i) {
+<span class="fc bfc" id="L645" title="All 2 branches covered.">    if (i == text.length() - 1) return true;</span>
+<span class="fc" id="L646">    String next = text.substring(i + 1, i + 2);</span>
+<span class="pc bpc" id="L647" title="3 of 4 branches missed.">    if (i == text.length() - 2 &amp;&amp; isWhitespaceOrPunct(next)) {</span>
+<span class="nc" id="L648">      return true;</span>
+    }
+<span class="fc" id="L650">    String nextNext = text.substring(i + 2, i + 3);</span>
+<span class="fc bfc" id="L651" title="All 2 branches covered.">    return ((isWhitespaceOrPunct(next) &amp;&amp;</span>
+<span class="pc bpc" id="L652" title="4 of 6 branches missed.">           !isSingleQuote(next)) || (isSingleQuote(next) &amp;&amp; isWhitespaceOrPunct(nextNext)));</span>
+  }
+
+  public static boolean isWhitespaceOrPunct(String c) {
+<span class="fc" id="L656">    Pattern punctOrWhite = Pattern.compile(&quot;[\\s\\p{Punct}]&quot;, Pattern.UNICODE_CHARACTER_CLASS);</span>
+<span class="fc" id="L657">    Matcher m = punctOrWhite.matcher(c);</span>
+<span class="fc" id="L658">    return m.matches();</span>
+  }
+
+  public static boolean isSingleQuote(String c) {
+<span class="fc" id="L662">    return c.equals(&quot;'&quot;);</span>
+  }
+
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requires() {
+<span class="fc" id="L667">    return Collections.EMPTY_SET;</span>
+  }
+
+  @Override
+  public Set&lt;Class&lt;? extends CoreAnnotation&gt;&gt; requirementsSatisfied() {
+<span class="fc" id="L672">    return Collections.singleton(CoreAnnotations.QuotationsAnnotation.class);</span>
+  }
+
+
+  // helper method to recursively gather all embedded quotes
+  public static List&lt;CoreMap&gt; gatherQuotes(CoreMap curr) {
+<span class="nc" id="L678">    List&lt;CoreMap&gt; embedded = curr.get(CoreAnnotations.QuotationsAnnotation.class);</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">    if (embedded != null) {</span>
+<span class="nc" id="L680">      List&lt;CoreMap&gt; extended = Generics.newArrayList();</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">      for (CoreMap quote : embedded) {</span>
+<span class="nc" id="L682">        extended.addAll(gatherQuotes(quote));</span>
+<span class="nc" id="L683">      }</span>
+<span class="nc" id="L684">      extended.addAll(embedded);</span>
+<span class="nc" id="L685">      return extended;</span>
+    } else {
+<span class="nc" id="L687">      return Generics.newArrayList();</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

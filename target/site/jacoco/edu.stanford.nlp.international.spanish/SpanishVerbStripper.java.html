@@ -1,0 +1,380 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SpanishVerbStripper.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.international.spanish</a> &gt; <span class="el_source">SpanishVerbStripper.java</span></div><h1>SpanishVerbStripper.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.international.spanish;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.Serializable;
+import java.io.UnsupportedEncodingException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Provides a utility function for removing attached pronouns from
+ * Spanish verb forms.
+ *
+ * @author Jon Gauthier
+ * @author Ishita Prasad
+ */
+public final class SpanishVerbStripper implements Serializable  {
+
+  /** A logger for this class */
+<span class="nc" id="L31">  private static final Redwood.RedwoodChannels log = Redwood.channels(SpanishVerbStripper.class);</span>
+
+  // The following three classes of verb forms can carry attached
+  // pronouns:
+  //
+  //   - Infinitives
+  //   - Gerunds
+  //   - Affirmative imperatives
+
+  /**
+   * A struct describing the result of verb stripping.
+   */
+  public static class StrippedVerb {
+    private String stem;
+    private String originalStem;
+    private List&lt;String&gt; pronouns;
+
+<span class="nc" id="L48">    public StrippedVerb(String originalStem, List&lt;String&gt; pronouns) {</span>
+<span class="nc" id="L49">      this.originalStem = originalStem;</span>
+<span class="nc" id="L50">      this.pronouns = pronouns;</span>
+<span class="nc" id="L51">    }</span>
+
+    public void setStem(String stem) {
+<span class="nc" id="L54">      this.stem = stem;</span>
+<span class="nc" id="L55">    }</span>
+
+    /**
+     * Return the normalized stem of the verb -- the way it would appear in
+     * isolation without attached pronouns.
+     *
+     * Here are example mappings from original verb to normalized stem:
+     *
+     * &lt;ul&gt;
+     *   &lt;li&gt;sentaos -&amp;gt; sentad&lt;/li&gt;
+     *   &lt;li&gt;vámonos -&amp;gt; vamos&lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+<span class="nc" id="L68">    public String getStem() { return stem; }</span>
+
+    /**
+     * Returns the original stem of the verb, simply split off from pronouns.
+     * (Contrast with {@link #getStem()}, which returns a normalized form.)
+     */
+<span class="nc" id="L74">    public String getOriginalStem() { return originalStem; }</span>
+
+<span class="nc" id="L76">    public List&lt;String&gt; getPronouns() { return pronouns; }</span>
+  }
+
+  /* HashMap of singleton instances */
+<span class="nc" id="L80">  private static final Map&lt;String, SpanishVerbStripper&gt; instances = new HashMap&lt;&gt;();</span>
+
+  private final HashMap&lt;String, String&gt; dict;
+
+  private static final String DEFAULT_DICT =
+    &quot;edu/stanford/nlp/international/spanish/enclitic-inflections.data&quot;;
+
+  /** Any attached pronouns. The extra grouping around this pattern allows it to be used in String concatenations. */
+  private static final String PATTERN_ATTACHED_PRONOUNS =
+    &quot;(?:(?:[mts]e|n?os|les?)(?:l[oa]s?)?|l[oa]s?)$&quot;;
+
+<span class="nc" id="L91">  private static final Pattern pTwoAttachedPronouns =</span>
+<span class="nc" id="L92">    Pattern.compile(&quot;([mts]e|n?os|les?)(l[eoa]s?)$&quot;);</span>
+
+<span class="nc" id="L94">  private static final Pattern pOneAttachedPronoun =</span>
+<span class="nc" id="L95">    Pattern.compile(&quot;([mts]e|n?os|les?|l[oa]s?)$&quot;);</span>
+
+  /**
+   * Matches infinitives and gerunds with attached pronouns.
+   * Original: Pattern.compile(&quot;(?:[aeiáéí]r|[áé]ndo)&quot; + PATTERN_ATTACHED_PRONOUNS);
+   */
+<span class="nc" id="L101">  private static final Pattern pStrippable =</span>
+<span class="nc" id="L102">    Pattern.compile(&quot;(?:[aeiáéí]r|[áé]ndo|[aeáé]n?|[aeáé]mos?|[aeiáéí](?:d(?!os)|(?=os)))&quot; + PATTERN_ATTACHED_PRONOUNS);</span>
+
+  /**
+   * Matches irregular imperatives:
+   * decir = di, hacer = haz, ver = ve, poner = pon, salir = sal,
+   * ser = sé, tener = ten, venir = ven
+   * And id + os = idos, not ios
+   */
+<span class="nc" id="L110">  private static final Pattern pIrregulars =</span>
+<span class="nc" id="L111">    Pattern.compile(&quot;^(?:d[ií]|h[aá]z|v[eé]|p[oó]n|s[aá]l|sé|t[eé]n|v[eé]n|(?:id(?=os$)))&quot; + PATTERN_ATTACHED_PRONOUNS);</span>
+
+  /**
+   * Sets up dictionary of valid verbs and their POS info from an input file.
+   * The input file must be a list of whitespace-separated verb-lemma-POS triples, one verb
+   * form per line.
+   *
+   * @param dictPath the path to the dictionary file
+   */
+  private static HashMap&lt;String, String&gt; setupDictionary(String dictPath) {
+<span class="nc" id="L121">    HashMap&lt;String, String&gt; dictionary = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L122">    BufferedReader br = null;</span>
+    try {
+<span class="nc" id="L124">      br = IOUtils.readerFromString(dictPath);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">      for (String line; (line = br.readLine()) != null; ) {</span>
+<span class="nc" id="L126">        String[] words = line.trim().split(&quot;\\s&quot;);</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        if (words.length &lt; 3) {</span>
+<span class="nc" id="L128">          System.err.printf(&quot;SpanishVerbStripper: adding words to dict, missing fields, ignoring line: %s%n&quot;, line);</span>
+        } else {
+<span class="nc" id="L130">          dictionary.put(words[0], words[2]);</span>
+        }
+<span class="nc" id="L132">      }</span>
+<span class="nc" id="L133">    } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L134">      e.printStackTrace();</span>
+<span class="nc" id="L135">    } catch (IOException e) {</span>
+<span class="nc" id="L136">      log.info(&quot;Could not load Spanish data file &quot; + dictPath);</span>
+    } finally {
+<span class="nc" id="L138">      IOUtils.closeIgnoringExceptions(br);</span>
+<span class="nc" id="L139">    }</span>
+<span class="nc" id="L140">    return dictionary;</span>
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L144">  private static final Pair&lt;Pattern, String&gt;[] accentFixes = new Pair[] {</span>
+<span class="nc" id="L145">    new Pair(Pattern.compile(&quot;á&quot;), &quot;a&quot;),</span>
+<span class="nc" id="L146">    new Pair(Pattern.compile(&quot;é&quot;), &quot;e&quot;),</span>
+<span class="nc" id="L147">    new Pair(Pattern.compile(&quot;í&quot;), &quot;i&quot;),</span>
+<span class="nc" id="L148">    new Pair(Pattern.compile(&quot;ó&quot;), &quot;o&quot;),</span>
+<span class="nc" id="L149">    new Pair(Pattern.compile(&quot;ú&quot;), &quot;u&quot;)</span>
+  };
+
+  // CONSTRUCTOR
+
+  /** Access via the singleton-like getInstance() methods. */
+<span class="nc" id="L155">  private SpanishVerbStripper(String dictPath) {</span>
+<span class="nc" id="L156">    dict = setupDictionary(dictPath);</span>
+<span class="nc" id="L157">  }</span>
+
+  /**
+   * Singleton pattern function for getting a default verb stripper.
+   */
+  public static SpanishVerbStripper getInstance() {
+<span class="nc" id="L163">    return getInstance(DEFAULT_DICT);</span>
+  }
+
+  /**
+   * Singleton pattern function for getting a verb stripper based on
+   * the dictionary at dictPath.
+   *
+   * @param dictPath the path to the dictionary for this verb stripper.
+   */
+  public static SpanishVerbStripper getInstance(String dictPath) {
+<span class="nc" id="L173">    SpanishVerbStripper svs = instances.get(dictPath);</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">    if (svs == null) {</span>
+<span class="nc" id="L175">      svs = new SpanishVerbStripper(dictPath);</span>
+<span class="nc" id="L176">      instances.put(dictPath, svs);</span>
+    }
+<span class="nc" id="L178">    return svs;</span>
+  }
+
+  /**
+   * The verbs in this set have accents in their infinitive forms;
+   * don't remove the accents when stripping pronouns!
+   */
+<span class="nc" id="L185">  private static final Set&lt;String&gt; accentedInfinitives = new HashSet&lt;&gt;(Arrays.asList(</span>
+          &quot;desleír&quot;,
+          &quot;desoír&quot;,
+          &quot;embaír&quot;,
+          &quot;engreír&quot;,
+          &quot;entreoír&quot;,
+          &quot;freír&quot;,
+          &quot;oír&quot;,
+          &quot;refreír&quot;,
+          &quot;reír&quot;,
+          &quot;sofreír&quot;,
+          &quot;sonreír&quot;
+  ));
+
+  // STATIC FUNCTIONS
+
+  /**
+   * Determine if the given word is a verb which needs to be stripped.
+   */
+  public static boolean isStrippable(String word) {
+<span class="nc bnc" id="L205" title="All 4 branches missed.">    return pStrippable.matcher(word).find() || pIrregulars.matcher(word).find();</span>
+  }
+
+  private static String removeAccents(String word) {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">    if (accentedInfinitives.contains(word))</span>
+<span class="nc" id="L210">      return word;</span>
+
+<span class="nc" id="L212">    String stripped = word;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    for (Pair&lt;Pattern, String&gt; accentFix : accentFixes)</span>
+<span class="nc" id="L214">      stripped = accentFix.first().matcher(stripped)</span>
+<span class="nc" id="L215">        .replaceAll(accentFix.second());</span>
+<span class="nc" id="L216">    return stripped;</span>
+  }
+
+  /**
+   * Determines the case of the letter as if it had been part of the
+   * original string
+   *
+   * @param letter The character whose case must be determined
+   * @param original The string we are modelling the case on
+   */
+  private static char getCase(String original, char letter) {
+<span class="nc bnc" id="L227" title="All 2 branches missed.">    if (Character.isUpperCase(original.charAt(original.length()-1))) {</span>
+<span class="nc" id="L228">      return Character.toUpperCase(letter);</span>
+    } else {
+<span class="nc" id="L230">      return Character.toLowerCase(letter);</span>
+    }
+  }
+
+<span class="nc" id="L234">  private static final Pattern nosse = Pattern.compile(&quot;nos|se&quot;);</span>
+
+  /**
+   * Validate and normalize the given verb stripper result.
+   *
+   * Returns &lt;tt&gt;true&lt;/tt&gt; if the given data is a valid pairing of verb form
+   * and clitic pronoun(s).
+   *
+   * May modify &lt;tt&gt;pair&lt;/tt&gt; in place in order to make the pair valid.
+   * For example, if the pair &lt;tt&gt;(senta, os)&lt;/tt&gt; is provided, this
+   * method will return &lt;tt&gt;true&lt;/tt&gt; and modify the pair to be
+   * &lt;tt&gt;(sentad, os)&lt;/tt&gt;.
+   */
+  private boolean normalizeStrippedVerb(StrippedVerb verb) {
+<span class="nc" id="L248">    String normalized = removeAccents(verb.getOriginalStem());</span>
+<span class="nc" id="L249">    String firstPron = verb.getPronouns().get(0).toLowerCase();</span>
+
+    // Look up verb in dictionary.
+<span class="nc" id="L252">    String verbKey = normalized.toLowerCase();</span>
+<span class="nc" id="L253">    String pos = dict.get(verbKey);</span>
+<span class="nc" id="L254">    boolean valid = false;</span>
+
+    // System.out.println(verbKey + &quot; &quot; + dict.containsKey(verbKey + 's'));
+
+    // Validate resulting split verb and normalize the new form at the same
+    // time.
+<span class="nc bnc" id="L260" title="All 2 branches missed.">    if (pos != null) {</span>
+      // Check not invalid combination of verb root and pronoun.
+      // (If we combine a second-person plural imperative and the
+      // second person plural object pronoun, we expect to see an
+      // elided verb root, not the normal one that's in the
+      // dictionary.)
+<span class="nc bnc" id="L266" title="All 4 branches missed.">      valid = ! (pos.equals(&quot;VMM02P0&quot;) &amp;&amp; firstPron.equalsIgnoreCase(&quot;os&quot;));</span>
+<span class="nc bnc" id="L267" title="All 4 branches missed.">    } else if (firstPron.equalsIgnoreCase(&quot;os&quot;) &amp;&amp; dict.containsKey(verbKey + 'd')) {</span>
+      // Special case: de-elide elided verb root in the case of a second
+      // person plural imperative + second person object pronoun
+      //
+      // (e.g., given (senta, os), return (sentad, os))
+<span class="nc" id="L272">      normalized = normalized + getCase(normalized, 'd');</span>
+<span class="nc" id="L273">      valid = true;</span>
+<span class="nc bnc" id="L274" title="All 4 branches missed.">    } else if (nosse.matcher(firstPron).matches() &amp;&amp; dict.containsKey(verbKey + 's')) {</span>
+      // Special case: de-elide elided verb root in the case of a first
+      // person plural imperative + object pronoun
+      //
+      // (vámo, nos) -&gt; (vámos, nos)
+<span class="nc" id="L279">      normalized = normalized + getCase(normalized, 's');</span>
+<span class="nc" id="L280">      valid = true;</span>
+    }
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">    if (valid) {</span>
+      // Update normalized form.
+<span class="nc" id="L285">      verb.setStem(normalized);</span>
+<span class="nc" id="L286">      return true;</span>
+    }
+
+<span class="nc" id="L289">    return false;</span>
+  }
+
+  /**
+   * Separate attached pronouns from the given verb.
+   *
+   * @param word A valid Spanish verb with clitic pronouns attached.
+   * @param pSuffix A pattern to match these attached pronouns.
+   * @return A {@link StrippedVerb} instance or &lt;tt&gt;null&lt;/tt&gt; if no attached
+   *         pronouns were found.
+   */
+  private StrippedVerb stripSuffix(String word, Pattern pSuffix) {
+<span class="nc" id="L301">    Matcher m = pSuffix.matcher(word);</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">    if (m.find()) {</span>
+<span class="nc" id="L303">      String stripped = word.substring(0, m.start());</span>
+
+<span class="nc" id="L305">      List&lt;String&gt; attached = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">      for (int i = 0; i &lt; m.groupCount(); i++)</span>
+<span class="nc" id="L307">        attached.add(m.group(i + 1));</span>
+
+<span class="nc" id="L309">      return new StrippedVerb(stripped, attached);</span>
+    }
+
+<span class="nc" id="L312">    return null;</span>
+  }
+
+  /**
+   * Attempt to separate attached pronouns from the given verb.
+   *
+   * @param verb Spanish verb
+   * @return Returns a tuple &lt;tt&gt;((originalStem, normalizedStem), pronouns)&lt;/tt&gt;,
+   *         or &lt;tt&gt;null&lt;/tt&gt; if no pronouns could be located and separated.
+   *         &lt;ul&gt;
+   *           &lt;li&gt;Pair of:
+   *             &lt;ul&gt;
+   *               &lt;li&gt;&lt;tt&gt;originalStem&lt;/tt&gt;: The verb stem simply split from the
+   *                   following pronouns.&lt;/li&gt;
+   *               &lt;li&gt;&lt;tt&gt;normalizedStem&lt;/tt&gt;: The verb stem normalized to
+   *                   dictionary form, i.e. in the form it would appear with the
+   *                   same conjugation but no pronouns. See
+   *                   {@link #validateVerbPair(Pair&lt;Pair&lt;String, String&gt;, List&lt;String&gt;)}
+   *                   for more details.&lt;/li&gt;
+   *             &lt;/ul&gt;&lt;/li&gt;
+   *           &lt;li&gt;&lt;tt&gt;pronouns&lt;/tt&gt;: Pronouns which were attached to the verb.&lt;/li&gt;
+   *         &lt;/ul&gt;
+   */
+  public StrippedVerb separatePronouns(String verb) {
+    StrippedVerb result;
+
+    // Try to strip just one pronoun first
+<span class="nc" id="L339">    result = stripSuffix(verb, pOneAttachedPronoun);</span>
+<span class="nc bnc" id="L340" title="All 4 branches missed.">    if (result != null &amp;&amp; normalizeStrippedVerb(result)) {</span>
+<span class="nc" id="L341">      return result;</span>
+    }
+
+    // Now two
+<span class="nc" id="L345">    result = stripSuffix(verb, pTwoAttachedPronouns);</span>
+<span class="nc bnc" id="L346" title="All 4 branches missed.">    if (result != null &amp;&amp; normalizeStrippedVerb(result)) {</span>
+<span class="nc" id="L347">      return result;</span>
+    }
+
+<span class="nc" id="L350">    return null;</span>
+  }
+
+  /**
+   * Remove attached pronouns from a strippable Spanish verb form. (Use
+   * {@link #isStrippable(String)} to determine if a word is a
+   * strippable verb.)
+   *
+   * Converts, e.g.,
+   * &lt;ul&gt;
+   *   &lt;li&gt; decírmelo -&amp;gt; decir
+   *   &lt;li&gt; mudarse -&amp;gt; mudar
+   *   &lt;li&gt; contándolos -&amp;gt; contando
+   *   &lt;li&gt; hazlo -&amp;gt; haz
+   * &lt;/ul&gt;
+   *
+   * @return A verb form stripped of attached pronouns, or &lt;tt&gt;null&lt;/tt&gt;
+   *           if no pronouns were located / stripped.
+   */
+  public String stripVerb(String verb) {
+<span class="nc" id="L370">    StrippedVerb separated = separatePronouns(verb);</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    if (separated != null) {</span>
+<span class="nc" id="L372">      return separated.getStem();</span>
+    }
+<span class="nc" id="L374">    return null;</span>
+  }
+
+  private static final long serialVersionUID = -4780144226395772354L;
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

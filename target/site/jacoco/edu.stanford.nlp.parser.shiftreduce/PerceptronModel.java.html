@@ -1,0 +1,662 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PerceptronModel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.shiftreduce</a> &gt; <span class="el_source">PerceptronModel.java</span></div><h1>PerceptronModel.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.shiftreduce;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Random;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.parser.common.ParserConstraint;
+import edu.stanford.nlp.parser.lexparser.EvaluateTreebank;
+import edu.stanford.nlp.stats.IntCounter;
+import edu.stanford.nlp.tagger.common.Tagger;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.Treebank;
+import edu.stanford.nlp.util.CollectionUtils;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.ReflectionLoading;
+import edu.stanford.nlp.util.ScoredComparator;
+import edu.stanford.nlp.util.ScoredObject;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.Triple;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+
+public class PerceptronModel extends BaseModel  {
+
+  /** A logger for this class */
+<span class="nc" id="L38">  private static Redwood.RedwoodChannels log = Redwood.channels(PerceptronModel.class); // Serializable</span>
+  Map&lt;String, Weight&gt; featureWeights;
+  final FeatureFactory featureFactory;
+
+  public PerceptronModel(ShiftReduceOptions op, Index&lt;Transition&gt; transitionIndex,
+                         Set&lt;String&gt; knownStates, Set&lt;String&gt; rootStates, Set&lt;String&gt; rootOnlyStates) {
+<span class="nc" id="L44">    super(op, transitionIndex, knownStates, rootStates, rootOnlyStates);</span>
+<span class="nc" id="L45">    this.featureWeights = Generics.newHashMap();</span>
+
+<span class="nc" id="L47">    String[] classes = op.featureFactoryClass.split(&quot;;&quot;);</span>
+<span class="nc bnc" id="L48" title="All 2 branches missed.">    if (classes.length == 1) {</span>
+<span class="nc" id="L49">      this.featureFactory = ReflectionLoading.loadByReflection(classes[0]);</span>
+    } else {
+<span class="nc" id="L51">      FeatureFactory[] factories = new FeatureFactory[classes.length];</span>
+<span class="nc bnc" id="L52" title="All 2 branches missed.">      for (int i = 0; i &lt; classes.length; ++i) {</span>
+<span class="nc" id="L53">        int paren = classes[i].indexOf('(');</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">        if (paren &gt;= 0) {</span>
+<span class="nc" id="L55">          String arg = classes[i].substring(paren + 1, classes[i].length() - 1);</span>
+<span class="nc" id="L56">          factories[i] = ReflectionLoading.loadByReflection(classes[i].substring(0, paren), arg);</span>
+<span class="nc" id="L57">        } else {</span>
+<span class="nc" id="L58">          factories[i] = ReflectionLoading.loadByReflection(classes[i]);</span>
+        }
+      }
+<span class="nc" id="L61">      this.featureFactory = new CombinationFeatureFactory(factories);</span>
+    }
+<span class="nc" id="L63">  }</span>
+
+  public PerceptronModel(PerceptronModel other) {
+<span class="nc" id="L66">    super(other);</span>
+<span class="nc" id="L67">    this.featureFactory = other.featureFactory;</span>
+
+<span class="nc" id="L69">    this.featureWeights = Generics.newHashMap();</span>
+<span class="nc bnc" id="L70" title="All 2 branches missed.">    for (String feature : other.featureWeights.keySet()) {</span>
+<span class="nc" id="L71">      featureWeights.put(feature, new Weight(other.featureWeights.get(feature)));</span>
+<span class="nc" id="L72">    }</span>
+<span class="nc" id="L73">  }</span>
+
+<span class="nc" id="L75">  private static final NumberFormat NF = new DecimalFormat(&quot;0.00&quot;);</span>
+<span class="nc" id="L76">  private static final NumberFormat FILENAME = new DecimalFormat(&quot;0000&quot;);</span>
+
+  public void averageScoredModels(Collection&lt;ScoredObject&lt;PerceptronModel&gt;&gt; scoredModels) {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">    if (scoredModels.isEmpty()) {</span>
+<span class="nc" id="L80">      throw new IllegalArgumentException(&quot;Cannot average empty models&quot;);</span>
+    }
+
+<span class="nc" id="L83">    log.info(&quot;Averaging &quot; + scoredModels.size() + &quot; models with scores&quot;);</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">    for (ScoredObject&lt;PerceptronModel&gt; model : scoredModels) {</span>
+<span class="nc" id="L85">      log.info(&quot; &quot; + NF.format(model.score()));</span>
+<span class="nc" id="L86">    }</span>
+<span class="nc" id="L87">    log.info();</span>
+
+<span class="nc" id="L89">    List&lt;PerceptronModel&gt; models = CollectionUtils.transformAsList(scoredModels, ScoredObject::object);</span>
+<span class="nc" id="L90">    averageModels(models);</span>
+<span class="nc" id="L91">  }</span>
+
+  public void  averageModels(Collection&lt;PerceptronModel&gt; models) {
+<span class="nc bnc" id="L94" title="All 2 branches missed.">    if (models.isEmpty()) {</span>
+<span class="nc" id="L95">      throw new IllegalArgumentException(&quot;Cannot average empty models&quot;);</span>
+    }
+
+<span class="nc" id="L98">    Set&lt;String&gt; features = Generics.newHashSet();</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">    for (PerceptronModel model : models) {</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">      for (String feature : model.featureWeights.keySet()) {</span>
+<span class="nc" id="L101">        features.add(feature);</span>
+<span class="nc" id="L102">      }</span>
+<span class="nc" id="L103">    }</span>
+
+<span class="nc" id="L105">    featureWeights = Generics.newHashMap();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">    for (String feature : features) {</span>
+<span class="nc" id="L107">      featureWeights.put(feature, new Weight());</span>
+<span class="nc" id="L108">    }</span>
+
+<span class="nc" id="L110">    int numModels = models.size();</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    for (String feature : features) {</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">      for (PerceptronModel model : models) {</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if (!model.featureWeights.containsKey(feature)) {</span>
+<span class="nc" id="L114">          continue;</span>
+        }
+<span class="nc" id="L116">        featureWeights.get(feature).addScaled(model.featureWeights.get(feature), 1.0f / numModels);</span>
+<span class="nc" id="L117">      }</span>
+<span class="nc" id="L118">    }</span>
+<span class="nc" id="L119">  }</span>
+
+  /**
+   * Iterate over the feature weight map.
+   * For each feature, remove all transitions with score of 0.
+   * Any feature with no transitions left is then removed
+   */
+  void condenseFeatures() {
+<span class="nc" id="L127">    Iterator&lt;String&gt; featureIt = featureWeights.keySet().iterator();</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">    while (featureIt.hasNext()) {</span>
+<span class="nc" id="L129">      String feature = featureIt.next();</span>
+<span class="nc" id="L130">      Weight weights = featureWeights.get(feature);</span>
+<span class="nc" id="L131">      weights.condense();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">      if (weights.size() == 0) {</span>
+<span class="nc" id="L133">        featureIt.remove();</span>
+      }
+<span class="nc" id="L135">    }</span>
+<span class="nc" id="L136">  }</span>
+
+  void filterFeatures(Set&lt;String&gt; keep) {
+<span class="nc" id="L139">    Iterator&lt;String&gt; featureIt = featureWeights.keySet().iterator();</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">    while (featureIt.hasNext()) {</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">      if (!keep.contains(featureIt.next())) {</span>
+<span class="nc" id="L142">        featureIt.remove();</span>
+      }
+    }
+<span class="nc" id="L145">  }</span>
+
+
+  /**
+   * Output some random facts about the model
+   */
+  public void outputStats() {
+<span class="nc" id="L152">    log.info(&quot;Number of known features: &quot; + featureWeights.size());</span>
+<span class="nc" id="L153">    int numWeights = 0;</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">    for (Map.Entry&lt;String, Weight&gt; stringWeightEntry : featureWeights.entrySet()) {</span>
+<span class="nc" id="L155">      numWeights += stringWeightEntry.getValue().size();</span>
+<span class="nc" id="L156">    }</span>
+<span class="nc" id="L157">    log.info(&quot;Number of non-zero weights: &quot; + numWeights);</span>
+
+<span class="nc" id="L159">    int wordLength = 0;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">    for (String feature : featureWeights.keySet()) {</span>
+<span class="nc" id="L161">      wordLength += feature.length();</span>
+<span class="nc" id="L162">    }</span>
+<span class="nc" id="L163">    log.info(&quot;Total word length: &quot; + wordLength);</span>
+
+<span class="nc" id="L165">    log.info(&quot;Number of transitions: &quot; + transitionIndex.size());</span>
+<span class="nc" id="L166">  }</span>
+
+  /** Reconstruct that tag set that was used to train the model by decoding some of the features.
+   *  This is slow and brittle but should work!  Only if &quot;-&quot; is not in the tag set....
+   */
+  @Override
+  Set&lt;String&gt; tagSet() {
+<span class="nc" id="L173">    Set&lt;String&gt; tags = Generics.newHashSet();</span>
+<span class="nc" id="L174">    Pattern p1 = Pattern.compile(&quot;Q0TQ1T-([^-]+)-.*&quot;);</span>
+<span class="nc" id="L175">    Pattern p2 = Pattern.compile(&quot;S0T-(.*)&quot;);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">    for (String feat : featureWeights.keySet()) {</span>
+<span class="nc" id="L177">      Matcher m1 = p1.matcher(feat);</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">      if (m1.matches()) {</span>
+<span class="nc" id="L179">        tags.add(m1.group(1));</span>
+      }
+<span class="nc" id="L181">      Matcher m2 = p2.matcher(feat);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">      if (m2.matches()) {</span>
+<span class="nc" id="L183">        tags.add(m2.group(1));</span>
+      }
+<span class="nc" id="L185">    }</span>
+    // Add the end of sentence tag!
+    // The SR model doesn't use it, but other models do and report it.
+    // todo [cdm 2014]: Maybe we should reverse the convention here?!?
+<span class="nc" id="L189">    tags.add(Tagger.EOS_TAG);</span>
+<span class="nc" id="L190">    return tags;</span>
+  }
+
+  /** Convenience method: returns one highest scoring transition, without any ParserConstraints */
+  private ScoredObject&lt;Integer&gt; findHighestScoringTransition(State state, List&lt;String&gt; features, boolean requireLegal) {
+<span class="nc" id="L195">    Collection&lt;ScoredObject&lt;Integer&gt;&gt; transitions = findHighestScoringTransitions(state, features, requireLegal, 1, null);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">    if (transitions.isEmpty()) {</span>
+<span class="nc" id="L197">      return null;</span>
+    }
+<span class="nc" id="L199">    return transitions.iterator().next();</span>
+  }
+
+  @Override
+  public Collection&lt;ScoredObject&lt;Integer&gt;&gt; findHighestScoringTransitions(State state, boolean requireLegal, int numTransitions, List&lt;ParserConstraint&gt; constraints) {
+<span class="nc" id="L204">    List&lt;String&gt; features = featureFactory.featurize(state);</span>
+<span class="nc" id="L205">    return findHighestScoringTransitions(state, features, requireLegal, numTransitions, constraints);</span>
+  }
+
+  private Collection&lt;ScoredObject&lt;Integer&gt;&gt; findHighestScoringTransitions(State state, List&lt;String&gt; features, boolean requireLegal, int numTransitions, List&lt;ParserConstraint&gt; constraints) {
+<span class="nc" id="L209">    float[] scores = new float[transitionIndex.size()];</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">    for (String feature : features) {</span>
+<span class="nc" id="L211">      Weight weight = featureWeights.get(feature);</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">      if (weight == null) {</span>
+        // Features not in our index are ignored
+<span class="nc" id="L214">        continue;</span>
+      }
+<span class="nc" id="L216">      weight.score(scores);</span>
+<span class="nc" id="L217">    }</span>
+
+<span class="nc" id="L219">    PriorityQueue&lt;ScoredObject&lt;Integer&gt;&gt; queue = new PriorityQueue&lt;&gt;(numTransitions + 1, ScoredComparator.ASCENDING_COMPARATOR);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">    for (int i = 0; i &lt; scores.length; ++i) {</span>
+<span class="nc bnc" id="L221" title="All 4 branches missed.">      if (!requireLegal || transitionIndex.get(i).isLegal(state, constraints)) {</span>
+<span class="nc" id="L222">        queue.add(new ScoredObject&lt;&gt;(i, scores[i]));</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (queue.size() &gt; numTransitions) {</span>
+<span class="nc" id="L224">          queue.poll();</span>
+        }
+      }
+    }
+
+<span class="nc" id="L229">    return queue;</span>
+  }
+
+  private static class Update {
+    final List&lt;String&gt; features;
+    final int goldTransition;
+    final int predictedTransition;
+    final float delta;
+
+<span class="nc" id="L238">    Update(List&lt;String&gt; features, int goldTransition, int predictedTransition, float delta) {</span>
+<span class="nc" id="L239">      this.features = features;</span>
+<span class="nc" id="L240">      this.goldTransition = goldTransition;</span>
+<span class="nc" id="L241">      this.predictedTransition = predictedTransition;</span>
+<span class="nc" id="L242">      this.delta = delta;</span>
+<span class="nc" id="L243">    }</span>
+  }
+
+  private Pair&lt;Integer, Integer&gt; trainTree(int index, List&lt;Tree&gt; binarizedTrees, List&lt;List&lt;Transition&gt;&gt; transitionLists, List&lt;Update&gt; updates, Oracle oracle) {
+<span class="nc" id="L247">    int numCorrect = 0;</span>
+<span class="nc" id="L248">    int numWrong = 0;</span>
+
+<span class="nc" id="L250">    Tree tree = binarizedTrees.get(index);</span>
+
+<span class="nc" id="L252">    ReorderingOracle reorderer = null;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">    if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_ORACLE ||</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_BEAM) {</span>
+<span class="nc" id="L255">      reorderer = new ReorderingOracle(op);</span>
+    }
+
+    // TODO.  This training method seems to be working in that it
+    // trains models just like the gold and early termination methods do.
+    // However, it causes the feature space to go crazy.  Presumably
+    // leaving out features with low weights or low frequencies would
+    // significantly help with that.  Otherwise, not sure how to keep
+    // it under control.
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.ORACLE) {</span>
+<span class="nc" id="L265">      State state = ShiftReduceParser.initialStateFromGoldTagTree(tree);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">      while (!state.isFinished()) {</span>
+<span class="nc" id="L267">        List&lt;String&gt; features = featureFactory.featurize(state);</span>
+<span class="nc" id="L268">        ScoredObject&lt;Integer&gt; prediction = findHighestScoringTransition(state, features, true);</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (prediction == null) {</span>
+<span class="nc" id="L270">          throw new AssertionError(&quot;Did not find a legal transition&quot;);</span>
+        }
+<span class="nc" id="L272">        int predictedNum = prediction.object();</span>
+<span class="nc" id="L273">        Transition predicted = transitionIndex.get(predictedNum);</span>
+<span class="nc" id="L274">        OracleTransition gold = oracle.goldTransition(index, state);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (gold.isCorrect(predicted)) {</span>
+<span class="nc" id="L276">          numCorrect++;</span>
+<span class="nc bnc" id="L277" title="All 4 branches missed.">          if (gold.transition != null &amp;&amp; !gold.transition.equals(predicted)) {</span>
+<span class="nc" id="L278">            int transitionNum = transitionIndex.indexOf(gold.transition);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            if (transitionNum &lt; 0) {</span>
+              // TODO: do we want to add unary transitions which are
+              // only possible when the parser has gone off the rails?
+<span class="nc" id="L282">              continue;</span>
+            }
+<span class="nc" id="L284">            updates.add(new Update(features, transitionNum, -1, 1.0f));</span>
+<span class="nc" id="L285">          }</span>
+        } else {
+<span class="nc" id="L287">          numWrong++;</span>
+<span class="nc" id="L288">          int transitionNum = -1;</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">          if (gold.transition != null) {</span>
+<span class="nc" id="L290">            transitionNum = transitionIndex.indexOf(gold.transition);</span>
+            // TODO: this can theoretically result in a -1 gold
+            // transition if the transition exists, but is a
+            // CompoundUnaryTransition which only exists because the
+            // parser is wrong.  Do we want to add those transitions?
+          }
+<span class="nc" id="L296">          updates.add(new Update(features, transitionNum, predictedNum, 1.0f));</span>
+        }
+<span class="nc" id="L298">        state = predicted.apply(state);</span>
+<span class="nc" id="L299">      }</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    } else if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.BEAM ||</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">               op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_BEAM) {</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">      if (op.trainOptions().beamSize &lt;= 0) {</span>
+<span class="nc" id="L303">        throw new IllegalArgumentException(&quot;Illegal beam size &quot; + op.trainOptions().beamSize);</span>
+      }
+<span class="nc" id="L305">      List&lt;Transition&gt; transitions = Generics.newLinkedList(transitionLists.get(index));</span>
+<span class="nc" id="L306">      PriorityQueue&lt;State&gt; agenda = new PriorityQueue&lt;&gt;(op.trainOptions().beamSize + 1, ScoredComparator.ASCENDING_COMPARATOR);</span>
+<span class="nc" id="L307">      State goldState = ShiftReduceParser.initialStateFromGoldTagTree(tree);</span>
+<span class="nc" id="L308">      agenda.add(goldState);</span>
+<span class="nc" id="L309">      int transitionCount = 0;</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">      while (transitions.size() &gt; 0) {</span>
+<span class="nc" id="L311">        Transition goldTransition = transitions.get(0);</span>
+<span class="nc" id="L312">        Transition highestScoringTransitionFromGoldState = null;</span>
+<span class="nc" id="L313">        double highestScoreFromGoldState = 0.0;</span>
+<span class="nc" id="L314">        PriorityQueue&lt;State&gt; newAgenda = new PriorityQueue&lt;&gt;(op.trainOptions().beamSize + 1, ScoredComparator.ASCENDING_COMPARATOR);</span>
+<span class="nc" id="L315">        State highestScoringState = null;</span>
+<span class="nc" id="L316">        State highestCurrentState = null;</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        for (State currentState : agenda) {</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">          boolean isGoldState = (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_BEAM &amp;&amp;</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                                 goldState.areTransitionsEqual(currentState));</span>
+
+<span class="nc" id="L321">          List&lt;String&gt; features = featureFactory.featurize(currentState);</span>
+<span class="nc" id="L322">          Collection&lt;ScoredObject&lt;Integer&gt;&gt; stateTransitions = findHighestScoringTransitions(currentState, features, true, op.trainOptions().beamSize, null);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">          for (ScoredObject&lt;Integer&gt; transition : stateTransitions) {</span>
+<span class="nc" id="L324">            State newState = transitionIndex.get(transition.object()).apply(currentState, transition.score());</span>
+<span class="nc" id="L325">            newAgenda.add(newState);</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            if (newAgenda.size() &gt; op.trainOptions().beamSize) {</span>
+<span class="nc" id="L327">              newAgenda.poll();</span>
+            }
+<span class="nc bnc" id="L329" title="All 4 branches missed.">            if (highestScoringState == null || highestScoringState.score() &lt; newState.score()) {</span>
+<span class="nc" id="L330">              highestScoringState = newState;</span>
+<span class="nc" id="L331">              highestCurrentState = currentState;</span>
+            }
+<span class="nc bnc" id="L333" title="All 4 branches missed.">            if (isGoldState &amp;&amp;</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                (highestScoringTransitionFromGoldState == null || transition.score() &gt; highestScoreFromGoldState)) {</span>
+<span class="nc" id="L335">              highestScoringTransitionFromGoldState = transitionIndex.get(transition.object());</span>
+<span class="nc" id="L336">              highestScoreFromGoldState = transition.score();</span>
+            }
+<span class="nc" id="L338">          }</span>
+<span class="nc" id="L339">        }</span>
+
+        // This can happen if the REORDER_BEAM method backs itself
+        // into a corner, such as transitioning to something that
+        // can't have a FinalizeTransition applied.  This doesn't
+        // happen for the BEAM method because in that case the correct
+        // state (eg one with ROOT) isn't on the agenda so it stops.
+<span class="nc bnc" id="L346" title="All 4 branches missed.">        if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_BEAM &amp;&amp; highestScoringTransitionFromGoldState == null) {</span>
+<span class="nc" id="L347">          break;</span>
+        }
+
+<span class="nc" id="L350">        State newGoldState = goldTransition.apply(goldState, 0.0);</span>
+
+        // if highest scoring state used the correct transition, no training
+        // otherwise, down the last transition, up the correct
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        if (!newGoldState.areTransitionsEqual(highestScoringState)) {</span>
+<span class="nc" id="L355">          ++numWrong;</span>
+<span class="nc" id="L356">          List&lt;String&gt; goldFeatures = featureFactory.featurize(goldState);</span>
+<span class="nc" id="L357">          int lastTransition = transitionIndex.indexOf(highestScoringState.transitions.peek());</span>
+<span class="nc" id="L358">          updates.add(new Update(featureFactory.featurize(highestCurrentState), -1, lastTransition, 1.0f));</span>
+<span class="nc" id="L359">          updates.add(new Update(goldFeatures, transitionIndex.indexOf(goldTransition), -1, 1.0f));</span>
+
+<span class="nc bnc" id="L361" title="All 2 branches missed.">          if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.BEAM) {</span>
+            // If the correct state has fallen off the agenda, break
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            if (!ShiftReduceUtils.findStateOnAgenda(newAgenda, newGoldState)) {</span>
+<span class="nc" id="L364">              break;</span>
+            } else {
+<span class="nc" id="L366">              transitions.remove(0);</span>
+            }
+<span class="nc bnc" id="L368" title="All 2 branches missed.">          } else if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_BEAM) {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            if (!ShiftReduceUtils.findStateOnAgenda(newAgenda, newGoldState)) {</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">              if (!reorderer.reorder(goldState, highestScoringTransitionFromGoldState, transitions)) {</span>
+<span class="nc" id="L371">                break;</span>
+              }
+<span class="nc" id="L373">              newGoldState = highestScoringTransitionFromGoldState.apply(goldState);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">              if (!ShiftReduceUtils.findStateOnAgenda(newAgenda, newGoldState)) {</span>
+<span class="nc" id="L375">                break;</span>
+              }
+            } else {
+<span class="nc" id="L378">              transitions.remove(0);</span>
+            }
+          }
+<span class="nc" id="L381">        } else {</span>
+<span class="nc" id="L382">          ++numCorrect;</span>
+<span class="nc" id="L383">          transitions.remove(0);</span>
+        }
+
+<span class="nc" id="L386">        goldState = newGoldState;</span>
+<span class="nc" id="L387">        agenda = newAgenda;</span>
+<span class="nc" id="L388">      }</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">    } else if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.REORDER_ORACLE ||</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">               op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.EARLY_TERMINATION ||</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">               op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.GOLD) {</span>
+<span class="nc" id="L392">      State state = ShiftReduceParser.initialStateFromGoldTagTree(tree);</span>
+<span class="nc" id="L393">      List&lt;Transition&gt; transitions = transitionLists.get(index);</span>
+<span class="nc" id="L394">      transitions = Generics.newLinkedList(transitions);</span>
+<span class="nc" id="L395">      boolean keepGoing = true;</span>
+<span class="nc bnc" id="L396" title="All 4 branches missed.">      while (transitions.size() &gt; 0 &amp;&amp; keepGoing) {</span>
+<span class="nc" id="L397">        Transition transition = transitions.get(0);</span>
+<span class="nc" id="L398">        int transitionNum = transitionIndex.indexOf(transition);</span>
+<span class="nc" id="L399">        List&lt;String&gt; features = featureFactory.featurize(state);</span>
+<span class="nc" id="L400">        int predictedNum = findHighestScoringTransition(state, features, false).object();</span>
+<span class="nc" id="L401">        Transition predicted = transitionIndex.get(predictedNum);</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        if (transitionNum == predictedNum) {</span>
+<span class="nc" id="L403">          transitions.remove(0);</span>
+<span class="nc" id="L404">          state = transition.apply(state);</span>
+<span class="nc" id="L405">          numCorrect++;</span>
+        } else {
+<span class="nc" id="L407">          numWrong++;</span>
+          // TODO: allow weighted features, weighted training, etc
+<span class="nc" id="L409">          updates.add(new Update(features, transitionNum, predictedNum, 1.0f));</span>
+<span class="nc bnc" id="L410" title="All 4 branches missed.">          switch (op.trainOptions().trainingMethod) {</span>
+          case EARLY_TERMINATION:
+<span class="nc" id="L412">            keepGoing = false;</span>
+<span class="nc" id="L413">            break;</span>
+          case GOLD:
+<span class="nc" id="L415">            transitions.remove(0);</span>
+<span class="nc" id="L416">            state = transition.apply(state);</span>
+<span class="nc" id="L417">            break;</span>
+          case REORDER_ORACLE:
+<span class="nc" id="L419">            keepGoing = reorderer.reorder(state, predicted, transitions);</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (keepGoing) {</span>
+<span class="nc" id="L421">              state = predicted.apply(state);</span>
+            }
+            break;
+          default:
+<span class="nc" id="L425">            throw new IllegalArgumentException(&quot;Unexpected method &quot; + op.trainOptions().trainingMethod);</span>
+          }
+        }
+<span class="nc" id="L428">      }</span>
+    }
+
+<span class="nc" id="L431">    return Pair.makePair(numCorrect, numWrong);</span>
+  }
+
+  private class TrainTreeProcessor implements ThreadsafeProcessor&lt;Integer, Pair&lt;Integer, Integer&gt;&gt; {
+    List&lt;Tree&gt; binarizedTrees;
+    List&lt;List&lt;Transition&gt;&gt; transitionLists;
+    List&lt;Update&gt; updates; // this needs to be a synchronized list
+    Oracle oracle;
+
+<span class="nc" id="L440">    public TrainTreeProcessor(List&lt;Tree&gt; binarizedTrees, List&lt;List&lt;Transition&gt;&gt; transitionLists, List&lt;Update&gt; updates, Oracle oracle) {</span>
+<span class="nc" id="L441">      this.binarizedTrees = binarizedTrees;</span>
+<span class="nc" id="L442">      this.transitionLists = transitionLists;</span>
+<span class="nc" id="L443">      this.updates = updates;</span>
+<span class="nc" id="L444">      this.oracle = oracle;</span>
+<span class="nc" id="L445">    }</span>
+
+    public Pair&lt;Integer, Integer&gt; process(Integer index) {
+<span class="nc" id="L448">      return trainTree(index, binarizedTrees, transitionLists, updates, oracle);</span>
+    }
+
+    public TrainTreeProcessor newInstance() {
+      // already threadsafe
+<span class="nc" id="L453">      return this;</span>
+    }
+  }
+
+  /**
+   * Trains a batch of trees and returns the following: a list of
+   * Update objects, the number of transitions correct, and the number
+   * of transitions wrong.
+   * &lt;br&gt;
+   * If the model is trained with multiple threads, it is expected
+   * that a valid MulticoreWrapper is passed in which does the
+   * processing.  In that case, the processing is done on all of the
+   * trees without updating any weights, which allows the results for
+   * multithreaded training to be reproduced.
+   */
+  private Triple&lt;List&lt;Update&gt;, Integer, Integer&gt; trainBatch(List&lt;Integer&gt; indices, List&lt;Tree&gt; binarizedTrees, List&lt;List&lt;Transition&gt;&gt; transitionLists, List&lt;Update&gt; updates, Oracle oracle, MulticoreWrapper&lt;Integer, Pair&lt;Integer, Integer&gt;&gt; wrapper) {
+<span class="nc" id="L469">    int numCorrect = 0;</span>
+<span class="nc" id="L470">    int numWrong = 0;</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">    if (op.trainOptions.trainingThreads == 1) {</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">      for (Integer index : indices) {</span>
+<span class="nc" id="L473">        Pair&lt;Integer, Integer&gt; count = trainTree(index, binarizedTrees, transitionLists, updates, oracle);</span>
+<span class="nc" id="L474">        numCorrect += count.first;</span>
+<span class="nc" id="L475">        numWrong += count.second;</span>
+<span class="nc" id="L476">      }</span>
+    } else {
+<span class="nc bnc" id="L478" title="All 2 branches missed.">      for (Integer index : indices) {</span>
+<span class="nc" id="L479">        wrapper.put(index);</span>
+<span class="nc" id="L480">      }</span>
+<span class="nc" id="L481">      wrapper.join(false);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">      while (wrapper.peek()) {</span>
+<span class="nc" id="L483">        Pair&lt;Integer, Integer&gt; result = wrapper.poll();</span>
+<span class="nc" id="L484">        numCorrect += result.first;</span>
+<span class="nc" id="L485">        numWrong += result.second;</span>
+<span class="nc" id="L486">      }</span>
+    }
+<span class="nc" id="L488">    return new Triple&lt;&gt;(updates, numCorrect, numWrong);</span>
+  }
+
+
+  private void trainModel(String serializedPath, Tagger tagger, Random random, List&lt;Tree&gt; binarizedTrees, List&lt;List&lt;Transition&gt;&gt; transitionLists, Treebank devTreebank, int nThreads, Set&lt;String&gt; allowedFeatures) {
+<span class="nc" id="L493">    double bestScore = 0.0;</span>
+<span class="nc" id="L494">    int bestIteration = 0;</span>
+<span class="nc" id="L495">    PriorityQueue&lt;ScoredObject&lt;PerceptronModel&gt;&gt; bestModels = null;</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">    if (op.trainOptions().averagedModels &gt; 0) {</span>
+<span class="nc" id="L497">      bestModels = new PriorityQueue&lt;&gt;(op.trainOptions().averagedModels + 1, ScoredComparator.ASCENDING_COMPARATOR);</span>
+    }
+
+<span class="nc" id="L500">    List&lt;Integer&gt; indices = Generics.newArrayList();</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">    for (int i = 0; i &lt; binarizedTrees.size(); ++i) {</span>
+<span class="nc" id="L502">      indices.add(i);</span>
+    }
+
+<span class="nc" id="L505">    Oracle oracle = null;</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    if (op.trainOptions().trainingMethod == ShiftReduceTrainOptions.TrainingMethod.ORACLE) {</span>
+<span class="nc" id="L507">      oracle = new Oracle(binarizedTrees, op.compoundUnaries, rootStates);</span>
+    }
+
+<span class="nc" id="L510">    List&lt;Update&gt; updates = Generics.newArrayList();</span>
+<span class="nc" id="L511">    MulticoreWrapper&lt;Integer, Pair&lt;Integer, Integer&gt;&gt; wrapper = null;</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">    if (nThreads != 1) {</span>
+<span class="nc" id="L513">      updates = Collections.synchronizedList(updates);</span>
+<span class="nc" id="L514">      wrapper = new MulticoreWrapper&lt;&gt;(op.trainOptions.trainingThreads, new TrainTreeProcessor(binarizedTrees, transitionLists, updates, oracle));</span>
+    }
+
+<span class="nc" id="L517">    IntCounter&lt;String&gt; featureFrequencies = null;</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">    if (op.trainOptions().featureFrequencyCutoff &gt; 1) {</span>
+<span class="nc" id="L519">      featureFrequencies = new IntCounter&lt;&gt;();</span>
+    }
+
+<span class="nc bnc" id="L522" title="All 2 branches missed.">    for (int iteration = 1; iteration &lt;= op.trainOptions.trainingIterations; ++iteration) {</span>
+<span class="nc" id="L523">      Timing trainingTimer = new Timing();</span>
+<span class="nc" id="L524">      int numCorrect = 0;</span>
+<span class="nc" id="L525">      int numWrong = 0;</span>
+<span class="nc" id="L526">      Collections.shuffle(indices, random);</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">      for (int start = 0; start &lt; indices.size(); start += op.trainOptions.batchSize) {</span>
+<span class="nc" id="L528">        int end = Math.min(start + op.trainOptions.batchSize, indices.size());</span>
+<span class="nc" id="L529">        Triple&lt;List&lt;Update&gt;, Integer, Integer&gt; result = trainBatch(indices.subList(start, end), binarizedTrees, transitionLists, updates, oracle, wrapper);</span>
+
+<span class="nc" id="L531">        numCorrect += result.second;</span>
+<span class="nc" id="L532">        numWrong += result.third;</span>
+
+<span class="nc bnc" id="L534" title="All 2 branches missed.">        for (Update update : result.first) {</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">          for (String feature : update.features) {</span>
+<span class="nc bnc" id="L536" title="All 4 branches missed.">            if (allowedFeatures != null &amp;&amp; !allowedFeatures.contains(feature)) {</span>
+<span class="nc" id="L537">              continue;</span>
+            }
+<span class="nc" id="L539">            Weight weights = featureWeights.get(feature);</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            if (weights == null) {</span>
+<span class="nc" id="L541">              weights = new Weight();</span>
+<span class="nc" id="L542">              featureWeights.put(feature, weights);</span>
+            }
+<span class="nc" id="L544">            weights.updateWeight(update.goldTransition, update.delta);</span>
+<span class="nc" id="L545">            weights.updateWeight(update.predictedTransition, -update.delta);</span>
+
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            if (featureFrequencies != null) {</span>
+<span class="nc bnc" id="L548" title="All 4 branches missed.">              featureFrequencies.incrementCount(feature, (update.goldTransition &gt;= 0 &amp;&amp; update.predictedTransition &gt;= 0) ? 2 : 1);</span>
+            }
+<span class="nc" id="L550">          }</span>
+<span class="nc" id="L551">        }</span>
+<span class="nc" id="L552">        updates.clear();</span>
+      }
+<span class="nc" id="L554">      trainingTimer.done(&quot;Iteration &quot; + iteration);</span>
+<span class="nc" id="L555">      log.info(&quot;While training, got &quot; + numCorrect + &quot; transitions correct and &quot; + numWrong + &quot; transitions wrong&quot;);</span>
+<span class="nc" id="L556">      outputStats();</span>
+
+
+<span class="nc" id="L559">      double labelF1 = 0.0;</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">      if (devTreebank != null) {</span>
+<span class="nc" id="L561">        EvaluateTreebank evaluator = new EvaluateTreebank(op, null, new ShiftReduceParser(op, this), tagger);</span>
+<span class="nc" id="L562">        evaluator.testOnTreebank(devTreebank);</span>
+<span class="nc" id="L563">        labelF1 = evaluator.getLBScore();</span>
+<span class="nc" id="L564">        log.info(&quot;Label F1 after &quot; + iteration + &quot; iterations: &quot; + labelF1);</span>
+
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        if (labelF1 &gt; bestScore) {</span>
+<span class="nc" id="L567">          log.info(&quot;New best dev score (previous best &quot; + bestScore + &quot;)&quot;);</span>
+<span class="nc" id="L568">          bestScore = labelF1;</span>
+<span class="nc" id="L569">          bestIteration = iteration;</span>
+        } else {
+<span class="nc" id="L571">          log.info(&quot;Failed to improve for &quot; + (iteration - bestIteration) + &quot; iteration(s) on previous best score of &quot; + bestScore);</span>
+<span class="nc bnc" id="L572" title="All 4 branches missed.">          if (op.trainOptions.stalledIterationLimit &gt; 0 &amp;&amp; (iteration - bestIteration &gt;= op.trainOptions.stalledIterationLimit)) {</span>
+<span class="nc" id="L573">            log.info(&quot;Failed to improve for too long, stopping training&quot;);</span>
+<span class="nc" id="L574">            break;</span>
+          }
+        }
+<span class="nc" id="L577">        log.info();</span>
+
+<span class="nc bnc" id="L579" title="All 2 branches missed.">        if (bestModels != null) {</span>
+<span class="nc" id="L580">          bestModels.add(new ScoredObject&lt;&gt;(new PerceptronModel(this), labelF1));</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">          if (bestModels.size() &gt; op.trainOptions().averagedModels) {</span>
+<span class="nc" id="L582">            bestModels.poll();</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L586" title="All 6 branches missed.">      if (op.trainOptions().saveIntermediateModels &amp;&amp; serializedPath != null &amp;&amp; op.trainOptions.debugOutputFrequency &gt; 0) {</span>
+<span class="nc" id="L587">        String tempName = serializedPath.substring(0, serializedPath.length() - 7) + &quot;-&quot; + FILENAME.format(iteration) + &quot;-&quot; + NF.format(labelF1) + &quot;.ser.gz&quot;;</span>
+<span class="nc" id="L588">        ShiftReduceParser temp = new ShiftReduceParser(op, this);</span>
+<span class="nc" id="L589">        temp.saveModel(tempName);</span>
+        // TODO: we could save a cutoff version of the model,
+        // especially if we also get a dev set number for it, but that
+        // might be overkill
+      }
+    }
+
+<span class="nc bnc" id="L596" title="All 2 branches missed.">    if (wrapper != null) {</span>
+<span class="nc" id="L597">      wrapper.join();</span>
+    }
+
+<span class="nc bnc" id="L600" title="All 2 branches missed.">    if (bestModels != null) {</span>
+<span class="nc bnc" id="L601" title="All 4 branches missed.">      if (op.trainOptions().cvAveragedModels &amp;&amp; devTreebank != null) {</span>
+<span class="nc" id="L602">        List&lt;ScoredObject&lt;PerceptronModel&gt;&gt; models = Generics.newArrayList();</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        while (bestModels.size() &gt; 0) {</span>
+<span class="nc" id="L604">          models.add(bestModels.poll());</span>
+        }
+<span class="nc" id="L606">        Collections.reverse(models);</span>
+<span class="nc" id="L607">        double bestF1 = 0.0;</span>
+<span class="nc" id="L608">        int bestSize = 0;</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        for (int i = 1; i &lt;= models.size(); ++i) {</span>
+<span class="nc" id="L610">          log.info(&quot;Testing with &quot; + i + &quot; models averaged together&quot;);</span>
+          // TODO: this is kind of ugly, would prefer a separate object
+<span class="nc" id="L612">          averageScoredModels(models.subList(0, i));</span>
+<span class="nc" id="L613">          ShiftReduceParser temp = new ShiftReduceParser(op, this);</span>
+<span class="nc" id="L614">          EvaluateTreebank evaluator = new EvaluateTreebank(temp.getOp(), null, temp, tagger);</span>
+<span class="nc" id="L615">          evaluator.testOnTreebank(devTreebank);</span>
+<span class="nc" id="L616">          double labelF1 = evaluator.getLBScore();</span>
+<span class="nc" id="L617">          log.info(&quot;Label F1 for &quot; + i + &quot; models: &quot; + labelF1);</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">          if (labelF1 &gt; bestF1) {</span>
+<span class="nc" id="L619">            bestF1 = labelF1;</span>
+<span class="nc" id="L620">            bestSize = i;</span>
+          }
+        }
+<span class="nc" id="L623">        averageScoredModels(models.subList(0, bestSize));</span>
+<span class="nc" id="L624">      } else {</span>
+<span class="nc" id="L625">        averageScoredModels(bestModels);</span>
+      }
+    }
+
+    // TODO: perhaps we should filter the features and then get dev
+    // set scores.  That way we can merge the models which are best
+    // after filtering.
+<span class="nc bnc" id="L632" title="All 2 branches missed.">    if (featureFrequencies != null) {</span>
+<span class="nc" id="L633">      filterFeatures(featureFrequencies.keysAbove(op.trainOptions().featureFrequencyCutoff));</span>
+    }
+
+<span class="nc" id="L636">    condenseFeatures();</span>
+<span class="nc" id="L637">  }</span>
+
+
+  /**
+   * Will train the model on the given treebank, using devTreebank as
+   * a dev set.  If op.retrainAfterCutoff is set, will rerun training
+   * after the first time through on a limited set of features.
+   */
+  public void trainModel(String serializedPath, Tagger tagger, Random random, List&lt;Tree&gt; binarizedTrees, List&lt;List&lt;Transition&gt;&gt; transitionLists, Treebank devTreebank, int nThreads) {
+<span class="nc bnc" id="L646" title="All 4 branches missed.">    if (op.trainOptions().retrainAfterCutoff &amp;&amp; op.trainOptions().featureFrequencyCutoff &gt; 0) {</span>
+<span class="nc" id="L647">      String tempName = serializedPath.substring(0, serializedPath.length() - 7) + &quot;-&quot; + &quot;temp.ser.gz&quot;;</span>
+<span class="nc" id="L648">      trainModel(tempName, tagger, random, binarizedTrees, transitionLists, devTreebank, nThreads, null);</span>
+<span class="nc" id="L649">      ShiftReduceParser temp = new ShiftReduceParser(op, this);</span>
+<span class="nc" id="L650">      temp.saveModel(tempName);</span>
+<span class="nc" id="L651">      Set&lt;String&gt; features = featureWeights.keySet();</span>
+<span class="nc" id="L652">      featureWeights = Generics.newHashMap();</span>
+<span class="nc" id="L653">      trainModel(serializedPath, tagger, random, binarizedTrees, transitionLists, devTreebank, nThreads, features);</span>
+<span class="nc" id="L654">    } else {</span>
+<span class="nc" id="L655">      trainModel(serializedPath, tagger, random, binarizedTrees, transitionLists, devTreebank, nThreads, null);</span>
+    }
+<span class="nc" id="L657">  }</span>
+
+
+  private static final long serialVersionUID = 1;
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

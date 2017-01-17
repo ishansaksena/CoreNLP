@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DVParserCostAndGradient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.dvparser</a> &gt; <span class="el_source">DVParserCostAndGradient.java</span></div><h1>DVParserCostAndGradient.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.dvparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.util.ArrayList;
+import java.util.Formatter;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+
+import org.ejml.simple.SimpleMatrix;
+
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.neural.NeuralUtils;
+import edu.stanford.nlp.optimization.AbstractCachingDiffFunction;
+import edu.stanford.nlp.parser.common.NoSuchParseException;
+import edu.stanford.nlp.parser.lexparser.Options;
+import edu.stanford.nlp.parser.metrics.TreeSpanScoring;
+import edu.stanford.nlp.trees.DeepTree;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.IntPair;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.TwoDimensionalMap;
+import edu.stanford.nlp.util.concurrent.MulticoreWrapper;
+import edu.stanford.nlp.util.concurrent.ThreadsafeProcessor;
+
+public class DVParserCostAndGradient extends AbstractCachingDiffFunction  {
+
+  /** A logger for this class */
+<span class="nc" id="L33">  private static Redwood.RedwoodChannels log = Redwood.channels(DVParserCostAndGradient.class);</span>
+  List&lt;Tree&gt; trainingBatch;
+  IdentityHashMap&lt;Tree, List&lt;Tree&gt;&gt; topParses;
+  DVModel dvModel;
+  Options op;
+
+  public DVParserCostAndGradient(List&lt;Tree&gt; trainingBatch,
+                                 IdentityHashMap&lt;Tree, List&lt;Tree&gt;&gt; topParses,
+<span class="nc" id="L41">                                 DVModel dvModel, Options op) {</span>
+<span class="nc" id="L42">    this.trainingBatch = trainingBatch;</span>
+<span class="nc" id="L43">    this.topParses = topParses;</span>
+<span class="nc" id="L44">    this.dvModel = dvModel;</span>
+<span class="nc" id="L45">    this.op = op;</span>
+<span class="nc" id="L46">  }</span>
+
+  /**
+   * Return a null list if we don't care about context words, return a
+   * list of the words at the leaves of the tree if we do care
+   */
+  private List&lt;String&gt; getContextWords(Tree tree) {
+<span class="nc" id="L53">    List&lt;String&gt; words = null;</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">    if (op.trainOptions.useContextWords) {</span>
+<span class="nc" id="L55">      words = Generics.newArrayList();</span>
+<span class="nc" id="L56">      List&lt;Label&gt; leaves = tree.yield();</span>
+<span class="nc bnc" id="L57" title="All 2 branches missed.">      for (Label word : leaves) {</span>
+<span class="nc" id="L58">        words.add(word.value());</span>
+<span class="nc" id="L59">      }</span>
+    }
+<span class="nc" id="L61">    return words;</span>
+  }
+
+  private SimpleMatrix concatenateContextWords(SimpleMatrix childVec, IntPair span, List&lt;String&gt; words) {
+    // TODO: factor out getting the words
+<span class="nc bnc" id="L66" title="All 2 branches missed.">    SimpleMatrix left = (span.getSource() &lt; 0) ? dvModel.getStartWordVector() : dvModel.getWordVector(words.get(span.getSource()));</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">    SimpleMatrix right = (span.getTarget() &gt;= words.size()) ? dvModel.getEndWordVector() : dvModel.getWordVector(words.get(span.getTarget()));</span>
+<span class="nc" id="L68">    return NeuralUtils.concatenate(childVec, left, right);</span>
+  }
+
+  public static void outputSpans(Tree tree) {
+<span class="nc" id="L72">    log.info(tree.getSpan() + &quot; &quot;);</span>
+<span class="nc bnc" id="L73" title="All 2 branches missed.">    for (Tree child : tree.children()) {</span>
+<span class="nc" id="L74">      outputSpans(child);</span>
+    }
+<span class="nc" id="L76">  }</span>
+
+  // TODO: make this part of DVModel or DVParser?
+  public double score(Tree tree, IdentityHashMap&lt;Tree, SimpleMatrix&gt; nodeVectors) {
+<span class="nc" id="L80">    List&lt;String&gt; words = getContextWords(tree);</span>
+    // score of the entire tree is the sum of the scores of all of
+    // its nodes
+    // TODO: make the node vectors part of the tree itself?
+<span class="nc" id="L84">    IdentityHashMap&lt;Tree, Double&gt; scores = new IdentityHashMap&lt;&gt;();</span>
+    try {
+<span class="nc" id="L86">      forwardPropagateTree(tree, words, nodeVectors, scores);</span>
+<span class="nc" id="L87">    } catch (AssertionError e) {</span>
+<span class="nc" id="L88">      log.info(&quot;Failed to correctly process tree &quot; + tree);</span>
+<span class="nc" id="L89">      throw e;</span>
+<span class="nc" id="L90">    }</span>
+
+<span class="nc" id="L92">    double score = 0.0;</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">    for (Tree node : scores.keySet()) {</span>
+<span class="nc" id="L94">      score += scores.get(node);</span>
+      //log.info(Double.toString(score));
+<span class="nc" id="L96">    }</span>
+<span class="nc" id="L97">    return score;</span>
+  }
+
+  private void forwardPropagateTree(Tree tree, List&lt;String&gt; words,
+                                    IdentityHashMap&lt;Tree, SimpleMatrix&gt; nodeVectors,
+                                    IdentityHashMap&lt;Tree, Double&gt; scores) {
+<span class="nc bnc" id="L103" title="All 2 branches missed.">    if (tree.isLeaf()) {</span>
+<span class="nc" id="L104">      return;</span>
+    }
+
+<span class="nc bnc" id="L107" title="All 2 branches missed.">    if (tree.isPreTerminal()) {</span>
+<span class="nc" id="L108">      Tree wordNode = tree.children()[0];</span>
+<span class="nc" id="L109">      String word = wordNode.label().value();</span>
+<span class="nc" id="L110">      SimpleMatrix wordVector = dvModel.getWordVector(word);</span>
+<span class="nc" id="L111">      wordVector = NeuralUtils.elementwiseApplyTanh(wordVector);</span>
+<span class="nc" id="L112">      nodeVectors.put(tree, wordVector);</span>
+<span class="nc" id="L113">      return;</span>
+    }
+
+<span class="nc bnc" id="L116" title="All 2 branches missed.">    for (Tree child : tree.children()) {</span>
+<span class="nc" id="L117">      forwardPropagateTree(child, words, nodeVectors, scores);</span>
+    }
+
+    // at this point, nodeVectors contains the vectors for all of
+    // the children of tree
+
+    SimpleMatrix childVec;
+<span class="nc bnc" id="L124" title="All 2 branches missed.">    if (tree.children().length == 2) {</span>
+<span class="nc" id="L125">      childVec = NeuralUtils.concatenateWithBias(nodeVectors.get(tree.children()[0]), nodeVectors.get(tree.children()[1]));</span>
+    } else {
+<span class="nc" id="L127">      childVec = NeuralUtils.concatenateWithBias(nodeVectors.get(tree.children()[0]));</span>
+    }
+<span class="nc bnc" id="L129" title="All 2 branches missed.">    if (op.trainOptions.useContextWords) {</span>
+<span class="nc" id="L130">      childVec = concatenateContextWords(childVec, tree.getSpan(), words);</span>
+    }
+
+<span class="nc" id="L133">    SimpleMatrix W = dvModel.getWForNode(tree);</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">    if (W == null) {</span>
+<span class="nc" id="L135">      String error = &quot;Could not find W for tree &quot; + tree;</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L137">        log.info(error);</span>
+      }
+<span class="nc" id="L139">      throw new NoSuchParseException(error);</span>
+    }
+<span class="nc" id="L141">    SimpleMatrix currentVector = W.mult(childVec);</span>
+<span class="nc" id="L142">    currentVector = NeuralUtils.elementwiseApplyTanh(currentVector);</span>
+<span class="nc" id="L143">    nodeVectors.put(tree, currentVector);</span>
+
+<span class="nc" id="L145">    SimpleMatrix scoreW = dvModel.getScoreWForNode(tree);</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">    if (scoreW == null) {</span>
+<span class="nc" id="L147">      String error = &quot;Could not find scoreW for tree &quot; + tree;</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">      if (op.testOptions.verbose) {</span>
+<span class="nc" id="L149">        log.info(error);</span>
+      }
+<span class="nc" id="L151">      throw new NoSuchParseException(error);</span>
+    }
+<span class="nc" id="L153">    double score = scoreW.dot(currentVector);</span>
+    //score = NeuralUtils.sigmoid(score);
+<span class="nc" id="L155">    scores.put(tree, score);</span>
+    //log.info(Double.toString(score)+&quot; &quot;);
+<span class="nc" id="L157">  }</span>
+
+  public int domainDimension() {
+    // TODO: cache this for speed?
+<span class="nc" id="L161">    return dvModel.totalParamSize();</span>
+  }
+
+  static final double TRAIN_LAMBDA = 1.0;
+
+  public List&lt;DeepTree&gt; getAllHighestScoringTreesTest(List&lt;Tree&gt; trees){
+<span class="nc" id="L167">	  List&lt;DeepTree&gt; allBestTrees = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">	  for (Tree tree : trees) {</span>
+<span class="nc" id="L169">		  allBestTrees.add(getHighestScoringTree(tree, 0));</span>
+<span class="nc" id="L170">	  }</span>
+<span class="nc" id="L171">	  return allBestTrees;</span>
+  }
+
+  public DeepTree getHighestScoringTree(Tree tree, double lambda){
+<span class="nc" id="L175">    List&lt;Tree&gt; hypotheses = topParses.get(tree);</span>
+<span class="nc bnc" id="L176" title="All 4 branches missed.">    if (hypotheses == null || hypotheses.size() == 0) {</span>
+<span class="nc" id="L177">      throw new AssertionError(&quot;Failed to get any hypothesis trees for &quot; + tree);</span>
+    }
+<span class="nc" id="L179">    double bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L180">    Tree bestTree = null;</span>
+<span class="nc" id="L181">    IdentityHashMap&lt;Tree, SimpleMatrix&gt; bestVectors = null;</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">    for (Tree hypothesis : hypotheses) {</span>
+<span class="nc" id="L183">      IdentityHashMap&lt;Tree, SimpleMatrix&gt; nodeVectors = new IdentityHashMap&lt;&gt;();</span>
+<span class="nc" id="L184">      double scoreHyp = score(hypothesis, nodeVectors);</span>
+<span class="nc" id="L185">      double deltaMargin =0;</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">      if (lambda != 0){</span>
+        //TODO: RS: Play around with this parameter to prevent blowing up of scores
+<span class="nc" id="L188">        deltaMargin = op.trainOptions.deltaMargin * lambda * getMargin(tree, hypothesis);</span>
+      }
+
+<span class="nc" id="L191">      scoreHyp = scoreHyp + deltaMargin;</span>
+<span class="nc bnc" id="L192" title="All 4 branches missed.">      if (bestTree == null || scoreHyp &gt; bestScore) {</span>
+<span class="nc" id="L193">        bestTree = hypothesis;</span>
+<span class="nc" id="L194">        bestScore = scoreHyp;</span>
+<span class="nc" id="L195">        bestVectors = nodeVectors;</span>
+      }
+<span class="nc" id="L197">    }</span>
+
+<span class="nc" id="L199">    DeepTree returnTree = new DeepTree(bestTree,bestVectors,bestScore);</span>
+<span class="nc" id="L200">    return returnTree;</span>
+  }
+
+<span class="nc" id="L203">  class ScoringProcessor implements ThreadsafeProcessor&lt;Tree, Pair&lt;DeepTree, DeepTree&gt;&gt; {</span>
+    @Override
+    public Pair&lt;DeepTree, DeepTree&gt; process(Tree tree) {
+      // For each tree, move in the direction of the gold tree, and
+      // move away from the direction of the best scoring hypothesis
+
+<span class="nc" id="L209">      IdentityHashMap&lt;Tree, SimpleMatrix&gt; goldVectors = new IdentityHashMap&lt;&gt;();</span>
+<span class="nc" id="L210">      double scoreGold = score(tree, goldVectors);</span>
+<span class="nc" id="L211">      DeepTree bestTree = getHighestScoringTree(tree, TRAIN_LAMBDA);</span>
+<span class="nc" id="L212">      DeepTree goldTree = new DeepTree(tree, goldVectors, scoreGold);</span>
+<span class="nc" id="L213">      return Pair.makePair(goldTree, bestTree);</span>
+    }
+
+    @Override
+    public ThreadsafeProcessor&lt;Tree, Pair&lt;DeepTree, DeepTree&gt;&gt; newInstance() {
+      // should be threadsafe
+<span class="nc" id="L219">      return this;</span>
+    }
+  }
+
+
+  // fill value &amp; derivative
+  public void calculate(double[] theta) {
+<span class="nc" id="L226">    dvModel.vectorToParams(theta);</span>
+
+<span class="nc" id="L228">    double localValue = 0.0;</span>
+<span class="nc" id="L229">    double[] localDerivative = new double[theta.length];</span>
+
+    TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryW_dfsG,binaryW_dfsB;
+<span class="nc" id="L232">    binaryW_dfsG = TwoDimensionalMap.treeMap();</span>
+<span class="nc" id="L233">    binaryW_dfsB = TwoDimensionalMap.treeMap();</span>
+    TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryScoreDerivativesG,binaryScoreDerivativesB ;
+<span class="nc" id="L235">    binaryScoreDerivativesG = TwoDimensionalMap.treeMap();</span>
+<span class="nc" id="L236">    binaryScoreDerivativesB = TwoDimensionalMap.treeMap();</span>
+    Map&lt;String, SimpleMatrix&gt; unaryW_dfsG,unaryW_dfsB ;
+<span class="nc" id="L238">    unaryW_dfsG = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L239">    unaryW_dfsB = new TreeMap&lt;&gt;();</span>
+    Map&lt;String, SimpleMatrix&gt; unaryScoreDerivativesG,unaryScoreDerivativesB ;
+<span class="nc" id="L241">    unaryScoreDerivativesG = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L242">    unaryScoreDerivativesB= new TreeMap&lt;&gt;();</span>
+
+<span class="nc" id="L244">    Map&lt;String, SimpleMatrix&gt; wordVectorDerivativesG = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L245">    Map&lt;String, SimpleMatrix&gt; wordVectorDerivativesB = new TreeMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">    for (TwoDimensionalMap.Entry&lt;String, String, SimpleMatrix&gt; entry : dvModel.binaryTransform) {</span>
+<span class="nc" id="L248">      int numRows = entry.getValue().numRows();</span>
+<span class="nc" id="L249">      int numCols = entry.getValue().numCols();</span>
+<span class="nc" id="L250">      binaryW_dfsG.put(entry.getFirstKey(), entry.getSecondKey(), new SimpleMatrix(numRows, numCols));</span>
+<span class="nc" id="L251">      binaryW_dfsB.put(entry.getFirstKey(), entry.getSecondKey(), new SimpleMatrix(numRows, numCols));</span>
+<span class="nc" id="L252">      binaryScoreDerivativesG.put(entry.getFirstKey(), entry.getSecondKey(), new SimpleMatrix(1, numRows));</span>
+<span class="nc" id="L253">      binaryScoreDerivativesB.put(entry.getFirstKey(), entry.getSecondKey(), new SimpleMatrix(1, numRows));</span>
+<span class="nc" id="L254">    }</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">    for (Map.Entry&lt;String, SimpleMatrix&gt; entry : dvModel.unaryTransform.entrySet()) {</span>
+<span class="nc" id="L256">      int numRows = entry.getValue().numRows();</span>
+<span class="nc" id="L257">      int numCols = entry.getValue().numCols();</span>
+<span class="nc" id="L258">      unaryW_dfsG.put(entry.getKey(), new SimpleMatrix(numRows, numCols));</span>
+<span class="nc" id="L259">      unaryW_dfsB.put(entry.getKey(), new SimpleMatrix(numRows, numCols));</span>
+<span class="nc" id="L260">      unaryScoreDerivativesG.put(entry.getKey(), new SimpleMatrix(1, numRows));</span>
+<span class="nc" id="L261">      unaryScoreDerivativesB.put(entry.getKey(), new SimpleMatrix(1, numRows));</span>
+<span class="nc" id="L262">    }</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    if (op.trainOptions.trainWordVectors) {</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      for (Map.Entry&lt;String, SimpleMatrix&gt; entry : dvModel.wordVectors.entrySet()) {</span>
+<span class="nc" id="L265">        int numRows = entry.getValue().numRows();</span>
+<span class="nc" id="L266">        int numCols = entry.getValue().numCols();</span>
+<span class="nc" id="L267">        wordVectorDerivativesG.put(entry.getKey(), new SimpleMatrix(numRows, numCols));</span>
+<span class="nc" id="L268">        wordVectorDerivativesB.put(entry.getKey(), new SimpleMatrix(numRows, numCols));</span>
+<span class="nc" id="L269">      }</span>
+    }
+
+    // Some optimization methods prints out a line without an end, so our
+    // debugging statements are misaligned
+<span class="nc" id="L274">    Timing scoreTiming = new Timing();</span>
+<span class="nc" id="L275">    scoreTiming.doing(&quot;Scoring trees&quot;);</span>
+<span class="nc" id="L276">    int treeNum = 0;</span>
+<span class="nc" id="L277">    MulticoreWrapper&lt;Tree, Pair&lt;DeepTree, DeepTree&gt;&gt; wrapper = new MulticoreWrapper&lt;&gt;(op.trainOptions.trainingThreads, new ScoringProcessor());</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    for (Tree tree : trainingBatch) {</span>
+<span class="nc" id="L279">      wrapper.put(tree);</span>
+<span class="nc" id="L280">    }</span>
+<span class="nc" id="L281">    wrapper.join();</span>
+<span class="nc" id="L282">    scoreTiming.done();</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">    while (wrapper.peek()) {</span>
+<span class="nc" id="L284">      Pair&lt;DeepTree, DeepTree&gt; result = wrapper.poll();</span>
+<span class="nc" id="L285">      DeepTree goldTree = result.first;</span>
+<span class="nc" id="L286">      DeepTree bestTree = result.second;</span>
+
+<span class="nc" id="L288">      StringBuilder treeDebugLine = new StringBuilder();</span>
+<span class="nc" id="L289">      Formatter formatter = new Formatter(treeDebugLine);</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">      boolean isDone = (Math.abs(bestTree.getScore() - goldTree.getScore()) &lt;= 0.00001 || goldTree.getScore() &gt; bestTree.getScore());</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      String done = isDone ? &quot;done&quot; : &quot;&quot;;</span>
+<span class="nc" id="L292">      formatter.format(&quot;Tree %6d Highest tree: %12.4f Correct tree: %12.4f %s&quot;, treeNum, bestTree.getScore(), goldTree.getScore(), done);</span>
+<span class="nc" id="L293">      log.info(treeDebugLine.toString());</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">      if (!isDone){</span>
+        // if the gold tree is better than the best hypothesis tree by
+        // a large enough margin, then the score difference will be 0
+        // and we ignore the tree
+
+<span class="nc" id="L299">        double valueDelta = bestTree.getScore() - goldTree.getScore();</span>
+        //double valueDelta = Math.max(0.0, - scoreGold + bestScore);
+<span class="nc" id="L301">        localValue += valueDelta;</span>
+
+        // get the context words for this tree - should be the same
+        // for either goldTree or bestTree
+<span class="nc" id="L305">        List&lt;String&gt; words = getContextWords(goldTree.getTree());</span>
+
+        // The derivatives affected by this tree are only based on the
+        // nodes present in this tree, eg not all matrix derivatives
+        // will be affected by this tree
+<span class="nc" id="L310">        backpropDerivative(goldTree.getTree(), words, goldTree.getVectors(),</span>
+                           binaryW_dfsG, unaryW_dfsG,
+                           binaryScoreDerivativesG, unaryScoreDerivativesG,
+                           wordVectorDerivativesG);
+
+<span class="nc" id="L315">        backpropDerivative(bestTree.getTree(), words, bestTree.getVectors(),</span>
+                           binaryW_dfsB, unaryW_dfsB,
+                           binaryScoreDerivativesB, unaryScoreDerivativesB,
+                           wordVectorDerivativesB);
+
+      }
+<span class="nc" id="L321">      ++treeNum;</span>
+<span class="nc" id="L322">    }</span>
+
+    double[] localDerivativeGood;
+    double[] localDerivativeB;
+<span class="nc bnc" id="L326" title="All 2 branches missed.">    if (op.trainOptions.trainWordVectors) {</span>
+<span class="nc" id="L327">      localDerivativeGood = NeuralUtils.paramsToVector(theta.length,</span>
+<span class="nc" id="L328">                                                       binaryW_dfsG.valueIterator(), unaryW_dfsG.values().iterator(),</span>
+<span class="nc" id="L329">                                                       binaryScoreDerivativesG.valueIterator(),</span>
+<span class="nc" id="L330">                                                       unaryScoreDerivativesG.values().iterator(),</span>
+<span class="nc" id="L331">                                                       wordVectorDerivativesG.values().iterator());</span>
+
+<span class="nc" id="L333">      localDerivativeB = NeuralUtils.paramsToVector(theta.length,</span>
+<span class="nc" id="L334">                                                    binaryW_dfsB.valueIterator(), unaryW_dfsB.values().iterator(),</span>
+<span class="nc" id="L335">                                                    binaryScoreDerivativesB.valueIterator(),</span>
+<span class="nc" id="L336">                                                    unaryScoreDerivativesB.values().iterator(),</span>
+<span class="nc" id="L337">                                                    wordVectorDerivativesB.values().iterator());</span>
+    } else {
+<span class="nc" id="L339">      localDerivativeGood = NeuralUtils.paramsToVector(theta.length,</span>
+<span class="nc" id="L340">                                                       binaryW_dfsG.valueIterator(), unaryW_dfsG.values().iterator(),</span>
+<span class="nc" id="L341">                                                       binaryScoreDerivativesG.valueIterator(),</span>
+<span class="nc" id="L342">                                                       unaryScoreDerivativesG.values().iterator());</span>
+
+<span class="nc" id="L344">      localDerivativeB = NeuralUtils.paramsToVector(theta.length,</span>
+<span class="nc" id="L345">                                                    binaryW_dfsB.valueIterator(), unaryW_dfsB.values().iterator(),</span>
+<span class="nc" id="L346">                                                    binaryScoreDerivativesB.valueIterator(),</span>
+<span class="nc" id="L347">                                                    unaryScoreDerivativesB.values().iterator());</span>
+    }
+
+    // correct - highest
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    for (int i =0 ;i&lt;localDerivativeGood.length;i++){</span>
+<span class="nc" id="L352">      localDerivative[i] = localDerivativeB[i] - localDerivativeGood[i];</span>
+    }
+
+    // TODO: this is where we would combine multiple costs if we had parallelized the calculation
+<span class="nc" id="L356">    value = localValue;</span>
+<span class="nc" id="L357">    derivative = localDerivative;</span>
+
+    // normalizing by training batch size
+<span class="nc" id="L360">    value = (1.0/trainingBatch.size()) * value;</span>
+<span class="nc" id="L361">    ArrayMath.multiplyInPlace(derivative, (1.0/trainingBatch.size()));</span>
+
+    // add regularization to cost:
+<span class="nc" id="L364">    double[] currentParams = dvModel.paramsToVector();</span>
+<span class="nc" id="L365">    double regCost = 0;</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">    for (double currentParam : currentParams) {</span>
+<span class="nc" id="L367">      regCost += currentParam * currentParam;</span>
+    }
+<span class="nc" id="L369">    regCost = op.trainOptions.regCost * 0.5 * regCost;</span>
+<span class="nc" id="L370">    value  += regCost;</span>
+    // add regularization to gradient
+<span class="nc" id="L372">    ArrayMath.multiplyInPlace(currentParams, op.trainOptions.regCost);</span>
+<span class="nc" id="L373">    ArrayMath.pairwiseAddInPlace(derivative, currentParams);</span>
+
+<span class="nc" id="L375">  }</span>
+
+  public double getMargin(Tree goldTree, Tree bestHypothesis) {
+<span class="nc" id="L378">    return TreeSpanScoring.countSpanErrors(op.langpack(), goldTree, bestHypothesis);</span>
+  }
+
+
+  public void backpropDerivative(Tree tree, List&lt;String&gt; words,
+                                 IdentityHashMap&lt;Tree, SimpleMatrix&gt; nodeVectors,
+                                 TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryW_dfs,
+                                 Map&lt;String, SimpleMatrix&gt; unaryW_dfs,
+                                 TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryScoreDerivatives,
+                                 Map&lt;String, SimpleMatrix&gt; unaryScoreDerivatives,
+                                 Map&lt;String, SimpleMatrix&gt; wordVectorDerivatives) {
+<span class="nc" id="L389">    SimpleMatrix delta = new SimpleMatrix(op.lexOptions.numHid, 1);</span>
+<span class="nc" id="L390">    backpropDerivative(tree, words, nodeVectors,</span>
+                       binaryW_dfs, unaryW_dfs,
+                       binaryScoreDerivatives, unaryScoreDerivatives, wordVectorDerivatives,
+                       delta);
+<span class="nc" id="L394">  }</span>
+
+  public void backpropDerivative(Tree tree, List&lt;String&gt; words,
+                                 IdentityHashMap&lt;Tree, SimpleMatrix&gt; nodeVectors,
+                                 TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryW_dfs,
+                                 Map&lt;String, SimpleMatrix&gt; unaryW_dfs,
+                                 TwoDimensionalMap&lt;String, String, SimpleMatrix&gt; binaryScoreDerivatives,
+                                 Map&lt;String, SimpleMatrix&gt; unaryScoreDerivatives,
+                                 Map&lt;String, SimpleMatrix&gt; wordVectorDerivatives,
+                                 SimpleMatrix deltaUp) {
+<span class="nc bnc" id="L404" title="All 2 branches missed.">    if (tree.isLeaf()) {</span>
+<span class="nc" id="L405">      return;</span>
+    }
+<span class="nc bnc" id="L407" title="All 2 branches missed.">    if (tree.isPreTerminal()) {</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">      if (op.trainOptions.trainWordVectors) {</span>
+<span class="nc" id="L409">        String word = tree.children()[0].label().value();</span>
+<span class="nc" id="L410">        word = dvModel.getVocabWord(word);</span>
+//        SimpleMatrix currentVector = nodeVectors.get(tree);
+//        SimpleMatrix currentVectorDerivative = nonlinearityVectorToDerivative(currentVector);
+//        SimpleMatrix derivative = deltaUp.elementMult(currentVectorDerivative);
+<span class="nc" id="L414">        SimpleMatrix derivative = deltaUp;</span>
+<span class="nc" id="L415">        wordVectorDerivatives.put(word, wordVectorDerivatives.get(word).plus(derivative));</span>
+      }
+<span class="nc" id="L417">      return;</span>
+    }
+<span class="nc" id="L419">    SimpleMatrix currentVector = nodeVectors.get(tree);</span>
+<span class="nc" id="L420">    SimpleMatrix currentVectorDerivative = NeuralUtils.elementwiseApplyTanhDerivative(currentVector);</span>
+
+<span class="nc" id="L422">    SimpleMatrix scoreW = dvModel.getScoreWForNode(tree);</span>
+<span class="nc" id="L423">    currentVectorDerivative = currentVectorDerivative.elementMult(scoreW.transpose());</span>
+
+    // the delta that is used at the current nodes
+<span class="nc" id="L426">    SimpleMatrix deltaCurrent = deltaUp.plus(currentVectorDerivative);</span>
+<span class="nc" id="L427">    SimpleMatrix W = dvModel.getWForNode(tree);</span>
+<span class="nc" id="L428">    SimpleMatrix WTdelta = W.transpose().mult(deltaCurrent);</span>
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">    if (tree.children().length == 2) {</span>
+      //TODO: RS: Change to the nice &quot;getWForNode&quot; setup?
+<span class="nc" id="L432">      String leftLabel = dvModel.basicCategory(tree.children()[0].label().value());</span>
+<span class="nc" id="L433">      String rightLabel = dvModel.basicCategory(tree.children()[1].label().value());</span>
+
+<span class="nc" id="L435">      binaryScoreDerivatives.put(leftLabel, rightLabel,</span>
+<span class="nc" id="L436">                                 binaryScoreDerivatives.get(leftLabel, rightLabel).plus(currentVector.transpose()));</span>
+
+
+<span class="nc" id="L439">      SimpleMatrix leftVector = nodeVectors.get(tree.children()[0]);</span>
+<span class="nc" id="L440">      SimpleMatrix rightVector = nodeVectors.get(tree.children()[1]);</span>
+<span class="nc" id="L441">      SimpleMatrix childrenVector = NeuralUtils.concatenateWithBias(leftVector, rightVector);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">      if (op.trainOptions.useContextWords) {</span>
+<span class="nc" id="L443">        childrenVector = concatenateContextWords(childrenVector, tree.getSpan(), words);</span>
+      }
+<span class="nc" id="L445">      SimpleMatrix W_df = deltaCurrent.mult(childrenVector.transpose());</span>
+<span class="nc" id="L446">      binaryW_dfs.put(leftLabel, rightLabel, binaryW_dfs.get(leftLabel, rightLabel).plus(W_df));</span>
+
+      // and then recurse
+<span class="nc" id="L449">      SimpleMatrix leftDerivative = NeuralUtils.elementwiseApplyTanhDerivative(leftVector);</span>
+<span class="nc" id="L450">      SimpleMatrix rightDerivative = NeuralUtils.elementwiseApplyTanhDerivative(rightVector);</span>
+<span class="nc" id="L451">      SimpleMatrix leftWTDelta = WTdelta.extractMatrix(0, deltaCurrent.numRows(), 0, 1);</span>
+<span class="nc" id="L452">      SimpleMatrix rightWTDelta = WTdelta.extractMatrix(deltaCurrent.numRows(), deltaCurrent.numRows() * 2, 0, 1);</span>
+<span class="nc" id="L453">      backpropDerivative(tree.children()[0], words, nodeVectors,</span>
+                         binaryW_dfs, unaryW_dfs,
+                         binaryScoreDerivatives, unaryScoreDerivatives, wordVectorDerivatives,
+<span class="nc" id="L456">                         leftDerivative.elementMult(leftWTDelta));</span>
+<span class="nc" id="L457">      backpropDerivative(tree.children()[1], words, nodeVectors,</span>
+                         binaryW_dfs, unaryW_dfs,
+                         binaryScoreDerivatives, unaryScoreDerivatives, wordVectorDerivatives,
+<span class="nc" id="L460">                         rightDerivative.elementMult(rightWTDelta));</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">    } else if (tree.children().length == 1) {</span>
+<span class="nc" id="L462">      String childLabel = dvModel.basicCategory(tree.children()[0].label().value());</span>
+
+<span class="nc" id="L464">      unaryScoreDerivatives.put(childLabel,unaryScoreDerivatives.get(childLabel).plus(currentVector.transpose()));</span>
+
+<span class="nc" id="L466">      SimpleMatrix childVector = nodeVectors.get(tree.children()[0]);</span>
+<span class="nc" id="L467">      SimpleMatrix childVectorWithBias = NeuralUtils.concatenateWithBias(childVector);</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">      if (op.trainOptions.useContextWords) {</span>
+<span class="nc" id="L469">        childVectorWithBias = concatenateContextWords(childVectorWithBias, tree.getSpan(), words);</span>
+      }
+<span class="nc" id="L471">      SimpleMatrix W_df = deltaCurrent.mult(childVectorWithBias.transpose());</span>
+
+      // System.out.println(&quot;unary backprop derivative for &quot; + childLabel);
+      // System.out.println(&quot;Old transform:&quot;);
+      // System.out.println(unaryW_dfs.get(childLabel));
+      // System.out.println(&quot; Delta:&quot;);
+      // System.out.println(W_df.scale(scale));
+<span class="nc" id="L478">      unaryW_dfs.put(childLabel,unaryW_dfs.get(childLabel).plus(W_df));</span>
+
+      // and then recurse
+<span class="nc" id="L481">      SimpleMatrix childDerivative = NeuralUtils.elementwiseApplyTanhDerivative(childVector);</span>
+      //SimpleMatrix childDerivative = childVector;
+<span class="nc" id="L483">      SimpleMatrix childWTDelta = WTdelta.extractMatrix(0, deltaCurrent.numRows(), 0, 1);</span>
+<span class="nc" id="L484">      backpropDerivative(tree.children()[0], words, nodeVectors,</span>
+                         binaryW_dfs, unaryW_dfs,
+                         binaryScoreDerivatives, unaryScoreDerivatives, wordVectorDerivatives,
+<span class="nc" id="L487">                         childDerivative.elementMult(childWTDelta));</span>
+    }
+<span class="nc" id="L489">  }</span>
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

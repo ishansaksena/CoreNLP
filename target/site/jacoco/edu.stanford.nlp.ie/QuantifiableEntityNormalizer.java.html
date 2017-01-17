@@ -1,0 +1,1556 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QuantifiableEntityNormalizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie</a> &gt; <span class="el_source">QuantifiableEntityNormalizer.java</span></div><h1>QuantifiableEntityNormalizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ie.pascal.ISODateInstance;
+import edu.stanford.nlp.ie.regexp.NumberSequenceClassifier;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.time.TimeAnnotations;
+import edu.stanford.nlp.time.Timex;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.EditDistance;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+
+import static java.lang.System.err;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+
+/**
+ * Various methods for normalizing Money, Date, Percent, Time, and
+ * Number, Ordinal amounts.
+ * These matchers are generous in that they try to quantify something
+ * that's already been labelled by an NER system; don't use them to make
+ * classification decisions.  This class has a twin in the pipeline world:
+ * {@link edu.stanford.nlp.pipeline.QuantifiableEntityNormalizingAnnotator}.
+ * Please keep the substantive content here, however, so as to lessen code
+ * duplication.
+ *  &lt;p&gt;
+ *  &lt;i&gt;Implementation note:&lt;/i&gt; The extensive test code for this class is
+ *  now in a separate JUnit Test class.  This class depends on the background
+ *  symbol for NER being the default background symbol.  This should be fixed
+ *  at some point.
+ *
+ * @author Chris Cox
+ * @author Christopher Manning (extended for RTE)
+ * @author Anna Rafferty
+ */
+<span class="pc bpc" id="L43" title="1 of 2 branches missed.">public class QuantifiableEntityNormalizer  {</span>
+
+  /** A logger for this class */
+<span class="fc" id="L46">  private static Redwood.RedwoodChannels log = Redwood.channels(QuantifiableEntityNormalizer.class);</span>
+
+  private static final boolean DEBUG = false;
+  private static final boolean DEBUG2 = false;  // String normlz functions
+
+<span class="fc" id="L51">  public static String BACKGROUND_SYMBOL = SeqClassifierFlags.DEFAULT_BACKGROUND_SYMBOL; // this isn't a constant; it's set by the QuantifiableEntityNormalizingAnnotator</span>
+
+<span class="fc" id="L53">  private static final Pattern timePattern = Pattern.compile(&quot;([0-2]?[0-9])((?::[0-5][0-9]){0,2})([PpAa]\\.?[Mm]\\.?)?&quot;);</span>
+
+<span class="fc" id="L55">  private static final Pattern moneyPattern = Pattern.compile(&quot;([$\u00A3\u00A5\u20AC#]?)(-?[0-9,]*)(\\.[0-9]*)?+&quot;);</span>
+<span class="fc" id="L56">  private static final Pattern scorePattern = Pattern.compile(&quot; *([0-9]+) *- *([0-9]+) *&quot;);</span>
+
+  //Collections of entity types
+  private static final Set&lt;String&gt; quantifiable;  //Entity types that are quantifiable
+  private static final Set&lt;String&gt; collapseBeforeParsing;
+  private static final Set&lt;String&gt; timeUnitWords;
+  private static final Map&lt;String, Double&gt; moneyMultipliers;
+  private static final Map&lt;String, Integer&gt; moneyMultipliers2;
+  private static final Map&lt;String, Character&gt; currencyWords;
+  public static final ClassicCounter&lt;String&gt; wordsToValues;
+  public static final ClassicCounter&lt;String&gt; ordinalsToValues;
+
+  static {
+
+<span class="fc" id="L70">    quantifiable = Generics.newHashSet();</span>
+<span class="fc" id="L71">    quantifiable.add(&quot;MONEY&quot;);</span>
+<span class="fc" id="L72">    quantifiable.add(&quot;TIME&quot;);</span>
+<span class="fc" id="L73">    quantifiable.add(&quot;DATE&quot;);</span>
+<span class="fc" id="L74">    quantifiable.add(&quot;PERCENT&quot;);</span>
+<span class="fc" id="L75">    quantifiable.add(&quot;NUMBER&quot;);</span>
+<span class="fc" id="L76">    quantifiable.add(&quot;ORDINAL&quot;);</span>
+<span class="fc" id="L77">    quantifiable.add(&quot;DURATION&quot;);</span>
+
+<span class="fc" id="L79">    collapseBeforeParsing = Generics.newHashSet();</span>
+<span class="fc" id="L80">    collapseBeforeParsing.add(&quot;PERSON&quot;);</span>
+<span class="fc" id="L81">    collapseBeforeParsing.add(&quot;ORGANIZATION&quot;);</span>
+<span class="fc" id="L82">    collapseBeforeParsing.add(&quot;LOCATION&quot;);</span>
+
+<span class="fc" id="L84">    timeUnitWords = Generics.newHashSet();</span>
+<span class="fc" id="L85">    timeUnitWords.add(&quot;second&quot;);</span>
+<span class="fc" id="L86">    timeUnitWords.add(&quot;seconds&quot;);</span>
+<span class="fc" id="L87">    timeUnitWords.add(&quot;minute&quot;);</span>
+<span class="fc" id="L88">    timeUnitWords.add(&quot;minutes&quot;);</span>
+<span class="fc" id="L89">    timeUnitWords.add(&quot;hour&quot;);</span>
+<span class="fc" id="L90">    timeUnitWords.add(&quot;hours&quot;);</span>
+<span class="fc" id="L91">    timeUnitWords.add(&quot;day&quot;);</span>
+<span class="fc" id="L92">    timeUnitWords.add(&quot;days&quot;);</span>
+<span class="fc" id="L93">    timeUnitWords.add(&quot;week&quot;);</span>
+<span class="fc" id="L94">    timeUnitWords.add(&quot;weeks&quot;);</span>
+<span class="fc" id="L95">    timeUnitWords.add(&quot;month&quot;);</span>
+<span class="fc" id="L96">    timeUnitWords.add(&quot;months&quot;);</span>
+<span class="fc" id="L97">    timeUnitWords.add(&quot;year&quot;);</span>
+<span class="fc" id="L98">    timeUnitWords.add(&quot;years&quot;);</span>
+
+<span class="fc" id="L100">    currencyWords = Generics.newHashMap();</span>
+<span class="fc" id="L101">    currencyWords.put(&quot;dollars?&quot;, '$');</span>
+<span class="fc" id="L102">    currencyWords.put(&quot;cents?&quot;, '$');</span>
+<span class="fc" id="L103">    currencyWords.put(&quot;pounds?&quot;, '\u00A3');</span>
+<span class="fc" id="L104">    currencyWords.put(&quot;pence|penny&quot;, '\u00A3');</span>
+<span class="fc" id="L105">    currencyWords.put(&quot;yen&quot;, '\u00A5');</span>
+<span class="fc" id="L106">    currencyWords.put(&quot;euros?&quot;, '\u20AC');</span>
+<span class="fc" id="L107">    currencyWords.put(&quot;won&quot;, '\u20A9');</span>
+<span class="fc" id="L108">    currencyWords.put(&quot;\\$&quot;, '$');</span>
+<span class="fc" id="L109">    currencyWords.put(&quot;\u00A2&quot;, '$');  // cents</span>
+<span class="fc" id="L110">    currencyWords.put(&quot;\u00A3&quot;, '\u00A3');  // pounds</span>
+<span class="fc" id="L111">    currencyWords.put(&quot;#&quot;, '\u00A3');      // for Penn treebank</span>
+<span class="fc" id="L112">    currencyWords.put(&quot;\u00A5&quot;, '\u00A5');  // Yen</span>
+<span class="fc" id="L113">    currencyWords.put(&quot;\u20AC&quot;, '\u20AC');  // Euro</span>
+<span class="fc" id="L114">    currencyWords.put(&quot;\u20A9&quot;, '\u20A9');  // Won</span>
+<span class="fc" id="L115">    currencyWords.put(&quot;yuan&quot;, '\u5143');   // Yuan</span>
+
+<span class="fc" id="L117">    moneyMultipliers = Generics.newHashMap();</span>
+<span class="fc" id="L118">    moneyMultipliers.put(&quot;trillion&quot;, 1000000000000.0);  // can't be an integer</span>
+<span class="fc" id="L119">    moneyMultipliers.put(&quot;billion&quot;,1000000000.0);</span>
+<span class="fc" id="L120">    moneyMultipliers.put(&quot;bn&quot;,1000000000.0);</span>
+<span class="fc" id="L121">    moneyMultipliers.put(&quot;million&quot;, 1000000.0);</span>
+<span class="fc" id="L122">    moneyMultipliers.put(&quot;thousand&quot;, 1000.0);</span>
+<span class="fc" id="L123">    moneyMultipliers.put(&quot;hundred&quot;, 100.0);</span>
+<span class="fc" id="L124">    moneyMultipliers.put(&quot;b.&quot;, 1000000000.0);</span>
+<span class="fc" id="L125">    moneyMultipliers.put(&quot;m.&quot;, 1000000.0);</span>
+<span class="fc" id="L126">    moneyMultipliers.put(&quot; m &quot;,1000000.0);</span>
+<span class="fc" id="L127">    moneyMultipliers.put(&quot; k &quot;,1000.0);</span>
+
+<span class="fc" id="L129">    moneyMultipliers2 = Generics.newHashMap();</span>
+<span class="fc" id="L130">    moneyMultipliers2.put(&quot;[0-9](m)(?:[^a-zA-Z]|$)&quot;, 1000000);</span>
+<span class="fc" id="L131">    moneyMultipliers2.put(&quot;[0-9](b)(?:[^a-zA-Z]|$)&quot;, 1000000000);</span>
+
+<span class="fc" id="L133">    wordsToValues = new ClassicCounter&lt;&gt;();</span>
+<span class="fc" id="L134">    wordsToValues.setCount(&quot;zero&quot;, 0.0);</span>
+<span class="fc" id="L135">    wordsToValues.setCount(&quot;one&quot;, 1.0);</span>
+<span class="fc" id="L136">    wordsToValues.setCount(&quot;two&quot;, 2.0);</span>
+<span class="fc" id="L137">    wordsToValues.setCount(&quot;three&quot;, 3.0);</span>
+<span class="fc" id="L138">    wordsToValues.setCount(&quot;four&quot;, 4.0);</span>
+<span class="fc" id="L139">    wordsToValues.setCount(&quot;five&quot;, 5.0);</span>
+<span class="fc" id="L140">    wordsToValues.setCount(&quot;six&quot;, 6.0);</span>
+<span class="fc" id="L141">    wordsToValues.setCount(&quot;seven&quot;, 7.0);</span>
+<span class="fc" id="L142">    wordsToValues.setCount(&quot;eight&quot;, 8.0);</span>
+<span class="fc" id="L143">    wordsToValues.setCount(&quot;nine&quot;, 9.0);</span>
+<span class="fc" id="L144">    wordsToValues.setCount(&quot;ten&quot;, 10.0);</span>
+<span class="fc" id="L145">    wordsToValues.setCount(&quot;eleven&quot;, 11.0);</span>
+<span class="fc" id="L146">    wordsToValues.setCount(&quot;twelve&quot;, 12.0);</span>
+<span class="fc" id="L147">    wordsToValues.setCount(&quot;thirteen&quot;, 13.0);</span>
+<span class="fc" id="L148">    wordsToValues.setCount(&quot;fourteen&quot;, 14.0);</span>
+<span class="fc" id="L149">    wordsToValues.setCount(&quot;fifteen&quot;, 15.0);</span>
+<span class="fc" id="L150">    wordsToValues.setCount(&quot;sixteen&quot;, 16.0);</span>
+<span class="fc" id="L151">    wordsToValues.setCount(&quot;seventeen&quot;, 17.0);</span>
+<span class="fc" id="L152">    wordsToValues.setCount(&quot;eighteen&quot;, 18.0);</span>
+<span class="fc" id="L153">    wordsToValues.setCount(&quot;nineteen&quot;, 19.0);</span>
+<span class="fc" id="L154">    wordsToValues.setCount(&quot;twenty&quot;, 20.0);</span>
+<span class="fc" id="L155">    wordsToValues.setCount(&quot;thirty&quot;, 30.0);</span>
+<span class="fc" id="L156">    wordsToValues.setCount(&quot;forty&quot;, 40.0);</span>
+<span class="fc" id="L157">    wordsToValues.setCount(&quot;fifty&quot;, 50.0);</span>
+<span class="fc" id="L158">    wordsToValues.setCount(&quot;sixty&quot;, 60.0);</span>
+<span class="fc" id="L159">    wordsToValues.setCount(&quot;seventy&quot;, 70.0);</span>
+<span class="fc" id="L160">    wordsToValues.setCount(&quot;eighty&quot;, 80.0);</span>
+<span class="fc" id="L161">    wordsToValues.setCount(&quot;ninety&quot;, 90.0);</span>
+<span class="fc" id="L162">    wordsToValues.setCount(&quot;hundred&quot;, 100.0);</span>
+<span class="fc" id="L163">    wordsToValues.setCount(&quot;thousand&quot;, 1000.0);</span>
+<span class="fc" id="L164">    wordsToValues.setCount(&quot;million&quot;, 1000000.0);</span>
+<span class="fc" id="L165">    wordsToValues.setCount(&quot;billion&quot;, 1000000000.0);</span>
+<span class="fc" id="L166">    wordsToValues.setCount(&quot;bn&quot;, 1000000000.0);</span>
+<span class="fc" id="L167">    wordsToValues.setCount(&quot;trillion&quot;, 1000000000000.0);</span>
+<span class="fc" id="L168">    wordsToValues.setCount(&quot;dozen&quot;, 12.0);</span>
+
+<span class="fc" id="L170">    ordinalsToValues = new ClassicCounter&lt;&gt;();</span>
+<span class="fc" id="L171">    ordinalsToValues.setCount(&quot;zeroth&quot;, 0.0);</span>
+<span class="fc" id="L172">    ordinalsToValues.setCount(&quot;first&quot;, 1.0);</span>
+<span class="fc" id="L173">    ordinalsToValues.setCount(&quot;second&quot;, 2.0);</span>
+<span class="fc" id="L174">    ordinalsToValues.setCount(&quot;third&quot;, 3.0);</span>
+<span class="fc" id="L175">    ordinalsToValues.setCount(&quot;fourth&quot;, 4.0);</span>
+<span class="fc" id="L176">    ordinalsToValues.setCount(&quot;fifth&quot;, 5.0);</span>
+<span class="fc" id="L177">    ordinalsToValues.setCount(&quot;sixth&quot;, 6.0);</span>
+<span class="fc" id="L178">    ordinalsToValues.setCount(&quot;seventh&quot;, 7.0);</span>
+<span class="fc" id="L179">    ordinalsToValues.setCount(&quot;eighth&quot;, 8.0);</span>
+<span class="fc" id="L180">    ordinalsToValues.setCount(&quot;ninth&quot;, 9.0);</span>
+<span class="fc" id="L181">    ordinalsToValues.setCount(&quot;tenth&quot;, 10.0);</span>
+<span class="fc" id="L182">    ordinalsToValues.setCount(&quot;eleventh&quot;, 11.0);</span>
+<span class="fc" id="L183">    ordinalsToValues.setCount(&quot;twelfth&quot;, 12.0);</span>
+<span class="fc" id="L184">    ordinalsToValues.setCount(&quot;thirteenth&quot;, 13.0);</span>
+<span class="fc" id="L185">    ordinalsToValues.setCount(&quot;fourteenth&quot;, 14.0);</span>
+<span class="fc" id="L186">    ordinalsToValues.setCount(&quot;fifteenth&quot;, 15.0);</span>
+<span class="fc" id="L187">    ordinalsToValues.setCount(&quot;sixteenth&quot;, 16.0);</span>
+<span class="fc" id="L188">    ordinalsToValues.setCount(&quot;seventeenth&quot;, 17.0);</span>
+<span class="fc" id="L189">    ordinalsToValues.setCount(&quot;eighteenth&quot;, 18.0);</span>
+<span class="fc" id="L190">    ordinalsToValues.setCount(&quot;nineteenth&quot;, 19.0);</span>
+<span class="fc" id="L191">    ordinalsToValues.setCount(&quot;twentieth&quot;, 20.0);</span>
+<span class="fc" id="L192">    ordinalsToValues.setCount(&quot;twenty-first&quot;, 21.0);</span>
+<span class="fc" id="L193">    ordinalsToValues.setCount(&quot;twenty-second&quot;, 22.0);</span>
+<span class="fc" id="L194">    ordinalsToValues.setCount(&quot;twenty-third&quot;, 23.0);</span>
+<span class="fc" id="L195">    ordinalsToValues.setCount(&quot;twenty-fourth&quot;, 24.0);</span>
+<span class="fc" id="L196">    ordinalsToValues.setCount(&quot;twenty-fifth&quot;, 25.0);</span>
+<span class="fc" id="L197">    ordinalsToValues.setCount(&quot;twenty-sixth&quot;, 26.0);</span>
+<span class="fc" id="L198">    ordinalsToValues.setCount(&quot;twenty-seventh&quot;, 27.0);</span>
+<span class="fc" id="L199">    ordinalsToValues.setCount(&quot;twenty-eighth&quot;, 28.0);</span>
+<span class="fc" id="L200">    ordinalsToValues.setCount(&quot;twenty-ninth&quot;, 29.0);</span>
+<span class="fc" id="L201">    ordinalsToValues.setCount(&quot;thirtieth&quot;, 30.0);</span>
+<span class="fc" id="L202">    ordinalsToValues.setCount(&quot;thirty-first&quot;, 31.0);</span>
+<span class="fc" id="L203">    ordinalsToValues.setCount(&quot;fortieth&quot;, 40.0);</span>
+<span class="fc" id="L204">    ordinalsToValues.setCount(&quot;fiftieth&quot;, 50.0);</span>
+<span class="fc" id="L205">    ordinalsToValues.setCount(&quot;sixtieth&quot;, 60.0);</span>
+<span class="fc" id="L206">    ordinalsToValues.setCount(&quot;seventieth&quot;, 70.0);</span>
+<span class="fc" id="L207">    ordinalsToValues.setCount(&quot;eightieth&quot;, 80.0);</span>
+<span class="fc" id="L208">    ordinalsToValues.setCount(&quot;ninetieth&quot;, 90.0);</span>
+<span class="fc" id="L209">    ordinalsToValues.setCount(&quot;hundredth&quot;, 100.0);</span>
+<span class="fc" id="L210">    ordinalsToValues.setCount(&quot;thousandth&quot;, 1000.0);</span>
+<span class="fc" id="L211">    ordinalsToValues.setCount(&quot;millionth&quot;, 1000000.0);</span>
+<span class="fc" id="L212">    ordinalsToValues.setCount(&quot;billionth&quot;, 1000000000.0);</span>
+<span class="fc" id="L213">    ordinalsToValues.setCount(&quot;trillionth&quot;, 1000000000000.0);</span>
+  }
+
+<span class="nc" id="L216">  private QuantifiableEntityNormalizer() {} // this is all static</span>
+
+  /**
+   * This method returns the closest match in set such that the match
+   * has more than three letters and differs from word only by one substitution,
+   * deletion, or insertion.  If not match exists, returns null.
+   */
+  private static String getOneSubstitutionMatch(String word, Set&lt;String&gt; set) {
+    // TODO (?) pass the EditDistance around more places to make this
+    // more efficient.  May not really matter.
+<span class="fc" id="L226">    EditDistance ed = new EditDistance();</span>
+<span class="fc bfc" id="L227" title="All 2 branches covered.">    for(String cur : set) {</span>
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">      if(isOneSubstitutionMatch(word, cur, ed))</span>
+<span class="nc" id="L229">        return cur;</span>
+<span class="fc" id="L230">    }</span>
+<span class="fc" id="L231">    return null;</span>
+  }
+
+  private static boolean isOneSubstitutionMatch(String word, String match,
+                                                EditDistance ed) {
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">    if(word.equalsIgnoreCase(match))</span>
+<span class="nc" id="L237">      return true;</span>
+<span class="fc bfc" id="L238" title="All 2 branches covered.">    if(match.length() &gt; 3) {</span>
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">      if(ed.score(word, match) &lt;= 1)</span>
+<span class="nc" id="L240">        return true;</span>
+    }
+<span class="fc" id="L242">    return false;</span>
+  }
+
+  /** Convert the content of a List of CoreMaps to a single
+   *  space-separated String.  This grabs stuff based on the get(CoreAnnotations.NamedEntityTagAnnotation.class) field.
+   *  [CDM: Changed to look at NamedEntityTagAnnotation not AnswerClass Jun 2010, hoping that will fix a bug.]
+   *
+   *  @param l The List
+   *  @return one string containing all words in the list, whitespace separated
+   */
+  public static &lt;E extends CoreMap&gt; String singleEntityToString(List&lt;E&gt; l) {
+<span class="nc" id="L253">    String entityType = l.get(0).get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc" id="L254">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">    for (E w : l) {</span>
+<span class="nc bnc" id="L256" title="All 4 branches missed.">      assert(w.get(CoreAnnotations.NamedEntityTagAnnotation.class).equals(entityType));</span>
+<span class="nc" id="L257">      sb.append(w.get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L258">      sb.append(' ');</span>
+<span class="nc" id="L259">    }</span>
+<span class="nc" id="L260">    return sb.toString();</span>
+  }
+
+
+  /**
+   * Currently this populates a List&amp;lt;CoreLabel&amp;gt; with words from the passed List,
+   * but NER entities are collapsed and {@link CoreLabel} constituents of entities have
+   * NER information in their &quot;quantity&quot; fields.
+   * &lt;p&gt;
+   * NOTE: This now seems to be used nowhere.  The collapsing is done elsewhere.
+   * That's probably appropriate; it doesn't seem like this should be part of
+   * QuantifiableEntityNormalizer, since it's set to collapse non-quantifiable
+   * entities....
+   *
+   * @param l a list of CoreLabels with NER labels,
+   * @return a Sentence where PERSON, ORG, LOC, entities are collapsed.
+   */
+  public static List&lt;CoreLabel&gt; collapseNERLabels(List&lt;CoreLabel&gt; l){
+    if(DEBUG) {
+      for (CoreLabel w: l) {
+        log.info(&quot;&lt;&lt;&quot;+w.get(CoreAnnotations.TextAnnotation.class)+&quot;::&quot;+w.get(CoreAnnotations.PartOfSpeechAnnotation.class)+&quot;::&quot;+w.get(CoreAnnotations.NamedEntityTagAnnotation.class)+&quot;&gt;&gt;&quot;);
+      }
+    }
+
+<span class="nc" id="L284">    List&lt;CoreLabel&gt; s = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L285">    String lastEntity = BACKGROUND_SYMBOL;</span>
+<span class="nc" id="L286">    StringBuilder entityStringCollector = null;</span>
+
+    //Iterate through each word....
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    for (CoreLabel w: l) {</span>
+<span class="nc" id="L290">      String entityType = w.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+      //if we've just completed an entity and we're looking at a non-continuation,
+      //we want to add that now.
+<span class="nc bnc" id="L293" title="All 4 branches missed.">      if (entityStringCollector != null &amp;&amp; ! entityType.equals(lastEntity)) {</span>
+<span class="nc" id="L294">        CoreLabel nextWord = new CoreLabel();</span>
+<span class="nc" id="L295">        nextWord.setWord(entityStringCollector.toString());</span>
+<span class="nc" id="L296">        nextWord.set(CoreAnnotations.PartOfSpeechAnnotation.class, &quot;NNP&quot;);</span>
+<span class="nc" id="L297">        nextWord.set(CoreAnnotations.NamedEntityTagAnnotation.class, lastEntity);</span>
+<span class="nc" id="L298">        s.add(nextWord);</span>
+        if (DEBUG) {
+          err.print(&quot;Quantifiable: Collapsing &quot;);
+          err.println(entityStringCollector.toString());
+        }
+<span class="nc" id="L303">        entityStringCollector = null;</span>
+      }
+      //If its not to be collapsed, toss it onto the sentence.
+<span class="nc bnc" id="L306" title="All 2 branches missed.">      if ( ! collapseBeforeParsing.contains(entityType)) {</span>
+<span class="nc" id="L307">        s.add(w);</span>
+      } else { //If it is to be collapsed....
+        //if its a continuation of the last entity, add it to the
+        //current buffer.
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        if (entityType.equals(lastEntity)){</span>
+<span class="nc bnc" id="L312" title="All 4 branches missed.">          assert entityStringCollector != null;</span>
+<span class="nc" id="L313">          entityStringCollector.append('_');</span>
+<span class="nc" id="L314">          entityStringCollector.append(w.get(CoreAnnotations.TextAnnotation.class));</span>
+        } else {
+          //and its NOT a continuation, make a new buffer.
+<span class="nc" id="L317">          entityStringCollector = new StringBuilder();</span>
+<span class="nc" id="L318">          entityStringCollector.append(w.get(CoreAnnotations.TextAnnotation.class));</span>
+        }
+      }
+<span class="nc" id="L321">      lastEntity=entityType;</span>
+<span class="nc" id="L322">    }</span>
+    // if the last token was a named-entity, we add it here.
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    if (entityStringCollector!=null) {</span>
+<span class="nc" id="L325">      CoreLabel nextWord = new CoreLabel();</span>
+<span class="nc" id="L326">      nextWord.setWord(entityStringCollector.toString());</span>
+<span class="nc" id="L327">      nextWord.set(CoreAnnotations.PartOfSpeechAnnotation.class, &quot;NNP&quot;);</span>
+<span class="nc" id="L328">      nextWord.set(CoreAnnotations.NamedEntityTagAnnotation.class, lastEntity);</span>
+<span class="nc" id="L329">      s.add(nextWord);</span>
+    }
+<span class="nc bnc" id="L331" title="All 2 branches missed.">    for (CoreLabel w : s) {</span>
+<span class="nc" id="L332">      log.info(&quot;&lt;&lt;&quot;+w.get(CoreAnnotations.TextAnnotation.class)+&quot;::&quot;+w.get(CoreAnnotations.PartOfSpeechAnnotation.class)+&quot;::&quot;+w.get(CoreAnnotations.NamedEntityTagAnnotation.class)+&quot;&gt;&gt;&quot;);</span>
+<span class="nc" id="L333">    }</span>
+<span class="nc" id="L334">    return s;</span>
+  }
+
+
+  /**
+   * Provided for backwards compatibility; see normalizedDateString(s, openRangeMarker)
+   */
+  static String normalizedDateString(String s, Timex timexFromSUTime) {
+<span class="fc" id="L342">    return normalizedDateString(s, ISODateInstance.NO_RANGE, timexFromSUTime);</span>
+  }
+
+  /**
+   * Returns a string that represents either a single date or a range of
+   * dates.  Representation pattern is roughly ISO8601, with some extensions
+   * for greater expressivity; see {@link ISODateInstance} for details.
+   * @param s Date string to normalize
+   * @param openRangeMarker a marker for whether this date is not involved in
+   * an open range, is involved in an open range that goes forever backward and
+   * stops at s, or is involved in an open range that goes forever forward and
+   * starts at s.  See {@link ISODateInstance}.
+   * @return A yyyymmdd format normalized date
+   */
+  static String normalizedDateString(String s, String openRangeMarker, Timex timexFromSUTime) {
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">    if(timexFromSUTime != null) {</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">      if(timexFromSUTime.value() != null){</span>
+        // fully disambiguated temporal
+<span class="nc" id="L360">        return timexFromSUTime.value();</span>
+      } else {
+        // this is a relative date, e.g., &quot;yesterday&quot;
+<span class="nc" id="L363">        return timexFromSUTime.altVal();</span>
+      }
+    }
+
+<span class="fc" id="L367">    ISODateInstance d = new ISODateInstance(s, openRangeMarker);</span>
+    if (DEBUG2) err.println(&quot;normalizeDate: &quot; + s + &quot; to &quot; + d.getDateString());
+<span class="fc" id="L369">    return (d.getDateString());</span>
+  }
+
+  static String normalizedDurationString(String s, Timex timexFromSUTime) {
+<span class="nc bnc" id="L373" title="All 2 branches missed.">    if(timexFromSUTime != null) {</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      if(timexFromSUTime.value() != null){</span>
+        // fully disambiguated temporal
+<span class="nc" id="L376">        return timexFromSUTime.value();</span>
+      } else {
+        // something else
+<span class="nc" id="L379">        return timexFromSUTime.altVal();</span>
+      }
+    }
+    // TODO: normalize duration ourselves
+<span class="nc" id="L383">    return null;</span>
+  }
+
+  /**
+   * Tries to heuristically determine if the given word is a year
+   */
+  static boolean isYear(CoreMap word) {
+<span class="nc" id="L390">    String wordString = word.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L391" title="All 4 branches missed.">    if(word.get(CoreAnnotations.PartOfSpeechAnnotation.class) == null || word.get(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;CD&quot;)) {</span>
+      //one possibility: it's a two digit year with an apostrophe: '90
+<span class="nc bnc" id="L393" title="All 4 branches missed.">      if(wordString.length() == 3  &amp;&amp; wordString.startsWith(&quot;'&quot;)) {</span>
+        if (DEBUG) {
+          log.info(&quot;Found potential two digit year: &quot; + wordString);
+        }
+<span class="nc" id="L397">        wordString = wordString.substring(1);</span>
+        try {
+<span class="nc" id="L399">          Integer.parseInt(wordString);</span>
+<span class="nc" id="L400">          return true;</span>
+<span class="nc" id="L401">        } catch(Exception e) {</span>
+<span class="nc" id="L402">          return false;</span>
+        }
+      }
+      //if it is 4 digits, with first one &lt;3 (usually we're not talking about
+      //the far future, say it's a year
+<span class="nc bnc" id="L407" title="All 2 branches missed.">      if(wordString.length() == 4) {</span>
+        try {
+<span class="nc" id="L409">          int num = Integer.parseInt(wordString);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">          if(num &lt; 3000)</span>
+<span class="nc" id="L411">            return true;</span>
+<span class="nc" id="L412">        } catch(Exception e) {</span>
+<span class="nc" id="L413">          return false;</span>
+<span class="nc" id="L414">        }</span>
+      }
+    }
+<span class="nc" id="L417">    return false;</span>
+  }
+
+
+  private static final String dateRangeAfterOneWord = &quot;after|since&quot;;
+  private static final String dateRangeBeforeOneWord = &quot;before|until&quot;;
+  private static final List&lt;Pair&lt;String, String&gt;&gt; dateRangeBeforePairedOneWord;
+  static {
+<span class="fc" id="L425">    dateRangeBeforePairedOneWord = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L426">    dateRangeBeforePairedOneWord.add(new Pair&lt;&gt;(&quot;between&quot;, &quot;and&quot;));</span>
+<span class="fc" id="L427">    dateRangeBeforePairedOneWord.add(new Pair&lt;&gt;(&quot;from&quot;, &quot;to&quot;));</span>
+<span class="fc" id="L428">    dateRangeBeforePairedOneWord.add(new Pair&lt;&gt;(&quot;from&quot;, &quot;-&quot;));</span>
+  }
+
+  private static final String datePrepositionAfterWord = &quot;in|of&quot;;
+
+
+  /**
+   * Takes the strings of the one previous and 3 next words to a date to
+   * detect date range modifiers like &quot;before&quot; or &quot;between \&lt;date\&gt; and \&lt;date\&gt;
+   * @param &lt;E&gt;
+   */
+  private static &lt;E extends CoreMap&gt; String detectDateRangeModifier(List&lt;E&gt; date, List&lt;E&gt; list, int beforeIndex, int afterIndex) {
+<span class="nc bnc" id="L440" title="All 2 branches missed.">    E prev = (beforeIndex &gt;= 0) ? list.get(beforeIndex) : null;</span>
+<span class="nc" id="L441">    int sz = list.size();</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    E next = (afterIndex &lt; sz) ? list.get(afterIndex) : null;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">    E next2 = (afterIndex + 1 &lt; sz) ? list.get(afterIndex + 1) : null;</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    E next3 = (afterIndex + 2 &lt; sz) ? list.get(afterIndex + 2) : null;</span>
+
+
+    if (DEBUG) {
+      err.println(&quot;DateRange: previous: &quot; + prev);
+      err.println(&quot;Quantifiable: next: &quot; + next + ' ' + next2 + ' ' + next3);
+    }
+
+    //sometimes the year gets tagged as CD but not as a date - if this happens, we want to add it in
+<span class="nc bnc" id="L453" title="All 4 branches missed.">    if (next != null &amp;&amp; isYear(next)) {</span>
+<span class="nc" id="L454">      date.add(next);</span>
+<span class="nc" id="L455">      next.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DATE&quot;);</span>
+<span class="nc" id="L456">      afterIndex++;</span>
+    }
+<span class="nc bnc" id="L458" title="All 4 branches missed.">    if (next2 != null &amp;&amp; isYear(next2)) {</span>
+      // This code here just seems wrong.... why are we marking next as a date without checking anything?
+<span class="nc" id="L460">      date.add(next);</span>
+<span class="nc bnc" id="L461" title="All 4 branches missed.">      assert(next != null); // keep the static analysis happy.</span>
+<span class="nc" id="L462">      next.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DATE&quot;);</span>
+<span class="nc" id="L463">      date.add(next2);</span>
+<span class="nc" id="L464">      next2.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DATE&quot;);</span>
+<span class="nc" id="L465">      afterIndex += 2;</span>
+    }
+
+    //sometimes the date will be stated in a form like &quot;June of 1984&quot; -&gt; we'd like this to be 198406
+<span class="nc bnc" id="L469" title="All 4 branches missed.">    if(next != null &amp;&amp; next.get(CoreAnnotations.TextAnnotation.class).matches(datePrepositionAfterWord)) {</span>
+      //check if the next next word is a year or month
+<span class="nc bnc" id="L471" title="All 4 branches missed.">      if(next2 != null &amp;&amp; (isYear(next2))) {//TODO: implement month!</span>
+<span class="nc" id="L472">        date.add(next);</span>
+<span class="nc" id="L473">        date.add(next2);</span>
+<span class="nc" id="L474">        afterIndex += 2;</span>
+      }
+    }
+
+    //String range = detectTwoSidedRangeModifier(date.get(0), list, beforeIndex, afterIndex);
+    //if(range !=ISODateInstance.NO_RANGE) return range;
+    //check if it's an open range - two sided ranges get checked elsewhere
+    //based on the prev word
+<span class="nc bnc" id="L482" title="All 2 branches missed.">    if(prev != null) {</span>
+<span class="nc" id="L483">      String prevWord = prev.get(CoreAnnotations.TextAnnotation.class).toLowerCase();</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">      if(prevWord.matches(dateRangeBeforeOneWord)) {</span>
+        //we have an open range of the before type - e.g., Before June 6, John was 5
+<span class="nc" id="L486">        prev.set(CoreAnnotations.PartOfSpeechAnnotation.class, &quot;DATE_MOD&quot;);</span>
+<span class="nc" id="L487">        return ISODateInstance.OPEN_RANGE_BEFORE;</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">      } else if(prevWord.matches(dateRangeAfterOneWord)) {</span>
+        //we have an open range of the after type - e.g., After June 6, John was 6
+<span class="nc" id="L490">        prev.set(CoreAnnotations.PartOfSpeechAnnotation.class, &quot;DATE_MOD&quot;);</span>
+<span class="nc" id="L491">        return ISODateInstance.OPEN_RANGE_AFTER;</span>
+      }
+    }
+
+
+<span class="nc" id="L496">    return ISODateInstance.NO_RANGE;</span>
+  }
+
+  // Version of above without any weird stuff
+  private static &lt;E extends CoreMap&gt; String detectDateRangeModifier(E prev)
+  {
+<span class="nc bnc" id="L502" title="All 2 branches missed.">    if(prev != null) {</span>
+<span class="nc" id="L503">      String prevWord = prev.get(CoreAnnotations.TextAnnotation.class).toLowerCase();</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">      if(prevWord.matches(dateRangeBeforeOneWord)) {</span>
+        //we have an open range of the before type - e.g., Before June 6, John was 5
+<span class="nc" id="L506">        return ISODateInstance.OPEN_RANGE_BEFORE;</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">      } else if(prevWord.matches(dateRangeAfterOneWord)) {</span>
+        //we have an open range of the after type - e.g., After June 6, John was 6
+<span class="nc" id="L509">        return ISODateInstance.OPEN_RANGE_AFTER;</span>
+      }
+    }
+<span class="nc" id="L512">    return ISODateInstance.NO_RANGE;</span>
+  }
+
+
+  /**
+   * This should detect things like &quot;between 5 and 5 million&quot; and &quot;from April 3 to June 6&quot;
+   * Each side of the range is tagged with the correct numeric quantity (e.g., 5/5x10E6 or
+   * ****0403/****0606) and the other words (e.g., &quot;between&quot;, &quot;and&quot;, &quot;from&quot;, &quot;to&quot;) are
+   * tagged as quantmod to avoid penalizing them for lack of alignment/matches.
+   *
+   * This method should be called after other collapsing is complete (e.g. 5 million should already be
+   * concatenated)
+   * @param &lt;E&gt;
+   */
+  private static &lt;E extends CoreMap&gt; List&lt;E&gt; detectTwoSidedRangeModifier(E firstDate, List&lt;E&gt; list, int beforeIndex, int afterIndex, boolean concatenate) {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">    E prev = (beforeIndex &gt;= 0) ? list.get(beforeIndex) : null;</span>
+    //E cur = list.get(0);
+<span class="nc" id="L529">    int sz = list.size();</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">    E next = (afterIndex &lt; sz) ? list.get(afterIndex) : null;</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">    E next2 = (afterIndex + 1 &lt; sz) ? list.get(afterIndex + 1) : null;</span>
+<span class="nc" id="L532">    List&lt;E&gt; toRemove = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L534" title="All 2 branches missed.">    String curNER = (firstDate == null ? &quot;&quot; : firstDate.get(CoreAnnotations.NamedEntityTagAnnotation.class));</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">    if(curNER == null) curNER = &quot;&quot;;</span>
+<span class="nc bnc" id="L536" title="All 4 branches missed.">    if(firstDate == null || firstDate.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) == null) return toRemove;</span>
+    //TODO: make ranges actually work
+    //first check if it's of the form &quot;between &lt;date&gt; and &lt;date&gt;&quot;/etc
+
+<span class="nc bnc" id="L540" title="All 2 branches missed.">    if (prev != null) {</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">      for (Pair&lt;String, String&gt; ranges : dateRangeBeforePairedOneWord) {</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (prev.get(CoreAnnotations.TextAnnotation.class).matches(ranges.first())) {</span>
+<span class="nc bnc" id="L543" title="All 4 branches missed.">          if (next != null &amp;&amp; next2 != null) {</span>
+<span class="nc" id="L544">            String nerNext2 = next2.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L545" title="All 6 branches missed.">            if (next.get(CoreAnnotations.TextAnnotation.class).matches(ranges.second()) &amp;&amp; nerNext2 != null &amp;&amp; nerNext2.equals(curNER)) {</span>
+              //Add rest in
+<span class="nc" id="L547">              prev.set(CoreAnnotations.PartOfSpeechAnnotation.class, &quot;QUANT_MOD&quot;);</span>
+              String rangeString;
+<span class="nc bnc" id="L549" title="All 2 branches missed.">              if(curNER.equals(&quot;DATE&quot;)) {</span>
+<span class="nc" id="L550">                ISODateInstance c = new ISODateInstance(new ISODateInstance(firstDate.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class)),</span>
+<span class="nc" id="L551">                    new ISODateInstance(next2.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class)));</span>
+<span class="nc" id="L552">                rangeString = c.getDateString();</span>
+<span class="nc" id="L553">              } else {</span>
+<span class="nc" id="L554">                rangeString = firstDate.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + '-' + next2.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class);</span>
+              }
+              if (DEBUG) {
+                log.info(&quot;#1: Changing normalized NER from &quot; + firstDate.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + &quot; to &quot; + rangeString + &quot; at index &quot; + beforeIndex);
+              }
+<span class="nc" id="L559">              firstDate.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, rangeString);</span>
+              if (DEBUG) {
+                log.info(&quot;#2: Changing normalized NER from &quot; + next2.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + &quot; to &quot; + rangeString + &quot; at index &quot; + afterIndex);
+              }
+<span class="nc" id="L563">              next2.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, rangeString);</span>
+<span class="nc" id="L564">              next.set(CoreAnnotations.NamedEntityTagAnnotation.class, nerNext2);</span>
+              if (DEBUG) {
+                log.info(&quot;#3: Changing normalized NER from &quot; + next.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + &quot; to &quot; + rangeString + &quot; at index &quot; + (afterIndex + 1));
+              }
+<span class="nc" id="L568">              next.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, rangeString);</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">              if (concatenate) {</span>
+<span class="nc" id="L570">                List&lt;E&gt; numberWords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L571">                numberWords.add(firstDate);</span>
+<span class="nc" id="L572">                numberWords.add(next);</span>
+<span class="nc" id="L573">                numberWords.add(next2);</span>
+<span class="nc" id="L574">                concatenateNumericString(numberWords, toRemove);</span>
+
+              }
+            }
+          }
+        }
+<span class="nc" id="L580">      }</span>
+    }
+<span class="nc" id="L582">    return toRemove;</span>
+  }
+
+  /**
+   * Concatenates separate words of a date or other numeric quantity into one node (e.g., 3 November -&gt; 3_November)
+   * Tag is CD or NNP, and other words are added to the remove list
+   */
+  static &lt;E extends CoreMap&gt; void concatenateNumericString(List&lt;E&gt; words, List&lt;E&gt; toRemove) {
+<span class="nc bnc" id="L590" title="All 2 branches missed.">    if (words.size() &lt;= 1) return;</span>
+<span class="nc" id="L591">    boolean first = true;</span>
+<span class="nc" id="L592">    StringBuilder newText = new StringBuilder();</span>
+<span class="nc" id="L593">    E foundEntity = null;</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">    for (E word : words) {</span>
+<span class="nc bnc" id="L595" title="All 6 branches missed.">      if (foundEntity == null &amp;&amp; (word.get(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;CD&quot;) || word.get(CoreAnnotations.PartOfSpeechAnnotation.class).equals(&quot;NNP&quot;))) {</span>
+<span class="nc" id="L596">        foundEntity = word;</span>
+      }
+<span class="nc bnc" id="L598" title="All 2 branches missed.">      if (first) {</span>
+<span class="nc" id="L599">        first = false;</span>
+      } else {
+<span class="nc" id="L601">        newText.append('_');</span>
+      }
+<span class="nc" id="L603">      newText.append(word.get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc" id="L604">    }</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">    if (foundEntity == null) {</span>
+<span class="nc" id="L606">      foundEntity = words.get(0);//if we didn't find one with the appropriate tag, just take the first one</span>
+    }
+<span class="nc" id="L608">    toRemove.addAll(words);</span>
+<span class="nc" id="L609">    toRemove.remove(foundEntity);</span>
+<span class="nc" id="L610">    foundEntity.set(CoreAnnotations.PartOfSpeechAnnotation.class, &quot;CD&quot;);  // cdm 2008: is this actually good for dates??</span>
+<span class="nc" id="L611">    String collapsed = newText.toString();</span>
+<span class="nc" id="L612">    foundEntity.set(CoreAnnotations.TextAnnotation.class, collapsed);</span>
+<span class="nc" id="L613">    foundEntity.set(CoreAnnotations.OriginalTextAnnotation.class, collapsed);</span>
+<span class="nc" id="L614">  }</span>
+
+
+  public static String normalizedTimeString(String s, Timex timexFromSUTime) {
+<span class="fc" id="L618">    return normalizedTimeString(s, null, timexFromSUTime);</span>
+  }
+
+  public static String normalizedTimeString(String s, String ampm, Timex timexFromSUTime) {
+<span class="pc bpc" id="L622" title="1 of 2 branches missed.">    if(timexFromSUTime != null){</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">      if(timexFromSUTime.value() != null){</span>
+        // this timex is fully disambiguated
+<span class="nc" id="L625">        return timexFromSUTime.value();</span>
+      } else {
+        // not disambiguated; contains some relative date
+<span class="nc" id="L628">        return timexFromSUTime.altVal();</span>
+      }
+    }
+
+    if (DEBUG2) err.println(&quot;normalizingTime: &quot; + s);
+<span class="fc" id="L633">    s = s.replaceAll(&quot;[ \t\n\0\f\r]&quot;, &quot;&quot;);</span>
+<span class="fc" id="L634">    Matcher m = timePattern.matcher(s);</span>
+<span class="pc bpc" id="L635" title="1 of 2 branches missed.">    if (s.equalsIgnoreCase(&quot;noon&quot;)) {</span>
+<span class="nc" id="L636">      return &quot;12:00pm&quot;;</span>
+<span class="fc bfc" id="L637" title="All 2 branches covered.">    } else if (s.equalsIgnoreCase(&quot;midnight&quot;)) {</span>
+<span class="fc" id="L638">      return &quot;00:00am&quot;;  // or &quot;12:00am&quot; ?</span>
+<span class="pc bpc" id="L639" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;morning&quot;)) {</span>
+<span class="nc" id="L640">      return &quot;M&quot;;</span>
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;afternoon&quot;)) {</span>
+<span class="nc" id="L642">      return &quot;A&quot;;</span>
+<span class="pc bpc" id="L643" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;evening&quot;)) {</span>
+<span class="nc" id="L644">      return &quot;EN&quot;;</span>
+<span class="pc bpc" id="L645" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;night&quot;)) {</span>
+<span class="nc" id="L646">      return &quot;N&quot;;</span>
+<span class="pc bpc" id="L647" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;day&quot;)) {</span>
+<span class="nc" id="L648">      return &quot;D&quot;;</span>
+<span class="pc bpc" id="L649" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;suppertime&quot;)) {</span>
+<span class="nc" id="L650">      return &quot;EN&quot;;</span>
+<span class="pc bpc" id="L651" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;lunchtime&quot;)) {</span>
+<span class="nc" id="L652">      return &quot;MD&quot;;</span>
+<span class="pc bpc" id="L653" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;midday&quot;)) {</span>
+<span class="nc" id="L654">      return &quot;MD&quot;;</span>
+<span class="pc bpc" id="L655" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;teatime&quot;)) {</span>
+<span class="nc" id="L656">      return &quot;A&quot;;</span>
+<span class="pc bpc" id="L657" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;dinnertime&quot;)) {</span>
+<span class="nc" id="L658">      return &quot;EN&quot;;</span>
+<span class="pc bpc" id="L659" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;dawn&quot;)) {</span>
+<span class="nc" id="L660">      return &quot;EM&quot;;</span>
+<span class="pc bpc" id="L661" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;dusk&quot;)) {</span>
+<span class="nc" id="L662">      return &quot;EN&quot;;</span>
+<span class="pc bpc" id="L663" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;sundown&quot;)) {</span>
+<span class="nc" id="L664">      return &quot;EN&quot;;</span>
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;sunup&quot;)) {</span>
+<span class="nc" id="L666">      return &quot;EM&quot;;</span>
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">    } else if (s.equalsIgnoreCase(&quot;daybreak&quot;)) {</span>
+<span class="nc" id="L668">      return &quot;EM&quot;;</span>
+<span class="pc bpc" id="L669" title="1 of 2 branches missed.">    } else if (m.matches()) {</span>
+      if (DEBUG2) {
+        err.printf(&quot;timePattern matched groups: |%s| |%s| |%s| |%s|\n&quot;, m.group(0), m.group(1), m.group(2), m.group(3));
+      }
+      // group 1 is hours, group 2 is minutes and maybe seconds; group 3 is am/pm
+<span class="fc" id="L674">      StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L675">      sb.append(m.group(1));</span>
+<span class="pc bpc" id="L676" title="1 of 4 branches missed.">      if (m.group(2) == null || &quot;&quot;.equals(m.group(2))) {</span>
+<span class="fc" id="L677">        sb.append(&quot;:00&quot;);</span>
+      } else {
+<span class="fc" id="L679">        sb.append(m.group(2));</span>
+      }
+<span class="fc bfc" id="L681" title="All 2 branches covered.">      if (m.group(3) != null) {</span>
+<span class="fc" id="L682">        String suffix = m.group(3);</span>
+<span class="fc" id="L683">        suffix = suffix.replaceAll(&quot;\\.&quot;, &quot;&quot;);</span>
+<span class="fc" id="L684">        suffix = suffix.toLowerCase();</span>
+<span class="fc" id="L685">        sb.append(suffix);</span>
+<span class="pc bpc" id="L686" title="1 of 2 branches missed.">      } else if (ampm != null) {</span>
+<span class="nc" id="L687">        sb.append(ampm);</span>
+      } else {
+        // Do nothing; leave ambiguous
+        // sb.append(&quot;pm&quot;);
+      }
+      if (DEBUG2) {
+        err.println(&quot;normalizedTimeString new str: &quot; + sb.toString());
+      }
+<span class="fc" id="L695">      return sb.toString();</span>
+    } else if (DEBUG) {
+      err.println(&quot;Quantifiable: couldn't normalize &quot; + s);
+    }
+<span class="nc" id="L699">    return null;</span>
+  }
+
+  /**
+   * Heuristically decides if s is in American (42.33) or European (42,33) number format
+   * and tries to turn European version into American.
+   *
+   */
+  private static String convertToAmerican(String s) {
+<span class="fc bfc" id="L708" title="All 2 branches covered.">    if(s.contains(&quot;,&quot;)) {</span>
+      //turn all but the last into blanks - this isn't really correct, but it's close enough for now
+<span class="pc bpc" id="L710" title="1 of 2 branches missed.">      while(s.indexOf(',') != s.lastIndexOf(','))</span>
+<span class="nc" id="L711">        s = s.replaceFirst(&quot;,&quot;, &quot;&quot;);</span>
+<span class="fc" id="L712">      int place = s.lastIndexOf(',');</span>
+      //if it's american, should have at least three characters after it
+<span class="pc bpc" id="L714" title="1 of 4 branches missed.">      if (place  &gt;= s.length() - 3 &amp;&amp; place != s.length() - 1) {</span>
+<span class="fc" id="L715">        s = s.substring(0, place) + '.' + s.substring(place + 1);</span>
+      } else {
+<span class="fc" id="L717">        s = s.replace(&quot;,&quot;, &quot;&quot;);</span>
+      }
+    }
+<span class="fc" id="L720">    return s;</span>
+  }
+
+  static String normalizedMoneyString(String s, Number numberFromSUTime) {
+    //first, see if it looks like european style
+<span class="fc" id="L725">    s = convertToAmerican(s);</span>
+    // clean up string
+<span class="fc" id="L727">    s = s.replaceAll(&quot;[ \t\n\0\f\r,]&quot;, &quot;&quot;);</span>
+<span class="fc" id="L728">    s = s.toLowerCase();</span>
+    if (DEBUG2) {
+      err.println(&quot;normalizedMoneyString: Normalizing &quot;+s);
+    }
+
+<span class="fc" id="L733">    double multiplier = 1.0;</span>
+
+    // do currency words
+<span class="fc" id="L736">    char currencySign = '$';</span>
+<span class="fc bfc" id="L737" title="All 2 branches covered.">    for (String currencyWord : currencyWords.keySet()) {</span>
+<span class="fc bfc" id="L738" title="All 2 branches covered.">      if (StringUtils.find(s, currencyWord)) {</span>
+        if (DEBUG2) { err.println(&quot;Found units: &quot; + currencyWord); }
+<span class="pc bpc" id="L740" title="1 of 6 branches missed.">        if (currencyWord.equals(&quot;pence|penny&quot;) || currencyWord.equals(&quot;cents?&quot;) || currencyWord.equals(&quot;\u00A2&quot;)) {</span>
+<span class="fc" id="L741">          multiplier *= 0.01;</span>
+        }
+        // if(DEBUG){err.println(&quot;Quantifiable: Found &quot;+ currencyWord);}
+<span class="fc" id="L744">        s = s.replaceAll(currencyWord, &quot;&quot;);</span>
+<span class="fc" id="L745">        currencySign = currencyWords.get(currencyWord);</span>
+      }
+<span class="fc" id="L747">    }</span>
+
+    // process rest as number
+<span class="fc" id="L750">    String value = normalizedNumberStringQuiet(s, multiplier, &quot;&quot;, numberFromSUTime);</span>
+<span class="pc bpc" id="L751" title="1 of 2 branches missed.">    if (value == null) {</span>
+<span class="nc" id="L752">      return null;</span>
+    } else {
+<span class="fc" id="L754">      return currencySign + value;</span>
+    }
+  }
+
+  public static String normalizedNumberString(String s, String nextWord, Number numberFromSUTime) {
+    if (DEBUG2) { err.println(&quot;normalizedNumberString: normalizing &quot;+s); }
+<span class="fc" id="L760">    return normalizedNumberStringQuiet(s, 1.0, nextWord, numberFromSUTime);</span>
+  }
+
+
+<span class="fc" id="L764">  private static final Pattern allSpaces = Pattern.compile(&quot; *&quot;);</span>
+
+
+  public static String normalizedNumberStringQuiet(String s,
+      double multiplier,
+      String nextWord,
+      Number numberFromSUTime) {
+    // normalizations from SUTime take precedence, if available
+<span class="pc bpc" id="L772" title="1 of 2 branches missed.">    if(numberFromSUTime != null){</span>
+<span class="nc" id="L773">      double v = Double.valueOf(numberFromSUTime.toString());</span>
+<span class="nc" id="L774">      return Double.toString(v * multiplier);</span>
+    }
+
+    // clean up string
+<span class="fc" id="L778">    String origSClean = s.replaceAll(&quot;[\t\n\0\f\r]&quot;, &quot;&quot;);</span>
+<span class="fc bfc" id="L779" title="All 2 branches covered.">    if (allSpaces.matcher(origSClean).matches()) {</span>
+<span class="fc" id="L780">      return s;</span>
+    }
+<span class="fc" id="L782">    String[] origSSplit = origSClean.split(&quot; &quot;);</span>
+<span class="fc" id="L783">    s = s.replaceAll(&quot;[ \t\n\0\f\r]&quot;, &quot;&quot;);</span>
+    //see if it looks like european style
+<span class="fc" id="L785">    s = convertToAmerican(s);</span>
+    // remove parenthesis around numbers
+    // if PTBTokenized, this next bit should be a no-op
+    // in some contexts parentheses might indicate a negative number, but ignore that.
+<span class="pc bpc" id="L789" title="3 of 4 branches missed.">    if (s.startsWith(&quot;(&quot;) &amp;&amp; s.endsWith(&quot;)&quot;)) {</span>
+<span class="nc" id="L790">      s = s.substring(1, s.length() - 1);</span>
+      if (DEBUG2) err.println(&quot;Deleted (): &quot; + s);
+    }
+<span class="fc" id="L793">    s = s.toLowerCase();</span>
+
+    // get multipliers like &quot;billion&quot;
+<span class="fc" id="L796">    boolean foundMultiplier = false;</span>
+<span class="fc bfc" id="L797" title="All 2 branches covered.">    for (String moneyTag : moneyMultipliers.keySet()) {</span>
+<span class="fc bfc" id="L798" title="All 2 branches covered.">      if (s.contains(moneyTag)) {</span>
+        // if (DEBUG) {err.println(&quot;Quantifiable: Found &quot;+ moneyTag);}
+        //special case check: m can mean either meters or million - if nextWord is high or long, we assume meters - this is a huge and bad hack!!!
+<span class="pc bpc" id="L801" title="5 of 6 branches missed.">        if(moneyTag.equals(&quot;m&quot;) &amp;&amp; (nextWord.equals(&quot;high&quot;) || nextWord.equals(&quot;long&quot;) )) continue;</span>
+<span class="fc" id="L802">        s = s.replaceAll(moneyTag, &quot;&quot;);</span>
+<span class="fc" id="L803">        multiplier *= moneyMultipliers.get(moneyTag);</span>
+<span class="fc" id="L804">        foundMultiplier = true;</span>
+      }
+<span class="fc" id="L806">    }</span>
+<span class="fc bfc" id="L807" title="All 2 branches covered.">    for (String moneyTag : moneyMultipliers2.keySet()) {</span>
+<span class="fc" id="L808">      Matcher m = Pattern.compile(moneyTag).matcher(s);</span>
+<span class="fc bfc" id="L809" title="All 2 branches covered.">      if (m.find()) {</span>
+        // if(DEBUG){err.println(&quot;Quantifiable: Found &quot;+ moneyTag);}
+<span class="fc" id="L811">        multiplier *= moneyMultipliers2.get(moneyTag);</span>
+<span class="fc" id="L812">        foundMultiplier = true;</span>
+<span class="fc" id="L813">        int start = m.start(1);</span>
+<span class="fc" id="L814">        int end = m.end(1);</span>
+        // err.print(&quot;Deleting from &quot; + s);
+<span class="fc" id="L816">        s = s.substring(0, start) + s.substring(end);</span>
+        // err.println(&quot;; Result is &quot; + s);
+      }
+<span class="fc" id="L819">    }</span>
+<span class="fc bfc" id="L820" title="All 2 branches covered.">    if(!foundMultiplier) {</span>
+<span class="fc" id="L821">      EditDistance ed = new EditDistance();</span>
+<span class="fc bfc" id="L822" title="All 2 branches covered.">      for (String moneyTag : moneyMultipliers.keySet()) {</span>
+<span class="pc bpc" id="L823" title="1 of 2 branches missed.">        if(isOneSubstitutionMatch(origSSplit[origSSplit.length - 1],</span>
+                                  moneyTag, ed)) {
+<span class="nc" id="L825">          s = s.replaceAll(moneyTag, &quot;&quot;);</span>
+<span class="nc" id="L826">          multiplier *= moneyMultipliers.get(moneyTag);</span>
+        }
+<span class="fc" id="L828">      }</span>
+    }
+
+    if (DEBUG2) err.println(&quot;Looking for number words in |&quot; + s + &quot;|; multiplier is &quot; + multiplier);
+
+    // handle numbers written in words
+<span class="fc" id="L834">    String[] parts = s.split(&quot;[ -]&quot;);</span>
+<span class="fc" id="L835">    boolean processed = false;</span>
+<span class="fc" id="L836">    double dd = 0.0;</span>
+<span class="fc bfc" id="L837" title="All 2 branches covered.">    for (String part : parts) {</span>
+<span class="fc bfc" id="L838" title="All 2 branches covered.">      if (wordsToValues.containsKey(part)) {</span>
+<span class="fc" id="L839">        dd += wordsToValues.getCount(part);</span>
+<span class="fc" id="L840">        processed = true;</span>
+      } else {
+<span class="fc" id="L842">        String partMatch = getOneSubstitutionMatch(part, wordsToValues.keySet());</span>
+<span class="pc bpc" id="L843" title="1 of 2 branches missed.">        if(partMatch != null) {</span>
+<span class="nc" id="L844">          dd += wordsToValues.getCount(partMatch);</span>
+<span class="nc" id="L845">          processed = true;</span>
+        }
+      }
+    }
+<span class="fc bfc" id="L849" title="All 2 branches covered.">    if (processed) {</span>
+<span class="fc" id="L850">      dd *= multiplier;</span>
+<span class="fc" id="L851">      return Double.toString(dd);</span>
+    }
+
+    // handle numbers written as numbers
+   //  s = s.replaceAll(&quot;-&quot;, &quot;&quot;); //This is bad: it lets 22-7 be the number 227!
+<span class="fc" id="L856">    s = s.replaceAll(&quot;[A-Za-z]&quot;, &quot;&quot;);</span>
+
+    // handle scores or range
+<span class="fc" id="L859">    Matcher m2 = scorePattern.matcher(s);</span>
+<span class="fc bfc" id="L860" title="All 2 branches covered.">    if (m2.matches()) {</span>
+<span class="fc" id="L861">      double d1 = Double.parseDouble(m2.group(1));</span>
+<span class="fc" id="L862">      double d2 = Double.parseDouble(m2.group(2));</span>
+<span class="fc" id="L863">      return Double.toString(d1) + &quot; - &quot; + Double.toString(d2);</span>
+    }
+
+    // check for hyphenated word like 4-Ghz: delete final -
+<span class="pc bpc" id="L867" title="1 of 2 branches missed.">    if (s.endsWith(&quot;-&quot;)) {</span>
+<span class="nc" id="L868">      s = s.substring(0, s.length() - 1);</span>
+    }
+
+<span class="fc" id="L871">    Matcher m = moneyPattern.matcher(s);</span>
+<span class="pc bpc" id="L872" title="1 of 2 branches missed.">    if (m.matches()) {</span>
+      if (DEBUG2) {
+        err.println(&quot;Number matched with |&quot; + m.group(2) + &quot;| |&quot; +
+            m.group(3) + '|');
+      }
+      try {
+<span class="fc" id="L878">        double d = 0.0;</span>
+<span class="pc bpc" id="L879" title="1 of 4 branches missed.">        if (m.group(2) != null &amp;&amp; ! m.group(2).equals(&quot;&quot;)) {</span>
+<span class="fc" id="L880">          d = Double.parseDouble(m.group(2));</span>
+        }
+<span class="pc bpc" id="L882" title="1 of 4 branches missed.">        if (m.group(3) != null &amp;&amp; ! m.group(3).equals(&quot;&quot;)) {</span>
+<span class="fc" id="L883">          d += Double.parseDouble(m.group(3));</span>
+        }
+<span class="fc bfc" id="L885" title="All 4 branches covered.">        if (d == 0.0 &amp;&amp; multiplier != 1.0) {</span>
+          // we'd found a multiplier
+<span class="fc" id="L887">          d = 1.0;</span>
+        }
+<span class="fc" id="L889">        d *= multiplier;</span>
+<span class="fc" id="L890">        return Double.toString(d);</span>
+<span class="nc" id="L891">      } catch (Exception e) {</span>
+        if (DEBUG2) {
+          e.printStackTrace();
+        }
+<span class="nc" id="L895">        return null;</span>
+      }
+<span class="nc bnc" id="L897" title="All 2 branches missed.">    } else if (multiplier != 1.0) {</span>
+      // we found a multiplier, so we have something
+<span class="nc" id="L899">      return Double.toString(multiplier);</span>
+    } else {
+<span class="nc" id="L901">      return null;</span>
+    }
+  }
+
+  public static String normalizedOrdinalString(String s, Number numberFromSUTime) {
+    if (DEBUG2) { err.println(&quot;normalizedOrdinalString: normalizing &quot;+s); }
+<span class="fc" id="L907">    return normalizedOrdinalStringQuiet(s, numberFromSUTime);</span>
+  }
+
+<span class="fc" id="L910">  public static final Pattern numberPattern = Pattern.compile(&quot;([0-9.]+)&quot;);</span>
+
+  public static String normalizedOrdinalStringQuiet(String s, Number numberFromSUTime) {
+    // clean up string
+<span class="fc" id="L914">    s = s.replaceAll(&quot;[ \t\n\0\f\r,]&quot;, &quot;&quot;);</span>
+    // remove parenthesis around numbers
+    // if PTBTokenized, this next bit should be a no-op
+    // in some contexts parentheses might indicate a negative number, but ignore that.
+<span class="pc bpc" id="L918" title="3 of 4 branches missed.">    if (s.startsWith(&quot;(&quot;) &amp;&amp; s.endsWith(&quot;)&quot;)) {</span>
+<span class="nc" id="L919">      s = s.substring(1, s.length() - 1);</span>
+      if (DEBUG2) err.println(&quot;Deleted (): &quot; + s);
+    }
+<span class="fc" id="L922">    s = s.toLowerCase();</span>
+
+    if (DEBUG2) err.println(&quot;Looking for ordinal words in |&quot; + s + '|');
+<span class="fc bfc" id="L925" title="All 2 branches covered.">    if (Character.isDigit(s.charAt(0))) {</span>
+<span class="fc" id="L926">      Matcher matcher = numberPattern.matcher(s);</span>
+<span class="fc" id="L927">      matcher.find();</span>
+      // just parse number part, assuming last two letters are st/nd/rd
+<span class="fc" id="L929">      return normalizedNumberStringQuiet(matcher.group(), 1.0, &quot;&quot;, numberFromSUTime);</span>
+<span class="pc bpc" id="L930" title="1 of 2 branches missed.">    } else if (ordinalsToValues.containsKey(s)) {</span>
+<span class="fc" id="L931">      return Double.toString(ordinalsToValues.getCount(s));</span>
+    } else {
+<span class="nc" id="L933">      String val = getOneSubstitutionMatch(s, ordinalsToValues.keySet());</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">      if(val != null)</span>
+<span class="nc" id="L935">        return Double.toString(ordinalsToValues.getCount(val));</span>
+      else
+<span class="nc" id="L937">        return null;</span>
+    }
+  }
+
+  public static String normalizedPercentString(String s, Number numberFromSUTime) {
+    if (DEBUG2) {
+      err.println(&quot;normalizedPercentString: &quot; + s);
+    }
+<span class="fc" id="L945">    s = s.replaceAll(&quot;\\s&quot;, &quot;&quot;);</span>
+<span class="fc" id="L946">    s = s.toLowerCase();</span>
+<span class="pc bpc" id="L947" title="1 of 4 branches missed.">    if (s.contains(&quot;%&quot;) || s.contains(&quot;percent&quot;)) {</span>
+<span class="fc" id="L948">      s = s.replaceAll(&quot;percent|%&quot;, &quot;&quot;);</span>
+    }
+<span class="fc" id="L950">    String norm = normalizedNumberStringQuiet(s, 1.0, &quot;&quot;, numberFromSUTime);</span>
+<span class="pc bpc" id="L951" title="1 of 2 branches missed.">    if (norm == null) {</span>
+<span class="nc" id="L952">      return null;</span>
+    }
+<span class="fc" id="L954">    return '%' + norm;</span>
+  }
+
+  /** Fetches the first encountered Number set by SUTime */
+  private static &lt;E extends CoreMap&gt; Number fetchNumberFromSUTime(List&lt;E&gt; l) {
+<span class="nc bnc" id="L959" title="All 2 branches missed.">    for(E e: l) {</span>
+<span class="nc bnc" id="L960" title="All 2 branches missed.">      if(e.containsKey(CoreAnnotations.NumericCompositeValueAnnotation.class)){</span>
+<span class="nc" id="L961">        return e.get(CoreAnnotations.NumericCompositeValueAnnotation.class);</span>
+      }
+<span class="nc" id="L963">    }</span>
+<span class="nc" id="L964">    return null;</span>
+  }
+
+  private static &lt;E extends CoreMap&gt; Timex fetchTimexFromSUTime(List&lt;E&gt; l) {
+<span class="nc bnc" id="L968" title="All 2 branches missed.">    for(E e: l) {</span>
+<span class="nc bnc" id="L969" title="All 2 branches missed.">      if(e.containsKey(TimeAnnotations.TimexAnnotation.class)){</span>
+<span class="nc" id="L970">        return e.get(TimeAnnotations.TimexAnnotation.class);</span>
+      }
+<span class="nc" id="L972">    }</span>
+<span class="nc" id="L973">    return null;</span>
+  }
+
+  private static &lt;E extends CoreMap&gt; List&lt;E&gt; processEntity(List&lt;E&gt; l,
+        String entityType, String compModifier, String nextWord) {
+<span class="nc bnc" id="L978" title="All 4 branches missed.">    assert(quantifiable.contains(entityType));</span>
+    if (DEBUG) {
+      log.info(&quot;Quantifiable.processEntity: &quot; + l);
+    }
+    String s;
+<span class="nc bnc" id="L983" title="All 2 branches missed.">    if (entityType.equals(&quot;TIME&quot;)) {</span>
+<span class="nc" id="L984">      s = timeEntityToString(l);</span>
+    } else {
+<span class="nc" id="L986">      s = singleEntityToString(l);</span>
+    }
+
+<span class="nc" id="L989">    Number numberFromSUTime = fetchNumberFromSUTime(l);</span>
+<span class="nc" id="L990">    Timex timexFromSUTime = fetchTimexFromSUTime(l);</span>
+
+    if (DEBUG) log.info(&quot;Quantifiable: working on &quot; + s);
+<span class="nc" id="L993">    String p = null;</span>
+<span class="nc bnc" id="L994" title="All 30 branches missed.">    switch (entityType) {</span>
+      case &quot;NUMBER&quot;: {
+<span class="nc" id="L996">        p = &quot;&quot;;</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">        if (compModifier != null) {</span>
+<span class="nc" id="L998">          p = compModifier;</span>
+        }
+<span class="nc" id="L1000">        String q = normalizedNumberString(s, nextWord, numberFromSUTime);</span>
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">        if (q != null) {</span>
+<span class="nc" id="L1002">          p = p.concat(q);</span>
+        } else {
+<span class="nc" id="L1004">          p = null;</span>
+        }
+<span class="nc" id="L1006">        break;</span>
+      }
+      case &quot;ORDINAL&quot;:
+<span class="nc" id="L1009">        p = normalizedOrdinalString(s, numberFromSUTime);</span>
+<span class="nc" id="L1010">        break;</span>
+      case &quot;DURATION&quot;:
+        // SUTime marks some ordinals, e.g., &quot;22nd time&quot;, as durations
+<span class="nc" id="L1013">        p = normalizedDurationString(s, timexFromSUTime);</span>
+<span class="nc" id="L1014">        break;</span>
+      case &quot;MONEY&quot;: {
+<span class="nc" id="L1016">        p = &quot;&quot;;</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">        if (compModifier != null) {</span>
+<span class="nc" id="L1018">          p = compModifier;</span>
+        }
+<span class="nc" id="L1020">        String q = normalizedMoneyString(s, numberFromSUTime);</span>
+<span class="nc bnc" id="L1021" title="All 2 branches missed.">        if (q != null) {</span>
+<span class="nc" id="L1022">          p = p.concat(q);</span>
+        } else {
+<span class="nc" id="L1024">          p = null;</span>
+        }
+<span class="nc" id="L1026">        break;</span>
+      }
+      case &quot;DATE&quot;:
+<span class="nc" id="L1029">        p = normalizedDateString(s, timexFromSUTime);</span>
+<span class="nc" id="L1030">        break;</span>
+      case &quot;TIME&quot;: {
+<span class="nc" id="L1032">        p = &quot;&quot;;</span>
+<span class="nc bnc" id="L1033" title="All 4 branches missed.">        if (compModifier != null &amp;&amp; !compModifier.matches(&quot;am|pm&quot;)) {</span>
+<span class="nc" id="L1034">          p = compModifier;</span>
+        }
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">        String q = normalizedTimeString(s, compModifier != null ? compModifier : &quot;&quot;, timexFromSUTime);</span>
+<span class="nc bnc" id="L1037" title="All 6 branches missed.">        if (q != null &amp;&amp; q.length() == 1 &amp;&amp; !q.equals(&quot;D&quot;)) {</span>
+<span class="nc" id="L1038">          p = p.concat(q);</span>
+        } else {
+<span class="nc" id="L1040">          p = q;</span>
+        }
+<span class="nc" id="L1042">        break;</span>
+      }
+      case &quot;PERCENT&quot;: {
+<span class="nc" id="L1045">        p = &quot;&quot;;</span>
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">        if (compModifier != null) {</span>
+<span class="nc" id="L1047">          p = compModifier;</span>
+        }
+<span class="nc" id="L1049">        String q = normalizedPercentString(s, numberFromSUTime);</span>
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">        if (q != null) {</span>
+<span class="nc" id="L1051">          p = p.concat(q);</span>
+        } else {
+<span class="nc" id="L1053">          p = null;</span>
+        }
+<span class="nc" id="L1055">        break;</span>
+      }
+    }
+    if (DEBUG) {
+      err.println(&quot;Quantifiable: Processed '&quot; + s + &quot;' as '&quot; + p + '\'');
+    }
+
+<span class="nc" id="L1062">    int i = 0;</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">    for (E wi : l) {</span>
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">      if (p != null) {</span>
+        if (DEBUG) {
+          log.info(&quot;#4: Changing normalized NER from &quot; + wi.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + &quot; to &quot; + p + &quot; at index &quot; + i);
+        }
+<span class="nc" id="L1068">        wi.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, p);</span>
+      }
+      //currently we also write this into the answers;
+      //wi.setAnswer(wi.get(CoreAnnotations.AnswerAnnotation.class)+&quot;(&quot;+p+&quot;)&quot;);
+<span class="nc" id="L1072">      i++;</span>
+<span class="nc" id="L1073">    }</span>
+<span class="nc" id="L1074">    return l;</span>
+  }
+
+
+  /** @param l The list of tokens in a time entity
+   *  @return the word in the time word list that should be normalized
+   */
+  private static &lt;E extends CoreMap&gt; String timeEntityToString(List&lt;E&gt; l) {
+<span class="nc" id="L1082">    String entityType = l.get(0).get(CoreAnnotations.AnswerAnnotation.class);</span>
+<span class="nc" id="L1083">    int size = l.size();</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">    for (E w : l) {</span>
+<span class="nc bnc" id="L1085" title="All 4 branches missed.">      assert(w.get(CoreAnnotations.AnswerAnnotation.class) == null ||</span>
+<span class="nc bnc" id="L1086" title="All 2 branches missed.">          w.get(CoreAnnotations.AnswerAnnotation.class).equals(entityType));</span>
+<span class="nc" id="L1087">      Matcher m = timePattern.matcher(w.get(CoreAnnotations.TextAnnotation.class));</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">      if (m.matches())</span>
+<span class="nc" id="L1089">        return w.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc" id="L1090">    }</span>
+    if (DEBUG) {
+      log.info(&quot;default: &quot; + l.get(size-1).get(CoreAnnotations.TextAnnotation.class));
+    }
+<span class="nc" id="L1094">    return l.get(size-1).get(CoreAnnotations.TextAnnotation.class);</span>
+  }
+
+
+  /**
+   * Takes the output of an {@link AbstractSequenceClassifier} and marks up
+   * each document by normalizing quantities. Each {@link CoreLabel} in any
+   * of the documents which is normalizable will receive a &quot;normalizedQuantity&quot;
+   * attribute.
+   *
+   * @param l a {@link List} of {@link List}s of {@link CoreLabel}s
+   * @return The list with normalized entity fields filled in
+   */
+  public static List&lt;List&lt;CoreLabel&gt;&gt; normalizeClassifierOutput(List&lt;List&lt;CoreLabel&gt;&gt; l){
+<span class="nc bnc" id="L1108" title="All 2 branches missed.">    for (List&lt;CoreLabel&gt; doc: l) {</span>
+<span class="nc" id="L1109">      addNormalizedQuantitiesToEntities(doc);</span>
+<span class="nc" id="L1110">    }</span>
+<span class="nc" id="L1111">    return l;</span>
+  }
+
+  private static final String lessEqualThreeWords = &quot;no (?:more|greater|higher) than|as (?:many|much) as&quot;;
+  private static final String greaterEqualThreeWords = &quot;no (?:less|fewer) than|as few as&quot;;
+
+  private static final String greaterThanTwoWords = &quot;(?:more|greater|larger|higher) than&quot;;
+  private static final String lessThanTwoWords = &quot;(?:less|fewer|smaller) than|at most&quot;;
+  private static final String lessEqualTwoWords = &quot;no (?:more|greater)_than|or less|up to&quot;;
+  private static final String greaterEqualTwoWords = &quot;no (?:less|fewer)_than|or more|at least&quot;;
+  private static final String approxTwoWords = &quot;just (?:over|under)|or so&quot;;
+
+  private static final String greaterThanOneWord = &quot;(?:above|over|more_than|greater_than)&quot;;
+  private static final String lessThanOneWord = &quot;(?:below|under|less_than)&quot;;
+  private static final String lessEqualOneWord = &quot;(?:up_to|within)&quot;;
+  // note that ones like &quot;nearly&quot; or &quot;almost&quot; can be above or below:
+  // &quot;almost 500 killed&quot;, &quot;almost zero inflation&quot;
+  private static final String approxOneWord = &quot;(?:approximately|estimated|nearly|around|about|almost|just_over|just_under)&quot;;
+  private static final String other = &quot;other&quot;;
+
+  /**
+   * Takes the strings of the three previous and next words to a quantity and
+   * detects a
+   * quantity modifier like &quot;less than&quot;, &quot;more than&quot;, etc.
+   * Any of these words may be &lt;code&gt;null&lt;/code&gt; or an empty String.
+   */
+  private static &lt;E extends CoreMap&gt; String detectQuantityModifier(List&lt;E&gt; list, int beforeIndex, int afterIndex) {
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">    String prev = (beforeIndex &gt;= 0) ? list.get(beforeIndex).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">    String prev2 = (beforeIndex - 1 &gt;= 0) ? list.get(beforeIndex - 1).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc bnc" id="L1140" title="All 2 branches missed.">    String prev3 = (beforeIndex - 2 &gt;= 0) ? list.get(beforeIndex - 2).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc" id="L1141">    int sz = list.size();</span>
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">    String next = (afterIndex &lt; sz) ? list.get(afterIndex).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">    String next2 = (afterIndex + 1 &lt; sz) ? list.get(afterIndex + 1).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">    String next3 = (afterIndex + 2 &lt; sz) ? list.get(afterIndex + 2).get(CoreAnnotations.TextAnnotation.class).toLowerCase(): &quot;&quot;;</span>
+
+    if (DEBUG) {
+      err.println(&quot;Quantifiable: previous: &quot; + prev3 + ' ' + prev2+ ' ' + prev);
+      err.println(&quot;Quantifiable: next: &quot; + next + ' ' + next2 + ' ' + next3);
+    }
+
+<span class="nc" id="L1151">    String longPrev = prev3 + ' ' + prev2 + ' ' + prev;</span>
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">    if (longPrev.matches(lessEqualThreeWords)) { return &quot;&lt;=&quot;; }</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">    if (longPrev.matches(greaterEqualThreeWords)) { return &quot;&gt;=&quot;; }</span>
+
+<span class="nc" id="L1155">    longPrev = prev2 + ' ' + prev;</span>
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">    if (longPrev.matches(greaterThanTwoWords)) { return &quot;&gt;&quot;; }</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">    if (longPrev.matches(lessEqualTwoWords)) { return &quot;&lt;=&quot;; }</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">    if (longPrev.matches(greaterEqualTwoWords)) { return &quot;&gt;=&quot;; }</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">    if (longPrev.matches(lessThanTwoWords)) { return &quot;&lt;&quot;; }</span>
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">    if (longPrev.matches(approxTwoWords)) { return &quot;~&quot;; }</span>
+
+<span class="nc" id="L1162">    String longNext = next + ' ' + next2;</span>
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">    if (longNext.matches(greaterEqualTwoWords)) { return &quot;&gt;=&quot;; }</span>
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">    if (longNext.matches(lessEqualTwoWords)) { return &quot;&lt;=&quot;; }</span>
+
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">    if (prev.matches(greaterThanOneWord)) { return &quot;&gt;&quot;; }</span>
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">    if (prev.matches(lessThanOneWord)) { return &quot;&lt;&quot;; }</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">    if (prev.matches(lessEqualOneWord)) { return &quot;&lt;=&quot;; }</span>
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">    if (prev.matches(approxOneWord)) { return &quot;~&quot;; }</span>
+
+<span class="nc bnc" id="L1171" title="All 2 branches missed.">    if (next.matches(other)) { return &quot;&gt;=&quot;; }</span>
+
+    if (DEBUG) { err.println(&quot;Quantifiable: not a quantity modifier&quot;); }
+<span class="nc" id="L1174">    return null;</span>
+  }
+
+
+<span class="fc" id="L1178">  private static String earlyOneWord = &quot;early&quot;;</span>
+<span class="fc" id="L1179">  private static String earlyTwoWords = &quot;(?:dawn|eve|beginning) of&quot;;</span>
+<span class="fc" id="L1180">  private static String earlyThreeWords = &quot;early in the&quot;;</span>
+<span class="fc" id="L1181">  private static String lateOneWord = &quot;late&quot;;</span>
+<span class="fc" id="L1182">  private static String lateTwoWords = &quot;late at|end of&quot;;</span>
+<span class="fc" id="L1183">  private static String lateThreeWords = &quot;end of the&quot;;</span>
+<span class="fc" id="L1184">  private static String middleTwoWords = &quot;(?:middle|midst) of&quot;;</span>
+<span class="fc" id="L1185">  private static String middleThreeWords = &quot;(?:middle|midst) of the&quot;;</span>
+
+<span class="fc" id="L1187">  private static String amOneWord = &quot;[Aa]\\.?[Mm]\\.?&quot;;</span>
+<span class="fc" id="L1188">  private static String pmOneWord = &quot;[Pp]\\.?[Mm]\\.?&quot;;</span>
+<span class="fc" id="L1189">  private static String amThreeWords = &quot;in the morning&quot;;</span>
+<span class="fc" id="L1190">  private static String pmTwoWords = &quot;at night&quot;;</span>
+<span class="fc" id="L1191">  private static String pmThreeWords = &quot;in the (?:afternoon|evening)&quot;;</span>
+
+
+  /**
+   * Takes the strings of the three previous words to a quantity and detects a
+   * quantity modifier like &quot;less than&quot;, &quot;more than&quot;, etc.
+   * Any of these words may be &lt;code&gt;null&lt;/code&gt; or an empty String.
+   */
+  private static &lt;E extends CoreMap&gt; String detectTimeOfDayModifier(List&lt;E&gt; list, int beforeIndex, int afterIndex) {
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">    String prev = (beforeIndex &gt;= 0) ? list.get(beforeIndex).get(CoreAnnotations.TextAnnotation.class).toLowerCase() : &quot;&quot;;</span>
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">    String prev2 = (beforeIndex - 1 &gt;= 0) ? list.get(beforeIndex - 1).get(CoreAnnotations.TextAnnotation.class).toLowerCase() : &quot;&quot;;</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">    String prev3 = (beforeIndex - 2 &gt;= 0) ? list.get(beforeIndex - 2).get(CoreAnnotations.TextAnnotation.class).toLowerCase() : &quot;&quot;;</span>
+<span class="nc" id="L1203">    int sz = list.size();</span>
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">    String next = (afterIndex &lt; sz) ? list.get(afterIndex).get(CoreAnnotations.TextAnnotation.class).toLowerCase() : &quot;&quot;;</span>
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">    String next2 = (afterIndex + 1 &lt; sz) ? list.get(afterIndex + 1).get(CoreAnnotations.TextAnnotation.class).toLowerCase() : &quot;&quot;;</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">    String next3 = (afterIndex + 2 &lt; sz) ? list.get(afterIndex + 2).get(CoreAnnotations.TextAnnotation.class).toLowerCase() : &quot;&quot;;</span>
+
+<span class="nc" id="L1208">    String longPrev = prev3 + ' ' + prev2 + ' ' + prev;</span>
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">    if (longPrev.matches(earlyThreeWords)) {</span>
+<span class="nc" id="L1210">      return &quot;E&quot;;</span>
+    }
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">    else if (longPrev.matches(lateThreeWords)) {</span>
+<span class="nc" id="L1213">      return &quot;L&quot;;</span>
+    }
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">    else if (longPrev.matches(middleThreeWords)) {</span>
+<span class="nc" id="L1216">      return &quot;M&quot;;</span>
+    }
+
+<span class="nc" id="L1219">    longPrev = prev2 + ' ' + prev;</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">    if (longPrev.matches(earlyTwoWords)) {</span>
+<span class="nc" id="L1221">      return &quot;E&quot;;</span>
+    }
+<span class="nc bnc" id="L1223" title="All 2 branches missed.">    else if (longPrev.matches(lateTwoWords)) {</span>
+<span class="nc" id="L1224">      return &quot;L&quot;;</span>
+    }
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">    else if (longPrev.matches(middleTwoWords)) {</span>
+<span class="nc" id="L1227">      return &quot;M&quot;;</span>
+    }
+
+<span class="nc bnc" id="L1230" title="All 4 branches missed.">    if (prev.matches(earlyOneWord) || prev2.matches(earlyOneWord)) {</span>
+<span class="nc" id="L1231">      return &quot;E&quot;;</span>
+    }
+<span class="nc bnc" id="L1233" title="All 4 branches missed.">    else if (prev.matches(lateOneWord) || prev2.matches(lateOneWord)) {</span>
+<span class="nc" id="L1234">      return &quot;L&quot;;</span>
+    }
+
+<span class="nc" id="L1237">    String longNext = next3 + ' ' + next2 + ' ' + next;</span>
+<span class="nc bnc" id="L1238" title="All 2 branches missed.">    if (longNext.matches(pmThreeWords)) {</span>
+<span class="nc" id="L1239">      return &quot;pm&quot;;</span>
+    }
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">    if (longNext.matches(amThreeWords)) {</span>
+<span class="nc" id="L1242">      return &quot;am&quot;;</span>
+    }
+
+<span class="nc" id="L1245">    longNext = next2 + ' ' + next;</span>
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">    if (longNext.matches(pmTwoWords)) {</span>
+<span class="nc" id="L1247">      return &quot;pm&quot;;</span>
+    }
+
+<span class="nc bnc" id="L1250" title="All 6 branches missed.">    if (next.matches(amOneWord) || next2.matches(&quot;morning&quot;) || next3.matches(&quot;morning&quot;)) {</span>
+<span class="nc" id="L1251">      return &quot;am&quot;;</span>
+    }
+<span class="nc bnc" id="L1253" title="All 6 branches missed.">    if (next.matches(pmOneWord) || next2.matches(&quot;afternoon&quot;) || next3.matches(&quot;afternoon&quot;)</span>
+<span class="nc bnc" id="L1254" title="All 4 branches missed.">        || next2.matches(&quot;night&quot;) || next3.matches(&quot;night&quot;)</span>
+<span class="nc bnc" id="L1255" title="All 4 branches missed.">        || next2.matches(&quot;evening&quot;) || next3.matches(&quot;evening&quot;)) {</span>
+<span class="nc" id="L1256">      return &quot;pm&quot;;</span>
+    }
+
+<span class="nc" id="L1259">    return &quot;&quot;;</span>
+  }
+
+  /**
+   * Identifies contiguous MONEY, TIME, DATE, or PERCENT entities
+   * and tags each of their constituents with a &quot;normalizedQuantity&quot;
+   * label which contains the appropriate normalized string corresponding to
+   * the full quantity. Quantities are not concatenated
+   *
+   * @param l A list of {@link CoreMap}s representing a single
+   *      document.  Note: the Labels are updated in place.
+   */
+  public static &lt;E extends CoreMap&gt; void addNormalizedQuantitiesToEntities(List&lt;E&gt; l) {
+<span class="nc" id="L1272">    addNormalizedQuantitiesToEntities(l, false, false);</span>
+<span class="nc" id="L1273">  }</span>
+
+  public static &lt;E extends CoreMap&gt; void addNormalizedQuantitiesToEntities(List&lt;E&gt; l, boolean concatenate) {
+<span class="nc" id="L1276">    addNormalizedQuantitiesToEntities(l, concatenate, false);</span>
+<span class="nc" id="L1277">  }</span>
+
+  private static boolean checkStrings(String s1, String s2) {
+<span class="nc bnc" id="L1280" title="All 4 branches missed.">    if (s1 == null || s2 == null) {</span>
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">      return s1 == s2;</span>
+    } else {
+<span class="nc" id="L1283">      return s1.equals(s2);</span>
+    }
+  }
+
+  private static boolean checkNumbers(Number n1, Number n2) {
+<span class="nc bnc" id="L1288" title="All 4 branches missed.">    if (n1 == null || n2 == null) {</span>
+<span class="nc bnc" id="L1289" title="All 2 branches missed.">      return n1 == n2;</span>
+    } else {
+<span class="nc" id="L1291">      return n1.equals(n2);</span>
+    }
+  }
+
+  public static &lt;E extends CoreMap&gt; boolean isCompatible(String tag, E prev, E cur) {
+<span class="nc bnc" id="L1296" title="All 4 branches missed.">    if (&quot;NUMBER&quot;.equals(tag) || &quot;ORDINAL&quot;.equals(tag)) {</span>
+      // Get NumericCompositeValueAnnotation and say two entities are incompatible if they are different
+<span class="nc" id="L1298">      Number n1 = cur.get(CoreAnnotations.NumericCompositeValueAnnotation.class);</span>
+<span class="nc" id="L1299">      Number n2 = prev.get(CoreAnnotations.NumericCompositeValueAnnotation.class);</span>
+<span class="nc" id="L1300">      boolean compatible = checkNumbers(n1,n2);</span>
+<span class="nc bnc" id="L1301" title="All 2 branches missed.">      if (!compatible) return compatible;</span>
+    }
+
+<span class="nc bnc" id="L1304" title="All 8 branches missed.">    if (&quot;TIME&quot;.equals(tag) || &quot;SET&quot;.equals(tag) || &quot;DATE&quot;.equals(tag) || &quot;DURATION&quot;.equals(tag)) {</span>
+      // Check timex...
+<span class="nc" id="L1306">      Timex timex1 = cur.get(TimeAnnotations.TimexAnnotation.class);</span>
+<span class="nc" id="L1307">      Timex timex2 = prev.get(TimeAnnotations.TimexAnnotation.class);</span>
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">      String tid1 = (timex1 != null)? timex1.tid():null;</span>
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">      String tid2 = (timex2 != null)? timex2.tid():null;</span>
+<span class="nc" id="L1310">      boolean compatible = checkStrings(tid1,tid2);</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">      if (!compatible) return compatible;</span>
+    }
+
+<span class="nc" id="L1314">    return true;</span>
+  }
+
+  /**
+   * Identifies contiguous MONEY, TIME, DATE, or PERCENT entities
+   * and tags each of their constituents with a &quot;normalizedQuantity&quot;
+   * label which contains the appropriate normalized string corresponding to
+   * the full quantity.
+   *
+   * @param list A list of {@link CoreMap}s representing a single
+   *      document.  Note: the Labels are updated in place.
+   * @param concatenate true if quantities should be concatenated into one label, false otherwise
+   */
+  public static &lt;E extends CoreMap&gt; void addNormalizedQuantitiesToEntities(List&lt;E&gt; list, boolean concatenate, boolean usesSUTime) {
+<span class="nc" id="L1328">    List&lt;E&gt; toRemove = new ArrayList&lt;&gt;(); // list for storing those objects we're going to remove at the end (e.g., if concatenate, we replace 3 November with 3_November, have to remove one of the originals)</span>
+
+    // Goes through tokens and tries to fix up NER annotations
+<span class="nc" id="L1331">    fixupNerBeforeNormalization(list);</span>
+
+    // Now that NER tags has been fixed up, we do another pass to add the normalization
+<span class="nc" id="L1334">    String prevNerTag = BACKGROUND_SYMBOL;</span>
+<span class="nc" id="L1335">    String timeModifier = &quot;&quot;;</span>
+<span class="nc" id="L1336">    int beforeIndex = -1;</span>
+<span class="nc" id="L1337">    ArrayList&lt;E&gt; collector = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1338" title="All 2 branches missed.">    for (int i = 0, sz = list.size(); i &lt;= sz; i++) {</span>
+<span class="nc" id="L1339">      E wi = null;</span>
+<span class="nc" id="L1340">      String currNerTag = null;</span>
+<span class="nc" id="L1341">      String nextWord = &quot;&quot;;</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">      if (i &lt; list.size()) {</span>
+<span class="nc" id="L1343">        wi = list.get(i);</span>
+        if (DEBUG) { log.info(&quot;addNormalizedQuantitiesToEntities: wi is &quot; + wi + &quot;; collector is &quot; + collector); }
+<span class="nc bnc" id="L1345" title="All 2 branches missed.">        if ((i+1) &lt; sz) {</span>
+<span class="nc" id="L1346">          nextWord = list.get(i+1).get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">          if(nextWord == null) nextWord = &quot;&quot;;</span>
+        }
+
+<span class="nc" id="L1350">        currNerTag = wi.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">        if (&quot;TIME&quot;.equals(currNerTag)) {</span>
+<span class="nc bnc" id="L1352" title="All 2 branches missed.">          if (timeModifier.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1353">            timeModifier = detectTimeOfDayModifier(list, i-1, i+1);</span>
+          }
+        }
+      }
+
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">      E wprev = (i &gt; 0)? list.get(i-1):null;</span>
+      // if the current wi is a non-continuation and the last one was a
+      // quantity, we close and process the last segment.
+<span class="nc bnc" id="L1361" title="All 8 branches missed.">      if ((currNerTag == null || ! currNerTag.equals(prevNerTag) || !isCompatible(prevNerTag, wprev, wi)) &amp;&amp; quantifiable.contains(prevNerTag)) {</span>
+<span class="nc" id="L1362">        String compModifier = null;</span>
+        // special handling of TIME
+<span class="nc bnc" id="L1364" title="All 10 branches missed.">        switch (prevNerTag) {</span>
+          case &quot;TIME&quot;:
+<span class="nc" id="L1366">            processEntity(collector, prevNerTag, timeModifier, nextWord);</span>
+<span class="nc" id="L1367">            break;</span>
+          case (&quot;DATE&quot;):
+            //detect date range modifiers by looking at nearby words
+<span class="nc bnc" id="L1370" title="All 2 branches missed.">            E prev = (beforeIndex &gt;= 0) ? list.get(beforeIndex) : null;</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">            if (usesSUTime) {</span>
+              // If sutime was used don't do any weird relabeling of more things as DATE
+<span class="nc" id="L1373">              compModifier = detectDateRangeModifier(prev);</span>
+            } else {
+<span class="nc" id="L1375">              compModifier = detectDateRangeModifier(collector, list, beforeIndex, i);</span>
+            }
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">            if (!compModifier.equals(ISODateInstance.BOUNDED_RANGE))</span>
+<span class="nc" id="L1378">              processEntity(collector, prevNerTag, compModifier, nextWord);</span>
+            //now repair this date if it's more than one word
+            //doesn't really matter which one we keep ideally we should be doing lemma/etc matching anyway
+            //but we vaguely try to deal with this by choosing the NNP or the CD
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">            if (concatenate)</span>
+<span class="nc" id="L1383">              concatenateNumericString(collector, toRemove);</span>
+            break;
+          default:
+            // detect &quot;more than&quot;, &quot;nearly&quot;, etc. by looking at nearby words.
+<span class="nc bnc" id="L1387" title="All 4 branches missed.">            if (prevNerTag.equals(&quot;MONEY&quot;) || prevNerTag.equals(&quot;NUMBER&quot;) ||</span>
+<span class="nc bnc" id="L1388" title="All 2 branches missed.">                prevNerTag.equals(&quot;PERCENT&quot;)) {</span>
+<span class="nc" id="L1389">              compModifier = detectQuantityModifier(list, beforeIndex, i);</span>
+            }
+<span class="nc" id="L1391">            processEntity(collector, prevNerTag, compModifier, nextWord);</span>
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">            if (concatenate) {</span>
+<span class="nc" id="L1393">              concatenateNumericString(collector, toRemove);</span>
+            }
+            break;
+        }
+
+<span class="nc" id="L1398">        collector = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1399">        timeModifier = &quot;&quot;;</span>
+      }
+
+      // if the current wi is a quantity, we add it to the collector.
+      // if its the first word in a quantity, we record index before it
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">      if (quantifiable.contains(currNerTag)) {</span>
+<span class="nc bnc" id="L1405" title="All 2 branches missed.">        if (collector.isEmpty()) {</span>
+<span class="nc" id="L1406">          beforeIndex = i - 1;</span>
+        }
+<span class="nc" id="L1408">        collector.add(wi);</span>
+      }
+<span class="nc" id="L1410">      prevNerTag = currNerTag;</span>
+    }
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">    if (concatenate) {</span>
+<span class="nc" id="L1413">      list.removeAll(toRemove);</span>
+    }
+<span class="nc" id="L1415">    List&lt;E&gt; moreRemoves = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1416" title="All 2 branches missed.">    for (int i = 0, sz = list.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L1417">      E wi = list.get(i);</span>
+<span class="nc" id="L1418">      moreRemoves.addAll(detectTwoSidedRangeModifier(wi, list, i-1, i+1, concatenate));</span>
+    }
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">    if (concatenate) {</span>
+<span class="nc" id="L1421">      list.removeAll(moreRemoves);</span>
+    }
+<span class="nc" id="L1423">  }</span>
+
+  public static &lt;E extends CoreMap&gt; void fixupNerBeforeNormalization(List&lt;E&gt; list)
+  {
+    // Goes through tokens and tries to fix up NER annotations
+<span class="nc" id="L1428">    String prevNerTag = BACKGROUND_SYMBOL;</span>
+<span class="nc" id="L1429">    String prevNumericType = null;</span>
+<span class="nc" id="L1430">    Timex prevTimex = null;</span>
+<span class="nc bnc" id="L1431" title="All 2 branches missed.">    for (int i = 0, sz = list.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L1432">      E wi = list.get(i);</span>
+<span class="nc" id="L1433">      Timex timex = wi.get(TimeAnnotations.TimexAnnotation.class);</span>
+<span class="nc" id="L1434">      String numericType = wi.get(CoreAnnotations.NumericCompositeTypeAnnotation.class);</span>
+
+<span class="nc bnc" id="L1436" title="All 2 branches missed.">      String curWord = (wi.get(CoreAnnotations.TextAnnotation.class) != null ? wi.get(CoreAnnotations.TextAnnotation.class) : &quot;&quot;);</span>
+<span class="nc" id="L1437">      String currNerTag = wi.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+
+      if (DEBUG) { log.info(&quot;fixupNerBeforeNormalization: wi is &quot; + wi); }
+      // Attempts repairs to NER tags only if not marked by SUTime already
+<span class="nc bnc" id="L1441" title="All 4 branches missed.">      if (timex == null &amp;&amp; numericType == null) {</span>
+        // repairs commas in between dates...  String constant first in equals() in case key has null value....
+<span class="nc bnc" id="L1443" title="All 6 branches missed.">        if ((i+1) &lt; sz &amp;&amp; &quot;,&quot;.equals(wi.get(CoreAnnotations.TextAnnotation.class)) &amp;&amp; &quot;DATE&quot;.equals(prevNerTag)) {</span>
+<span class="nc bnc" id="L1444" title="All 4 branches missed.">          if (prevTimex == null &amp;&amp; prevNumericType == null) {</span>
+<span class="nc" id="L1445">            E nextToken = list.get(i+1);</span>
+<span class="nc" id="L1446">            String nextNER = nextToken.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L1447" title="All 4 branches missed.">            if (nextNER != null &amp;&amp; nextNER.equals(&quot;DATE&quot;)) {</span>
+<span class="nc" id="L1448">              wi.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DATE&quot;);</span>
+            }
+          }
+        }
+
+        //repairs mistagged multipliers after a numeric quantity
+<span class="nc bnc" id="L1454" title="All 4 branches missed.">        if (!curWord.equals(&quot;&quot;) &amp;&amp; (moneyMultipliers.containsKey(curWord) ||</span>
+<span class="nc bnc" id="L1455" title="All 4 branches missed.">                (getOneSubstitutionMatch(curWord, moneyMultipliers.keySet()) != null)) &amp;&amp;</span>
+<span class="nc bnc" id="L1456" title="All 4 branches missed.">                prevNerTag != null &amp;&amp; (prevNerTag.equals(&quot;MONEY&quot;) || prevNerTag.equals(&quot;NUMBER&quot;))) {</span>
+<span class="nc" id="L1457">          wi.set(CoreAnnotations.NamedEntityTagAnnotation.class, prevNerTag);</span>
+        }
+
+        //repairs four digit ranges (2002-2004) that have not been tagged as years - maybe bad? (empirically useful)
+<span class="nc bnc" id="L1461" title="All 2 branches missed.">        if (curWord.contains(&quot;-&quot;)) {</span>
+<span class="nc" id="L1462">          String[] sides = curWord.split(&quot;-&quot;);</span>
+<span class="nc bnc" id="L1463" title="All 2 branches missed.">          if (sides.length == 2) {</span>
+            try {
+<span class="nc" id="L1465">              int first = Integer.parseInt(sides[0]);</span>
+<span class="nc" id="L1466">              int second = Integer.parseInt(sides[1]);</span>
+              //they're both integers, see if they're both between 1000-3000 (likely years)
+<span class="nc bnc" id="L1468" title="All 8 branches missed.">              if (1000 &lt;= first &amp;&amp; first &lt;= 3000 &amp;&amp; 1000 &lt;= second &amp;&amp; second &lt;= 3000) {</span>
+<span class="nc" id="L1469">                wi.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DATE&quot;);</span>
+<span class="nc" id="L1470">                String dateStr = new ISODateInstance(new ISODateInstance(sides[0]), new ISODateInstance(sides[1])).getDateString();</span>
+                if (DEBUG) {
+                  log.info(&quot;#5: Changing normalized NER from &quot; +
+                          wi.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class) + &quot; to &quot; + dateStr + &quot; at index &quot; + i);
+                }
+<span class="nc" id="L1475">                wi.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, dateStr);</span>
+<span class="nc" id="L1476">                continue;</span>
+              }
+<span class="nc" id="L1478">            } catch (Exception e) {</span>
+              // they weren't numbers.
+<span class="nc" id="L1480">            }</span>
+          }
+        }
+
+        // Marks time units as DURATION if they are preceded by a NUMBER tag.  e.g. &quot;two years&quot; or &quot;5 minutes&quot;
+<span class="nc bnc" id="L1485" title="All 4 branches missed.">        if ( timeUnitWords.contains(curWord) &amp;&amp;</span>
+<span class="nc bnc" id="L1486" title="All 2 branches missed.">                (currNerTag == null || !&quot;DURATION&quot;.equals(currNerTag) ) &amp;&amp;</span>
+<span class="nc bnc" id="L1487" title="All 2 branches missed.">                (&quot;NUMBER&quot;.equals(prevNerTag))) {</span>
+<span class="nc" id="L1488">          wi.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DURATION&quot;);</span>
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">          for (int j = i-1; j &gt; 0; j--) {</span>
+<span class="nc" id="L1490">            E prev = list.get(j);</span>
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">            if (&quot;NUMBER&quot;.equals(prev.get(CoreAnnotations.NamedEntityTagAnnotation.class))) {</span>
+<span class="nc" id="L1492">              prev.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;DURATION&quot;);</span>
+            }
+          }
+        }
+      } else {
+        // Fixup SUTime marking of twenty-second
+<span class="nc bnc" id="L1498" title="All 4 branches missed.">        if (&quot;DURATION&quot;.equals(currNerTag) &amp;&amp; ordinalsToValues.containsKey(curWord)</span>
+<span class="nc bnc" id="L1499" title="All 4 branches missed.">                &amp;&amp; curWord.endsWith(&quot;second&quot;) &amp;&amp; timex.text().equals(curWord)) {</span>
+<span class="nc" id="L1500">          wi.set(CoreAnnotations.NamedEntityTagAnnotation.class, &quot;ORDINAL&quot;);</span>
+        }
+      }
+
+<span class="nc" id="L1504">      prevNerTag = currNerTag;</span>
+<span class="nc" id="L1505">      prevNumericType = numericType;</span>
+<span class="nc" id="L1506">      prevTimex = timex;</span>
+    }
+<span class="nc" id="L1508">  }</span>
+
+    /**
+     * Runs a deterministic named entity classifier which is good at recognizing
+     * numbers and money and date expressions not recognized by our statistical
+     * NER.  It then changes any BACKGROUND_SYMBOL's from the list to
+     * the value tagged by this deterministic NER.
+     * It then adds normalized values for quantifiable entities.
+     *
+     * @param l A document to label
+     * @return The list with results of 'specialized' (rule-governed) NER filled in
+     */
+  public static &lt;E extends CoreLabel&gt; List&lt;E&gt; applySpecializedNER(List&lt;E&gt; l) {
+<span class="nc" id="L1521">    int sz = l.size();</span>
+    // copy l
+<span class="nc" id="L1523">    List&lt;CoreLabel&gt; copyL = new ArrayList&lt;&gt;(sz);</span>
+<span class="nc bnc" id="L1524" title="All 2 branches missed.">    for (int i = 0; i &lt; sz; i++) {</span>
+      if (DEBUG2) {
+        if (i == 1) {
+          String tag = l.get(i).get(CoreAnnotations.PartOfSpeechAnnotation.class);
+          if (tag == null || tag.equals(&quot;&quot;)) {
+            err.println(&quot;Quantifiable: error! tag is &quot; + tag);
+          }
+        }
+      }
+<span class="nc" id="L1533">      copyL.add(new CoreLabel(l.get(i)));</span>
+    }
+    // run NumberSequenceClassifier
+<span class="nc" id="L1536">    AbstractSequenceClassifier&lt;CoreLabel&gt; nsc = new NumberSequenceClassifier();</span>
+<span class="nc" id="L1537">    copyL = nsc.classify(copyL);</span>
+    // update entity only if it was not O
+<span class="nc bnc" id="L1539" title="All 2 branches missed.">    for (int i = 0; i &lt; sz; i++) {</span>
+<span class="nc" id="L1540">      E before = l.get(i);</span>
+<span class="nc" id="L1541">      CoreLabel nscAnswer = copyL.get(i);</span>
+<span class="nc bnc" id="L1542" title="All 4 branches missed.">      if (before.get(CoreAnnotations.NamedEntityTagAnnotation.class) == null &amp;&amp; before.get(CoreAnnotations.NamedEntityTagAnnotation.class).equals(BACKGROUND_SYMBOL) &amp;&amp;</span>
+<span class="nc bnc" id="L1543" title="All 4 branches missed.">          (nscAnswer.get(CoreAnnotations.AnswerAnnotation.class) != null &amp;&amp; !nscAnswer.get(CoreAnnotations.AnswerAnnotation.class).equals(BACKGROUND_SYMBOL))) {</span>
+<span class="nc" id="L1544">        log.info(&quot;Quantifiable: updating class for &quot; +</span>
+<span class="nc" id="L1545">            before.get(CoreAnnotations.TextAnnotation.class) + '/' +</span>
+<span class="nc" id="L1546">            before.get(CoreAnnotations.NamedEntityTagAnnotation.class) + &quot; to &quot; + nscAnswer.get(CoreAnnotations.AnswerAnnotation.class));</span>
+<span class="nc" id="L1547">        before.set(CoreAnnotations.NamedEntityTagAnnotation.class, nscAnswer.get(CoreAnnotations.AnswerAnnotation.class));</span>
+      }
+    }
+
+<span class="nc" id="L1551">    addNormalizedQuantitiesToEntities(l);</span>
+<span class="nc" id="L1552">    return l;</span>
+  } // end applySpecializedNER
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

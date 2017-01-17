@@ -1,0 +1,633 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CGMinimizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">CGMinimizer.java</span></div><h1>CGMinimizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.util.CallbackFunction;
+
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.Arrays;
+
+/**
+ * Conjugate-gradient implementation based on the code in Numerical
+ * Recipes in C.  (See p. 423 and others.)  As of now, it requires a
+ * differentiable function (DiffFunction) as input.  Equality
+ * constraints are supported; inequality constraints may soon be
+ * added.
+ * &lt;p/&gt;
+ * The basic way to use the minimizer is with a null constructor, then
+ * the simple minimize method:
+ * &lt;p/&gt;
+ * &lt;p&gt;&lt;code&gt;Minimizer cgm = new CGMinimizer();&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;DiffFunction df = new SomeDiffFunction();&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;double tol = 1e-4;&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;double[] initial = getInitialGuess();&lt;/code&gt;
+ * &lt;br&gt;&lt;code&gt;double[] minimum = cgm.minimize(df,tol,initial);&lt;/code&gt;
+ *
+ * @author &lt;a href=&quot;mailto:klein@cs.stanford.edu&quot;&gt;Dan Klein&lt;/a&gt;
+ * @version 1.0
+ * @since 1.0
+ */
+public class CGMinimizer implements Minimizer&lt;DiffFunction&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L33">  private static Redwood.RedwoodChannels log = Redwood.channels(CGMinimizer.class);</span>
+
+<span class="nc" id="L35">  private static NumberFormat nf = new DecimalFormat(&quot;0.000E0&quot;);</span>
+
+  private Function monitor; // = null;
+  private transient CallbackFunction iterationCallbackFunction;
+
+  private static final int numToPrint = 5;
+  private static final boolean simpleGD = false;
+  private static final boolean checkSimpleGDConvergence = true;
+  private static final boolean verbose = false;
+  private boolean silent;
+
+  private static final int ITMAX = 2000; // overridden in dbrent(); made bigger
+  private static final double EPS = 1.0e-30;
+
+  private static final int resetFrequency = 10;
+
+  static double[] copyArray(double[] a) {
+<span class="nc" id="L52">    return Arrays.copyOf(a, a.length);</span>
+  }
+
+  //  private static String arrayToString(double[] x) {
+  //    return arrayToString(x, x.length);
+  //  }
+
+  private static String arrayToString(double[] x, int num) {
+<span class="nc" id="L60">    StringBuilder sb = new StringBuilder(&quot;(&quot;);</span>
+<span class="nc bnc" id="L61" title="All 2 branches missed.">    if (num &gt; x.length) {</span>
+<span class="nc" id="L62">      num = x.length;</span>
+    }
+<span class="nc bnc" id="L64" title="All 2 branches missed.">    for (int j = 0; j &lt; num; j++) {</span>
+<span class="nc" id="L65">      sb.append(x[j]);</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">      if (j != x.length - 1) {</span>
+<span class="nc" id="L67">        sb.append(&quot;, &quot;);</span>
+      }
+    }
+<span class="nc bnc" id="L70" title="All 2 branches missed.">    if (num &lt; x.length) {</span>
+<span class="nc" id="L71">      sb.append(&quot;...&quot;);</span>
+    }
+<span class="nc" id="L73">    sb.append(')');</span>
+<span class="nc" id="L74">    return sb.toString();</span>
+  }
+
+  private static double fabs(double x) {
+<span class="nc bnc" id="L78" title="All 2 branches missed.">    if (x &lt; 0) {</span>
+<span class="nc" id="L79">      return -x;</span>
+    }
+<span class="nc" id="L81">    return x;</span>
+  }
+
+  private static double fmax(double x, double y) {
+<span class="nc bnc" id="L85" title="All 2 branches missed.">    if (x &lt; y) {</span>
+<span class="nc" id="L86">      return y;</span>
+    }
+<span class="nc" id="L88">    return x;</span>
+  }
+
+  //  private static double fmin(double x, double y) {
+  //    if (x&gt;y)
+  //      return y;
+  //    return x;
+  //  }
+
+  private static double sign(double x, double y) {
+<span class="nc bnc" id="L98" title="All 2 branches missed.">    if (y &gt;= 0.0) {</span>
+<span class="nc" id="L99">      return fabs(x);</span>
+    }
+<span class="nc" id="L101">    return -fabs(x);</span>
+  }
+
+  //  private static double arrayMax(double[] x) {
+  //    double max = Double.NEGATIVE_INFINITY;
+  //    for (int i=0; i&lt;x.length; i++) {
+  //      if (max &lt; x[i])
+  //	max = x[i];
+  //    }
+  //    return max;
+  //  }
+  //
+  //  private static int arrayArgMax(double[] x) {
+  //    double max = Double.NEGATIVE_INFINITY;
+  //    int index = -1;
+  //    for (int i=0; i&lt;x.length; i++) {
+  //      if (max &lt; x[i]) {
+  //	max = x[i];
+  //	index = i;
+  //      }
+  //    }
+  //    return index;
+  //  }
+  //
+  //  private static double arrayMin(double[] x) {
+  //    double min = Double.POSITIVE_INFINITY;
+  //    for (int i=0; i&lt;x.length; i++) {
+  //      if (min &gt; x[i])
+  //	min = x[i];
+  //    }
+  //    return min;
+  //  }
+  //
+  //  private static int arrayArgMin(double[] x) {
+  //    double min = Double.POSITIVE_INFINITY;
+  //    int index = -1;
+  //    for (int i=0; i&lt;x.length; i++) {
+  //      if (min &gt; x[i]) {
+  //	min = x[i];
+  //	index = i;
+  //      }
+  //    }
+  //    return index;
+  //  }
+
+  static class OneDimDiffFunction {
+    private DiffFunction function;
+    private double[] initial;
+    private double[] direction;
+    private double[] tempVector;
+
+    private double[] vectorOf(double x) {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      for (int j = 0; j &lt; initial.length; j++) {</span>
+<span class="nc" id="L154">        tempVector[j] = initial[j] + x * direction[j];</span>
+      }
+      //log.info(&quot;Tmp &quot;+arrayToString(tempVector,10));
+      //log.info(&quot;Dir &quot;+arrayToString(direction,10));
+<span class="nc" id="L158">      return tempVector;</span>
+    }
+
+    double valueAt(double x) {
+<span class="nc" id="L162">      return function.valueAt(vectorOf(x));</span>
+    }
+
+    double derivativeAt(double x) {
+<span class="nc" id="L166">      double[] g = function.derivativeAt(vectorOf(x));</span>
+<span class="nc" id="L167">      double d = 0.0;</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      for (int j = 0; j &lt; g.length; j++) {</span>
+<span class="nc" id="L169">        d += g[j] * direction[j];</span>
+      }
+<span class="nc" id="L171">      return d;</span>
+    }
+
+<span class="nc" id="L174">    OneDimDiffFunction(DiffFunction function, double[] initial, double[] direction) {</span>
+<span class="nc" id="L175">      this.function = function;</span>
+<span class="nc" id="L176">      this.initial = copyArray(initial);</span>
+<span class="nc" id="L177">      this.direction = copyArray(direction);</span>
+<span class="nc" id="L178">      this.tempVector = new double[function.domainDimension()];</span>
+<span class="nc" id="L179">    }</span>
+
+  } // end class OneDimDiffFunction
+
+
+  // constants
+  private static final double GOLD = 1.618034;
+  private static final double GLIMIT = 100.0;
+  private static final double TINY = 1.0e-20;
+
+  private static Triple mnbrak(Triple abc, OneDimDiffFunction function) {
+    // inputs
+<span class="nc" id="L191">    double ax = abc.a;</span>
+<span class="nc" id="L192">    double fa = function.valueAt(ax);</span>
+
+<span class="nc" id="L194">    double bx = abc.b;</span>
+<span class="nc" id="L195">    double fb = function.valueAt(bx);</span>
+
+<span class="nc bnc" id="L197" title="All 2 branches missed.">    if (fb &gt; fa) {</span>
+      // swap
+<span class="nc" id="L199">      double temp = fa;</span>
+<span class="nc" id="L200">      fa = fb;</span>
+<span class="nc" id="L201">      fb = temp;</span>
+<span class="nc" id="L202">      temp = ax;</span>
+<span class="nc" id="L203">      ax = bx;</span>
+<span class="nc" id="L204">      bx = temp;</span>
+    }
+
+    // guess cx
+<span class="nc" id="L208">    double cx = bx + GOLD * (bx - ax);</span>
+<span class="nc" id="L209">    double fc = function.valueAt(cx);</span>
+
+    // loop until we get a bracket
+<span class="nc bnc" id="L212" title="All 2 branches missed.">    while (fb &gt; fc) {</span>
+<span class="nc" id="L213">      double r = (bx - ax) * (fb - fc);</span>
+<span class="nc" id="L214">      double q = (bx - cx) * (fb - fa);</span>
+<span class="nc" id="L215">      double u = bx - ((bx - cx) * q - (bx - ax) * r) / (2.0 * sign(fmax(fabs(q - r), TINY), q - r));</span>
+      double fu;
+<span class="nc" id="L217">      double ulim = bx + GLIMIT * (cx - bx);</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">      if ((bx - u) * (u - cx) &gt; 0.0) {</span>
+<span class="nc" id="L219">        fu = function.valueAt(u);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (fu &lt; fc) {</span>
+          //Ax = new Double(bx);
+          //Bx = new Double(u);
+          //Cx = new Double(cx);
+          //log.info(&quot;\nReturning3: a=&quot;+bx+&quot; (&quot;+fb+&quot;) b=&quot;+u+&quot;(&quot;+fu+&quot;) c=&quot;+cx+&quot; (&quot;+fc+&quot;)&quot;);
+<span class="nc" id="L225">          return new Triple(bx, u, cx);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        } else if (fu &gt; fb) {</span>
+          //Cx = new Double(u);
+          //Ax = new Double(ax);
+          //Bx = new Double(bx);
+          //log.info(&quot;\nReturning2: a=&quot;+ax+&quot; (&quot;+fa+&quot;) b=&quot;+bx+&quot;(&quot;+fb+&quot;) c=&quot;+u+&quot; (&quot;+fu+&quot;)&quot;);
+<span class="nc" id="L231">          return new Triple(ax, bx, u);</span>
+        }
+<span class="nc" id="L233">        u = cx + GOLD * (cx - bx);</span>
+<span class="nc" id="L234">        fu = function.valueAt(u);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">      } else if ((cx - u) * (u - ulim) &gt; 0.0) {</span>
+<span class="nc" id="L236">        fu = function.valueAt(u);</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (fu &lt; fc) {</span>
+<span class="nc" id="L238">          bx = cx;</span>
+<span class="nc" id="L239">          cx = u;</span>
+<span class="nc" id="L240">          u = cx + GOLD * (cx - bx);</span>
+<span class="nc" id="L241">          fb = fc;</span>
+<span class="nc" id="L242">          fc = fu;</span>
+<span class="nc" id="L243">          fu = function.valueAt(u);</span>
+        }
+<span class="nc bnc" id="L245" title="All 2 branches missed.">      } else if ((u - ulim) * (ulim - cx) &gt;= 0.0) {</span>
+<span class="nc" id="L246">        u = ulim;</span>
+<span class="nc" id="L247">        fu = function.valueAt(u);</span>
+      } else {
+<span class="nc" id="L249">        u = cx + GOLD * (cx - bx);</span>
+<span class="nc" id="L250">        fu = function.valueAt(u);</span>
+      }
+<span class="nc" id="L252">      ax = bx;</span>
+<span class="nc" id="L253">      bx = cx;</span>
+<span class="nc" id="L254">      cx = u;</span>
+<span class="nc" id="L255">      fa = fb;</span>
+<span class="nc" id="L256">      fb = fc;</span>
+<span class="nc" id="L257">      fc = fu;</span>
+<span class="nc" id="L258">    }</span>
+    //log.info(&quot;\nReturning: a=&quot;+ax+&quot; (&quot;+fa+&quot;) b=&quot;+bx+&quot;(&quot;+fb+&quot;) c=&quot;+cx+&quot; (&quot;+fc+&quot;)&quot;);
+<span class="nc" id="L260">    return new Triple(ax, bx, cx);</span>
+  }
+
+  private static double dbrent(OneDimDiffFunction function, double ax, double bx, double cx) {
+    // constants
+<span class="nc" id="L265">    final boolean dbVerbose = false;</span>
+<span class="nc" id="L266">    final int ITMAX = 100;</span>
+<span class="nc" id="L267">    final double TOL = 1.0e-4;</span>
+
+<span class="nc" id="L269">    double d = 0.0, e = 0.0;</span>
+
+<span class="nc bnc" id="L271" title="All 2 branches missed.">    double a = (ax &lt; cx ? ax : cx);</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    double b = (ax &gt; cx ? ax : cx);</span>
+<span class="nc" id="L273">    double x = bx;</span>
+<span class="nc" id="L274">    double v = bx;</span>
+<span class="nc" id="L275">    double w = bx;</span>
+<span class="nc" id="L276">    double fx = function.valueAt(x);</span>
+<span class="nc" id="L277">    double fv = fx;</span>
+<span class="nc" id="L278">    double fw = fx;</span>
+<span class="nc" id="L279">    double dx = function.derivativeAt(x);</span>
+<span class="nc" id="L280">    double dv = dx;</span>
+<span class="nc" id="L281">    double dw = dx;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">    for (int iteration = 0; iteration &lt; ITMAX; iteration++) {</span>
+      //log.info(&quot;dbrent &quot;+iteration+&quot; x &quot;+x+&quot; fx &quot;+fx);
+<span class="nc" id="L284">      double xm = 0.5 * (a + b);</span>
+<span class="nc" id="L285">      double tol1 = TOL * fabs(x);</span>
+<span class="nc" id="L286">      double tol2 = 2.0 * tol1;</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">      if (fabs(x - xm) &lt;= (tol2 - 0.5 * (b - a))) {</span>
+        if (dbVerbose) {
+          log.info(&quot;dbrent returning because min is cornered &quot; + a + &quot; (&quot; + function.valueAt(a) + &quot;) ~ &quot; + x + &quot; (&quot; + fx + &quot;) &quot; + b + &quot; (&quot; + function.valueAt(b) + ')');
+        }
+<span class="nc" id="L291">        return x;</span>
+      }
+      double u;
+<span class="nc bnc" id="L294" title="All 2 branches missed.">      if (fabs(e) &gt; tol1) {</span>
+<span class="nc" id="L295">        double d1 = 2.0 * (b - a);</span>
+<span class="nc" id="L296">        double d2 = d1;</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        if (dw != dx) {</span>
+<span class="nc" id="L298">          d1 = (w - x) * dx / (dx - dw);</span>
+        }
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (dv != dx) {</span>
+<span class="nc" id="L301">          d2 = (v - x) * dx / (dx - dv);</span>
+        }
+<span class="nc" id="L303">        double u1 = x + d1;</span>
+<span class="nc" id="L304">        double u2 = x + d2;</span>
+<span class="nc bnc" id="L305" title="All 4 branches missed.">        boolean ok1 = ((a - u1) * (u1 - b) &gt; 0.0 &amp;&amp; dx * d1 &lt;= 0.0);</span>
+<span class="nc bnc" id="L306" title="All 4 branches missed.">        boolean ok2 = ((a - u2) * (u2 - b) &gt; 0.0 &amp;&amp; dx * d2 &lt;= 0.0);</span>
+<span class="nc" id="L307">        double olde = e;</span>
+<span class="nc" id="L308">        e = d;</span>
+<span class="nc bnc" id="L309" title="All 4 branches missed.">        if (ok1 || ok2) {</span>
+<span class="nc bnc" id="L310" title="All 4 branches missed.">          if (ok1 &amp;&amp; ok2) {</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            d = (fabs(d1) &lt; fabs(d2) ? d1 : d2);</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">          } else if (ok1) {</span>
+<span class="nc" id="L313">            d = d1;</span>
+          } else {
+<span class="nc" id="L315">            d = d2;</span>
+          }
+<span class="nc bnc" id="L317" title="All 2 branches missed.">          if (fabs(d) &lt;= fabs(0.5 * olde)) {</span>
+<span class="nc" id="L318">            u = x + d;</span>
+<span class="nc bnc" id="L319" title="All 4 branches missed.">            if (u - a &lt; tol2 || b - u &lt; tol2) {</span>
+<span class="nc" id="L320">              d = sign(tol1, xm - x);</span>
+            }
+          } else {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            e = (dx &gt;= 0.0 ? a - x : b - x);</span>
+<span class="nc" id="L324">            d = 0.5 * e;</span>
+          }
+        } else {
+<span class="nc bnc" id="L327" title="All 2 branches missed.">          e = (dx &gt;= 0.0 ? a - x : b - x);</span>
+<span class="nc" id="L328">          d = 0.5 * e;</span>
+        }
+<span class="nc" id="L330">      } else {</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        e = (dx &gt;= 0.0 ? a - x : b - x);</span>
+<span class="nc" id="L332">        d = 0.5 * e;</span>
+      }
+      double fu;
+<span class="nc bnc" id="L335" title="All 2 branches missed.">      if (fabs(d) &gt;= tol1) {</span>
+<span class="nc" id="L336">        u = x + d;</span>
+<span class="nc" id="L337">        fu = function.valueAt(u);</span>
+      } else {
+<span class="nc" id="L339">        u = x + sign(tol1, d);</span>
+<span class="nc" id="L340">        fu = function.valueAt(u);</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (fu &gt; fx) {</span>
+          if (dbVerbose) {
+            log.info(&quot;dbrent returning because derivative is broken&quot;);
+          }
+<span class="nc" id="L345">          return x;</span>
+        }
+      }
+<span class="nc" id="L348">      double du = function.derivativeAt(u);</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">      if (fu &lt;= fx) {</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (u &gt;= x) {</span>
+<span class="nc" id="L351">          a = x;</span>
+        } else {
+<span class="nc" id="L353">          b = x;</span>
+        }
+<span class="nc" id="L355">        v = w;</span>
+<span class="nc" id="L356">        fv = fw;</span>
+<span class="nc" id="L357">        dv = dw;</span>
+<span class="nc" id="L358">        w = x;</span>
+<span class="nc" id="L359">        fw = fx;</span>
+<span class="nc" id="L360">        dw = dx;</span>
+<span class="nc" id="L361">        x = u;</span>
+<span class="nc" id="L362">        fx = fu;</span>
+<span class="nc" id="L363">        dx = du;</span>
+      } else {
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (u &lt; x) {</span>
+<span class="nc" id="L366">          a = u;</span>
+        } else {
+<span class="nc" id="L368">          b = u;</span>
+        }
+<span class="nc bnc" id="L370" title="All 4 branches missed.">        if (fu &lt;= fw || w == x) {</span>
+<span class="nc" id="L371">          v = w;</span>
+<span class="nc" id="L372">          fv = fw;</span>
+<span class="nc" id="L373">          dv = dw;</span>
+<span class="nc" id="L374">          w = u;</span>
+<span class="nc" id="L375">          fw = fu;</span>
+<span class="nc" id="L376">          dw = du;</span>
+<span class="nc bnc" id="L377" title="All 6 branches missed.">        } else if (fu &lt; fv || v == x || v == w) {</span>
+<span class="nc" id="L378">          v = u;</span>
+<span class="nc" id="L379">          fv = fu;</span>
+<span class="nc" id="L380">          dv = du;</span>
+        }
+      }
+    }
+    // dan's addition:
+<span class="nc bnc" id="L385" title="All 2 branches missed.">    if (fx &lt; function.valueAt(0.0)) {</span>
+<span class="nc" id="L386">      return x;</span>
+    }
+    if (dbVerbose) {
+      log.info(&quot;Warning: exiting dbrent because ITMAX exceeded!&quot;);
+    }
+<span class="nc" id="L391">    return 0.0;</span>
+  }
+
+  private static class Triple {
+    public double a;
+    public double b;
+    public double c;
+
+<span class="nc" id="L399">    public Triple(double a, double b, double c) {</span>
+<span class="nc" id="L400">      this.a = a;</span>
+<span class="nc" id="L401">      this.b = b;</span>
+<span class="nc" id="L402">      this.c = c;</span>
+<span class="nc" id="L403">    }</span>
+
+  }
+
+  //public double lastXx = 1.0;
+  double[] lineMinimize(DiffFunction function, double[] initial, double[] direction) {
+    // make a 1-dim function along the direction line
+    // THIS IS A HACK (but it's the NRiC peoples' hack)
+<span class="nc" id="L411">    OneDimDiffFunction oneDim = new OneDimDiffFunction(function, initial, direction);</span>
+    // do a 1-dim line min on this function
+    //Double Ax = new Double(0.0);
+    //Double Xx = new Double(1.0);
+    //Double Bx = new Double(0.0);
+    // bracket the extreme pt
+<span class="nc" id="L417">    double guess = 0.01;</span>
+    //log.info(&quot;Current &quot;+oneDim.valueAt(0)+&quot; nudge &quot;+(oneDim.smallestZeroPositiveLocation()*1e-2)+&quot; &quot;+oneDim.valueAt(oneDim.smallestZeroPositiveLocation()*1e-5));
+<span class="nc bnc" id="L419" title="All 2 branches missed.">    if (!silent) {</span>
+<span class="nc" id="L420">      log.info(&quot;[&quot;);</span>
+    }
+<span class="nc" id="L422">    Triple bracketing = mnbrak(new Triple(0, guess, 0), oneDim);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">    if (!silent) {</span>
+<span class="nc" id="L424">      log.info(&quot;]&quot;);</span>
+    }
+<span class="nc" id="L426">    double ax = bracketing.a;</span>
+<span class="nc" id="L427">    double xx = bracketing.b;</span>
+<span class="nc" id="L428">    double bx = bracketing.c;</span>
+    //lastXx = xx;
+    // CHECK FOR END OF WORLD
+<span class="nc bnc" id="L431" title="All 8 branches missed.">    if (!(ax &lt;= xx &amp;&amp; xx &lt;= bx) &amp;&amp; !(bx &lt;= xx &amp;&amp; xx &lt;= ax)) {</span>
+<span class="nc" id="L432">      log.info(&quot;Bad bracket order!&quot;);</span>
+    }
+    if (verbose) {
+      log.info(&quot;Bracketing found: &quot; + ax + ' ' + xx + ' ' + bx);
+      log.info(&quot;Bracketing found: &quot; + oneDim.valueAt(ax) + ' ' + oneDim.valueAt(xx) + ' ' + oneDim.valueAt(bx));
+      //log.info(&quot;Bracketing found: &quot;+arrayToString(oneDim.vectorOf(ax),3)+&quot; &quot;+arrayToString(oneDim.vectorOf(xx),3)+&quot; &quot;+arrayToString(oneDim.vectorOf(bx),3));
+    }
+    // find the extreme pt
+<span class="nc bnc" id="L440" title="All 2 branches missed.">    if (!silent) {</span>
+<span class="nc" id="L441">      log.info(&quot;&lt;&quot;);</span>
+    }
+<span class="nc" id="L443">    double xmin = dbrent(oneDim, ax, xx, bx);</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    if (!silent) {</span>
+<span class="nc" id="L445">      log.info(&quot;&gt;&quot;);</span>
+    }
+    // return the full vector
+    //log.info(&quot;Went &quot;+xmin+&quot; during lineMinimize&quot;);
+<span class="nc" id="L449">    return oneDim.vectorOf(xmin);</span>
+  }
+
+  @Override
+  public double[] minimize(DiffFunction function, double functionTolerance, double[] initial) {
+<span class="nc" id="L454">    return minimize(function, functionTolerance, initial, ITMAX);</span>
+  }
+
+  @Override
+  public double[] minimize(DiffFunction dFunction, double functionTolerance, double[] initial, int maxIterations) {
+    // check for derivatives
+
+<span class="nc" id="L461">    int dimension = dFunction.domainDimension();</span>
+    //lastXx = 1.0;
+
+    // evaluate function
+<span class="nc" id="L465">    double fp = dFunction.valueAt(initial);</span>
+    if (verbose) {
+      log.info(&quot;Initial: &quot; + fp);
+    }
+<span class="nc" id="L469">    double[] xi = copyArray(dFunction.derivativeAt(initial));</span>
+    if (verbose) {
+      log.info(&quot;Initial at: &quot; + arrayToString(initial, numToPrint));
+      log.info(&quot;Initial deriv: &quot; + arrayToString(xi, numToPrint));
+    }
+
+    // make some vectors
+<span class="nc" id="L476">    double[] g = new double[dimension];</span>
+<span class="nc" id="L477">    double[] h = new double[dimension];</span>
+<span class="nc" id="L478">    double[] p = new double[dimension];</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">    for (int j = 0; j &lt; dimension; j++) {</span>
+<span class="nc" id="L480">      g[j] = -xi[j];</span>
+<span class="nc" id="L481">      xi[j] = g[j];</span>
+<span class="nc" id="L482">      h[j] = g[j];</span>
+<span class="nc" id="L483">      p[j] = initial[j];</span>
+    }
+
+    // iterations
+<span class="nc" id="L487">    boolean simpleGDStep = false;</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">    for (int iterations = 1; iterations &lt; maxIterations; iterations++) {</span>
+
+<span class="nc bnc" id="L490" title="All 2 branches missed.">      if (!silent) {</span>
+<span class="nc" id="L491">        log.info(&quot;Iter &quot; + iterations + ' ');</span>
+      }
+      // do a line min along descent direction
+      //log.info(&quot;Minimizing from (&quot;+p[0]+&quot;,&quot;+p[1]+&quot;) along (&quot;+xi[0]+&quot;,&quot;+xi[1]+&quot;)\n&quot;);
+      if (verbose) {
+        log.info(&quot;Minimizing along &quot; + arrayToString(xi, numToPrint));
+      }
+      //log.info(&quot;Current is &quot;+fp);
+<span class="nc" id="L499">      double[] p2 = lineMinimize(dFunction, p, xi);</span>
+<span class="nc" id="L500">      double fp2 = dFunction.valueAt(p2);</span>
+      //log.info(&quot;Result is &quot;+fp2+&quot; (from &quot;+fp+&quot;) at (&quot;+p2[0]+&quot;,&quot;+p2[1]+&quot;)\n&quot;);
+      if (verbose) {
+        log.info(&quot;Result is &quot; + fp2 + &quot; after &quot; + iterations);
+        log.info(&quot;Result at &quot; + arrayToString(p2, numToPrint));
+      }
+
+      //log.info(fp2+&quot;|&quot;+(int)(Math.log((fabs(fp2-fp)+1e-100)/(fabs(fp)+fabs(fp2)+1e-100))/Math.log(10)));
+<span class="nc bnc" id="L508" title="All 2 branches missed.">      if (!silent) {</span>
+<span class="nc" id="L509">        System.err.printf(&quot; %s (delta: %s)\n&quot;,</span>
+<span class="nc" id="L510">          nf.format(fp2), nf.format(fp-fp2));</span>
+      }
+<span class="nc bnc" id="L512" title="All 2 branches missed.">      if (monitor != null) {</span>
+<span class="nc" id="L513">        double monitorReturn = monitor.valueAt(p2);</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        if (monitorReturn &lt; functionTolerance) {</span>
+<span class="nc" id="L515">          return p2;</span>
+        }
+      }
+      // check convergence
+<span class="nc bnc" id="L519" title="All 2 branches missed.">      if (2.0 * fabs(fp2 - fp) &lt;= functionTolerance * (fabs(fp2) + fabs(fp) + EPS)) {</span>
+        // convergence
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (!checkSimpleGDConvergence || simpleGDStep || simpleGD) {</span>
+<span class="nc" id="L522">          return p2;</span>
+        }
+<span class="nc" id="L524">        simpleGDStep = true;</span>
+        //log.info(&quot;Switched to GD for a step.&quot;);
+      } else {
+        //if (!simpleGD)
+        //log.info(&quot;Switching to CGD.&quot;);
+<span class="nc" id="L529">        simpleGDStep = false;</span>
+      }
+      // shift variables
+<span class="nc bnc" id="L532" title="All 2 branches missed.">      for (int j = 0; j &lt; dimension; j++) {</span>
+<span class="nc" id="L533">        xi[j] = p2[j] - p[j];</span>
+<span class="nc" id="L534">        p[j] = p2[j];</span>
+      }
+<span class="nc" id="L536">      fp = fp2;</span>
+      // find the new gradient
+<span class="nc" id="L538">      xi = copyArray(dFunction.derivativeAt(p));</span>
+
+<span class="nc bnc" id="L540" title="All 2 branches missed.">      if(iterationCallbackFunction != null){</span>
+<span class="nc" id="L541">        iterationCallbackFunction.callback(p2, iterations, fp2, xi);</span>
+      }
+
+      //log.info(&quot;mx &quot;+arrayMax(xi)+&quot; mn &quot;+arrayMin(xi));
+
+<span class="nc bnc" id="L546" title="All 4 branches missed.">      if (!simpleGDStep &amp;&amp; !simpleGD &amp;&amp; (iterations % resetFrequency != 0)) {</span>
+        // do the magic -- part i
+        // (calculate some dot products we'll need)
+<span class="nc" id="L549">        double dgg = 0.0;</span>
+<span class="nc" id="L550">        double gg = 0.0;</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        for (int j = 0; j &lt; dimension; j++) {</span>
+          // g dot g
+<span class="nc" id="L553">          gg += g[j] * g[j];</span>
+          // grad dot grad
+          // FR method is:
+          // dgg += x[j]*x[j];
+          // PR method is:
+<span class="nc" id="L558">          dgg += (xi[j] + g[j]) * xi[j];</span>
+        }
+
+        // check for miraculous convergence
+<span class="nc bnc" id="L562" title="All 2 branches missed.">        if (gg == 0.0) {</span>
+<span class="nc" id="L563">          return p;</span>
+        }
+
+        // magic part ii
+        // (update the sequence in a way that tries to preserve conjugacy)
+<span class="nc" id="L568">        double gam = dgg / gg;</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        for (int j = 0; j &lt; dimension; j++) {</span>
+<span class="nc" id="L570">          g[j] = -xi[j];</span>
+<span class="nc" id="L571">          h[j] = g[j] + gam * h[j];</span>
+<span class="nc" id="L572">          xi[j] = h[j];</span>
+        }
+<span class="nc" id="L574">      } else {</span>
+        // miraculous simpleGD convergence
+<span class="nc" id="L576">        double xixi = 0.0;</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">        for (int j = 0; j &lt; dimension; j++) {</span>
+<span class="nc" id="L578">          xixi += xi[j] * xi[j];</span>
+        }
+        // reset cgd
+<span class="nc bnc" id="L581" title="All 2 branches missed.">        for (int j = 0; j &lt; dimension; j++) {</span>
+<span class="nc" id="L582">          g[j] = -xi[j];</span>
+<span class="nc" id="L583">          xi[j] = g[j];</span>
+<span class="nc" id="L584">          h[j] = g[j];</span>
+        }
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        if (xixi == 0.0) {</span>
+<span class="nc" id="L587">          return p;</span>
+        }
+      }
+    }
+
+    // too many iterations
+<span class="nc" id="L593">    log.info(&quot;Warning: exiting minimize because ITER exceeded!&quot;);</span>
+<span class="nc" id="L594">    return p;</span>
+
+  }
+
+  /**
+   * Basic constructor, use this.
+   */
+  public CGMinimizer() {
+<span class="nc" id="L602">    this(true);</span>
+<span class="nc" id="L603">  }</span>
+
+  /**
+   * Pass in &lt;code&gt;false&lt;/code&gt; to get per-iteration progress reports
+   * (to stderr).
+   *
+   * @param silent a &lt;code&gt;boolean&lt;/code&gt; value
+   */
+<span class="nc" id="L611">  public CGMinimizer(boolean silent) {</span>
+<span class="nc" id="L612">    this.silent = silent;</span>
+<span class="nc" id="L613">  }</span>
+
+  /**
+   * Perform minimization with monitoring.  After each iteration,
+   * monitor.valueAt(x) gets called, with the double array &lt;code&gt;x&lt;/code&gt;
+   * being that iteration's ending point.  A return &lt;code&gt;&amp;lt;
+   * tol&lt;/code&gt; forces convergence (terminates the CG procedure).
+   * Specially for Kristina.
+   *
+   * @param monitor a &lt;code&gt;Function&lt;/code&gt; value
+   */
+  public CGMinimizer(Function monitor) {
+<span class="nc" id="L625">    this();</span>
+<span class="nc" id="L626">    this.monitor = monitor;</span>
+<span class="nc" id="L627">  }</span>
+
+  public void setIterationCallbackFunction(CallbackFunction func){
+<span class="nc" id="L630">    this.iterationCallbackFunction = func;</span>
+<span class="nc" id="L631">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,507 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SVMLightClassifierFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.classify</a> &gt; <span class="el_source">SVMLightClassifierFactory.java</span></div><h1>SVMLightClassifierFactory.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.classify;
+
+import edu.stanford.nlp.optimization.GoldenSectionLineSearch;
+import edu.stanford.nlp.stats.*;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.ling.Datum;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.optimization.LineSearcher;
+
+import java.io.*;
+import java.text.NumberFormat;
+import java.util.*;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+
+
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * This class is meant for training SVMs ({@link SVMLightClassifier}s).  It actually calls SVM Light, or
+ * SVM Struct for multiclass SVMs, or SVM perf is the option is enabled, on the command line, reads in the produced
+ * model file and creates a Linear Classifier.  A Platt model is also trained
+ * (unless otherwise specified) on top of the SVM so that probabilities can
+ * be produced. For multiclass classifier, you have to set C using setC otherwise the code will not run (by sonalg).
+ *
+ * @author Jenny Finkel
+ * @author Aria Haghighi
+ * @author Sarah Spikes (sdspikes@cs.stanford.edu) (templatization)
+ */
+
+public class SVMLightClassifierFactory&lt;L, F&gt; implements ClassifierFactory&lt;L, F, SVMLightClassifier&lt;L,F&gt;&gt;{ //extends AbstractLinearClassifierFactory {
+
+  /**
+   *
+   */
+  private static final long serialVersionUID = 1L;
+
+  /**
+   * C can be tuned using held-out set or cross-validation
+   * For binary SVM, if C=0, svmlight uses default of 1/(avg x*x) 
+   */
+<span class="nc" id="L42">  protected double C = -1.0;</span>
+<span class="nc" id="L43">  private boolean useSigmoid = false;</span>
+<span class="nc" id="L44">  protected boolean verbose = true;</span>
+<span class="nc" id="L45">  private String svmLightLearn = &quot;/u/nlp/packages/svm_light/svm_learn&quot;;</span>
+<span class="nc" id="L46">  private String svmStructLearn = &quot;/u/nlp/packages/svm_multiclass/svm_multiclass_learn&quot;;</span>
+<span class="nc" id="L47">  private String svmPerfLearn = &quot;/u/nlp/packages/svm_perf/svm_perf_learn&quot;;</span>
+<span class="nc" id="L48">  private String svmLightClassify = &quot;/u/nlp/packages/svm_light/svm_classify&quot;;</span>
+<span class="nc" id="L49">  private String svmStructClassify = &quot;/u/nlp/packages/svm_multiclass/svm_multiclass_classify&quot;;</span>
+<span class="nc" id="L50">  private String svmPerfClassify = &quot;/u/nlp/packages/svm_perf/svm_perf_classify&quot;;</span>
+
+<span class="nc" id="L52">  private boolean useAlphaFile = false;</span>
+  protected File alphaFile;
+<span class="nc" id="L54">  private boolean deleteTempFilesOnExit = true;</span>
+<span class="nc" id="L55">  private int svmLightVerbosity = 0;  // not verbose</span>
+<span class="nc" id="L56">  private boolean doEval = false;</span>
+<span class="nc" id="L57">  private boolean useSVMPerf = false;</span>
+
+<span class="nc" id="L59">  final static Redwood.RedwoodChannels logger = Redwood.channels(SVMLightClassifierFactory.class);</span>
+
+  /** @param svmLightLearn is the fullPathname of the training program of svmLight with default value &quot;/u/nlp/packages/svm_light/svm_learn&quot;
+   * @param svmStructLearn is the fullPathname of the training program of svmMultiClass with default value &quot;/u/nlp/packages/svm_multiclass/svm_multiclass_learn&quot;
+   * @param svmPerfLearn is the fullPathname of the training program of svmMultiClass with default value &quot;/u/nlp/packages/svm_perf/svm_perf_learn&quot;
+   */
+<span class="nc" id="L65">  public SVMLightClassifierFactory(String svmLightLearn, String svmStructLearn, String svmPerfLearn){</span>
+<span class="nc" id="L66">    this.svmLightLearn = svmLightLearn;</span>
+<span class="nc" id="L67">    this.svmStructLearn = svmStructLearn;</span>
+<span class="nc" id="L68">    this.svmPerfLearn = svmPerfLearn;</span>
+<span class="nc" id="L69">  }</span>
+
+<span class="nc" id="L71">  public SVMLightClassifierFactory(){</span>
+<span class="nc" id="L72">  }</span>
+
+<span class="nc" id="L74">  public SVMLightClassifierFactory(boolean useSVMPerf){</span>
+<span class="nc" id="L75">    this.useSVMPerf = useSVMPerf;</span>
+<span class="nc" id="L76">  }</span>
+
+  /**
+   * Set the C parameter (for the slack variables) for training the SVM.
+   */
+  public void setC(double C) {
+<span class="nc" id="L82">    this.C = C;</span>
+<span class="nc" id="L83">  }</span>
+
+  /**
+   * Get the C parameter (for the slack variables) for training the SVM.
+   */
+
+  public double getC() {
+<span class="nc" id="L90">    return C;</span>
+  }
+
+  /**
+   * Specify whether or not to train an overlying platt (sigmoid)
+   * model for producing meaningful probabilities.
+   */
+  public void setUseSigmoid(boolean useSigmoid) {
+<span class="nc" id="L98">    this.useSigmoid = useSigmoid;</span>
+<span class="nc" id="L99">  }</span>
+
+  /**
+   * Get whether or not to train an overlying platt (sigmoid)
+   * model for producing meaningful probabilities.
+   */
+  public boolean getUseSigma() {
+<span class="nc" id="L106">    return useSigmoid;</span>
+  }
+
+
+  public boolean getDeleteTempFilesOnExitFlag() {
+<span class="nc" id="L111">    return deleteTempFilesOnExit;</span>
+  }
+
+  public void setDeleteTempFilesOnExitFlag(boolean deleteTempFilesOnExit) {
+<span class="nc" id="L115">    this.deleteTempFilesOnExit = deleteTempFilesOnExit;</span>
+<span class="nc" id="L116">  }</span>
+
+  /**
+   * Reads in a model file in svm light format.  It needs to know if its multiclass or not
+   * because it affects the number of header lines.  Maybe there is another way to tell and we
+   * can remove this flag?
+   */
+  private static Pair&lt;Double, ClassicCounter&lt;Integer&gt;&gt; readModel(File modelFile, boolean multiclass) {
+<span class="nc" id="L124">    int modelLineCount = 0;</span>
+    try {
+
+<span class="nc bnc" id="L127" title="All 2 branches missed.">      int numLinesToSkip = multiclass ? 13 : 10;</span>
+<span class="nc" id="L128">      String stopToken   = &quot;#&quot;;</span>
+
+<span class="nc" id="L130">      BufferedReader in = new BufferedReader(new FileReader(modelFile));</span>
+
+<span class="nc bnc" id="L132" title="All 2 branches missed.">      for (int i=0; i &lt; numLinesToSkip; i++) { </span>
+<span class="nc" id="L133">        in.readLine();</span>
+<span class="nc" id="L134">        modelLineCount ++;</span>
+      }
+
+<span class="nc" id="L137">      List&lt;Pair&lt;Double, ClassicCounter&lt;Integer&gt;&gt;&gt; supportVectors = new ArrayList&lt;&gt;();</span>
+      // Read Threshold
+<span class="nc" id="L139">      String thresholdLine = in.readLine();</span>
+<span class="nc" id="L140">      modelLineCount ++;</span>
+<span class="nc" id="L141">      String[] pieces = thresholdLine.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L142">      double threshold = Double.parseDouble(pieces[0]);</span>
+      // Read Support Vectors
+<span class="nc bnc" id="L144" title="All 2 branches missed.">      while (in.ready()) {</span>
+<span class="nc" id="L145">        String svLine = in.readLine();</span>
+<span class="nc" id="L146">        modelLineCount ++;</span>
+<span class="nc" id="L147">        pieces = svLine.split(&quot;\\s+&quot;);</span>
+        // First Element is the alpha_i * y_i
+<span class="nc" id="L149">        double  alpha = Double.parseDouble(pieces[0]);</span>
+<span class="nc" id="L150">        ClassicCounter&lt;Integer&gt; supportVector  = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        for (int i=1; i &lt; pieces.length; ++i) {</span>
+<span class="nc" id="L152">          String piece = pieces[i];</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">          if (piece.equals(stopToken)) break;</span>
+          // Each in featureIndex:num class
+<span class="nc" id="L155">          String[] indexNum = piece.split(&quot;:&quot;);</span>
+<span class="nc" id="L156">          String featureIndex = indexNum[0];</span>
+          // mihai: we may see &quot;qid&quot; as indexNum[0]. just skip this piece. this is the block id useful only for reranking, which we don't do here.
+<span class="nc bnc" id="L158" title="All 2 branches missed.">          if(! featureIndex.equals(&quot;qid&quot;)){</span>
+<span class="nc" id="L159">            double count = Double.parseDouble(indexNum[1]);</span>
+<span class="nc" id="L160">            supportVector.incrementCount(Integer.valueOf(featureIndex), count);</span>
+          }
+        }
+<span class="nc" id="L163">        supportVectors.add(new Pair&lt;&gt;(alpha, supportVector));</span>
+<span class="nc" id="L164">      }</span>
+
+<span class="nc" id="L166">      in.close();</span>
+
+<span class="nc" id="L168">      return new Pair&lt;&gt;(threshold, getWeights(supportVectors));</span>
+    }
+<span class="nc" id="L170">    catch (Exception e) {</span>
+<span class="nc" id="L171">      e.printStackTrace();</span>
+<span class="nc" id="L172">      throw new RuntimeException(&quot;Error reading SVM model (line &quot; + modelLineCount + &quot; in file &quot; + modelFile.getAbsolutePath() + &quot;)&quot;);</span>
+    }
+  }
+
+  /**
+   * Takes all the support vectors, and their corresponding alphas, and computes a weight
+   * vector that can be used in a vanilla LinearClassifier.  This only works because
+   * we are using a linear kernel.  The Counter is over the feature indices (+1 cos for
+   * some reason svm_light is 1-indexed), not features.
+   */
+  private static ClassicCounter&lt;Integer&gt; getWeights(List&lt;Pair&lt;Double, ClassicCounter&lt;Integer&gt;&gt;&gt; supportVectors) {
+<span class="nc" id="L183">    ClassicCounter&lt;Integer&gt; weights = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">    for (Pair&lt;Double, ClassicCounter&lt;Integer&gt;&gt; sv : supportVectors) {</span>
+<span class="nc" id="L185">      ClassicCounter&lt;Integer&gt; c = new ClassicCounter&lt;&gt;(sv.second());</span>
+<span class="nc" id="L186">      Counters.multiplyInPlace(c, sv.first());</span>
+<span class="nc" id="L187">      Counters.addInPlace(weights, c);</span>
+<span class="nc" id="L188">    }</span>
+<span class="nc" id="L189">    return weights;</span>
+  }
+
+  /**
+   * Converts the weight Counter to be from indexed, svm_light format, to a format
+   * we can use in our LinearClassifier.
+   */
+  private ClassicCounter&lt;Pair&lt;F, L&gt;&gt; convertWeights(ClassicCounter&lt;Integer&gt; weights, Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex, boolean multiclass) {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">    return multiclass ? convertSVMStructWeights(weights, featureIndex, labelIndex) : convertSVMLightWeights(weights, featureIndex, labelIndex);</span>
+  }
+
+  /**
+   * Converts the svm_light weight Counter (which uses feature indices) into a weight Counter
+   * using the actual features and labels.  Because this is svm_light, and not svm_struct, the
+   * weights for the +1 class (which correspond to labelIndex.get(0)) and the -1 class
+   * (which correspond to labelIndex.get(1)) are just the negation of one another.
+   */
+  private ClassicCounter&lt;Pair&lt;F, L&gt;&gt; convertSVMLightWeights(ClassicCounter&lt;Integer&gt; weights, Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex) {
+<span class="nc" id="L207">    ClassicCounter&lt;Pair&lt;F, L&gt;&gt; newWeights = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">    for (int i : weights.keySet()) {</span>
+<span class="nc" id="L209">      F f = featureIndex.get(i-1);</span>
+<span class="nc" id="L210">      double w = weights.getCount(i);</span>
+      // the first guy in the labelIndex was the +1 class and the second guy
+      // was the -1 class
+<span class="nc" id="L213">      newWeights.incrementCount(new Pair&lt;&gt;(f, labelIndex.get(0)),w);</span>
+<span class="nc" id="L214">      newWeights.incrementCount(new Pair&lt;&gt;(f, labelIndex.get(1)),-w);</span>
+<span class="nc" id="L215">    }</span>
+<span class="nc" id="L216">    return newWeights;</span>
+  }
+
+  /**
+   * Converts the svm_struct weight Counter (in which the weight for a feature/label pair
+   * correspondes to ((labelIndex * numFeatures)+(featureIndex+1))) into a weight Counter
+   * using the actual features and labels.
+   */
+  private ClassicCounter&lt;Pair&lt;F, L&gt;&gt; convertSVMStructWeights(ClassicCounter&lt;Integer&gt; weights, Index&lt;F&gt; featureIndex, Index&lt;L&gt; labelIndex) {
+    // int numLabels = labelIndex.size();
+<span class="nc" id="L226">    int numFeatures = featureIndex.size();</span>
+<span class="nc" id="L227">    ClassicCounter&lt;Pair&lt;F, L&gt;&gt; newWeights = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">    for (int i : weights.keySet()) {</span>
+<span class="nc" id="L229">      L l = labelIndex.get((i-1) / numFeatures); // integer division on purpose</span>
+<span class="nc" id="L230">      F f = featureIndex.get((i-1) % numFeatures);</span>
+<span class="nc" id="L231">      double w = weights.getCount(i);</span>
+<span class="nc" id="L232">      newWeights.incrementCount(new Pair&lt;&gt;(f, l),w);</span>
+<span class="nc" id="L233">    }</span>
+
+<span class="nc" id="L235">    return newWeights;</span>
+  }
+
+  /**
+   * Builds a sigmoid model to turn the classifier outputs into probabilities.
+   */
+  private LinearClassifier&lt;L, L&gt; fitSigmoid(SVMLightClassifier&lt;L, F&gt; classifier, GeneralDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L242">    RVFDataset&lt;L, L&gt; plattDataset = new RVFDataset&lt;&gt;();</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    for (int i = 0; i &lt; dataset.size(); i++) {</span>
+<span class="nc" id="L244">      RVFDatum&lt;L, F&gt; d = dataset.getRVFDatum(i);</span>
+<span class="nc" id="L245">      Counter&lt;L&gt; scores = classifier.scoresOf((Datum&lt;L,F&gt;)d);</span>
+<span class="nc" id="L246">      scores.incrementCount(null);</span>
+<span class="nc" id="L247">      plattDataset.add(new RVFDatum&lt;&gt;(scores, d.label()));</span>
+    }
+<span class="nc" id="L249">    LinearClassifierFactory&lt;L, L&gt; factory = new LinearClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L250">    factory.setPrior(new LogPrior(LogPrior.LogPriorType.NULL));</span>
+<span class="nc" id="L251">    return factory.trainClassifier(plattDataset);</span>
+  }
+
+  /**
+   * This method will cross validate on the given data and number of folds
+   * to find the optimal C.  The scorer is how you determine what to
+   * optimize for (F-score, accuracy, etc).  The C is then saved, so that
+   * if you train a classifier after calling this method, that C will be used.
+   */
+  public void crossValidateSetC(GeneralDataset&lt;L, F&gt; dataset, int numFolds, final Scorer&lt;L&gt; scorer, LineSearcher minimizer) {
+<span class="nc" id="L261">    System.out.println(&quot;in Cross Validate&quot;);</span>
+
+<span class="nc" id="L263">    useAlphaFile = true;</span>
+<span class="nc" id="L264">    boolean oldUseSigmoid = useSigmoid;</span>
+<span class="nc" id="L265">    useSigmoid = false;</span>
+
+<span class="nc" id="L267">    final CrossValidator&lt;L, F&gt; crossValidator = new CrossValidator&lt;&gt;(dataset, numFolds);</span>
+<span class="nc" id="L268">    final Function&lt;Triple&lt;GeneralDataset&lt;L, F&gt;,GeneralDataset&lt;L, F&gt;,CrossValidator.SavedState&gt;,Double&gt; score =</span>
+        fold -&gt; {
+<span class="nc" id="L270">          GeneralDataset&lt;L, F&gt; trainSet = fold.first();</span>
+<span class="nc" id="L271">          GeneralDataset&lt;L, F&gt; devSet = fold.second();</span>
+<span class="nc" id="L272">          alphaFile = (File)fold.third().state;</span>
+          //train(trainSet,true,true);
+<span class="nc" id="L274">          SVMLightClassifier&lt;L, F&gt; classifier = trainClassifierBasic(trainSet);</span>
+<span class="nc" id="L275">          fold.third().state = alphaFile;</span>
+<span class="nc" id="L276">          return scorer.score(classifier,devSet);</span>
+        };
+
+<span class="nc" id="L279">    Function&lt;Double,Double&gt; negativeScorer =</span>
+        cToTry -&gt; {
+<span class="nc" id="L281">          C = cToTry;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">          if (verbose) { System.out.print(&quot;C = &quot;+cToTry+&quot; &quot;); }</span>
+<span class="nc" id="L283">          Double averageScore = crossValidator.computeAverage(score);</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">          if (verbose) { System.out.println(&quot; -&gt; average Score: &quot;+averageScore); }</span>
+<span class="nc" id="L285">          return -averageScore;</span>
+        };
+
+<span class="nc" id="L288">    C = minimizer.minimize(negativeScorer);</span>
+
+<span class="nc" id="L290">    useAlphaFile = false;</span>
+<span class="nc" id="L291">    useSigmoid = oldUseSigmoid;</span>
+<span class="nc" id="L292">  }</span>
+
+  public void heldOutSetC(GeneralDataset&lt;L, F&gt; train, double percentHeldOut, final Scorer&lt;L&gt; scorer, LineSearcher minimizer) {
+<span class="nc" id="L295">    Pair&lt;GeneralDataset&lt;L, F&gt;, GeneralDataset&lt;L, F&gt;&gt; data = train.split(percentHeldOut);</span>
+<span class="nc" id="L296">    heldOutSetC(data.first(), data.second(), scorer, minimizer);</span>
+<span class="nc" id="L297">  }</span>
+
+  /**
+   * This method will cross validate on the given data and number of folds
+   * to find the optimal C.  The scorer is how you determine what to
+   * optimize for (F-score, accuracy, etc).  The C is then saved, so that
+   * if you train a classifier after calling this method, that C will be used.
+   */
+  public void heldOutSetC(final GeneralDataset&lt;L, F&gt; trainSet, final GeneralDataset&lt;L, F&gt; devSet, final Scorer&lt;L&gt; scorer, LineSearcher minimizer) {
+
+<span class="nc" id="L307">    useAlphaFile = true;</span>
+<span class="nc" id="L308">    boolean oldUseSigmoid = useSigmoid;</span>
+<span class="nc" id="L309">    useSigmoid = false;</span>
+
+<span class="nc" id="L311">    Function&lt;Double,Double&gt; negativeScorer =</span>
+        cToTry -&gt; {
+<span class="nc" id="L313">          C = cToTry;</span>
+<span class="nc" id="L314">          SVMLightClassifier&lt;L, F&gt; classifier = trainClassifierBasic(trainSet);</span>
+<span class="nc" id="L315">          double score = scorer.score(classifier,devSet);</span>
+<span class="nc" id="L316">          return -score;</span>
+        };
+
+<span class="nc" id="L319">    C = minimizer.minimize(negativeScorer);</span>
+
+<span class="nc" id="L321">    useAlphaFile = false;</span>
+<span class="nc" id="L322">    useSigmoid = oldUseSigmoid;</span>
+<span class="nc" id="L323">  }</span>
+
+<span class="nc" id="L325">  private boolean tuneHeldOut = false;</span>
+<span class="nc" id="L326">  private boolean tuneCV = false;</span>
+<span class="nc" id="L327">  private Scorer&lt;L&gt; scorer = new MultiClassAccuracyStats&lt;&gt;();</span>
+<span class="nc" id="L328">  private LineSearcher tuneMinimizer = new GoldenSectionLineSearch(true);</span>
+  private int folds;
+  private double heldOutPercent;
+
+  public double getHeldOutPercent() {
+<span class="nc" id="L333">    return heldOutPercent;</span>
+  }
+
+  public void setHeldOutPercent(double heldOutPercent) {
+<span class="nc" id="L337">    this.heldOutPercent = heldOutPercent;</span>
+<span class="nc" id="L338">  }</span>
+
+  public int getFolds() {
+<span class="nc" id="L341">    return folds;</span>
+  }
+
+  public void setFolds(int folds) {
+<span class="nc" id="L345">    this.folds = folds;</span>
+<span class="nc" id="L346">  }</span>
+
+  public LineSearcher getTuneMinimizer() {
+<span class="nc" id="L349">    return tuneMinimizer;</span>
+  }
+
+  public void setTuneMinimizer(LineSearcher minimizer) {
+<span class="nc" id="L353">    this.tuneMinimizer = minimizer;</span>
+<span class="nc" id="L354">  }</span>
+
+  public Scorer getScorer() {
+<span class="nc" id="L357">    return scorer;</span>
+  }
+
+  public void setScorer(Scorer&lt;L&gt; scorer) {
+<span class="nc" id="L361">    this.scorer = scorer;</span>
+<span class="nc" id="L362">  }</span>
+
+  public boolean getTuneCV() {
+<span class="nc" id="L365">    return tuneCV;</span>
+  }
+
+  public void setTuneCV(boolean tuneCV) {
+<span class="nc" id="L369">    this.tuneCV = tuneCV;</span>
+<span class="nc" id="L370">  }</span>
+
+  public boolean getTuneHeldOut() {
+<span class="nc" id="L373">    return tuneHeldOut;</span>
+  }
+
+  public void setTuneHeldOut(boolean tuneHeldOut) {
+<span class="nc" id="L377">    this.tuneHeldOut = tuneHeldOut;</span>
+<span class="nc" id="L378">  }</span>
+
+  public int getSvmLightVerbosity() {
+<span class="nc" id="L381">    return svmLightVerbosity;</span>
+  }
+
+  public void setSvmLightVerbosity(int svmLightVerbosity) {
+<span class="nc" id="L385">    this.svmLightVerbosity = svmLightVerbosity;</span>
+<span class="nc" id="L386">  }</span>
+
+  public SVMLightClassifier&lt;L, F&gt; trainClassifier(GeneralDataset&lt;L, F&gt; dataset) {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">    if (tuneHeldOut) {</span>
+<span class="nc" id="L390">      heldOutSetC(dataset, heldOutPercent, scorer, tuneMinimizer);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">    } else if (tuneCV) {</span>
+<span class="nc" id="L392">      crossValidateSetC(dataset, folds, scorer, tuneMinimizer);</span>
+    }
+<span class="nc" id="L394">    return trainClassifierBasic(dataset);</span>
+  }
+
+<span class="nc" id="L397">  Pattern whitespacePattern = Pattern.compile(&quot;\\s+&quot;);</span>
+
+  public SVMLightClassifier&lt;L, F&gt; trainClassifierBasic(GeneralDataset&lt;L, F&gt; dataset) {
+<span class="nc" id="L400">    Index&lt;L&gt; labelIndex = dataset.labelIndex();</span>
+<span class="nc" id="L401">    Index&lt;F&gt; featureIndex = dataset.featureIndex;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">    boolean multiclass = (dataset.numClasses() &gt; 2);</span>
+    try {
+
+      // this is the file that the model will be saved to
+<span class="nc" id="L406">      File modelFile = File.createTempFile(&quot;svm-&quot;, &quot;.model&quot;);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">      if (deleteTempFilesOnExit) {</span>
+<span class="nc" id="L408">        modelFile.deleteOnExit();</span>
+      }
+
+      // this is the file that the svm light formated dataset
+      // will be printed to
+<span class="nc" id="L413">      File dataFile = File.createTempFile(&quot;svm-&quot;, &quot;.data&quot;);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">      if (deleteTempFilesOnExit) {</span>
+<span class="nc" id="L415">        dataFile.deleteOnExit();</span>
+      }
+
+      // print the dataset
+<span class="nc" id="L419">      PrintWriter pw = new PrintWriter(new FileWriter(dataFile));</span>
+<span class="nc" id="L420">      dataset.printSVMLightFormat(pw);</span>
+<span class="nc" id="L421">      pw.close();</span>
+
+      // -v 0 makes it not verbose
+      // -m 400 gives it a larger cache, for faster training
+<span class="nc bnc" id="L425" title="All 4 branches missed.">      String cmd = (multiclass ? svmStructLearn : (useSVMPerf ? svmPerfLearn : svmLightLearn)) + &quot; -v &quot; + svmLightVerbosity + &quot; -m 400 &quot;;</span>
+
+      // set the value of C if we have one specified
+<span class="nc bnc" id="L428" title="All 2 branches missed.">      if (C &gt; 0.0) cmd = cmd + &quot; -c &quot; + C + &quot; &quot;;  // C value</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">      else if(useSVMPerf) cmd = cmd + &quot; -c &quot; + 0.01 + &quot; &quot;; //It's required to specify this parameter for SVM perf</span>
+
+      // Alpha File
+<span class="nc bnc" id="L432" title="All 2 branches missed.">      if (useAlphaFile) {</span>
+<span class="nc" id="L433">        File newAlphaFile = File.createTempFile(&quot;svm-&quot;, &quot;.alphas&quot;);</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        if (deleteTempFilesOnExit) {</span>
+<span class="nc" id="L435">          newAlphaFile.deleteOnExit();</span>
+        }
+<span class="nc" id="L437">        cmd = cmd + &quot; -a &quot; + newAlphaFile.getAbsolutePath();</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (alphaFile != null) {</span>
+<span class="nc" id="L439">          cmd = cmd + &quot; -y &quot; + alphaFile.getAbsolutePath();</span>
+        }
+<span class="nc" id="L441">        alphaFile = newAlphaFile;</span>
+      }
+
+      // File and Model Data
+<span class="nc" id="L445">      cmd = cmd + &quot; &quot; + dataFile.getAbsolutePath() + &quot; &quot; + modelFile.getAbsolutePath();</span>
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">      if (verbose) logger.info(&quot;&lt;&lt; &quot;+cmd+&quot; &gt;&gt;&quot;);</span>
+
+      /*Process p = Runtime.getRuntime().exec(cmd);
+
+      p.waitFor();
+
+      if (p.exitValue() != 0) throw new RuntimeException(&quot;Error Training SVM Light exit value: &quot; + p.exitValue());
+      p.destroy();   */
+<span class="nc" id="L455">      SystemUtils.run(new ProcessBuilder(whitespacePattern.split(cmd)),</span>
+        new PrintWriter(System.err), new PrintWriter(System.err));
+
+<span class="nc bnc" id="L458" title="All 2 branches missed.">      if (doEval) {</span>
+<span class="nc" id="L459">        File predictFile = File.createTempFile(&quot;svm-&quot;, &quot;.pred&quot;);</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (deleteTempFilesOnExit) {</span>
+<span class="nc" id="L461">          predictFile.deleteOnExit();</span>
+        }
+<span class="nc bnc" id="L463" title="All 4 branches missed.">        String evalCmd = (multiclass ? svmStructClassify : (useSVMPerf ? svmPerfClassify : svmLightClassify)) + &quot; &quot;</span>
+<span class="nc" id="L464">                + dataFile.getAbsolutePath() + &quot; &quot; + modelFile.getAbsolutePath() + &quot; &quot; + predictFile.getAbsolutePath();</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        if (verbose) logger.info(&quot;&lt;&lt; &quot; + evalCmd + &quot; &gt;&gt;&quot;);</span>
+<span class="nc" id="L466">        SystemUtils.run(new ProcessBuilder(whitespacePattern.split(evalCmd)),</span>
+                new PrintWriter(System.err), new PrintWriter(System.err));
+      }
+      // read in the model file
+<span class="nc" id="L470">      Pair&lt;Double, ClassicCounter&lt;Integer&gt;&gt; weightsAndThresh = readModel(modelFile, multiclass);</span>
+<span class="nc" id="L471">      double threshold = weightsAndThresh.first();</span>
+<span class="nc" id="L472">      ClassicCounter&lt;Pair&lt;F, L&gt;&gt; weights = convertWeights(weightsAndThresh.second(), featureIndex, labelIndex, multiclass);</span>
+<span class="nc" id="L473">      ClassicCounter&lt;L&gt; thresholds = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">      if (!multiclass) {</span>
+<span class="nc" id="L475">        thresholds.setCount(labelIndex.get(0), -threshold);</span>
+<span class="nc" id="L476">        thresholds.setCount(labelIndex.get(1), threshold);</span>
+      }
+<span class="nc" id="L478">      SVMLightClassifier&lt;L, F&gt; classifier = new SVMLightClassifier&lt;&gt;(weights, thresholds);</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">      if (doEval) {</span>
+<span class="nc" id="L480">        File predictFile = File.createTempFile(&quot;svm-&quot;, &quot;.pred2&quot;);</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (deleteTempFilesOnExit) {</span>
+<span class="nc" id="L482">          predictFile.deleteOnExit();</span>
+        }
+<span class="nc" id="L484">        PrintWriter pw2 = new PrintWriter(predictFile);</span>
+<span class="nc" id="L485">        NumberFormat nf = NumberFormat.getNumberInstance();</span>
+<span class="nc" id="L486">        nf.setMaximumFractionDigits(5);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        for (Datum&lt;L,F&gt; datum:dataset) {</span>
+<span class="nc" id="L488">          Counter&lt;L&gt; scores = classifier.scoresOf(datum);</span>
+<span class="nc" id="L489">          pw2.println(Counters.toString(scores, nf));</span>
+<span class="nc" id="L490">        }</span>
+<span class="nc" id="L491">        pw2.close();</span>
+      }
+
+<span class="nc bnc" id="L494" title="All 2 branches missed.">      if (useSigmoid) {</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">        if (verbose) System.out.print(&quot;fitting sigmoid...&quot;);</span>
+<span class="nc" id="L496">        classifier.setPlatt(fitSigmoid(classifier, dataset));</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        if (verbose) System.out.println(&quot;done&quot;);</span>
+      }
+
+<span class="nc" id="L500">      return classifier;</span>
+<span class="nc" id="L501">    } catch (Exception e) {</span>
+<span class="nc" id="L502">      throw new RuntimeException(e);</span>
+    }
+  }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

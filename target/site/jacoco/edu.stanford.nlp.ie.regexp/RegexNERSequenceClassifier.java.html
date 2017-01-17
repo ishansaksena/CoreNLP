@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RegexNERSequenceClassifier.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.regexp</a> &gt; <span class="el_source">RegexNERSequenceClassifier.java</span></div><h1>RegexNERSequenceClassifier.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.regexp; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.Properties;
+
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+
+import edu.stanford.nlp.ie.AbstractSequenceClassifier;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.sequences.DocumentReaderAndWriter;
+import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.util.Generics;
+
+/**
+ * A sequence classifier that labels tokens with types based on a simple manual mapping from
+ * regular expressions to the types of the entities they are meant to describe.
+ * The user provides a file formatted as follows:
+ * &lt;pre&gt;
+ *    regex1    TYPE    overwritableType1,Type2...    priority
+ *    regex2    TYPE    overwritableType1,Type2...    priority
+ *    ...
+ * &lt;/pre&gt;
+ * where each argument is tab-separated, and the last two arguments are optional. Several regexes can be
+ * associated with a single type. In the case where multiple regexes match a phrase, the priority ranking
+ * is used to choose between the possible types. This classifier is designed to be used as part of a full
+ * NER system to label entities that don't fall into the usual NER categories. It only records the label
+ * if the token has not already been NER-annotated, or it has been annotated but the NER-type has been
+ * designated overwritable (the third argument).  Note that this is evaluated token-wise in this classifier,
+ * and so it may assign a label against a token sequence that is partly background and partly overwritable.
+ * (In contrast, RegexNERAnnotator doesn't allow this.)
+ * It assigns labels to AnswerAnnotation, while checking for existing labels in NamedEntityTagAnnotation.
+ *
+ * The first column regex may be a sequence of regex, each separated by whitespace (matching &quot;\\s+&quot;).
+ * The regex will match if the successive regex match a sequence of tokens in the input.
+ * Spaces can only be used to separate regular expression tokens; within tokens \\s or similar non-space
+ * representations need to be used instead.
+ * Notes: Following Java regex conventions, some characters in the file need to be escaped. Only a single
+ * backslash should be used though, as these are not String literals. The input to RegexNER will have
+ * already been tokenized.  So, for example, with our usual English tokenization, things like genitives
+ * and commas at the end of words will be separated in the input and matched as a separate token.
+ *
+ * This class isn't implemented very efficiently, since every regex is evaluated at every token position.
+ * So it can and does get quite slow if you have a lot of patterns in your NER rules.
+ * {@code TokensRegex} is a more general framework to provide the functionality of this class.
+ * But at present we still use this class.
+ *
+ * @author jtibs
+ * @author Mihai
+ */
+public class RegexNERSequenceClassifier extends AbstractSequenceClassifier&lt;CoreLabel&gt;  {
+
+  /** A logger for this class */
+<span class="fc" id="L69">  private static Redwood.RedwoodChannels log = Redwood.channels(RegexNERSequenceClassifier.class);</span>
+
+  private final List&lt;Entry&gt; entries;
+
+  private final Set&lt;String&gt; myLabels;
+
+  private final boolean ignoreCase;
+
+  // Make this a property?  (But already done as a property at CoreNLP level.)
+  // ms: but really this should be rewritten from scratch
+  //     we should have a language to specify regexes over *tokens*, where each token could be a regular Java regex (over words, POSs, etc.)
+  private final Pattern validPosPattern;
+  public static final String DEFAULT_VALID_POS = &quot;^(NN|JJ)&quot;;
+
+
+  public RegexNERSequenceClassifier(String mapping, boolean ignoreCase, boolean overwriteMyLabels) {
+<span class="fc" id="L85">    this(mapping, ignoreCase, overwriteMyLabels, DEFAULT_VALID_POS);</span>
+<span class="fc" id="L86">  }</span>
+
+  /**
+   * Make a new instance of this classifier. The ignoreCase option allows case-insensitive
+   * regular expression matching, allowing the idea that the provided file might just
+   * be a manual list of the possible entities for each type.
+   *
+   * @param mapping A String describing a file/classpath/URI for the RegexNER patterns
+   * @param ignoreCase The regex in the mapping file should be compiled ignoring case
+   * @param overwriteMyLabels If true, this classifier overwrites NE labels generated through
+   *                          this regex NER. This is necessary because sometimes the
+   *                          RegexNERSequenceClassifier is run successively over the same
+   *                          text (e.g., to overwrite some older annotations).
+   * @param validPosRegex May be null or an empty String, in which case any (or no) POS is valid
+   *                      in matching. Otherwise, this is a regex which is matched with find()
+   *                      [not matches()] and which must be matched by the POS of at least one
+   *                      word in the sequence for it to be labeled via any matching rules.
+   *                      (Note that this is a postfilter; using this will not speed up matching.)
+   */
+  public RegexNERSequenceClassifier(String mapping, boolean ignoreCase, boolean overwriteMyLabels, String validPosRegex) {
+<span class="fc" id="L106">    super(new Properties());</span>
+<span class="pc bpc" id="L107" title="2 of 4 branches missed.">    if (validPosRegex != null &amp;&amp; !validPosRegex.equals(&quot;&quot;)) {</span>
+<span class="fc" id="L108">      validPosPattern = Pattern.compile(validPosRegex);</span>
+    } else {
+<span class="nc" id="L110">      validPosPattern = null;</span>
+    }
+<span class="fc" id="L112">    BufferedReader rd = null;</span>
+    try {
+<span class="fc" id="L114">      rd = IOUtils.readerFromString(mapping);</span>
+<span class="fc" id="L115">      entries = readEntries(rd, ignoreCase);</span>
+<span class="nc" id="L116">    } catch (IOException e) {</span>
+<span class="nc" id="L117">      throw new RuntimeIOException(&quot;Couldn't read RegexNER from &quot; + mapping, e);</span>
+    } finally {
+<span class="pc" id="L119">      IOUtils.closeIgnoringExceptions(rd);</span>
+<span class="fc" id="L120">    }</span>
+
+<span class="fc" id="L122">    this.ignoreCase = ignoreCase;</span>
+<span class="fc" id="L123">    myLabels = Generics.newHashSet();</span>
+    // Can always override background or none.
+<span class="fc" id="L125">    myLabels.add(flags.backgroundSymbol);</span>
+<span class="fc" id="L126">    myLabels.add(null);</span>
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">    if (overwriteMyLabels) {</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">      for (Entry entry: entries) myLabels.add(entry.type);</span>
+    }
+    // log.info(&quot;RegexNER using labels: &quot; +  myLabels);
+<span class="fc" id="L131">  }</span>
+
+  /**
+   * Make a new instance of this classifier. The ignoreCase option allows case-insensitive
+   * regular expression matching, allowing the idea that the provided file might just
+   * be a manual list of the possible entities for each type.
+   *
+   * @param reader A Reader for the RegexNER patterns
+   * @param ignoreCase The regex in the mapping file should be compiled ignoring case
+   * @param overwriteMyLabels If true, this classifier overwrites NE labels generated through
+   *                          this regex NER. This is necessary because sometimes the
+   *                          RegexNERSequenceClassifier is run successively over the same
+   *                          text (e.g., to overwrite some older annotations).
+   * @param validPosRegex May be null or an empty String, in which case any (or no) POS is valid
+   *                      in matching. Otherwise, this is a regex, and only words with a POS that
+   *                      match the regex will be labeled via any matching rules.
+   */
+  public RegexNERSequenceClassifier(BufferedReader reader,
+                                    boolean ignoreCase,
+                                    boolean overwriteMyLabels,
+                                    String validPosRegex) {
+<span class="fc" id="L152">    super(new Properties());</span>
+<span class="pc bpc" id="L153" title="3 of 4 branches missed.">    if (validPosRegex != null &amp;&amp; !validPosRegex.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L154">      validPosPattern = Pattern.compile(validPosRegex);</span>
+    } else {
+<span class="fc" id="L156">      validPosPattern = null;</span>
+    }
+    try {
+<span class="fc" id="L159">      entries = readEntries(reader, ignoreCase);</span>
+<span class="nc" id="L160">    } catch (IOException e) {</span>
+<span class="nc" id="L161">      throw new RuntimeIOException(&quot;Couldn't read RegexNER from reader&quot;, e);</span>
+<span class="fc" id="L162">    }</span>
+
+<span class="fc" id="L164">    this.ignoreCase = ignoreCase;</span>
+<span class="fc" id="L165">    myLabels = Generics.newHashSet();</span>
+    // Can always override background or none.
+<span class="fc" id="L167">    myLabels.add(flags.backgroundSymbol);</span>
+<span class="fc" id="L168">    myLabels.add(null);</span>
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">    if (overwriteMyLabels) {</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">      for (Entry entry: entries) myLabels.add(entry.type);</span>
+    }
+    // log.info(&quot;RegexNER using labels: &quot; + myLabels);
+<span class="fc" id="L173">  }</span>
+
+  private static class Entry implements Comparable&lt;Entry&gt; {
+    public List&lt;Pattern&gt; regex; // the regex, tokenized by splitting on white space
+<span class="fc" id="L177">    public List&lt;String&gt; exact = new ArrayList&lt;&gt;();</span>
+    public String type; // the associated type
+    public Set&lt;String&gt; overwritableTypes;
+    public double priority;
+
+<span class="fc" id="L182">    public Entry(List&lt;Pattern&gt; regex, String type, Set&lt;String&gt; overwritableTypes, double priority) {</span>
+<span class="fc" id="L183">      this.regex = regex;</span>
+<span class="fc" id="L184">      this.type = type.intern();</span>
+<span class="fc" id="L185">      this.overwritableTypes = overwritableTypes;</span>
+<span class="fc" id="L186">      this.priority = priority;</span>
+      // Efficiency shortcut
+<span class="fc bfc" id="L188" title="All 2 branches covered.">      for (Pattern p : regex) {</span>
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        if (p.toString().matches(&quot;[a-zA-Z0-9]+&quot;)) {</span>
+<span class="fc" id="L190">          exact.add(p.toString());</span>
+        } else {
+<span class="fc" id="L192">          exact.add(null);</span>
+        }
+<span class="fc" id="L194">      }</span>
+<span class="fc" id="L195">    }</span>
+
+    /** If the given priorities are equal, an entry whose regex has more tokens is assigned
+     *  a higher priority. This implementation is not fine-grained enough to be consistent with equals.
+     */
+    @Override
+    public int compareTo(Entry other) {
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">      if (this.priority &gt; other.priority)</span>
+<span class="nc" id="L203">        return -1;</span>
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">      if (this.priority &lt; other.priority)</span>
+<span class="nc" id="L205">        return 1;</span>
+<span class="fc" id="L206">      return other.regex.size() - this.regex.size();</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L210">      return &quot;Entry{&quot; + regex + ' ' + type + ' ' + overwritableTypes + ' ' + priority + '}';</span>
+    }
+  }
+
+  private boolean containsValidPos(List&lt;CoreLabel&gt; tokens, int start, int end) {
+<span class="fc bfc" id="L215" title="All 2 branches covered.">    if (validPosPattern == null) {</span>
+<span class="fc" id="L216">      return true;</span>
+    }
+    // log.info(&quot;CHECKING &quot; + start + &quot; &quot; + end);
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">    for (int i = start; i &lt; end; i ++) {</span>
+      // log.info(&quot;TAG = &quot; + tokens.get(i).tag());
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">      if (tokens.get(i).tag() == null) {</span>
+<span class="nc" id="L222">        throw new IllegalArgumentException(&quot;RegexNER was asked to check for valid tags on an untagged sequence. Either tag the sequence, perhaps with the pos annotator, or create RegexNER with an empty validPosPattern, perhaps with the property regexner.validpospattern&quot;);</span>
+      }
+<span class="fc" id="L224">      Matcher m = validPosPattern.matcher(tokens.get(i).tag());</span>
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">      if (m.find()) return true;</span>
+    }
+<span class="nc" id="L227">    return false;</span>
+  }
+
+  @Override
+  public List&lt;CoreLabel&gt; classify(List&lt;CoreLabel&gt; document) {
+    // This is pretty deathly slow. It loops over each entry, and then loops over each document token for it.
+    // We could gain by compiling into disjunctions patterns for the same class with the same priorities and restrictions?
+<span class="fc bfc" id="L234" title="All 2 branches covered.">    for (Entry entry : entries) {</span>
+<span class="fc" id="L235">      int start = 0; // the index of the token from which we begin our search each iteration</span>
+      while (true) {
+        // only search the part of the document that we haven't yet considered
+        // log.info(&quot;REGEX FIND MATCH FOR &quot; + entry.regex.toString());
+<span class="fc" id="L239">        start = findStartIndex(entry, document, start, myLabels, this.ignoreCase);</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">        if (start &lt; 0) break; // no match found</span>
+
+        // make sure we annotate only valid POS tags
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        if (containsValidPos(document, start, start + entry.regex.size())) {</span>
+          // annotate each matching token
+<span class="fc bfc" id="L245" title="All 2 branches covered.">          for (int i = start; i &lt; start + entry.regex.size(); i++) {</span>
+<span class="fc" id="L246">            CoreLabel token = document.get(i);</span>
+<span class="fc" id="L247">            token.set(CoreAnnotations.AnswerAnnotation.class, entry.type);</span>
+          }
+        }
+<span class="fc" id="L250">        start++;</span>
+      }
+<span class="fc" id="L252">    }</span>
+<span class="fc" id="L253">    return document;</span>
+  }
+
+  /**
+   *  Creates a combined list of Entries using the provided mapping file, and sorts them by
+   *  first by priority, then the number of tokens in the regex.
+   *
+   *  @param mapping The Reader containing RegexNER mappings. It's lines are counted from 1
+   *  @return a sorted list of Entries
+   */
+  private static List&lt;Entry&gt; readEntries(BufferedReader mapping, boolean ignoreCase) throws IOException {
+<span class="fc" id="L264">    List&lt;Entry&gt; entries = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L266">    int lineCount = 0;</span>
+<span class="fc bfc" id="L267" title="All 2 branches covered.">    for (String line; (line = mapping.readLine()) != null; ) {</span>
+<span class="fc" id="L268">      lineCount ++;</span>
+<span class="fc" id="L269">      String[] split = line.split(&quot;\t&quot;);</span>
+<span class="pc bpc" id="L270" title="2 of 4 branches missed.">      if (split.length &lt; 2 || split.length &gt; 4)</span>
+<span class="nc" id="L271">        throw new IllegalArgumentException(&quot;Provided mapping file is in wrong format: &quot; + line);</span>
+
+<span class="fc" id="L273">      String[] regexes = split[0].trim().split(&quot;\\s+&quot;);</span>
+<span class="fc" id="L274">      String type = split[1].trim();</span>
+<span class="fc" id="L275">      Set&lt;String&gt; overwritableTypes = Generics.newHashSet();</span>
+<span class="fc" id="L276">      double priority = 0.0;</span>
+<span class="fc" id="L277">      List&lt;Pattern&gt; tokens = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L279" title="All 2 branches covered.">      if (split.length &gt;= 3) {</span>
+<span class="fc" id="L280">        overwritableTypes.addAll(Arrays.asList(split[2].trim().split(&quot;,&quot;)));</span>
+      }
+
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">      if (split.length == 4) {</span>
+        try {
+<span class="nc" id="L285">          priority = Double.parseDouble(split[3].trim());</span>
+<span class="nc" id="L286">        } catch(NumberFormatException e) {</span>
+<span class="nc" id="L287">          throw new IllegalArgumentException(&quot;ERROR: Invalid line &quot; + lineCount + &quot; in regexner file &quot; + mapping + &quot;: \&quot;&quot; + line + &quot;\&quot;!&quot;, e);</span>
+<span class="nc" id="L288">        }</span>
+      }
+
+      try {
+<span class="fc bfc" id="L292" title="All 2 branches covered.">        for (String str : regexes) {</span>
+<span class="fc bfc" id="L293" title="All 2 branches covered.">          if(ignoreCase) tokens.add(Pattern.compile(str, Pattern.CASE_INSENSITIVE));</span>
+<span class="fc" id="L294">          else tokens.add(Pattern.compile(str));</span>
+        }
+<span class="nc" id="L296">      } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L297">        throw new IllegalArgumentException(&quot;ERROR: Invalid line &quot; + lineCount + &quot; in regexner file &quot; + mapping + &quot;: \&quot;&quot; + line + &quot;\&quot;!&quot;, e);</span>
+<span class="fc" id="L298">      }</span>
+
+<span class="fc" id="L300">      entries.add(new Entry(tokens, type, overwritableTypes, priority));</span>
+<span class="fc" id="L301">    }</span>
+
+<span class="fc" id="L303">    Collections.sort(entries);</span>
+    // log.info(&quot;Read these entries:&quot;);
+    // log.info(entries);
+<span class="fc" id="L306">    return entries;</span>
+  }
+
+  /**
+   * Checks if the entry's regex sequence is contained in the tokenized document, starting the search
+   * from index searchStart. Also requires that each token's current NER-type be overwritable,
+   * and that each token has not yet been Answer-annotated.
+   *
+   * @param entry
+   * @param document
+   * @return on success, the index of the first token in the matching sequence, otherwise -1
+   */
+  private static int findStartIndex(Entry entry, List&lt;CoreLabel&gt; document, int searchStart, Set&lt;String&gt; myLabels, boolean ignoreCase) {
+<span class="fc" id="L319">    List&lt;Pattern&gt; regex = entry.regex;</span>
+<span class="fc" id="L320">    int rSize = regex.size();</span>
+    // log.info(&quot;REGEX FIND MATCH FOR &quot; + regex.toString() + &quot; length: &quot; + rSize);
+
+<span class="fc bfc" id="L323" title="All 2 branches covered.">    for (int start = searchStart, end = document.size() - regex.size(); start &lt;= end; start++) {</span>
+<span class="fc" id="L324">      boolean failed = false;</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">      for (int i = 0; i &lt; rSize; i++) {</span>
+<span class="fc" id="L326">        Pattern pattern = regex.get(i);</span>
+<span class="fc" id="L327">        String exact = entry.exact.get(i);</span>
+<span class="fc" id="L328">        CoreLabel token = document.get(start + i);</span>
+<span class="fc" id="L329">        String NERType = token.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="fc" id="L330">        String currentType = token.get(CoreAnnotations.AnswerAnnotation.class);</span>
+
+<span class="fc bfc" id="L332" title="All 6 branches covered.">        if (</span>
+            currentType != null ||
+<span class="fc bfc" id="L334" title="All 4 branches covered.">            (exact != null &amp;&amp; ! (ignoreCase ? exact.equalsIgnoreCase(token.word()) : exact.equals(token.word()))) ||</span>
+<span class="fc bfc" id="L335" title="All 4 branches covered.">            ! (entry.overwritableTypes.contains(NERType) || myLabels.contains(NERType))  ||</span>
+<span class="fc bfc" id="L336" title="All 2 branches covered.">            ! pattern.matcher(token.word()).matches()  // last, as this is likely the expensive operation</span>
+            ) {
+<span class="fc" id="L338">          failed = true;</span>
+<span class="fc" id="L339">          break;</span>
+        }
+      }
+<span class="fc bfc" id="L342" title="All 2 branches covered.">      if (! failed) {</span>
+        // log.info(&quot;MATCHED REGEX:&quot;);
+        // for(int i = start; i &lt; start + regex.size(); i ++) log.info(&quot; &quot; + document.get(i).word());
+        // log.info();
+<span class="fc" id="L346">        return start;</span>
+      }
+    }
+<span class="fc" id="L349">    return -1;</span>
+  }
+
+
+  @Override
+  public List&lt;CoreLabel&gt; classifyWithGlobalInformation(List&lt;CoreLabel&gt; tokenSeq, final CoreMap doc, final CoreMap sent) {
+<span class="nc" id="L355">    return classify(tokenSeq);</span>
+  }
+
+  // these methods are not implemented for a rule-based sequence classifier
+
+  @Override
+  public void train(Collection&lt;List&lt;CoreLabel&gt;&gt; docs,
+<span class="nc" id="L362">                    DocumentReaderAndWriter&lt;CoreLabel&gt; readerAndWriter) {}</span>
+
+  @Override
+<span class="nc" id="L365">  public void serializeClassifier(String serializePath) {}</span>
+
+<span class="nc" id="L367">  public void serializeClassifier(ObjectOutputStream oos) {}</span>
+
+  @Override
+  public void loadClassifier(ObjectInputStream in, Properties props)
+<span class="nc" id="L371">          throws IOException, ClassCastException, ClassNotFoundException {}</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

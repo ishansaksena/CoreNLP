@@ -1,0 +1,601 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CustomAnnotationSerializer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">CustomAnnotationSerializer.java</span></div><h1>CustomAnnotationSerializer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import java.io.*;
+import java.util.*;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+import edu.stanford.nlp.coref.CorefCoreAnnotations;
+
+import edu.stanford.nlp.coref.data.CorefChain;
+import edu.stanford.nlp.coref.data.Dictionaries;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.semgraph.SemanticGraphEdge;
+import edu.stanford.nlp.trees.LabeledScoredTreeFactory;
+import edu.stanford.nlp.trees.PennTreeReader;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.trees.TreeCoreAnnotations;
+import edu.stanford.nlp.util.*;
+
+/**
+ * Serializes Annotation objects using our own format.
+ *
+ * Note[gabor]: This is a lossy serialization! For similar performance, and
+ * lossless (or less lossy) serialization see,
+ * {@link edu.stanford.nlp.pipeline.ProtobufAnnotationSerializer}.
+ *
+ * @author Mihai
+ */
+public class CustomAnnotationSerializer extends AnnotationSerializer  {
+
+  /** A logger for this class */
+<span class="nc" id="L38">  private static Redwood.RedwoodChannels log = Redwood.channels(CustomAnnotationSerializer.class);</span>
+
+  private final boolean compress;
+
+  /**
+   * If true, it means we store/load also AntecedentAnnotation
+   * This annotation is used ONLY in our KBP annotation.
+   * By default, it is not needed because we store the entire coref graph anyway.
+   */
+  private final boolean haveExplicitAntecedent;
+
+  public CustomAnnotationSerializer() {
+<span class="nc" id="L50">    this(true, false);</span>
+<span class="nc" id="L51">  }</span>
+
+<span class="nc" id="L53">  public CustomAnnotationSerializer(boolean compress, boolean haveAnte) {</span>
+<span class="nc" id="L54">    this.compress = compress;</span>
+<span class="nc" id="L55">    this.haveExplicitAntecedent = haveAnte;</span>
+<span class="nc" id="L56">  }</span>
+
+
+  private static IntermediateSemanticGraph loadDependencyGraph(BufferedReader reader) throws IOException {
+<span class="nc" id="L60">    IntermediateSemanticGraph graph = new IntermediateSemanticGraph();</span>
+
+    // first line: list of nodes
+<span class="nc" id="L63">    String line = reader.readLine().trim();</span>
+    // System.out.println(&quot;PARSING LINE: &quot; + line);
+<span class="nc bnc" id="L65" title="All 2 branches missed.">    if(line.length() &gt; 0){</span>
+<span class="nc" id="L66">      String [] bits = line.split(&quot;\t&quot;);</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">      if(bits.length &lt; 3) throw new RuntimeException(&quot;ERROR: Invalid dependency node line: &quot; + line);</span>
+<span class="nc" id="L68">      String docId = bits[0];</span>
+<span class="nc bnc" id="L69" title="All 2 branches missed.">      if(docId.equals(&quot;-&quot;)) docId = &quot;&quot;;</span>
+<span class="nc" id="L70">      int sentIndex = Integer.valueOf(bits[1]);</span>
+<span class="nc bnc" id="L71" title="All 2 branches missed.">      for(int i = 2; i &lt; bits.length; i ++){</span>
+<span class="nc" id="L72">        String bit = bits[i];</span>
+<span class="nc" id="L73">        String[] bbits = bit.split(&quot;-&quot;);</span>
+<span class="nc" id="L74">        int copyAnnotation = -1;</span>
+<span class="nc" id="L75">        boolean isRoot = false;</span>
+<span class="nc bnc" id="L76" title="All 2 branches missed.">        if(bbits.length &gt; 3){</span>
+<span class="nc" id="L77">          throw new RuntimeException(&quot;ERROR: Invalid format for dependency graph: &quot; + line);</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        } else if(bbits.length == 2){</span>
+<span class="nc" id="L79">          copyAnnotation = Integer.valueOf(bbits[1]);</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">        } else if(bbits.length == 3){</span>
+<span class="nc" id="L81">          copyAnnotation = Integer.valueOf(bbits[1]);</span>
+<span class="nc" id="L82">          isRoot = bbits[2].equals(&quot;R&quot;);</span>
+        }
+<span class="nc" id="L84">        int index = Integer.valueOf(bbits[0]);</span>
+<span class="nc" id="L85">        graph.nodes.add(new IntermediateNode(docId, sentIndex, index, copyAnnotation, isRoot));</span>
+      }
+    }
+
+    // second line: list of deps
+<span class="nc" id="L90">    line = reader.readLine().trim();</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">    if(line.length() &gt; 0){</span>
+<span class="nc" id="L92">      String [] bits = line.split(&quot;\t&quot;);</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">      for(String bit: bits){</span>
+<span class="nc" id="L94">        String [] bbits = bit.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L95" title="All 4 branches missed.">        if(bbits.length &lt; 3 || bbits.length &gt; 6){</span>
+<span class="nc" id="L96">          throw new RuntimeException(&quot;ERROR: Invalid format for dependency graph: &quot; + line);</span>
+        }
+<span class="nc" id="L98">        String dep = bbits[0];</span>
+<span class="nc" id="L99">        int source = Integer.valueOf(bbits[1]);</span>
+<span class="nc" id="L100">        int target = Integer.valueOf(bbits[2]);</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        boolean isExtra = (bbits.length == 4) ? Boolean.valueOf(bbits[3]) : false;</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        int sourceCopy = (bbits.length &gt; 4) ? Integer.valueOf(bbits[4]) : 0;</span>
+<span class="nc bnc" id="L103" title="All 2 branches missed.">        int targetCopy = (bbits.length &gt; 5) ? Integer.valueOf(bbits[5]) : 0;</span>
+<span class="nc" id="L104">        graph.edges.add(new IntermediateEdge(dep, source, sourceCopy, target, targetCopy, isExtra));</span>
+      }
+    }
+
+<span class="nc" id="L108">    return graph;</span>
+  }
+
+  /**
+   * Saves all arcs in the graph on two lines: first line contains the vertices, second the edges.
+   * @param graph
+   * @param pw
+   */
+  private static void saveDependencyGraph(SemanticGraph graph, PrintWriter pw) {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">    if(graph == null){</span>
+<span class="nc" id="L118">      pw.println();</span>
+<span class="nc" id="L119">      pw.println();</span>
+<span class="nc" id="L120">      return;</span>
+    }
+<span class="nc" id="L122">    boolean outputHeader = false;</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">    for (IndexedWord node: graph.vertexSet()){</span>
+      // first line: sentence index for all nodes; we recover the words
+      // from the original tokens the first two tokens in this line
+      // indicate: docid, sentence index
+<span class="nc bnc" id="L127" title="All 2 branches missed.">      if (!outputHeader) {</span>
+<span class="nc" id="L128">        String docId = node.get(CoreAnnotations.DocIDAnnotation.class);</span>
+<span class="nc bnc" id="L129" title="All 4 branches missed.">        if(docId != null &amp;&amp; docId.length() &gt; 0) pw.print(docId);</span>
+<span class="nc" id="L130">        else pw.print(&quot;-&quot;);</span>
+<span class="nc" id="L131">        pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L132">        pw.print(node.get(CoreAnnotations.SentenceIndexAnnotation.class));</span>
+<span class="nc" id="L133">        outputHeader = true;</span>
+      }
+
+<span class="nc" id="L136">      pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L137">      pw.print(node.index());</span>
+      // CopyAnnotations indicate copied (or virtual nodes) generated due to CCs (see EnglishGrammaticalStructure)
+      // These annotations are usually not set, so print them only if necessary
+<span class="nc bnc" id="L140" title="All 2 branches missed.">      if(node.copyCount() &gt; 0){</span>
+<span class="nc" id="L141">        pw.print(&quot;-&quot;);</span>
+<span class="nc" id="L142">        pw.print(node.copyCount());</span>
+        // System.out.println(&quot;FOUND COPY ANNOTATION: &quot; + node.get(CoreAnnotations.CopyAnnotation.class));
+      }
+<span class="nc bnc" id="L145" title="All 2 branches missed.">      if (graph.getRoots().contains(node)) {</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (node.copyCount() &gt; 0) {</span>
+<span class="nc" id="L147">          pw.print(&quot;-R&quot;);</span>
+        } else {
+<span class="nc" id="L149">          pw.print(&quot;-0-R&quot;);</span>
+        }
+      }
+<span class="nc" id="L152">    }</span>
+<span class="nc" id="L153">    pw.println();</span>
+
+    // second line: all edges
+<span class="nc" id="L156">    boolean first = true;</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">    for (SemanticGraphEdge edge : graph.edgeIterable()) {</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">      if(! first) pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L159">      String rel = edge.getRelation().toString();</span>
+      // no spaces allowed in the relation name
+      // note that they might occur due to the tokenization of HTML/XML/RDF tags
+<span class="nc" id="L162">      rel = rel.replaceAll(&quot;\\s+&quot;, &quot;&quot;);</span>
+<span class="nc" id="L163">      pw.print(rel);</span>
+<span class="nc" id="L164">      pw.print(&quot; &quot;);</span>
+<span class="nc" id="L165">      pw.print(edge.getSource().index());</span>
+<span class="nc" id="L166">      pw.print(&quot; &quot;);</span>
+<span class="nc" id="L167">      pw.print(edge.getTarget().index());</span>
+<span class="nc bnc" id="L168" title="All 6 branches missed.">      if (edge.isExtra() || edge.getSource().copyCount() &gt; 0 || edge.getTarget().copyCount() &gt; 0) {</span>
+<span class="nc" id="L169">        pw.print(&quot; &quot;);</span>
+<span class="nc" id="L170">        pw.print(edge.isExtra());</span>
+<span class="nc" id="L171">        pw.print(&quot; &quot;);</span>
+<span class="nc" id="L172">        pw.print(edge.getSource().copyCount());</span>
+<span class="nc" id="L173">        pw.print(&quot; &quot;);</span>
+<span class="nc" id="L174">        pw.print(edge.getTarget().copyCount());</span>
+      }
+<span class="nc" id="L176">      first = false;</span>
+<span class="nc" id="L177">    }</span>
+<span class="nc" id="L178">    pw.println();</span>
+<span class="nc" id="L179">  }</span>
+
+  /** Serializes the CorefChain objects
+   *
+   * @param chains all clusters in a doc
+   * @param pw the buffer
+   */
+  private static void saveCorefChains(Map&lt;Integer, CorefChain&gt; chains, PrintWriter pw) {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">    if(chains == null) {</span>
+<span class="nc" id="L188">      pw.println();</span>
+<span class="nc" id="L189">      return;</span>
+    }
+
+    // how many clusters
+<span class="nc" id="L193">    pw.println(chains.size());</span>
+
+    // save each cluster
+<span class="nc bnc" id="L196" title="All 2 branches missed.">    for (Map.Entry&lt;Integer, CorefChain&gt; integerCorefChainEntry : chains.entrySet()) {</span>
+      // cluster id + how many mentions in the cluster
+<span class="nc" id="L198">      saveCorefChain(pw, integerCorefChainEntry.getKey(), integerCorefChainEntry.getValue());</span>
+<span class="nc" id="L199">    }</span>
+
+    // an empty line at end
+<span class="nc" id="L202">    pw.println();</span>
+<span class="nc" id="L203">  }</span>
+
+  private static int countMentions(CorefChain cluster) {
+<span class="nc" id="L206">    int count = 0;</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">    for(IntPair mid: cluster.getMentionMap().keySet()) {</span>
+<span class="nc" id="L208">      count += cluster.getMentionMap().get(mid).size();</span>
+<span class="nc" id="L209">    }</span>
+<span class="nc" id="L210">    return count;</span>
+  }
+
+  /**
+   * Serializes one coref cluster (i.e., one entity).
+   *
+   * @param pw the buffer
+   * @param cid id of cluster to save
+   * @param cluster the cluster
+   */
+  public static void saveCorefChain(PrintWriter pw, int cid, CorefChain cluster) {
+<span class="nc" id="L221">    pw.println(cid + &quot; &quot; + countMentions(cluster));</span>
+    // each mention saved on one line
+<span class="nc" id="L223">    Map&lt;IntPair, Set&lt;CorefChain.CorefMention&gt;&gt; mentionMap = cluster.getMentionMap();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">    for (Map.Entry&lt;IntPair, Set&lt;CorefChain.CorefMention&gt;&gt; intPairSetEntry : mentionMap.entrySet()) {</span>
+      // all mentions with the same head
+<span class="nc" id="L226">      IntPair mentionIndices = intPairSetEntry.getKey();</span>
+<span class="nc" id="L227">      Set&lt;CorefChain.CorefMention&gt; mentions = intPairSetEntry.getValue();</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">      for (CorefChain.CorefMention mention: mentions) {</span>
+        // one mention per line
+<span class="nc" id="L230">        pw.print(mentionIndices.getSource() + &quot; &quot; + mentionIndices.getTarget());</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if(mention == cluster.getRepresentativeMention()) pw.print(&quot; &quot; + 1);</span>
+<span class="nc" id="L232">        else pw.print(&quot; &quot; + 0);</span>
+
+<span class="nc" id="L234">        pw.print(&quot; &quot; + mention.mentionType);</span>
+<span class="nc" id="L235">        pw.print(&quot; &quot; + mention.number);</span>
+<span class="nc" id="L236">        pw.print(&quot; &quot; + mention.gender);</span>
+<span class="nc" id="L237">        pw.print(&quot; &quot; + mention.animacy);</span>
+<span class="nc" id="L238">        pw.print(&quot; &quot; + mention.startIndex);</span>
+<span class="nc" id="L239">        pw.print(&quot; &quot; + mention.endIndex);</span>
+<span class="nc" id="L240">        pw.print(&quot; &quot; + mention.headIndex);</span>
+<span class="nc" id="L241">        pw.print(&quot; &quot; + mention.corefClusterID);</span>
+<span class="nc" id="L242">        pw.print(&quot; &quot; + mention.mentionID);</span>
+<span class="nc" id="L243">        pw.print(&quot; &quot; + mention.sentNum);</span>
+<span class="nc" id="L244">        pw.print(&quot; &quot; + mention.position.length());</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        for(int i = 0; i &lt; mention.position.length(); i ++)</span>
+<span class="nc" id="L246">          pw.print(&quot; &quot; + mention.position.get(i));</span>
+<span class="nc" id="L247">        pw.print(&quot; &quot; + escapeSpace(mention.mentionSpan));</span>
+<span class="nc" id="L248">        pw.println();</span>
+<span class="nc" id="L249">      }</span>
+<span class="nc" id="L250">    }</span>
+<span class="nc" id="L251">  }</span>
+
+  private static String escapeSpace(String s) {
+<span class="nc" id="L254">    return s.replaceAll(&quot;\\s&quot;, SPACE_HOLDER);</span>
+  }
+  private static String unescapeSpace(String s) {
+<span class="nc" id="L257">    return s.replaceAll(SPACE_HOLDER, &quot; &quot;);</span>
+  }
+  private static Dictionaries.MentionType parseMentionType(String s) {
+<span class="nc" id="L260">    return Dictionaries.MentionType.valueOf(s);</span>
+  }
+  private static Dictionaries.Number parseNumber(String s) {
+<span class="nc" id="L263">    return Dictionaries.Number.valueOf(s);</span>
+  }
+  private static Dictionaries.Gender parseGender(String s) {
+<span class="nc" id="L266">    return Dictionaries.Gender.valueOf(s);</span>
+  }
+  private static Dictionaries.Animacy parseAnimacy(String s) {
+<span class="nc" id="L269">    return Dictionaries.Animacy.valueOf(s);</span>
+  }
+
+  /**
+   * Loads the CorefChain objects from the serialized buffer
+   * @param reader the buffer
+   * @return A map from cluster id to clusters
+   * @throws IOException
+   */
+  private static Map&lt;Integer, CorefChain&gt; loadCorefChains(BufferedReader reader) throws IOException {
+<span class="nc" id="L279">    String line = reader.readLine().trim();</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    if (line.isEmpty()) return null;</span>
+<span class="nc" id="L281">    int clusterCount = Integer.valueOf(line);</span>
+<span class="nc" id="L282">    Map&lt;Integer, CorefChain&gt; chains = Generics.newHashMap();</span>
+    // read each cluster
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    for(int c = 0; c &lt; clusterCount; c ++) {</span>
+<span class="nc" id="L285">      line = reader.readLine().trim();</span>
+<span class="nc" id="L286">      String [] bits = line.split(&quot;\\s&quot;);</span>
+<span class="nc" id="L287">      int cid = Integer.valueOf(bits[0]);</span>
+<span class="nc" id="L288">      int mentionCount = Integer.valueOf(bits[1]);</span>
+      Map&lt;IntPair, Set&lt;CorefChain.CorefMention&gt;&gt; mentionMap =
+<span class="nc" id="L290">              Generics.newHashMap();</span>
+<span class="nc" id="L291">      CorefChain.CorefMention representative = null;</span>
+      // read each mention in this cluster
+<span class="nc bnc" id="L293" title="All 2 branches missed.">      for(int m = 0; m &lt; mentionCount; m ++) {</span>
+<span class="nc" id="L294">        line = reader.readLine();</span>
+<span class="nc" id="L295">        bits = line.split(&quot;\\s&quot;);</span>
+<span class="nc" id="L296">        IntPair key = new IntPair(</span>
+<span class="nc" id="L297">                Integer.valueOf(bits[0]),</span>
+<span class="nc" id="L298">                Integer.valueOf(bits[1]));</span>
+<span class="nc" id="L299">        boolean rep = bits[2].equals(&quot;1&quot;);</span>
+
+<span class="nc" id="L301">        Dictionaries.MentionType mentionType = parseMentionType(bits[3]);</span>
+<span class="nc" id="L302">        Dictionaries.Number number = parseNumber(bits[4]);</span>
+<span class="nc" id="L303">        Dictionaries.Gender gender = parseGender(bits[5]);</span>
+<span class="nc" id="L304">        Dictionaries.Animacy animacy = parseAnimacy(bits[6]);</span>
+<span class="nc" id="L305">        int startIndex = Integer.valueOf(bits[7]);</span>
+<span class="nc" id="L306">        int endIndex = Integer.valueOf(bits[8]);</span>
+<span class="nc" id="L307">        int headIndex = Integer.valueOf(bits[9]);</span>
+<span class="nc" id="L308">        int clusterID = Integer.valueOf(bits[10]);</span>
+<span class="nc" id="L309">        int mentionID = Integer.valueOf(bits[11]);</span>
+<span class="nc" id="L310">        int sentNum = Integer.valueOf(bits[12]);</span>
+<span class="nc" id="L311">        int posLen = Integer.valueOf(bits[13]);</span>
+<span class="nc" id="L312">        int [] posElems = new int[posLen];</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        for(int i = 0; i &lt; posLen; i ++) {</span>
+<span class="nc" id="L314">          posElems[i] = Integer.valueOf(bits[14 + i]);</span>
+        }
+<span class="nc" id="L316">        IntTuple position = new IntTuple(posElems);</span>
+<span class="nc" id="L317">        String span = unescapeSpace(bits[14 + posLen]);</span>
+<span class="nc" id="L318">        CorefChain.CorefMention mention = new CorefChain.CorefMention(</span>
+                mentionType,
+                number,
+                gender,
+                animacy,
+                startIndex,
+                endIndex,
+                headIndex,
+                clusterID,
+                mentionID,
+                sentNum,
+                position,
+                span);
+
+<span class="nc" id="L332">        Set&lt;CorefChain.CorefMention&gt; mentionsWithThisHead =</span>
+<span class="nc" id="L333">                mentionMap.get(key);</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if(mentionsWithThisHead == null) {</span>
+<span class="nc" id="L335">          mentionsWithThisHead = Generics.newHashSet();</span>
+<span class="nc" id="L336">          mentionMap.put(key, mentionsWithThisHead);</span>
+        }
+<span class="nc" id="L338">        mentionsWithThisHead.add(mention);</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if(rep) representative = mention;</span>
+      }
+      // construct the cluster
+<span class="nc" id="L342">      CorefChain chain = new CorefChain(cid, mentionMap, representative);</span>
+<span class="nc" id="L343">      chains.put(cid, chain);</span>
+    }
+<span class="nc" id="L345">    reader.readLine();</span>
+<span class="nc" id="L346">    return chains;</span>
+  }
+
+  @Override
+  public OutputStream write(Annotation corpus, OutputStream os) throws IOException {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    if (!(os instanceof GZIPOutputStream)) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">      if(compress) os = new GZIPOutputStream(os);</span>
+    }
+<span class="nc" id="L354">    PrintWriter pw = new PrintWriter(os);</span>
+
+    // save the coref graph in the new format
+<span class="nc" id="L357">    Map&lt;Integer, CorefChain&gt; chains = corpus.get(CorefCoreAnnotations.CorefChainAnnotation.class);</span>
+<span class="nc" id="L358">    saveCorefChains(chains, pw);</span>
+
+    // save the coref graph on one line
+    // Note: this is the old format!
+<span class="nc" id="L362">    List&lt;Pair&lt;IntTuple, IntTuple&gt;&gt; corefGraph = corpus.get(CorefCoreAnnotations.CorefGraphAnnotation.class);</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">    if(corefGraph != null){</span>
+<span class="nc" id="L364">      boolean first = true;</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">      for(Pair&lt;IntTuple, IntTuple&gt; arc: corefGraph){</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        if(! first) pw.print(&quot; &quot;);</span>
+<span class="nc" id="L367">        pw.printf(&quot;%d %d %d %d&quot;, arc.first.get(0), arc.first.get(1), arc.second.get(0), arc.second.get(1));</span>
+<span class="nc" id="L368">        first = false;</span>
+<span class="nc" id="L369">      }</span>
+    }
+<span class="nc" id="L371">    pw.println();</span>
+
+    // save sentences separated by an empty line
+<span class="nc" id="L374">    List&lt;CoreMap&gt; sentences = corpus.get(CoreAnnotations.SentencesAnnotation.class);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">    for(CoreMap sent: sentences){</span>
+      // save the parse tree first, on a single line
+<span class="nc" id="L377">      Tree tree = sent.get(TreeCoreAnnotations.TreeAnnotation.class);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      if(tree != null){</span>
+<span class="nc" id="L379">        String treeString = tree.toString();</span>
+        // no \n allowed in the parse tree string (might happen due to tokenization of HTML/XML/RDF tags)
+<span class="nc" id="L381">        treeString = treeString.replaceAll(&quot;\n&quot;, &quot; &quot;);</span>
+<span class="nc" id="L382">        pw.println(treeString);</span>
+<span class="nc" id="L383">      }</span>
+<span class="nc" id="L384">      else pw.println();</span>
+
+<span class="nc" id="L386">      SemanticGraph collapsedDeps = sent.get(SemanticGraphCoreAnnotations.CollapsedDependenciesAnnotation.class);</span>
+<span class="nc" id="L387">      saveDependencyGraph(collapsedDeps, pw);</span>
+<span class="nc" id="L388">      SemanticGraph uncollapsedDeps = sent.get(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class);</span>
+<span class="nc" id="L389">      saveDependencyGraph(uncollapsedDeps, pw);</span>
+<span class="nc" id="L390">      SemanticGraph ccDeps = sent.get(SemanticGraphCoreAnnotations.CollapsedCCProcessedDependenciesAnnotation.class);</span>
+<span class="nc" id="L391">      saveDependencyGraph(ccDeps, pw);</span>
+
+      // save all sentence tokens
+<span class="nc" id="L394">      List&lt;CoreLabel&gt; tokens = sent.get(CoreAnnotations.TokensAnnotation.class);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">      if(tokens != null){</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        for(CoreLabel token: tokens){</span>
+<span class="nc" id="L397">          saveToken(token, haveExplicitAntecedent, pw);</span>
+<span class="nc" id="L398">          pw.println();</span>
+<span class="nc" id="L399">        }</span>
+      }
+
+      // add an empty line after every sentence
+<span class="nc" id="L403">      pw.println();</span>
+<span class="nc" id="L404">    }</span>
+<span class="nc" id="L405">    pw.flush();</span>
+<span class="nc" id="L406">    return os;</span>
+  }
+
+  @Override
+  public Pair&lt;Annotation, InputStream&gt; read(InputStream is) throws IOException {
+<span class="nc bnc" id="L411" title="All 4 branches missed.">    if(compress &amp;&amp; !(is instanceof GZIPInputStream)) is = new GZIPInputStream(is);</span>
+<span class="nc" id="L412">    BufferedReader reader = new BufferedReader(new InputStreamReader(is));</span>
+<span class="nc" id="L413">    Annotation doc = new Annotation(&quot;&quot;);</span>
+    String line;
+
+    // read the coref graph (new format)
+<span class="nc" id="L417">    Map&lt;Integer, CorefChain&gt; chains = loadCorefChains(reader);</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">    if(chains != null) doc.set(CorefCoreAnnotations.CorefChainAnnotation.class, chains);</span>
+
+    // read the coref graph (old format)
+<span class="nc" id="L421">    line = reader.readLine().trim();</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">    if(line.length() &gt; 0){</span>
+<span class="nc" id="L423">      String [] bits = line.split(&quot; &quot;);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">      if(bits.length % 4 != 0){</span>
+<span class="nc" id="L425">        throw new RuntimeIOException(&quot;ERROR: Incorrect format for the serialized coref graph: &quot; + line);</span>
+      }
+<span class="nc" id="L427">      List&lt;Pair&lt;IntTuple, IntTuple&gt;&gt; corefGraph = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">      for(int i = 0; i &lt; bits.length; i += 4){</span>
+<span class="nc" id="L429">        IntTuple src = new IntTuple(2);</span>
+<span class="nc" id="L430">        IntTuple dst = new IntTuple(2);</span>
+<span class="nc" id="L431">        src.set(0, Integer.parseInt(bits[i]));</span>
+<span class="nc" id="L432">        src.set(1, Integer.parseInt(bits[i + 1]));</span>
+<span class="nc" id="L433">        dst.set(0, Integer.parseInt(bits[i + 2]));</span>
+<span class="nc" id="L434">        dst.set(1, Integer.parseInt(bits[i + 3]));</span>
+<span class="nc" id="L435">        corefGraph.add(new Pair&lt;&gt;(src, dst));</span>
+      }
+<span class="nc" id="L437">      doc.set(CorefCoreAnnotations.CorefGraphAnnotation.class, corefGraph);</span>
+    }
+
+    // read individual sentences
+<span class="nc" id="L441">    List&lt;CoreMap&gt; sentences = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    while((line = reader.readLine()) != null){</span>
+<span class="nc" id="L443">      CoreMap sentence = new Annotation(&quot;&quot;);</span>
+
+      // first line is the parse tree. construct it with CoreLabels in Tree nodes
+<span class="nc" id="L446">      Tree tree = new PennTreeReader(new StringReader(line), new LabeledScoredTreeFactory(CoreLabel.factory())).readTree();</span>
+<span class="nc" id="L447">      sentence.set(TreeCoreAnnotations.TreeAnnotation.class, tree);</span>
+
+      // read the dependency graphs
+<span class="nc" id="L450">      IntermediateSemanticGraph intermCollapsedDeps = loadDependencyGraph(reader);</span>
+<span class="nc" id="L451">      IntermediateSemanticGraph intermUncollapsedDeps = loadDependencyGraph(reader);</span>
+<span class="nc" id="L452">      IntermediateSemanticGraph intermCcDeps = loadDependencyGraph(reader);</span>
+
+      // the remaining lines until empty line are tokens
+<span class="nc" id="L455">      List&lt;CoreLabel&gt; tokens = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">      while((line = reader.readLine()) != null){</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if(line.length() == 0) break;</span>
+<span class="nc" id="L458">        CoreLabel token = loadToken(line, haveExplicitAntecedent);</span>
+<span class="nc" id="L459">        tokens.add(token);</span>
+<span class="nc" id="L460">      }</span>
+<span class="nc" id="L461">      sentence.set(CoreAnnotations.TokensAnnotation.class, tokens);</span>
+
+      // convert the intermediate graph to an actual SemanticGraph
+<span class="nc" id="L464">      SemanticGraph collapsedDeps = intermCollapsedDeps.convertIntermediateGraph(tokens);</span>
+<span class="nc" id="L465">      sentence.set(SemanticGraphCoreAnnotations.CollapsedDependenciesAnnotation.class, collapsedDeps);</span>
+<span class="nc" id="L466">      SemanticGraph uncollapsedDeps = intermUncollapsedDeps.convertIntermediateGraph(tokens);</span>
+<span class="nc" id="L467">      sentence.set(SemanticGraphCoreAnnotations.BasicDependenciesAnnotation.class, uncollapsedDeps);</span>
+<span class="nc" id="L468">      SemanticGraph ccDeps = intermCcDeps.convertIntermediateGraph(tokens);</span>
+<span class="nc" id="L469">      sentence.set(SemanticGraphCoreAnnotations.CollapsedCCProcessedDependenciesAnnotation.class, ccDeps);</span>
+
+<span class="nc" id="L471">      sentences.add(sentence);</span>
+<span class="nc" id="L472">    }</span>
+<span class="nc" id="L473">    doc.set(CoreAnnotations.SentencesAnnotation.class, sentences);</span>
+
+<span class="nc" id="L475">    return Pair.makePair(doc, is);</span>
+  }
+
+  private static final String SPACE_HOLDER = &quot;##&quot;;
+
+  private static CoreLabel loadToken(String line, boolean haveExplicitAntecedent) {
+<span class="nc" id="L481">    CoreLabel token = new CoreLabel();</span>
+<span class="nc" id="L482">    String [] bits = line.split(&quot;\t&quot;, -1);</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">    if(bits.length &lt; 7) throw new RuntimeIOException(&quot;ERROR: Invalid format token for serialized token (only &quot; + bits.length + &quot; tokens): &quot; + line);</span>
+
+    // word
+<span class="nc" id="L486">    String word = bits[0].replaceAll(SPACE_HOLDER, &quot; &quot;);</span>
+<span class="nc" id="L487">    token.set(CoreAnnotations.TextAnnotation.class, word);</span>
+<span class="nc" id="L488">    token.set(CoreAnnotations.ValueAnnotation.class, word);</span>
+    // if(word.length() == 0) log.info(&quot;FOUND 0-LENGTH TOKEN!&quot;);
+
+    // lemma
+<span class="nc bnc" id="L492" title="All 4 branches missed.">    if(bits[1].length() &gt; 0 || bits[0].length() == 0){</span>
+<span class="nc" id="L493">      String lemma = bits[1].replaceAll(SPACE_HOLDER, &quot; &quot;);</span>
+<span class="nc" id="L494">      token.set(CoreAnnotations.LemmaAnnotation.class, lemma);</span>
+    }
+    // POS tag
+<span class="nc bnc" id="L497" title="All 2 branches missed.">    if(bits[2].length() &gt; 0) token.set(CoreAnnotations.PartOfSpeechAnnotation.class, bits[2]);</span>
+    // NE tag
+<span class="nc bnc" id="L499" title="All 2 branches missed.">    if(bits[3].length() &gt; 0) token.set(CoreAnnotations.NamedEntityTagAnnotation.class, bits[3]);</span>
+    // Normalized NE tag
+<span class="nc bnc" id="L501" title="All 2 branches missed.">    if(bits[4].length() &gt; 0) token.set(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class, bits[4]);</span>
+    // Character offsets
+<span class="nc bnc" id="L503" title="All 2 branches missed.">    if(bits[5].length() &gt; 0) token.set(CoreAnnotations.CharacterOffsetBeginAnnotation.class, Integer.parseInt(bits[5]));</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">    if(bits[6].length() &gt; 0) token.set(CoreAnnotations.CharacterOffsetEndAnnotation.class, Integer.parseInt(bits[6]));</span>
+
+<span class="nc bnc" id="L506" title="All 2 branches missed.">    if(haveExplicitAntecedent){</span>
+      // This block is specific to KBP
+      // We may have AntecedentAnnotation
+<span class="nc bnc" id="L509" title="All 2 branches missed.">      if(bits.length &gt; 7){</span>
+<span class="nc" id="L510">        String aa = bits[7].replaceAll(SPACE_HOLDER, &quot; &quot;);</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if(aa.length() &gt; 0) token.set(CoreAnnotations.AntecedentAnnotation.class, aa);</span>
+      }
+    }
+
+<span class="nc" id="L515">    return token;</span>
+  }
+
+  /**
+   * Saves one individual sentence token, in a simple tabular format, in the style of CoNLL
+   * @param token
+   * @param pw
+   */
+  private static void saveToken(CoreLabel token, boolean haveExplicitAntecedent, PrintWriter pw) {
+<span class="nc" id="L524">    String word = token.get(CoreAnnotations.TextAnnotation.class);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    if (word == null) {</span>
+<span class="nc" id="L526">      word = token.get(CoreAnnotations.ValueAnnotation.class);</span>
+    }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">    if(word != null){</span>
+<span class="nc" id="L529">      word = word.replaceAll(&quot;\\s+&quot;, SPACE_HOLDER); // spaces are used for formatting</span>
+<span class="nc" id="L530">      pw.print(word);</span>
+    }
+
+<span class="nc" id="L533">    pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L534">    String lemma = token.get(CoreAnnotations.LemmaAnnotation.class);</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">    if(lemma != null){</span>
+<span class="nc" id="L536">      lemma = lemma.replaceAll(&quot;\\s+&quot;, SPACE_HOLDER); // spaces are used for formatting</span>
+<span class="nc" id="L537">      pw.print(lemma);</span>
+    }
+
+<span class="nc" id="L540">    pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L541">    String pos = token.get(CoreAnnotations.PartOfSpeechAnnotation.class);</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    if(pos != null) pw.print(pos);</span>
+
+<span class="nc" id="L544">    pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L545">    String ner = token.get(CoreAnnotations.NamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">    if(ner != null) pw.print(ner);</span>
+
+<span class="nc" id="L548">    pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L549">    String normNer = token.get(CoreAnnotations.NormalizedNamedEntityTagAnnotation.class);</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">    if(normNer != null) pw.print(normNer);</span>
+
+<span class="nc" id="L552">    pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L553">    Integer charBegin = token.get(CoreAnnotations.CharacterOffsetBeginAnnotation.class);</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">    if(charBegin != null) pw.print(charBegin);</span>
+
+<span class="nc" id="L556">    pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L557">    Integer charEnd = token.get(CoreAnnotations.CharacterOffsetEndAnnotation.class);</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">    if(charEnd != null) pw.print(charEnd);</span>
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">    if(haveExplicitAntecedent){</span>
+      // This block is specific to KBP
+      // in some cases where we now the entity in focus (i.e., web queries), AntecedentAnnotation is generated
+      // let's save it as an optional, always last, token
+<span class="nc" id="L564">      String aa = token.get(CoreAnnotations.AntecedentAnnotation.class);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">      if(aa != null){</span>
+<span class="nc" id="L566">        pw.print(&quot;\t&quot;);</span>
+<span class="nc" id="L567">        aa = aa.replaceAll(&quot;\\s+&quot;, SPACE_HOLDER); // spaces are used for formatting</span>
+<span class="nc" id="L568">        pw.print(aa);</span>
+      }
+    }
+<span class="nc" id="L571">  }</span>
+
+  public static void main(String[] args) throws Exception {
+<span class="nc" id="L574">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L575">    StanfordCoreNLP pipeline = new StanfordCoreNLP(props);</span>
+<span class="nc" id="L576">    String file = props.getProperty(&quot;file&quot;);</span>
+<span class="nc" id="L577">    String loadFile = props.getProperty(&quot;loadFile&quot;);</span>
+<span class="nc bnc" id="L578" title="All 4 branches missed.">    if (loadFile != null &amp;&amp; ! loadFile.isEmpty()) {</span>
+<span class="nc" id="L579">      CustomAnnotationSerializer ser = new CustomAnnotationSerializer(false, false);</span>
+<span class="nc" id="L580">      InputStream is = new FileInputStream(loadFile);</span>
+<span class="nc" id="L581">      Pair&lt;Annotation, InputStream&gt; pair = ser.read(is);</span>
+<span class="nc" id="L582">      pair.second.close();</span>
+<span class="nc" id="L583">      Annotation anno = pair.first;</span>
+<span class="nc" id="L584">      System.out.println(anno.toShorterString(StringUtils.EMPTY_STRING_ARRAY));</span>
+<span class="nc" id="L585">      is.close();</span>
+<span class="nc bnc" id="L586" title="All 4 branches missed.">    } else if (file != null &amp;&amp; ! file.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L587">      String text = edu.stanford.nlp.io.IOUtils.slurpFile(file);</span>
+<span class="nc" id="L588">      Annotation doc = new Annotation(text);</span>
+<span class="nc" id="L589">      pipeline.annotate(doc);</span>
+
+<span class="nc" id="L591">      CustomAnnotationSerializer ser = new CustomAnnotationSerializer(false, false);</span>
+<span class="nc" id="L592">      PrintStream os = new PrintStream(new FileOutputStream(file + &quot;.ser&quot;));</span>
+<span class="nc" id="L593">      ser.write(doc, os).close();</span>
+<span class="nc" id="L594">      log.info(&quot;Serialized annotation saved in &quot; + file + &quot;.ser&quot;);</span>
+<span class="nc" id="L595">    } else {</span>
+<span class="nc" id="L596">      log.info(&quot;usage: CustomAnnotationSerializer [-file file] [-loadFile file]&quot;);</span>
+    }
+<span class="nc" id="L598">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

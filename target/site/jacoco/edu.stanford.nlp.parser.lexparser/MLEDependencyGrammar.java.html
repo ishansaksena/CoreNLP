@@ -1,0 +1,877 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MLEDependencyGrammar.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.parser.lexparser</a> &gt; <span class="el_source">MLEDependencyGrammar.java</span></div><h1>MLEDependencyGrammar.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.parser.lexparser; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.trees.Tree;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.HashIndex;
+import edu.stanford.nlp.util.Index;
+
+import static edu.stanford.nlp.parser.lexparser.IntTaggedWord.ANY_WORD_INT;
+import static edu.stanford.nlp.parser.lexparser.IntTaggedWord.ANY_TAG_INT;
+import static edu.stanford.nlp.parser.lexparser.IntTaggedWord.STOP_WORD_INT;
+import static edu.stanford.nlp.parser.lexparser.IntTaggedWord.STOP_TAG_INT;
+import static edu.stanford.nlp.parser.lexparser.IntDependency.ANY_DISTANCE_INT;
+
+import java.io.*;
+import java.text.NumberFormat;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+
+public class MLEDependencyGrammar extends AbstractDependencyGrammar  {
+
+  /** A logger for this class */
+<span class="nc" id="L28">  private static Redwood.RedwoodChannels log = Redwood.channels(MLEDependencyGrammar.class);</span>
+
+  final boolean useSmoothTagProjection;
+  final boolean useUnigramWordSmoothing;
+
+  static final boolean DEBUG = false;
+
+  protected int numWordTokens;
+
+  /** Stores all the counts for dependencies (with and without the word
+   *  being a wildcard) in the reduced tag space.
+   */
+  protected ClassicCounter&lt;IntDependency&gt; argCounter;
+  protected ClassicCounter&lt;IntDependency&gt; stopCounter;  // reduced tag space
+
+  /** Bayesian m-estimate prior for aT given hTWd against base distribution
+   *  of aT given hTd.
+   *  TODO: Note that these values are overwritten in the constructor. Find what is best and then maybe remove these defaults!
+   */
+<span class="nc" id="L47">  public double smooth_aT_hTWd = 32.0;</span>
+  /** Bayesian m-estimate prior for aTW given hTWd against base distribution
+   *  of aTW given hTd.
+   */
+<span class="nc" id="L51">  public double smooth_aTW_hTWd = 16.0;</span>
+<span class="nc" id="L52">  public double smooth_stop = 4.0;</span>
+  /** Interpolation between model that directly predicts aTW and model
+   *  that predicts aT and then aW given aT.  This percent of the mass
+   *  is on the model directly predicting aTW.
+   */
+<span class="nc" id="L57">  public double interp = 0.6;</span>
+  //  public double distanceDecay = 0.0;
+
+  // extra smoothing hyperparameters for tag projection backoff.  Only used if useSmoothTagProjection is true.
+<span class="nc" id="L61">  public double smooth_aTW_aT = 96.0;  // back off Bayesian m-estimate of aTW given aT to aPTW given aPT</span>
+<span class="nc" id="L62">  public double smooth_aTW_hTd = 32.0; // back off Bayesian m-estimate of aTW_hTd to aPTW_hPTd (?? guessed, not tuned)</span>
+<span class="nc" id="L63">  public double smooth_aT_hTd = 32.0;  // back off Bayesian m-estimate of aT_hTd to aPT_hPTd (?? guessed, not tuned)</span>
+<span class="nc" id="L64">  public double smooth_aPTW_aPT = 16.0;  // back off word prediction from tag to projected tag (only used if useUnigramWordSmoothing is true)</span>
+
+
+
+  public MLEDependencyGrammar(TreebankLangParserParams tlpParams, boolean directional, boolean distance, boolean coarseDistance, boolean basicCategoryTagsInDependencyGrammar, Options op, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc bnc" id="L69" title="All 2 branches missed.">    this(basicCategoryTagsInDependencyGrammar ? new BasicCategoryTagProjection(tlpParams.treebankLanguagePack()) : new TestTagProjection(), tlpParams, directional, distance, coarseDistance, op, wordIndex, tagIndex);</span>
+<span class="nc" id="L70">  }</span>
+
+  public MLEDependencyGrammar(TagProjection tagProjection, TreebankLangParserParams tlpParams, boolean directional, boolean useDistance, boolean useCoarseDistance, Options op, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L73">    super(tlpParams.treebankLanguagePack(), tagProjection, directional, useDistance, useCoarseDistance, op, wordIndex, tagIndex);</span>
+<span class="nc" id="L74">    useSmoothTagProjection = op.useSmoothTagProjection;</span>
+<span class="nc" id="L75">    useUnigramWordSmoothing = op.useUnigramWordSmoothing;</span>
+<span class="nc" id="L76">    argCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L77">    stopCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L78">    double[] smoothParams = tlpParams.MLEDependencyGrammarSmoothingParams();</span>
+<span class="nc" id="L79">    smooth_aT_hTWd = smoothParams[0];</span>
+<span class="nc" id="L80">    smooth_aTW_hTWd = smoothParams[1];</span>
+<span class="nc" id="L81">    smooth_stop = smoothParams[2];</span>
+<span class="nc" id="L82">    interp = smoothParams[3];</span>
+
+    // cdm added Jan 2007 to play with dep grammar smoothing.  Integrate this better if we keep it!
+<span class="nc" id="L85">    smoothTP = new BasicCategoryTagProjection(tlpParams.treebankLanguagePack());</span>
+<span class="nc" id="L86">  }</span>
+
+  @Override
+  public String toString() {
+<span class="nc" id="L90">    NumberFormat nf = NumberFormat.getNumberInstance();</span>
+<span class="nc" id="L91">    nf.setMaximumFractionDigits(2);</span>
+<span class="nc" id="L92">    StringBuilder sb = new StringBuilder(2000);</span>
+<span class="nc" id="L93">    String cl = getClass().getName();</span>
+<span class="nc" id="L94">    sb.append(cl.substring(cl.lastIndexOf('.') + 1)).append(&quot;[tagbins=&quot;);</span>
+<span class="nc" id="L95">    sb.append(numTagBins).append(&quot;,wordTokens=&quot;).append(numWordTokens).append(&quot;; head -&gt; arg\n&quot;);</span>
+//    for (Iterator dI = coreDependencies.keySet().iterator(); dI.hasNext();) {
+//      IntDependency d = (IntDependency) dI.next();
+//      double count = coreDependencies.getCount(d);
+//      sb.append(d + &quot; count &quot; + nf.format(count));
+//      if (dI.hasNext()) {
+//        sb.append(&quot;,&quot;);
+//      }
+//      sb.append(&quot;\n&quot;);
+//    }
+<span class="nc" id="L105">    sb.append(&quot;]&quot;);</span>
+<span class="nc" id="L106">    return sb.toString();</span>
+  }
+
+  public boolean pruneTW(IntTaggedWord argTW) {
+<span class="nc" id="L110">    String[] punctTags = tlp.punctuationTags();</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    for (String punctTag : punctTags) {</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">      if (argTW.tag == tagIndex.indexOf(punctTag)) {</span>
+<span class="nc" id="L113">        return true;</span>
+      }
+    }
+<span class="nc" id="L116">    return false;</span>
+  }
+
+<span class="nc" id="L119">  static class EndHead {</span>
+    public int end;
+    public int head;
+  }
+
+  /** Adds dependencies to list depList.  These are in terms of the original
+   *  tag set not the reduced (projected) tag set.
+   */
+  protected static EndHead treeToDependencyHelper(Tree tree, List&lt;IntDependency&gt; depList, int loc, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+    //       try {
+    // 	PrintWriter pw = new PrintWriter(new OutputStreamWriter(System.out,&quot;GB18030&quot;),true);
+    // 	tree.pennPrint(pw);
+    //       }
+    //       catch (UnsupportedEncodingException e) {}
+
+<span class="nc bnc" id="L134" title="All 4 branches missed.">    if (tree.isLeaf() || tree.isPreTerminal()) {</span>
+<span class="nc" id="L135">      EndHead tempEndHead = new EndHead();</span>
+<span class="nc" id="L136">      tempEndHead.head = loc;</span>
+<span class="nc" id="L137">      tempEndHead.end = loc + 1;</span>
+<span class="nc" id="L138">      return tempEndHead;</span>
+    }
+<span class="nc" id="L140">    Tree[] kids = tree.children();</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">    if (kids.length == 1) {</span>
+<span class="nc" id="L142">      return treeToDependencyHelper(kids[0], depList, loc, wordIndex, tagIndex);</span>
+    }
+<span class="nc" id="L144">    EndHead tempEndHead = treeToDependencyHelper(kids[0], depList, loc, wordIndex, tagIndex);</span>
+<span class="nc" id="L145">    int lHead = tempEndHead.head;</span>
+<span class="nc" id="L146">    int split = tempEndHead.end;</span>
+<span class="nc" id="L147">    tempEndHead = treeToDependencyHelper(kids[1], depList, tempEndHead.end, wordIndex, tagIndex);</span>
+<span class="nc" id="L148">    int end = tempEndHead.end;</span>
+<span class="nc" id="L149">    int rHead = tempEndHead.head;</span>
+<span class="nc" id="L150">    String hTag = ((HasTag) tree.label()).tag();</span>
+<span class="nc" id="L151">    String lTag = ((HasTag) kids[0].label()).tag();</span>
+<span class="nc" id="L152">    String rTag = ((HasTag) kids[1].label()).tag();</span>
+<span class="nc" id="L153">    String hWord = ((HasWord) tree.label()).word();</span>
+<span class="nc" id="L154">    String lWord = ((HasWord) kids[0].label()).word();</span>
+<span class="nc" id="L155">    String rWord = ((HasWord) kids[1].label()).word();</span>
+<span class="nc" id="L156">    boolean leftHeaded = hWord.equals(lWord);</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">    String aTag = (leftHeaded ? rTag : lTag);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">    String aWord = (leftHeaded ? rWord : lWord);</span>
+<span class="nc" id="L159">    int hT = tagIndex.indexOf(hTag);</span>
+<span class="nc" id="L160">    int aT = tagIndex.indexOf(aTag);</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">    int hW = (wordIndex.contains(hWord) ? wordIndex.indexOf(hWord) : wordIndex.indexOf(Lexicon.UNKNOWN_WORD));</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">    int aW = (wordIndex.contains(aWord) ? wordIndex.indexOf(aWord) : wordIndex.indexOf(Lexicon.UNKNOWN_WORD));</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">    int head = (leftHeaded ? lHead : rHead);</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">    int arg = (leftHeaded ? rHead : lHead);</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">    IntDependency dependency = new IntDependency(hW, hT, aW, aT, leftHeaded, (leftHeaded ? split - head - 1 : head - split));</span>
+<span class="nc" id="L166">    depList.add(dependency);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">    IntDependency stopL = new IntDependency(aW, aT, STOP_WORD_INT, STOP_TAG_INT, false, (leftHeaded ? arg - split : arg - loc));</span>
+<span class="nc" id="L168">    depList.add(stopL);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    IntDependency stopR = new IntDependency(aW, aT, STOP_WORD_INT, STOP_TAG_INT, true, (leftHeaded ? end - arg - 1 : split - arg - 1));</span>
+<span class="nc" id="L170">    depList.add(stopR);</span>
+    //System.out.println(&quot;Adding: &quot;+dependency+&quot; at &quot;+tree.label());
+<span class="nc" id="L172">    tempEndHead.head = head;</span>
+<span class="nc" id="L173">    return tempEndHead;</span>
+  }
+
+
+  public void dumpSizes() {
+//    System.out.println(&quot;core dep &quot; + coreDependencies.size());
+<span class="nc" id="L179">    System.out.println(&quot;arg counter &quot; + argCounter.size());</span>
+<span class="nc" id="L180">    System.out.println(&quot;stop counter &quot; + stopCounter.size());</span>
+<span class="nc" id="L181">  }</span>
+
+  /** Returns the List of dependencies for a binarized Tree.
+   *  In this tree, one of the two children always equals the head.
+   *  The dependencies are in terms of
+   *  the original tag set not the reduced (projected) tag set.
+   *
+   *  @param tree A tree to be analyzed as dependencies
+   *  @return The list of dependencies in the tree (int format)
+   */
+  public static List&lt;IntDependency&gt; treeToDependencyList(Tree tree, Index&lt;String&gt; wordIndex, Index&lt;String&gt; tagIndex) {
+<span class="nc" id="L192">    List&lt;IntDependency&gt; depList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L193">    treeToDependencyHelper(tree, depList, 0, wordIndex, tagIndex);</span>
+    if (DEBUG) {
+      System.out.println(&quot;----------------------------&quot;);
+      tree.pennPrint();
+      System.out.println(depList);
+    }
+<span class="nc" id="L199">    return depList;</span>
+  }
+
+  public double scoreAll(Collection&lt;IntDependency&gt; deps) {
+<span class="nc" id="L203">    double totalScore = 0.0;</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">    for (IntDependency d : deps) {</span>
+      //if (d.head.word == wordIndex.indexOf(&quot;via&quot;) ||
+      //          d.arg.word == wordIndex.indexOf(&quot;via&quot;))
+      //System.out.println(d+&quot; at &quot;+score(d));
+<span class="nc" id="L208">      double score = score(d);</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">      if (score &gt; Double.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L210">        totalScore += score;</span>
+      }
+<span class="nc" id="L212">    }</span>
+<span class="nc" id="L213">    return totalScore;</span>
+  }
+
+  /** Tune the smoothing and interpolation parameters of the dependency
+   *  grammar based on a tuning treebank.
+   *
+   *  @param trees A Collection of Trees for setting parameters
+   */
+  @Override
+  public void tune(Collection&lt;Tree&gt; trees) {
+<span class="nc" id="L223">    List&lt;IntDependency&gt; deps = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">    for (Tree tree : trees) {</span>
+<span class="nc" id="L225">      deps.addAll(treeToDependencyList(tree, wordIndex, tagIndex));</span>
+<span class="nc" id="L226">    }</span>
+
+<span class="nc" id="L228">    double bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L229">    double bestSmooth_stop = 0.0;</span>
+<span class="nc" id="L230">    double bestSmooth_aTW_hTWd = 0.0;</span>
+<span class="nc" id="L231">    double bestSmooth_aT_hTWd = 0.0;</span>
+<span class="nc" id="L232">    double bestInterp = 0.0;</span>
+
+<span class="nc" id="L234">    log.info(&quot;Tuning smooth_stop...&quot;);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">    for (smooth_stop = 1.0/100.0; smooth_stop &lt; 100.0; smooth_stop *= 1.25) {</span>
+<span class="nc" id="L236">      double totalScore = 0.0;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">      for (IntDependency dep : deps) {</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        if (!rootTW(dep.head)) {</span>
+<span class="nc" id="L239">          double stopProb = getStopProb(dep);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">          if (!dep.arg.equals(stopTW)) {</span>
+<span class="nc" id="L241">            stopProb = 1.0 - stopProb;</span>
+          }
+<span class="nc bnc" id="L243" title="All 2 branches missed.">          if (stopProb &gt; 0.0) {</span>
+<span class="nc" id="L244">            totalScore += Math.log(stopProb);</span>
+          }
+        }
+<span class="nc" id="L247">      }</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">      if (totalScore &gt; bestScore) {</span>
+<span class="nc" id="L249">        bestScore = totalScore;</span>
+<span class="nc" id="L250">        bestSmooth_stop = smooth_stop;</span>
+      }
+    }
+<span class="nc" id="L253">    smooth_stop = bestSmooth_stop;</span>
+<span class="nc" id="L254">    log.info(&quot;Tuning selected smooth_stop: &quot; + smooth_stop);</span>
+
+<span class="nc bnc" id="L256" title="All 2 branches missed.">    for (Iterator&lt;IntDependency&gt; iter = deps.iterator(); iter.hasNext(); ) {</span>
+<span class="nc" id="L257">      IntDependency dep = iter.next();</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">      if (dep.arg.equals(stopTW)) {</span>
+<span class="nc" id="L259">        iter.remove();</span>
+      }
+<span class="nc" id="L261">    }</span>
+
+<span class="nc" id="L263">    log.info(&quot;Tuning other parameters...&quot;);</span>
+
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    if ( ! useSmoothTagProjection) {</span>
+<span class="nc" id="L266">      bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">      for (smooth_aTW_hTWd = 0.5; smooth_aTW_hTWd &lt; 100.0; smooth_aTW_hTWd *= 1.25) {</span>
+<span class="nc" id="L268">        log.info(&quot;.&quot;);</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        for (smooth_aT_hTWd = 0.5; smooth_aT_hTWd &lt; 100.0; smooth_aT_hTWd *= 1.25) {</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">          for (interp = 0.02; interp &lt; 1.0; interp += 0.02) {</span>
+<span class="nc" id="L271">            double totalScore = 0.0;</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            for (IntDependency dep : deps) {</span>
+<span class="nc" id="L273">              double score = score(dep);</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">              if (score &gt; Double.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L275">                totalScore += score;</span>
+              }
+<span class="nc" id="L277">            }</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">            if (totalScore &gt; bestScore) {</span>
+<span class="nc" id="L279">              bestScore = totalScore;</span>
+<span class="nc" id="L280">              bestInterp = interp;</span>
+<span class="nc" id="L281">              bestSmooth_aTW_hTWd = smooth_aTW_hTWd;</span>
+<span class="nc" id="L282">              bestSmooth_aT_hTWd = smooth_aT_hTWd;</span>
+<span class="nc" id="L283">              log.info(&quot;Current best interp: &quot; + interp + &quot; with score &quot; + totalScore);</span>
+            }
+          }
+        }
+      }
+<span class="nc" id="L288">      smooth_aTW_hTWd = bestSmooth_aTW_hTWd;</span>
+<span class="nc" id="L289">      smooth_aT_hTWd = bestSmooth_aT_hTWd;</span>
+<span class="nc" id="L290">      interp = bestInterp;</span>
+    } else {
+      // for useSmoothTagProjection
+<span class="nc" id="L293">      double bestSmooth_aTW_aT = 0.0;</span>
+<span class="nc" id="L294">      double bestSmooth_aTW_hTd = 0.0;</span>
+<span class="nc" id="L295">      double bestSmooth_aT_hTd = 0.0;</span>
+
+<span class="nc" id="L297">      bestScore = Double.NEGATIVE_INFINITY;</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      for (smooth_aTW_hTWd = 1.125; smooth_aTW_hTWd &lt; 100.0; smooth_aTW_hTWd *= 1.5) {</span>
+<span class="nc" id="L299">        log.info(&quot;#&quot;);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        for (smooth_aT_hTWd = 1.125; smooth_aT_hTWd &lt; 100.0; smooth_aT_hTWd *= 1.5) {</span>
+<span class="nc" id="L301">          log.info(&quot;:&quot;);</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">          for (smooth_aTW_aT = 1.125; smooth_aTW_aT &lt; 200.0; smooth_aTW_aT *= 1.5) {</span>
+<span class="nc" id="L303">            log.info(&quot;.&quot;);</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">            for (smooth_aTW_hTd = 1.125; smooth_aTW_hTd &lt; 100.0; smooth_aTW_hTd *= 1.5) {</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">              for (smooth_aT_hTd = 1.125; smooth_aT_hTd &lt; 100.0; smooth_aT_hTd *= 1.5) {</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">                for (interp = 0.2; interp &lt;= 0.8; interp += 0.02) {</span>
+<span class="nc" id="L307">                  double totalScore = 0.0;</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                  for (IntDependency dep : deps) {</span>
+<span class="nc" id="L309">                    double score = score(dep);</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                    if (score &gt; Double.NEGATIVE_INFINITY) {</span>
+<span class="nc" id="L311">                      totalScore += score;</span>
+                    }
+<span class="nc" id="L313">                  }</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                  if (totalScore &gt; bestScore) {</span>
+<span class="nc" id="L315">                    bestScore = totalScore;</span>
+<span class="nc" id="L316">                    bestInterp = interp;</span>
+<span class="nc" id="L317">                    bestSmooth_aTW_hTWd = smooth_aTW_hTWd;</span>
+<span class="nc" id="L318">                    bestSmooth_aT_hTWd = smooth_aT_hTWd;</span>
+<span class="nc" id="L319">                    bestSmooth_aTW_aT = smooth_aTW_aT;</span>
+<span class="nc" id="L320">                    bestSmooth_aTW_hTd = smooth_aTW_hTd;</span>
+<span class="nc" id="L321">                    bestSmooth_aT_hTd = smooth_aT_hTd;</span>
+<span class="nc" id="L322">                    log.info(&quot;Current best interp: &quot; + interp + &quot; with score &quot; + totalScore);</span>
+                  }
+                }
+              }
+            }
+          }
+        }
+<span class="nc" id="L329">        log.info();</span>
+      }
+<span class="nc" id="L331">      smooth_aTW_hTWd = bestSmooth_aTW_hTWd;</span>
+<span class="nc" id="L332">      smooth_aT_hTWd = bestSmooth_aT_hTWd;</span>
+<span class="nc" id="L333">      smooth_aTW_aT = bestSmooth_aTW_aT;</span>
+<span class="nc" id="L334">      smooth_aTW_hTd = bestSmooth_aTW_hTd;</span>
+<span class="nc" id="L335">      smooth_aT_hTd = bestSmooth_aT_hTd;</span>
+<span class="nc" id="L336">      interp = bestInterp;</span>
+    }
+
+<span class="nc" id="L339">    log.info(&quot;\nTuning selected smooth_aTW_hTWd: &quot; + smooth_aTW_hTWd + &quot; smooth_aT_hTWd: &quot; + smooth_aT_hTWd + &quot; interp: &quot; + interp + &quot; smooth_aTW_aT: &quot; + smooth_aTW_aT + &quot; smooth_aTW_hTd: &quot; + smooth_aTW_hTd + &quot; smooth_aT_hTd: &quot; + smooth_aT_hTd);</span>
+<span class="nc" id="L340">  }</span>
+
+
+  /** Add this dependency with the given count to the grammar.
+   *  This is the main entry point of MLEDependencyGrammarExtractor.
+   *  This is a dependency represented in the full tag space.
+   */
+  public void addRule(IntDependency dependency, double count) {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    if ( ! directional) {</span>
+<span class="nc" id="L349">      dependency = new IntDependency(dependency.head, dependency.arg, false, dependency.distance);</span>
+    }
+    if (verbose) log.info(&quot;Adding dep &quot; + dependency);
+    //    coreDependencies.incrementCount(dependency, count);
+    /*new IntDependency(dependency.head.word,
+                                        dependency.head.tag,
+                                        dependency.arg.word,
+                                        dependency.arg.tag,
+                                        dependency.leftHeaded,
+                                        dependency.distance), count);
+    */
+<span class="nc" id="L360">    expandDependency(dependency, count);</span>
+    // log.info(&quot;stopCounter: &quot; + stopCounter);
+    // log.info(&quot;argCounter: &quot; + argCounter);
+<span class="nc" id="L363">  }</span>
+
+  /** The indices of this list are in the tag binned space. */
+<span class="nc" id="L366">  protected transient List&lt;IntTaggedWord&gt; tagITWList = null; //new ArrayList();</span>
+
+
+  /** This maps from a tag to a cached IntTagWord that represents the
+   *  tag by having the wildcard word ANY_WORD_INT and  the tag in the
+   *  reduced tag space.
+   *  The argument is in terms of the full tag space; internally this
+   *  function maps to the reduced space.
+   *  @param tag short representation of tag in full tag space
+   *  @return an IntTaggedWord in the reduced tag space
+   */
+  private IntTaggedWord getCachedITW(short tag) {
+    // The +2 below is because -1 and -2 are used with special meanings (see IntTaggedWord).
+<span class="nc bnc" id="L379" title="All 2 branches missed.">    if (tagITWList == null) {</span>
+<span class="nc" id="L380">      tagITWList = new ArrayList&lt;&gt;(numTagBins + 2);</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      for (int i=0; i&lt;numTagBins + 2; i++) {</span>
+<span class="nc" id="L382">        tagITWList.add(i, null);</span>
+      }
+    }
+<span class="nc" id="L385">    IntTaggedWord headT = tagITWList.get(tagBin(tag) + 2);</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">    if (headT == null) {</span>
+<span class="nc" id="L387">      headT = new IntTaggedWord(ANY_WORD_INT, tagBin(tag));</span>
+<span class="nc" id="L388">      tagITWList.set(tagBin(tag) + 2, headT);</span>
+    }
+<span class="nc" id="L390">    return headT;</span>
+  }
+
+  /** The dependency arg is still in the full tag space.
+   *
+   *  @param dependency An opbserved dependency
+   *  @param count The weight of the dependency
+   */
+  protected void expandDependency(IntDependency dependency, double count) {
+    //if (Test.prunePunc &amp;&amp; pruneTW(dependency.arg))
+    //  return;
+<span class="nc bnc" id="L401" title="All 4 branches missed.">    if (dependency.head == null || dependency.arg == null) {</span>
+<span class="nc" id="L402">      return;</span>
+    }
+
+<span class="nc bnc" id="L405" title="All 2 branches missed.">    if (dependency.arg.word != STOP_WORD_INT) {</span>
+<span class="nc" id="L406">      expandArg(dependency, valenceBin(dependency.distance), count);</span>
+    }
+<span class="nc" id="L408">    expandStop(dependency, distanceBin(dependency.distance), count, true);</span>
+<span class="nc" id="L409">  }</span>
+
+  private TagProjection smoothTP;
+  private Index&lt;String&gt; smoothTPIndex;
+  private static final String TP_PREFIX = &quot;.*TP*.&quot;;
+
+  private short tagProject(short tag) {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">    if (smoothTPIndex == null) {</span>
+<span class="nc" id="L417">      smoothTPIndex = new HashIndex&lt;&gt;(tagIndex);</span>
+    }
+<span class="nc bnc" id="L419" title="All 2 branches missed.">    if (tag &lt; 0) {</span>
+<span class="nc" id="L420">      return tag;</span>
+    } else {
+<span class="nc" id="L422">      String tagStr = smoothTPIndex.get(tag);</span>
+<span class="nc" id="L423">      String binStr = TP_PREFIX + smoothTP.project(tagStr);</span>
+<span class="nc" id="L424">      return (short) smoothTPIndex.addToIndex(binStr);</span>
+    }
+  }
+
+
+  /** Collect counts for a non-STOP dependent.
+   *  The dependency arg is still in the full tag space.
+   *
+   *  @param dependency A non-stop dependency
+   *  @param valBinDist A binned distance
+   *  @param count The weight with which to add this dependency
+   */
+  private void expandArg(IntDependency dependency, short valBinDist, double count) {
+<span class="nc" id="L437">    IntTaggedWord headT = getCachedITW(dependency.head.tag);</span>
+<span class="nc" id="L438">    IntTaggedWord argT = getCachedITW(dependency.arg.tag);</span>
+<span class="nc" id="L439">    IntTaggedWord head = new IntTaggedWord(dependency.head.word, tagBin(dependency.head.tag)); //dependency.head;</span>
+<span class="nc" id="L440">    IntTaggedWord arg = new IntTaggedWord(dependency.arg.word, tagBin(dependency.arg.tag)); //dependency.arg;</span>
+<span class="nc" id="L441">    boolean leftHeaded = dependency.leftHeaded;</span>
+
+    // argCounter stores stuff in both the original and the reduced tag space???
+<span class="nc" id="L444">    argCounter.incrementCount(intern(head, arg, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L445">    argCounter.incrementCount(intern(headT, arg, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L446">    argCounter.incrementCount(intern(head, argT, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L447">    argCounter.incrementCount(intern(headT, argT, leftHeaded, valBinDist), count);</span>
+
+<span class="nc" id="L449">    argCounter.incrementCount(intern(head, wildTW, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L450">    argCounter.incrementCount(intern(headT, wildTW, leftHeaded, valBinDist), count);</span>
+
+    // the WILD head stats are always directionless and not useDistance!
+<span class="nc" id="L453">    argCounter.incrementCount(intern(wildTW, arg, false, (short) -1), count);</span>
+<span class="nc" id="L454">    argCounter.incrementCount(intern(wildTW, argT, false, (short) -1), count);</span>
+
+<span class="nc bnc" id="L456" title="All 2 branches missed.">    if (useSmoothTagProjection) {</span>
+      // added stuff to do more smoothing.  CDM Jan 2007
+<span class="nc" id="L458">      IntTaggedWord headP = new IntTaggedWord(dependency.head.word, tagProject(dependency.head.tag));</span>
+<span class="nc" id="L459">      IntTaggedWord headTP = new IntTaggedWord(ANY_WORD_INT, tagProject(dependency.head.tag));</span>
+<span class="nc" id="L460">      IntTaggedWord argP = new IntTaggedWord(dependency.arg.word, tagProject(dependency.arg.tag));</span>
+<span class="nc" id="L461">      IntTaggedWord argTP = new IntTaggedWord(ANY_WORD_INT, tagProject(dependency.arg.tag));</span>
+
+<span class="nc" id="L463">      argCounter.incrementCount(intern(headP, argP, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L464">      argCounter.incrementCount(intern(headTP, argP, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L465">      argCounter.incrementCount(intern(headP, argTP, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L466">      argCounter.incrementCount(intern(headTP, argTP, leftHeaded, valBinDist), count);</span>
+
+<span class="nc" id="L468">      argCounter.incrementCount(intern(headP, wildTW, leftHeaded, valBinDist), count);</span>
+<span class="nc" id="L469">      argCounter.incrementCount(intern(headTP, wildTW, leftHeaded, valBinDist), count);</span>
+
+      // the WILD head stats are always directionless and not useDistance!
+<span class="nc" id="L472">      argCounter.incrementCount(intern(wildTW, argP, false, (short) -1), count);</span>
+<span class="nc" id="L473">      argCounter.incrementCount(intern(wildTW, argTP, false, (short) -1), count);</span>
+<span class="nc" id="L474">      argCounter.incrementCount(intern(wildTW, new IntTaggedWord(dependency.head.word, ANY_TAG_INT), false, (short) -1), count);</span>
+    }
+<span class="nc" id="L476">    numWordTokens++;</span>
+<span class="nc" id="L477">  }</span>
+
+  private void expandStop(IntDependency dependency, short distBinDist, double count, boolean wildForStop) {
+<span class="nc" id="L480">    IntTaggedWord headT = getCachedITW(dependency.head.tag);</span>
+<span class="nc" id="L481">    IntTaggedWord head = new IntTaggedWord(dependency.head.word, tagBin(dependency.head.tag)); //dependency.head;</span>
+<span class="nc" id="L482">    IntTaggedWord arg = new IntTaggedWord(dependency.arg.word, tagBin(dependency.arg.tag));//dependency.arg;</span>
+
+<span class="nc" id="L484">    boolean leftHeaded = dependency.leftHeaded;</span>
+
+<span class="nc bnc" id="L486" title="All 2 branches missed.">    if (arg.word == STOP_WORD_INT) {</span>
+<span class="nc" id="L487">      stopCounter.incrementCount(intern(head, arg, leftHeaded, distBinDist), count);</span>
+<span class="nc" id="L488">      stopCounter.incrementCount(intern(headT, arg, leftHeaded, distBinDist), count);</span>
+    }
+<span class="nc bnc" id="L490" title="All 4 branches missed.">    if (wildForStop || arg.word != STOP_WORD_INT) {</span>
+<span class="nc" id="L491">      stopCounter.incrementCount(intern(head, wildTW, leftHeaded, distBinDist), count);</span>
+<span class="nc" id="L492">      stopCounter.incrementCount(intern(headT, wildTW, leftHeaded, distBinDist), count);</span>
+    }
+<span class="nc" id="L494">  }</span>
+
+  public double countHistory(IntDependency dependency) {
+<span class="nc" id="L497">    IntDependency temp = new IntDependency(dependency.head.word, tagBin(dependency.head.tag), wildTW.word, wildTW.tag, dependency.leftHeaded, valenceBin(dependency.distance));</span>
+
+<span class="nc" id="L499">    return argCounter.getCount(temp);</span>
+  }
+
+  /** Score a tag binned dependency. */
+  public double scoreTB(IntDependency dependency) {
+<span class="nc" id="L504">    return op.testOptions.depWeight * Math.log(probTB(dependency));</span>
+  }
+
+  private static final boolean verbose = false;
+
+  protected static final double MIN_PROBABILITY = 1e-40;
+
+  /** Calculate the probability of a dependency as a real probability between
+   *  0 and 1 inclusive.
+   *  @param dependency The dependency for which the probability is to be
+   *       calculated.   The tags in this dependency are in the reduced
+   *       TagProjection space.
+   *  @return The probability of the dependency
+   */
+  protected double probTB(IntDependency dependency) {
+    if (verbose) {
+      // System.out.println(&quot;tagIndex: &quot; + tagIndex);
+      log.info(&quot;Generating &quot; + dependency);
+    }
+
+<span class="nc bnc" id="L524" title="All 4 branches missed.">    boolean leftHeaded = dependency.leftHeaded &amp;&amp; directional;</span>
+
+<span class="nc" id="L526">    int hW = dependency.head.word;</span>
+<span class="nc" id="L527">    int aW = dependency.arg.word;</span>
+<span class="nc" id="L528">    short hT = dependency.head.tag;</span>
+<span class="nc" id="L529">    short aT = dependency.arg.tag;</span>
+
+<span class="nc" id="L531">    IntTaggedWord aTW = dependency.arg;</span>
+<span class="nc" id="L532">    IntTaggedWord hTW = dependency.head;</span>
+
+<span class="nc" id="L534">    boolean isRoot = rootTW(dependency.head);</span>
+    double pb_stop_hTWds;
+<span class="nc bnc" id="L536" title="All 2 branches missed.">    if (isRoot) {</span>
+<span class="nc" id="L537">      pb_stop_hTWds = 0.0;</span>
+    } else {
+<span class="nc" id="L539">      pb_stop_hTWds = getStopProb(dependency);</span>
+    }
+
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    if (dependency.arg.word == STOP_WORD_INT) {</span>
+      // did we generate stop?
+<span class="nc" id="L544">      return pb_stop_hTWds;</span>
+    }
+
+<span class="nc" id="L547">    double pb_go_hTWds = 1.0 - pb_stop_hTWds;</span>
+
+    // generate the argument
+
+<span class="nc" id="L551">    short binDistance = valenceBin(dependency.distance);</span>
+
+    // KEY:
+    // c_     count of (read as joint count of first and second)
+    // p_     MLE prob of (or MAP if useSmoothTagProjection)
+    // pb_    MAP prob of (read as prob of first given second thing)
+    // a      arg
+    // h      head
+    // T      tag
+    // PT     projected tag
+    // W      word
+    // d      direction
+    // ds     distance (implicit: there when direction is mentioned!)
+
+<span class="nc" id="L565">    IntTaggedWord anyHead = new IntTaggedWord(ANY_WORD_INT, dependency.head.tag);</span>
+<span class="nc" id="L566">    IntTaggedWord anyArg = new IntTaggedWord(ANY_WORD_INT, dependency.arg.tag);</span>
+<span class="nc" id="L567">    IntTaggedWord anyTagArg = new IntTaggedWord(dependency.arg.word, ANY_TAG_INT);</span>
+
+<span class="nc" id="L569">    IntDependency temp = new IntDependency(dependency.head, dependency.arg, leftHeaded, binDistance);</span>
+<span class="nc" id="L570">    double c_aTW_hTWd = argCounter.getCount(temp);</span>
+<span class="nc" id="L571">    temp = new IntDependency(dependency.head, anyArg, leftHeaded, binDistance);</span>
+<span class="nc" id="L572">    double c_aT_hTWd = argCounter.getCount(temp);</span>
+<span class="nc" id="L573">    temp = new IntDependency(dependency.head, wildTW, leftHeaded, binDistance);</span>
+<span class="nc" id="L574">    double c_hTWd = argCounter.getCount(temp);</span>
+
+<span class="nc" id="L576">    temp = new IntDependency(anyHead, dependency.arg, leftHeaded, binDistance);</span>
+<span class="nc" id="L577">    double c_aTW_hTd = argCounter.getCount(temp);</span>
+<span class="nc" id="L578">    temp = new IntDependency(anyHead, anyArg, leftHeaded, binDistance);</span>
+<span class="nc" id="L579">    double c_aT_hTd = argCounter.getCount(temp);</span>
+<span class="nc" id="L580">    temp = new IntDependency(anyHead, wildTW, leftHeaded, binDistance);</span>
+<span class="nc" id="L581">    double c_hTd = argCounter.getCount(temp);</span>
+
+    // for smooth tag projection
+<span class="nc" id="L584">    short aPT = Short.MIN_VALUE;</span>
+<span class="nc" id="L585">    double c_aPTW_hPTd = Double.NaN;</span>
+<span class="nc" id="L586">    double c_aPT_hPTd = Double.NaN;</span>
+<span class="nc" id="L587">    double c_hPTd = Double.NaN;</span>
+<span class="nc" id="L588">    double c_aPTW_aPT = Double.NaN;</span>
+<span class="nc" id="L589">    double c_aPT = Double.NaN;</span>
+
+<span class="nc bnc" id="L591" title="All 2 branches missed.">    if (useSmoothTagProjection) {</span>
+<span class="nc" id="L592">      aPT = tagProject(dependency.arg.tag);</span>
+<span class="nc" id="L593">      short hPT = tagProject(dependency.head.tag);</span>
+
+<span class="nc" id="L595">      IntTaggedWord projectedArg = new IntTaggedWord(dependency.arg.word, aPT);</span>
+<span class="nc" id="L596">      IntTaggedWord projectedAnyHead = new IntTaggedWord(ANY_WORD_INT, hPT);</span>
+<span class="nc" id="L597">      IntTaggedWord projectedAnyArg = new IntTaggedWord(ANY_WORD_INT, aPT);</span>
+
+<span class="nc" id="L599">      temp = new IntDependency(projectedAnyHead, projectedArg, leftHeaded, binDistance);</span>
+<span class="nc" id="L600">      c_aPTW_hPTd = argCounter.getCount(temp);</span>
+<span class="nc" id="L601">      temp = new IntDependency(projectedAnyHead, projectedAnyArg, leftHeaded, binDistance);</span>
+<span class="nc" id="L602">      c_aPT_hPTd = argCounter.getCount(temp);</span>
+<span class="nc" id="L603">      temp = new IntDependency(projectedAnyHead, wildTW, leftHeaded, binDistance);</span>
+<span class="nc" id="L604">      c_hPTd = argCounter.getCount(temp);</span>
+
+<span class="nc" id="L606">      temp = new IntDependency(wildTW, projectedArg, false, ANY_DISTANCE_INT);</span>
+<span class="nc" id="L607">      c_aPTW_aPT = argCounter.getCount(temp);</span>
+<span class="nc" id="L608">      temp = new IntDependency(wildTW, projectedAnyArg, false, ANY_DISTANCE_INT);</span>
+<span class="nc" id="L609">      c_aPT = argCounter.getCount(temp);</span>
+    }
+
+    // wild head is always directionless and no use distance
+<span class="nc" id="L613">    temp = new IntDependency(wildTW, dependency.arg, false, ANY_DISTANCE_INT);</span>
+<span class="nc" id="L614">    double c_aTW = argCounter.getCount(temp);</span>
+<span class="nc" id="L615">    temp = new IntDependency(wildTW, anyArg, false, ANY_DISTANCE_INT);</span>
+<span class="nc" id="L616">    double c_aT = argCounter.getCount(temp);</span>
+<span class="nc" id="L617">    temp = new IntDependency(wildTW, anyTagArg, false, ANY_DISTANCE_INT);</span>
+<span class="nc" id="L618">    double c_aW = argCounter.getCount(temp);</span>
+
+    // do the Bayesian magic
+    // MLE probs
+    double p_aTW_hTd;
+    double p_aT_hTd;
+    double p_aTW_aT;
+    double p_aW;
+    double p_aPTW_aPT;
+    double p_aPTW_hPTd;
+    double p_aPT_hPTd;
+
+    // backoffs either mle or themselves bayesian smoothed depending on useSmoothTagProjection
+<span class="nc bnc" id="L631" title="All 2 branches missed.">    if (useSmoothTagProjection) {</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">      if (useUnigramWordSmoothing) {</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">        p_aW = c_aW &gt; 0.0 ? (c_aW / numWordTokens) : 1.0;  // NEED this 1.0 for unknown words!!!</span>
+<span class="nc" id="L634">        p_aPTW_aPT = (c_aPTW_aPT + smooth_aPTW_aPT * p_aW) / (c_aPT + smooth_aPTW_aPT);</span>
+      } else {
+<span class="nc bnc" id="L636" title="All 2 branches missed.">        p_aPTW_aPT = c_aPTW_aPT &gt; 0.0 ? (c_aPTW_aPT / c_aPT) : 1.0;  // NEED this 1.0 for unknown words!!!</span>
+      }
+<span class="nc" id="L638">      p_aTW_aT = (c_aTW + smooth_aTW_aT * p_aPTW_aPT) / (c_aT + smooth_aTW_aT);</span>
+
+<span class="nc bnc" id="L640" title="All 2 branches missed.">      p_aPTW_hPTd = c_hPTd &gt; 0.0 ? (c_aPTW_hPTd / c_hPTd): 0.0;</span>
+<span class="nc" id="L641">      p_aTW_hTd = (c_aTW_hTd + smooth_aTW_hTd * p_aPTW_hPTd) / (c_hTd + smooth_aTW_hTd);</span>
+
+<span class="nc bnc" id="L643" title="All 2 branches missed.">      p_aPT_hPTd = c_hPTd &gt; 0.0 ? (c_aPT_hPTd / c_hPTd) : 0.0;</span>
+<span class="nc" id="L644">      p_aT_hTd = (c_aT_hTd + smooth_aT_hTd * p_aPT_hPTd) / (c_hTd + smooth_aT_hTd);</span>
+    } else {
+      // here word generation isn't smoothed - can't get previously unseen word with tag.  Ugh.
+<span class="nc bnc" id="L647" title="All 2 branches missed.">      if (op.testOptions.useLexiconToScoreDependencyPwGt) {</span>
+        // We don't know the position.  Now -1 means average over 0 and 1.
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        p_aTW_aT = dependency.leftHeaded ? Math.exp(lex.score(dependency.arg, 1, wordIndex.get(dependency.arg.word), null)): Math.exp(lex.score(dependency.arg, -1, wordIndex.get(dependency.arg.word), null));</span>
+        // double oldScore = c_aTW &gt; 0.0 ? (c_aTW / c_aT) : 1.0;
+        // if (oldScore == 1.0) {
+        //  log.info(&quot;#### arg=&quot; + dependency.arg + &quot; score=&quot; + p_aTW_aT +
+        //                      &quot; oldScore=&quot; + oldScore + &quot; c_aTW=&quot; + c_aTW + &quot; c_aW=&quot; + c_aW);
+        // }
+      } else {
+<span class="nc bnc" id="L656" title="All 2 branches missed.">        p_aTW_aT = c_aTW &gt; 0.0 ? (c_aTW / c_aT) : 1.0;</span>
+      }
+<span class="nc bnc" id="L658" title="All 2 branches missed.">      p_aTW_hTd = c_hTd &gt; 0.0 ? (c_aTW_hTd / c_hTd) : 0.0;</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">      p_aT_hTd = c_hTd &gt; 0.0 ? (c_aT_hTd / c_hTd) : 0.0;</span>
+    }
+
+<span class="nc" id="L662">    double pb_aTW_hTWd = (c_aTW_hTWd + smooth_aTW_hTWd * p_aTW_hTd) / (c_hTWd + smooth_aTW_hTWd);</span>
+<span class="nc" id="L663">    double pb_aT_hTWd = (c_aT_hTWd + smooth_aT_hTWd * p_aT_hTd) / (c_hTWd + smooth_aT_hTWd);</span>
+
+<span class="nc" id="L665">    double score = (interp * pb_aTW_hTWd + (1.0 - interp) * p_aTW_aT * pb_aT_hTWd) * pb_go_hTWds;</span>
+
+    if (verbose) {
+      NumberFormat nf = NumberFormat.getNumberInstance();
+      nf.setMaximumFractionDigits(2);
+      if (useSmoothTagProjection) {
+        if (useUnigramWordSmoothing) {
+          log.info(&quot;  c_aW=&quot; + c_aW + &quot;, numWordTokens=&quot; + numWordTokens + &quot;, p(aW)=&quot; + nf.format(p_aW));
+        }
+        log.info(&quot;  c_aPTW_aPT=&quot; + c_aPTW_aPT + &quot;, c_aPT=&quot; + c_aPT + &quot;, smooth_aPTW_aPT=&quot; + smooth_aPTW_aPT + &quot;, p(aPTW|aPT)=&quot; + nf.format(p_aPTW_aPT));
+      }
+      log.info(&quot;  c_aTW=&quot; + c_aTW + &quot;, c_aT=&quot; + c_aT + &quot;, smooth_aTW_aT=&quot; + smooth_aTW_aT +&quot;, ## p(aTW|aT)=&quot; + nf.format(p_aTW_aT));
+
+      if (useSmoothTagProjection) {
+        log.info(&quot;  c_aPTW_hPTd=&quot; + c_aPTW_hPTd + &quot;, c_hPTd=&quot; + c_hPTd + &quot;, p(aPTW|hPTd)=&quot; + nf.format(p_aPTW_hPTd));
+      }
+      log.info(&quot;  c_aTW_hTd=&quot; + c_aTW_hTd + &quot;, c_hTd=&quot; + c_hTd + &quot;, smooth_aTW_hTd=&quot; + smooth_aTW_hTd +&quot;, p(aTW|hTd)=&quot; + nf.format(p_aTW_hTd));
+
+      if (useSmoothTagProjection) {
+        log.info(&quot;  c_aPT_hPTd=&quot; + c_aPT_hPTd + &quot;, c_hPTd=&quot; + c_hPTd + &quot;, p(aPT|hPTd)=&quot; + nf.format(p_aPT_hPTd));
+      }
+      log.info(&quot;  c_aT_hTd=&quot; + c_aT_hTd + &quot;, c_hTd=&quot; + c_hTd + &quot;, smooth_aT_hTd=&quot; + smooth_aT_hTd +&quot;, p(aT|hTd)=&quot; + nf.format(p_aT_hTd));
+
+      log.info(&quot;  c_aTW_hTWd=&quot; + c_aTW_hTWd + &quot;, c_hTWd=&quot; + c_hTWd + &quot;, smooth_aTW_hTWd=&quot; + smooth_aTW_hTWd +&quot;, ## p(aTW|hTWd)=&quot; + nf.format(pb_aTW_hTWd));
+      log.info(&quot;  c_aT_hTWd=&quot; + c_aT_hTWd + &quot;, c_hTWd=&quot; + c_hTWd + &quot;, smooth_aT_hTWd=&quot; + smooth_aT_hTWd +&quot;, ## p(aT|hTWd)=&quot; + nf.format(pb_aT_hTWd));
+
+      log.info(&quot;  interp=&quot; + interp + &quot;, prescore=&quot; + nf.format(interp * pb_aTW_hTWd + (1.0 - interp) * p_aTW_aT * pb_aT_hTWd) +
+                         &quot;, P(go|hTWds)=&quot; + nf.format(pb_go_hTWds) + &quot;, score=&quot; + nf.format(score));
+    }
+
+<span class="nc bnc" id="L695" title="All 4 branches missed.">    if (op.testOptions.prunePunc &amp;&amp; pruneTW(aTW)) {</span>
+<span class="nc" id="L696">      return 1.0;</span>
+    }
+
+<span class="nc bnc" id="L699" title="All 2 branches missed.">    if (Double.isNaN(score)) {</span>
+<span class="nc" id="L700">      score = 0.0;</span>
+    }
+
+    //if (op.testOptions.rightBonus &amp;&amp; ! dependency.leftHeaded)
+    //  score -= 0.2;
+
+<span class="nc bnc" id="L706" title="All 2 branches missed.">    if (score &lt; MIN_PROBABILITY) {</span>
+<span class="nc" id="L707">      score = 0.0;</span>
+    }
+
+<span class="nc" id="L710">    return score;</span>
+  }
+
+
+  /** Return the probability (as a real number between 0 and 1) of stopping
+   *  rather than generating another argument at this position.
+   *  @param dependency The dependency used as the basis for stopping on.
+   *     Tags are assumed to be in the TagProjection space.
+   *  @return The probability of generating this stop probability
+   */
+  protected double getStopProb(IntDependency dependency) {
+<span class="nc" id="L721">    short binDistance = distanceBin(dependency.distance);</span>
+<span class="nc" id="L722">    IntTaggedWord unknownHead = new IntTaggedWord(-1, dependency.head.tag);</span>
+<span class="nc" id="L723">    IntTaggedWord anyHead = new IntTaggedWord(ANY_WORD_INT, dependency.head.tag);</span>
+
+<span class="nc" id="L725">    IntDependency temp = new IntDependency(dependency.head, stopTW, dependency.leftHeaded, binDistance);</span>
+<span class="nc" id="L726">    double c_stop_hTWds = stopCounter.getCount(temp);</span>
+<span class="nc" id="L727">    temp = new IntDependency(unknownHead, stopTW, dependency.leftHeaded, binDistance);</span>
+<span class="nc" id="L728">    double c_stop_hTds = stopCounter.getCount(temp);</span>
+<span class="nc" id="L729">    temp = new IntDependency(dependency.head, wildTW, dependency.leftHeaded, binDistance);</span>
+<span class="nc" id="L730">    double c_hTWds = stopCounter.getCount(temp);</span>
+<span class="nc" id="L731">    temp = new IntDependency(anyHead, wildTW, dependency.leftHeaded, binDistance);</span>
+<span class="nc" id="L732">    double c_hTds = stopCounter.getCount(temp);</span>
+
+<span class="nc bnc" id="L734" title="All 2 branches missed.">    double p_stop_hTds = (c_hTds &gt; 0.0 ? c_stop_hTds / c_hTds : 1.0);</span>
+
+<span class="nc" id="L736">    double pb_stop_hTWds = (c_stop_hTWds + smooth_stop * p_stop_hTds) / (c_hTWds + smooth_stop);</span>
+
+    if (verbose) {
+      System.out.println(&quot;  c_stop_hTWds: &quot; + c_stop_hTWds + &quot;; c_hTWds: &quot; + c_hTWds + &quot;; c_stop_hTds: &quot; + c_stop_hTds + &quot;; c_hTds: &quot; + c_hTds);
+      System.out.println(&quot;  Generate STOP prob: &quot; + pb_stop_hTWds);
+    }
+<span class="nc" id="L742">    return pb_stop_hTWds;</span>
+  }
+
+  private void readObject(ObjectInputStream stream) throws IOException, ClassNotFoundException {
+<span class="nc" id="L746">    stream.defaultReadObject();</span>
+//    log.info(&quot;Before decompression:&quot;);
+//    log.info(&quot;arg size: &quot; + argCounter.size() + &quot;  total: &quot; + argCounter.totalCount());
+//    log.info(&quot;stop size: &quot; + stopCounter.size() + &quot;  total: &quot; + stopCounter.totalCount());
+
+<span class="nc" id="L751">    ClassicCounter&lt;IntDependency&gt; compressedArgC = argCounter;</span>
+<span class="nc" id="L752">    argCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L753">    ClassicCounter&lt;IntDependency&gt; compressedStopC = stopCounter;</span>
+<span class="nc" id="L754">    stopCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">    for (IntDependency d : compressedArgC.keySet()) {</span>
+<span class="nc" id="L756">      double count = compressedArgC.getCount(d);</span>
+<span class="nc" id="L757">      expandArg(d, d.distance, count);</span>
+<span class="nc" id="L758">    }</span>
+
+<span class="nc bnc" id="L760" title="All 2 branches missed.">    for (IntDependency d : compressedStopC.keySet()) {</span>
+<span class="nc" id="L761">      double count = compressedStopC.getCount(d);</span>
+<span class="nc" id="L762">      expandStop(d, d.distance, count, false);</span>
+<span class="nc" id="L763">    }</span>
+
+//    log.info(&quot;After decompression:&quot;);
+//    log.info(&quot;arg size: &quot; + argCounter.size() + &quot;  total: &quot; + argCounter.totalCount());
+//    log.info(&quot;stop size: &quot; + stopCounter.size() + &quot;  total: &quot; + stopCounter.totalCount());
+
+<span class="nc" id="L769">    expandDependencyMap = null;</span>
+<span class="nc" id="L770">  }</span>
+
+  private void writeObject(ObjectOutputStream stream) throws IOException {
+//    log.info(&quot;\nBefore compression:&quot;);
+//    log.info(&quot;arg size: &quot; + argCounter.size() + &quot;  total: &quot; + argCounter.totalCount());
+//    log.info(&quot;stop size: &quot; + stopCounter.size() + &quot;  total: &quot; + stopCounter.totalCount());
+
+<span class="nc" id="L777">    ClassicCounter&lt;IntDependency&gt; fullArgCounter = argCounter;</span>
+<span class="nc" id="L778">    argCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">    for (IntDependency dependency : fullArgCounter.keySet()) {</span>
+<span class="nc bnc" id="L780" title="All 8 branches missed.">      if (dependency.head != wildTW &amp;&amp; dependency.arg != wildTW &amp;&amp;</span>
+              dependency.head.word != -1 &amp;&amp; dependency.arg.word != -1) {
+<span class="nc" id="L782">        argCounter.incrementCount(dependency, fullArgCounter.getCount(dependency));</span>
+      }
+<span class="nc" id="L784">    }</span>
+
+<span class="nc" id="L786">    ClassicCounter&lt;IntDependency&gt; fullStopCounter = stopCounter;</span>
+<span class="nc" id="L787">    stopCounter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">    for (IntDependency dependency : fullStopCounter.keySet()) {</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">      if (dependency.head.word != -1) {</span>
+<span class="nc" id="L790">        stopCounter.incrementCount(dependency, fullStopCounter.getCount(dependency));</span>
+      }
+<span class="nc" id="L792">    }</span>
+
+//    log.info(&quot;After compression:&quot;);
+//    log.info(&quot;arg size: &quot; + argCounter.size() + &quot;  total: &quot; + argCounter.totalCount());
+//    log.info(&quot;stop size: &quot; + stopCounter.size() + &quot;  total: &quot; + stopCounter.totalCount());
+
+<span class="nc" id="L798">    stream.defaultWriteObject();</span>
+
+<span class="nc" id="L800">    argCounter = fullArgCounter;</span>
+<span class="nc" id="L801">    stopCounter = fullStopCounter;</span>
+<span class="nc" id="L802">  }</span>
+
+  /**
+   * Populates data in this DependencyGrammar from the character stream
+   * given by the Reader r.
+   */
+  @Override
+  public void readData(BufferedReader in) throws IOException {
+<span class="nc" id="L810">    final String LEFT = &quot;left&quot;;</span>
+<span class="nc" id="L811">    int lineNum = 1;</span>
+    // all lines have one rule per line
+<span class="nc" id="L813">    boolean doingStop = false;</span>
+
+<span class="nc bnc" id="L815" title="All 4 branches missed.">    for (String line = in.readLine(); line != null &amp;&amp; line.length() &gt; 0; line = in.readLine()) {</span>
+      try {
+<span class="nc bnc" id="L817" title="All 2 branches missed.">        if (line.equals(&quot;BEGIN_STOP&quot;)) {</span>
+<span class="nc" id="L818">          doingStop = true;</span>
+<span class="nc" id="L819">          continue;</span>
+        }
+<span class="nc" id="L821">        String[] fields = StringUtils.splitOnCharWithQuoting(line, ' ', '\&quot;', '\\'); // split on spaces, quote with doublequote, and escape with backslash</span>
+        //        System.out.println(&quot;fields:\n&quot; + fields[0] + &quot;\n&quot; + fields[1] + &quot;\n&quot; + fields[2] + &quot;\n&quot; + fields[3] + &quot;\n&quot; + fields[4] + &quot;\n&quot; + fields[5]);
+
+
+<span class="nc" id="L825">        short distance = (short)Integer.parseInt(fields[4]);</span>
+<span class="nc" id="L826">        IntTaggedWord tempHead = new IntTaggedWord(fields[0], '/', wordIndex, tagIndex);</span>
+<span class="nc" id="L827">        IntTaggedWord tempArg = new IntTaggedWord(fields[2], '/', wordIndex, tagIndex);</span>
+<span class="nc" id="L828">        IntDependency tempDependency = new IntDependency(tempHead, tempArg, fields[3].equals(LEFT), distance);</span>
+
+<span class="nc" id="L830">        double count = Double.parseDouble(fields[5]);</span>
+<span class="nc bnc" id="L831" title="All 2 branches missed.">        if (doingStop) {</span>
+<span class="nc" id="L832">          expandStop(tempDependency, distance, count, false);</span>
+        } else {
+<span class="nc" id="L834">          expandArg(tempDependency, distance, count);</span>
+        }
+<span class="nc" id="L836">      } catch (Exception e) {</span>
+<span class="nc" id="L837">        IOException ioe = new IOException(&quot;Error on line &quot; + lineNum + &quot;: &quot; + line);</span>
+<span class="nc" id="L838">        ioe.initCause(e);</span>
+<span class="nc" id="L839">        throw ioe;</span>
+<span class="nc" id="L840">      }</span>
+      //      System.out.println(&quot;read line &quot; + lineNum + &quot;: &quot; + line);
+<span class="nc" id="L842">      lineNum++;</span>
+    }
+<span class="nc" id="L844">  }</span>
+
+  /**
+   * Writes out data from this Object to the Writer w.
+   */
+  @Override
+  public void writeData(PrintWriter out) throws IOException {
+    // all lines have one rule per line
+
+<span class="nc bnc" id="L853" title="All 2 branches missed.">    for (IntDependency dependency : argCounter.keySet()) {</span>
+<span class="nc bnc" id="L854" title="All 8 branches missed.">      if (dependency.head != wildTW &amp;&amp; dependency.arg != wildTW &amp;&amp;</span>
+              dependency.head.word != -1 &amp;&amp; dependency.arg.word != -1) {
+<span class="nc" id="L856">        double count = argCounter.getCount(dependency);</span>
+<span class="nc" id="L857">        out.println(dependency.toString(wordIndex, tagIndex) + &quot; &quot; + count);</span>
+      }
+<span class="nc" id="L859">    }</span>
+
+<span class="nc" id="L861">    out.println(&quot;BEGIN_STOP&quot;);</span>
+
+<span class="nc bnc" id="L863" title="All 2 branches missed.">    for (IntDependency dependency : stopCounter.keySet()) {</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">      if (dependency.head.word != -1) {</span>
+<span class="nc" id="L865">        double count = stopCounter.getCount(dependency);</span>
+<span class="nc" id="L866">        out.println(dependency.toString(wordIndex, tagIndex) + &quot; &quot; + count);</span>
+      }
+<span class="nc" id="L868">    }</span>
+
+<span class="nc" id="L870">    out.flush();</span>
+<span class="nc" id="L871">  }</span>
+
+  private static final long serialVersionUID = 1L;
+
+} // end class DependencyGrammar
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

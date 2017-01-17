@@ -1,0 +1,705 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Clusterer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.coref.statistical</a> &gt; <span class="el_source">Clusterer.java</span></div><h1>Clusterer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.coref.statistical;
+
+import java.io.File;
+import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+import edu.stanford.nlp.coref.statistical.ClustererDataLoader.ClustererDoc;
+import edu.stanford.nlp.coref.statistical.EvalUtils.B3Evaluator;
+import edu.stanford.nlp.coref.statistical.EvalUtils.Evaluator;
+
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * System for building up coreference clusters incrementally, merging a pair of clusters each step.
+ * Trained with a variant of the SEARN imitation learning algorithm.
+ * @author Kevin Clark
+ */
+public class Clusterer {
+  private static final boolean USE_CLASSIFICATION = true;
+  private static final boolean USE_RANKING = true;
+  private static final boolean LEFT_TO_RIGHT = false;
+  private static final boolean EXACT_LOSS = false;
+  private static final double MUC_WEIGHT = 0.25;
+  private static final double EXPERT_DECAY = 0.0;
+  private static final double LEARNING_RATE = 0.05;
+  private static final int BUFFER_SIZE_MULTIPLIER = 20;
+  private static final int MAX_DOCS = 1000;
+  private static final int RETRAIN_ITERATIONS = 100;
+  private static final int NUM_EPOCHS = 15;
+  private static final int EVAL_FREQUENCY = 1;
+
+  private static final int MIN_PAIRS = 10;
+  private static final double MIN_PAIRWISE_SCORE = 0.15;
+  private static final int EARLY_STOP_THRESHOLD = 1000;
+  private static final double EARLY_STOP_VAL = 1500 / 0.2;
+
+<span class="nc" id="L46">  public static int currentDocId = 0;</span>
+<span class="nc" id="L47">  public static int isTraining = 1;</span>
+
+  private final ClustererClassifier classifier;
+  private final Random random;
+
+<span class="nc" id="L52">  public Clusterer() {</span>
+<span class="nc" id="L53">    random = new Random(0);</span>
+<span class="nc" id="L54">    classifier = new ClustererClassifier(LEARNING_RATE);</span>
+<span class="nc" id="L55">  }</span>
+
+<span class="nc" id="L57">  public Clusterer(String modelPath) {</span>
+<span class="nc" id="L58">    random = new Random(0);</span>
+<span class="nc" id="L59">    classifier = new ClustererClassifier(modelPath, LEARNING_RATE);</span>
+<span class="nc" id="L60">  }</span>
+
+  public List&lt;Pair&lt;Integer, Integer&gt;&gt; getClusterMerges(ClustererDoc doc) {
+<span class="nc" id="L63">    List&lt;Pair&lt;Integer, Integer&gt;&gt; merges = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L64">    State currentState = new State(doc);</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">    while (!currentState.isComplete()) {</span>
+<span class="nc" id="L66">      Pair&lt;Integer, Integer&gt; currentPair =</span>
+<span class="nc" id="L67">          currentState.mentionPairs.get(currentState.currentIndex);</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">      if (currentState.doBestAction(classifier)) {</span>
+<span class="nc" id="L69">        merges.add(currentPair);</span>
+      }
+<span class="nc" id="L71">    }</span>
+<span class="nc" id="L72">    return merges;</span>
+  }
+
+  public void doTraining(String modelName) {
+<span class="nc" id="L76">    classifier.setWeight(&quot;bias&quot;, -0.3);</span>
+<span class="nc" id="L77">    classifier.setWeight(&quot;anaphorSeen&quot;, -1);</span>
+<span class="nc" id="L78">    classifier.setWeight(&quot;max-ranking&quot;, 1);</span>
+<span class="nc" id="L79">    classifier.setWeight(&quot;bias-single&quot;, -0.3);</span>
+<span class="nc" id="L80">    classifier.setWeight(&quot;anaphorSeen-single&quot;, -1);</span>
+<span class="nc" id="L81">    classifier.setWeight(&quot;max-ranking-single&quot;, 1);</span>
+
+<span class="nc" id="L83">    String outputPath = StatisticalCorefTrainer.clusteringModelsPath +</span>
+        modelName + &quot;/&quot;;
+<span class="nc" id="L85">    File outDir = new File(outputPath);</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">    if (!outDir.exists()) {</span>
+<span class="nc" id="L87">      outDir.mkdir();</span>
+    }
+
+    PrintWriter progressWriter;
+    List&lt;ClustererDoc&gt; trainDocs;
+    try {
+<span class="nc" id="L93">      PrintWriter configWriter = new PrintWriter(outputPath + &quot;config&quot;, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L94">      configWriter.print(StatisticalCorefTrainer.fieldValues(this));</span>
+<span class="nc" id="L95">      configWriter.close();</span>
+<span class="nc" id="L96">      progressWriter = new PrintWriter(outputPath + &quot;progress&quot;, &quot;UTF-8&quot;);</span>
+
+<span class="nc" id="L98">      Redwood.log(&quot;scoref.train&quot;, &quot;Loading training data&quot;);</span>
+<span class="nc" id="L99">      StatisticalCorefTrainer.setDataPath(&quot;dev&quot;);</span>
+<span class="nc" id="L100">      trainDocs = ClustererDataLoader.loadDocuments(MAX_DOCS);</span>
+<span class="nc" id="L101">    } catch (Exception e) {</span>
+<span class="nc" id="L102">      throw new RuntimeException(&quot;Error setting up training&quot;, e);</span>
+<span class="nc" id="L103">    }</span>
+
+<span class="nc" id="L105">    double bestTrainScore = 0;</span>
+<span class="nc" id="L106">    List&lt;List&lt;Pair&lt;CandidateAction, CandidateAction&gt;&gt;&gt; examples = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">    for (int iteration = 0; iteration &lt; RETRAIN_ITERATIONS; iteration++) {</span>
+<span class="nc" id="L108">      Redwood.log(&quot;scoref.train&quot;, &quot;ITERATION &quot; + iteration);</span>
+<span class="nc" id="L109">      classifier.printWeightVector(null);</span>
+<span class="nc" id="L110">      Redwood.log(&quot;scoref.train&quot;, &quot;&quot;);</span>
+      try {
+<span class="nc" id="L112">        classifier.writeWeights(outputPath + &quot;model&quot;);</span>
+<span class="nc" id="L113">        classifier.printWeightVector(IOUtils.getPrintWriter(outputPath + &quot;weights&quot;));</span>
+<span class="nc" id="L114">      } catch (Exception e) {</span>
+<span class="nc" id="L115">        throw new RuntimeException();</span>
+<span class="nc" id="L116">      }</span>
+
+<span class="nc" id="L118">      long start = System.currentTimeMillis();</span>
+<span class="nc" id="L119">      Collections.shuffle(trainDocs, random);</span>
+
+<span class="nc" id="L121">      examples = examples.subList(Math.max(0, examples.size()</span>
+<span class="nc" id="L122">          - BUFFER_SIZE_MULTIPLIER * trainDocs.size()), examples.size());</span>
+<span class="nc" id="L123">      trainPolicy(examples);</span>
+
+<span class="nc bnc" id="L125" title="All 2 branches missed.">      if (iteration % EVAL_FREQUENCY == 0) {</span>
+<span class="nc" id="L126">        double trainScore = evaluatePolicy(trainDocs, true);</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        if (trainScore &gt; bestTrainScore) {</span>
+<span class="nc" id="L128">          bestTrainScore = trainScore;</span>
+<span class="nc" id="L129">          writeModel(&quot;best&quot;, outputPath);</span>
+        }
+
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (iteration % 10 == 0) {</span>
+<span class="nc" id="L133">          writeModel(&quot;iter_&quot; + iteration, outputPath);</span>
+        }
+<span class="nc" id="L135">        writeModel(&quot;last&quot;, outputPath);</span>
+
+<span class="nc" id="L137">        double timeElapsed = (System.currentTimeMillis() - start) / 1000.0;</span>
+<span class="nc" id="L138">        double ffhr = State.ffHits / (double) (State.ffHits + State.ffMisses);</span>
+<span class="nc" id="L139">        double shr = State.sHits / (double) (State.sHits + State.sMisses);</span>
+<span class="nc" id="L140">        double fhr = featuresCacheHits /</span>
+            (double) (featuresCacheHits + featuresCacheMisses);
+<span class="nc" id="L142">        Redwood.log(&quot;scoref.train&quot;, modelName);</span>
+<span class="nc" id="L143">        Redwood.log(&quot;scoref.train&quot;, String.format(&quot;Best train: %.4f&quot;, bestTrainScore));</span>
+<span class="nc" id="L144">        Redwood.log(&quot;scoref.train&quot;, String.format(&quot;Time elapsed: %.2f&quot;, timeElapsed));</span>
+<span class="nc" id="L145">        Redwood.log(&quot;scoref.train&quot;, String.format(&quot;Cost hit rate: %.4f&quot;, ffhr));</span>
+<span class="nc" id="L146">        Redwood.log(&quot;scoref.train&quot;, String.format(&quot;Score hit rate: %.4f&quot;, shr));</span>
+<span class="nc" id="L147">        Redwood.log(&quot;scoref.train&quot;, String.format(&quot;Features hit rate: %.4f&quot;, fhr));</span>
+<span class="nc" id="L148">        Redwood.log(&quot;scoref.train&quot;, &quot;&quot;);</span>
+
+<span class="nc" id="L150">        progressWriter.write(iteration + &quot; &quot; + trainScore + &quot; &quot;</span>
+            + &quot; &quot; + timeElapsed + &quot; &quot; + ffhr + &quot; &quot; + shr
+            + &quot; &quot; + fhr + &quot;\n&quot;);
+<span class="nc" id="L153">        progressWriter.flush();</span>
+      }
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">      for (ClustererDoc trainDoc : trainDocs) {</span>
+<span class="nc" id="L157">        examples.add(runPolicy(trainDoc, Math.pow(EXPERT_DECAY,</span>
+                (iteration + 1))));
+<span class="nc" id="L159">      }</span>
+    }
+
+<span class="nc" id="L162">    progressWriter.close();</span>
+<span class="nc" id="L163">  }</span>
+
+  private void writeModel(String name, String modelPath) {
+    try {
+<span class="nc" id="L167">      classifier.writeWeights(modelPath + name + &quot;_model.ser&quot;);</span>
+<span class="nc" id="L168">      classifier.printWeightVector(</span>
+<span class="nc" id="L169">          IOUtils.getPrintWriter(modelPath + name + &quot;_weights&quot;));</span>
+<span class="nc" id="L170">    } catch (Exception e) {</span>
+<span class="nc" id="L171">      throw new RuntimeException();</span>
+<span class="nc" id="L172">    }</span>
+<span class="nc" id="L173">  }</span>
+
+  private void trainPolicy(List&lt;List&lt;Pair&lt;CandidateAction, CandidateAction&gt;&gt;&gt; examples) {
+<span class="nc" id="L176">    List&lt;Pair&lt;CandidateAction, CandidateAction&gt;&gt; flattenedExamples = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L177">    examples.stream().forEach(flattenedExamples::addAll);</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">    for (int epoch = 0; epoch &lt; NUM_EPOCHS; epoch++) {</span>
+<span class="nc" id="L180">      Collections.shuffle(flattenedExamples, random);</span>
+<span class="nc" id="L181">      flattenedExamples.forEach(classifier::learn);</span>
+    }
+
+<span class="nc" id="L184">    double totalCost = flattenedExamples.stream()</span>
+<span class="nc" id="L185">        .mapToDouble(e -&gt; classifier.bestAction(e).cost).sum();</span>
+<span class="nc" id="L186">    Redwood.log(&quot;scoref.train&quot;,</span>
+<span class="nc" id="L187">        String.format(&quot;Training cost: %.4f&quot;, 100 * totalCost / flattenedExamples.size()));</span>
+<span class="nc" id="L188">  }</span>
+
+  private double evaluatePolicy(List&lt;ClustererDoc&gt; docs, boolean training) {
+<span class="nc" id="L191">    isTraining = 0;</span>
+<span class="nc" id="L192">    B3Evaluator evaluator = new B3Evaluator();</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">    for (ClustererDoc doc : docs) {</span>
+<span class="nc" id="L194">      State currentState = new State(doc);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">      while (!currentState.isComplete()) {</span>
+<span class="nc" id="L196">        currentState.doBestAction(classifier);</span>
+      }
+<span class="nc" id="L198">      currentState.updateEvaluator(evaluator);</span>
+<span class="nc" id="L199">    }</span>
+<span class="nc" id="L200">    isTraining = 1;</span>
+
+<span class="nc" id="L202">    double score = evaluator.getF1();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    Redwood.log(&quot;scoref.train&quot;, String.format(&quot;B3 F1 score on %s: %.4f&quot;,</span>
+<span class="nc" id="L204">        training ? &quot;train&quot; : &quot;validate&quot;, score));</span>
+<span class="nc" id="L205">    return score;</span>
+  }
+
+  private List&lt;Pair&lt;CandidateAction, CandidateAction&gt;&gt; runPolicy(ClustererDoc doc, double beta) {
+<span class="nc" id="L209">    List&lt;Pair&lt;CandidateAction, CandidateAction&gt;&gt; examples = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L210">    State currentState = new State(doc);</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">    while (!currentState.isComplete()) {</span>
+<span class="nc" id="L212">      Pair&lt;CandidateAction, CandidateAction&gt; actions = currentState.getActions(classifier);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">      if (actions == null) {</span>
+<span class="nc" id="L214">        continue;</span>
+      }
+<span class="nc" id="L216">      examples.add(actions);</span>
+
+<span class="nc bnc" id="L218" title="All 2 branches missed.">      boolean useExpert = random.nextDouble() &lt; beta;</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">      double action1Score = useExpert ? -actions.first.cost :</span>
+<span class="nc" id="L220">        classifier.weightFeatureProduct(actions.first.features);</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      double action2Score = useExpert ? -actions.second.cost :</span>
+<span class="nc" id="L222">        classifier.weightFeatureProduct(actions.second.features);</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">      currentState.doAction(action1Score &gt;= action2Score);</span>
+<span class="nc" id="L224">    }</span>
+
+<span class="nc" id="L226">    return examples;</span>
+  }
+
+<span class="nc" id="L229">  private static class GlobalFeatures {</span>
+    public boolean anaphorSeen;
+    public int currentIndex;
+    public int size;
+    public double docSize;
+  }
+
+  private static class State {
+    private static int sHits;
+    private static int sMisses;
+    private static int ffHits;
+    private static int ffMisses;
+
+    private final Map&lt;MergeKey, Boolean&gt; hashedScores;
+    private final Map&lt;Long, Double&gt; hashedCosts;
+
+    private final ClustererDoc doc;
+    private final List&lt;Cluster&gt; clusters;
+    private final Map&lt;Integer, Cluster&gt; mentionToCluster;
+    private final List&lt;Pair&lt;Integer, Integer&gt;&gt; mentionPairs;
+    private final List&lt;GlobalFeatures&gt; globalFeatures;
+
+    private int currentIndex;
+    private Cluster c1;
+    private Cluster c2;
+    private long hash;
+
+<span class="nc" id="L256">    public State(ClustererDoc doc) {</span>
+<span class="nc" id="L257">      currentDocId = doc.id;</span>
+<span class="nc" id="L258">      this.doc = doc;</span>
+<span class="nc" id="L259">      this.hashedScores = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L260">      this.hashedCosts = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L261">      this.clusters = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L262">      this.hash = 0;</span>
+
+<span class="nc" id="L264">      mentionToCluster = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">      for (int m : doc.mentions) {</span>
+<span class="nc" id="L266">        Cluster c = new Cluster(m);</span>
+<span class="nc" id="L267">        clusters.add(c);</span>
+<span class="nc" id="L268">        mentionToCluster.put(m, c);</span>
+<span class="nc" id="L269">        hash ^= c.hash * 7;</span>
+<span class="nc" id="L270">      }</span>
+
+<span class="nc" id="L272">      List&lt;Pair&lt;Integer, Integer&gt;&gt; allPairs = new ArrayList&lt;&gt;(doc.classificationScores.keySet());</span>
+
+<span class="nc" id="L274">      Counter&lt;Pair&lt;Integer, Integer&gt;&gt; scores =</span>
+          USE_RANKING ? doc.rankingScores : doc.classificationScores;
+<span class="nc" id="L276">      Collections.sort(allPairs, (p1, p2) -&gt; {</span>
+<span class="nc" id="L277">        double diff = scores.getCount(p2) - scores.getCount(p1);</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        return diff == 0 ? 0 : (int) Math.signum(diff);</span>
+      });
+
+<span class="nc" id="L281">      int i = 0;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">      for (i = 0; i &lt; allPairs.size(); i++) {</span>
+<span class="nc" id="L283">        double score = scores.getCount(allPairs.get(i));</span>
+<span class="nc bnc" id="L284" title="All 4 branches missed.">        if (score &lt; MIN_PAIRWISE_SCORE &amp;&amp; i &gt; MIN_PAIRS) {</span>
+<span class="nc" id="L285">          break;</span>
+        }
+<span class="nc bnc" id="L287" title="All 4 branches missed.">        if (i &gt;= EARLY_STOP_THRESHOLD &amp;&amp; i / score &gt; EARLY_STOP_VAL) {</span>
+<span class="nc" id="L288">          break;</span>
+        }
+      }
+<span class="nc" id="L291">      mentionPairs = allPairs.subList(0, i);</span>
+      if (LEFT_TO_RIGHT) {
+        Collections.sort(mentionPairs, (p1, p2) -&gt; {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">          if (p1.second.equals(p2.second)) {</span>
+<span class="nc" id="L295">            double diff = scores.getCount(p2) - scores.getCount(p1);</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            return diff == 0 ? 0 : (int) Math.signum(diff);</span>
+          }
+<span class="nc" id="L298">          return doc.mentionIndices.get(p1.second)</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">              &lt; doc.mentionIndices.get(p2.second) ? -1 : 1;</span>
+        });
+        for (int j = 0; j &lt; mentionPairs.size(); j++) {
+          Pair&lt;Integer, Integer&gt; p1 = mentionPairs.get(j);
+          for (int k = j + 1; k &lt; mentionPairs.size(); k++) {
+            Pair&lt;Integer, Integer&gt; p2 = mentionPairs.get(k);
+            assert(doc.mentionIndices.get(p1.second)
+                &lt;= doc.mentionIndices.get(p2.second));
+          }
+        }
+      }
+
+<span class="nc" id="L311">      Counter&lt;Integer&gt; seenAnaphors = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L312">      Counter&lt;Integer&gt; seenAntecedents = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L313">      globalFeatures = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">      for (int j = 0; j &lt; allPairs.size(); j++) {</span>
+<span class="nc" id="L315">        Pair&lt;Integer, Integer&gt; mentionPair = allPairs.get(j);</span>
+<span class="nc" id="L316">        GlobalFeatures gf = new GlobalFeatures();</span>
+<span class="nc" id="L317">        gf.currentIndex = j;</span>
+<span class="nc" id="L318">        gf.anaphorSeen = seenAnaphors.containsKey(mentionPair.second);</span>
+<span class="nc" id="L319">        gf.size = mentionPairs.size();</span>
+<span class="nc" id="L320">        gf.docSize = doc.mentions.size() / 300.0;</span>
+<span class="nc" id="L321">        globalFeatures.add(gf);</span>
+
+<span class="nc" id="L323">        seenAnaphors.incrementCount(mentionPair.second);</span>
+<span class="nc" id="L324">        seenAntecedents.incrementCount(mentionPair.first);</span>
+      }
+
+<span class="nc" id="L327">      currentIndex = 0;</span>
+<span class="nc" id="L328">      setClusters();</span>
+<span class="nc" id="L329">    }</span>
+
+<span class="nc" id="L331">    public State(State state) {</span>
+<span class="nc" id="L332">      this.hashedScores = state.hashedScores;</span>
+<span class="nc" id="L333">      this.hashedCosts = state.hashedCosts;</span>
+
+<span class="nc" id="L335">      this.doc = state.doc;</span>
+<span class="nc" id="L336">      this.hash = state.hash;</span>
+<span class="nc" id="L337">      this.mentionPairs = state.mentionPairs;</span>
+<span class="nc" id="L338">      this.currentIndex = state.currentIndex;</span>
+<span class="nc" id="L339">      this.globalFeatures = state.globalFeatures;</span>
+
+<span class="nc" id="L341">      this.clusters = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L342">      this.mentionToCluster = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">      for (Cluster c : state.clusters) {</span>
+<span class="nc" id="L344">        Cluster copy = new Cluster(c);</span>
+<span class="nc" id="L345">        clusters.add(copy);</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        for (int m : copy.mentions) {</span>
+<span class="nc" id="L347">          mentionToCluster.put(m, copy);</span>
+<span class="nc" id="L348">        }</span>
+<span class="nc" id="L349">      }</span>
+
+<span class="nc" id="L351">      setClusters();</span>
+<span class="nc" id="L352">    }</span>
+
+    public void setClusters() {
+<span class="nc" id="L355">      Pair&lt;Integer, Integer&gt; currentPair = mentionPairs.get(currentIndex);</span>
+<span class="nc" id="L356">      c1 = mentionToCluster.get(currentPair.first);</span>
+<span class="nc" id="L357">      c2 = mentionToCluster.get(currentPair.second);</span>
+<span class="nc" id="L358">    }</span>
+
+    public void doAction(boolean isMerge) {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">      if (isMerge) {</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        if (c2.size() &gt; c1.size()) {</span>
+<span class="nc" id="L363">          Cluster tmp = c1;</span>
+<span class="nc" id="L364">          c1 = c2;</span>
+<span class="nc" id="L365">          c2 = tmp;</span>
+        }
+
+<span class="nc" id="L368">        hash ^= 7 * c1.hash;</span>
+<span class="nc" id="L369">        hash ^= 7 * c2.hash;</span>
+
+<span class="nc" id="L371">        c1.merge(c2);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        for (int m : c2.mentions) {</span>
+<span class="nc" id="L373">          mentionToCluster.put(m, c1);</span>
+<span class="nc" id="L374">        }</span>
+<span class="nc" id="L375">        clusters.remove(c2);</span>
+
+<span class="nc" id="L377">        hash ^= 7 * c1.hash;</span>
+      }
+<span class="nc" id="L379">      currentIndex++;</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">      if (!isComplete()) {</span>
+<span class="nc" id="L381">        setClusters();</span>
+      }
+<span class="nc bnc" id="L383" title="All 2 branches missed.">      while (c1 == c2) {</span>
+<span class="nc" id="L384">        currentIndex++;</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (isComplete()) {</span>
+<span class="nc" id="L386">          break;</span>
+        }
+<span class="nc" id="L388">        setClusters();</span>
+      }
+<span class="nc" id="L390">    }</span>
+
+    public boolean doBestAction(ClustererClassifier classifier) {
+<span class="nc" id="L393">      Boolean doMerge = hashedScores.get(new MergeKey(c1, c2, currentIndex));</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">      if (doMerge == null) {</span>
+<span class="nc" id="L395">        Counter&lt;String&gt; features = getFeatures(doc, c1, c2,</span>
+<span class="nc" id="L396">            globalFeatures.get(currentIndex));</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        doMerge = classifier.weightFeatureProduct(features) &gt; 0;</span>
+<span class="nc" id="L398">        hashedScores.put(new MergeKey(c1, c2, currentIndex), doMerge);</span>
+<span class="nc" id="L399">        sMisses += isTraining;</span>
+<span class="nc" id="L400">      } else {</span>
+<span class="nc" id="L401">        sHits += isTraining;</span>
+      }
+
+<span class="nc" id="L404">      doAction(doMerge);</span>
+<span class="nc" id="L405">      return doMerge;</span>
+    }
+
+    public boolean isComplete() {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">      return currentIndex &gt;= mentionPairs.size();</span>
+    }
+
+    public double getFinalCost(ClustererClassifier classifier) {
+      while(EXACT_LOSS &amp;&amp; !isComplete()) {
+        if (hashedCosts.containsKey(hash)) {
+          ffHits += isTraining;;
+          return hashedCosts.get(hash);
+        }
+        doBestAction(classifier);
+      }
+<span class="nc" id="L420">      ffMisses += isTraining;</span>
+
+<span class="nc" id="L422">      double cost = EvalUtils.getCombinedF1(MUC_WEIGHT, doc.goldClusters, clusters,</span>
+          doc.mentionToGold, mentionToCluster);
+<span class="nc" id="L424">      hashedCosts.put(hash, cost);</span>
+<span class="nc" id="L425">      return cost;</span>
+    }
+
+    public void updateEvaluator(Evaluator evaluator) {
+<span class="nc" id="L429">      evaluator.update(doc.goldClusters, clusters, doc.mentionToGold, mentionToCluster);</span>
+<span class="nc" id="L430">    }</span>
+
+    public Pair&lt;CandidateAction, CandidateAction&gt; getActions(ClustererClassifier classifier) {
+<span class="nc" id="L433">      Counter&lt;String&gt; mergeFeatures = getFeatures(doc, c1, c2,</span>
+<span class="nc" id="L434">          globalFeatures.get(currentIndex));</span>
+<span class="nc" id="L435">      double mergeScore = Math.exp(classifier.weightFeatureProduct(mergeFeatures));</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">      hashedScores.put(new MergeKey(c1, c2, currentIndex), mergeScore &gt; 0.5);</span>
+
+<span class="nc" id="L438">      State merge = new State(this);</span>
+<span class="nc" id="L439">      merge.doAction(true);</span>
+<span class="nc" id="L440">      double mergeB3 = merge.getFinalCost(classifier);</span>
+
+<span class="nc" id="L442">      State noMerge = new State(this);</span>
+<span class="nc" id="L443">      noMerge.doAction(false);</span>
+<span class="nc" id="L444">      double noMergeB3 = noMerge.getFinalCost(classifier);</span>
+
+<span class="nc" id="L446">      double weight = doc.mentions.size() / 100.0;</span>
+<span class="nc" id="L447">      double maxB3 = Math.max(mergeB3, noMergeB3);</span>
+<span class="nc" id="L448">      return new Pair&lt;&gt;(</span>
+              new CandidateAction(mergeFeatures, weight * (maxB3 - mergeB3)),
+              new CandidateAction(new ClassicCounter&lt;&gt;(), weight * (maxB3 - noMergeB3)));
+    }
+  }
+
+  private static class MergeKey {
+    private final int hash;
+
+<span class="nc" id="L457">    public MergeKey(Cluster c1, Cluster c2, int ind) {</span>
+<span class="nc" id="L458">      hash = (int)(c1.hash ^ c2.hash) + (2003 * ind) + currentDocId;</span>
+<span class="nc" id="L459">    }</span>
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L463">      return hash;</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L468" title="All 2 branches missed.">      return ((MergeKey) o).hash == hash;</span>
+    }
+  }
+
+  public static class Cluster {
+<span class="nc" id="L473">    private static final Map&lt;Pair&lt;Integer, Integer&gt;, Long&gt; MENTION_HASHES = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L474">    private static final Random RANDOM = new Random(0);</span>
+
+    public final List&lt;Integer&gt; mentions;
+    public long hash;
+
+<span class="nc" id="L479">    public Cluster(int m) {</span>
+<span class="nc" id="L480">      mentions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L481">      mentions.add(m);</span>
+<span class="nc" id="L482">      hash = getMentionHash(m);</span>
+<span class="nc" id="L483">    }</span>
+
+<span class="nc" id="L485">    public Cluster(Cluster c) {</span>
+<span class="nc" id="L486">      mentions = new ArrayList&lt;&gt;(c.mentions);</span>
+<span class="nc" id="L487">      hash = c.hash;</span>
+<span class="nc" id="L488">    }</span>
+
+    public void merge(Cluster c) {
+<span class="nc" id="L491">      mentions.addAll(c.mentions);</span>
+<span class="nc" id="L492">      hash ^= c.hash;</span>
+<span class="nc" id="L493">    }</span>
+
+    public int size() {
+<span class="nc" id="L496">      return mentions.size();</span>
+    }
+
+    public long getHash() {
+<span class="nc" id="L500">      return hash;</span>
+    }
+
+    private static long getMentionHash(int m) {
+<span class="nc" id="L504">      Pair&lt;Integer, Integer&gt; pair = new Pair&lt;&gt;(m, currentDocId);</span>
+<span class="nc" id="L505">      Long hash = MENTION_HASHES.get(pair);</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">      if (hash == null) {</span>
+<span class="nc" id="L507">        hash = RANDOM.nextLong();</span>
+<span class="nc" id="L508">        MENTION_HASHES.put(pair, hash);</span>
+      }
+<span class="nc" id="L510">      return hash;</span>
+    }
+  }
+
+  private static int featuresCacheHits;
+  private static int featuresCacheMisses;
+<span class="nc" id="L516">  private static Map&lt;MergeKey, CompressedFeatureVector&gt; featuresCache = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L517">  private static Compressor&lt;String&gt; compressor = new Compressor&lt;&gt;();</span>
+
+  private static Counter&lt;String&gt; getFeatures(ClustererDoc doc, Pair&lt;Integer, Integer&gt; mentionPair,
+      Counter&lt;Pair&lt;Integer, Integer&gt;&gt; scores) {
+<span class="nc" id="L521">    Counter&lt;String&gt; features = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">    if (!scores.containsKey(mentionPair)) {</span>
+<span class="nc" id="L523">      mentionPair = new Pair&lt;&gt;(mentionPair.second, mentionPair.first);</span>
+    }
+<span class="nc" id="L525">    double score = scores.getCount(mentionPair);</span>
+<span class="nc" id="L526">    features.incrementCount(&quot;max&quot;, score);</span>
+<span class="nc" id="L527">    return features;</span>
+  }
+
+  private static Counter&lt;String&gt; getFeatures(ClustererDoc doc,
+      List&lt;Pair&lt;Integer, Integer&gt;&gt; mentionPairs, Counter&lt;Pair&lt;Integer, Integer&gt;&gt; scores) {
+<span class="nc" id="L532">    Counter&lt;String&gt; features = new ClassicCounter&lt;&gt;();</span>
+
+<span class="nc" id="L534">    double maxScore = 0;</span>
+<span class="nc" id="L535">    double minScore = 1;</span>
+<span class="nc" id="L536">    Counter&lt;String&gt; totals = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L537">    Counter&lt;String&gt; totalsLog = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L538">    Counter&lt;String&gt; counts = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">    for (Pair&lt;Integer, Integer&gt; mentionPair : mentionPairs) {</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">      if (!scores.containsKey(mentionPair)) {</span>
+<span class="nc" id="L541">        mentionPair = new Pair&lt;&gt;(mentionPair.second, mentionPair.first);</span>
+      }
+<span class="nc" id="L543">      double score = scores.getCount(mentionPair);</span>
+<span class="nc" id="L544">      double logScore = cappedLog(score);</span>
+
+<span class="nc" id="L546">      String mt1 = doc.mentionTypes.get(mentionPair.first);</span>
+<span class="nc" id="L547">      String mt2 = doc.mentionTypes.get(mentionPair.second);</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      mt1 = mt1.equals(&quot;PRONOMINAL&quot;) ? &quot;PRONOMINAL&quot; : &quot;NON_PRONOMINAL&quot;;</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">      mt2 = mt2.equals(&quot;PRONOMINAL&quot;) ? &quot;PRONOMINAL&quot; : &quot;NON_PRONOMINAL&quot;;</span>
+<span class="nc" id="L550">      String conj = &quot;_&quot; + mt1 + &quot;_&quot; + mt2;</span>
+
+<span class="nc" id="L552">      maxScore = Math.max(maxScore, score);</span>
+<span class="nc" id="L553">      minScore = Math.min(minScore, score);</span>
+
+<span class="nc" id="L555">      totals.incrementCount(&quot;&quot;, score);</span>
+<span class="nc" id="L556">      totalsLog.incrementCount(&quot;&quot;, logScore);</span>
+<span class="nc" id="L557">      counts.incrementCount(&quot;&quot;);</span>
+
+<span class="nc" id="L559">      totals.incrementCount(conj, score);</span>
+<span class="nc" id="L560">      totalsLog.incrementCount(conj, logScore);</span>
+<span class="nc" id="L561">      counts.incrementCount(conj);</span>
+<span class="nc" id="L562">    }</span>
+
+<span class="nc" id="L564">    features.incrementCount(&quot;max&quot;, maxScore);</span>
+<span class="nc" id="L565">    features.incrementCount(&quot;min&quot;, minScore);</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">    for (String key : counts.keySet()) {</span>
+<span class="nc" id="L567">      features.incrementCount(&quot;avg&quot; + key, totals.getCount(key) / mentionPairs.size());</span>
+<span class="nc" id="L568">      features.incrementCount(&quot;avgLog&quot; + key, totalsLog.getCount(key) / mentionPairs.size());</span>
+<span class="nc" id="L569">    }</span>
+
+<span class="nc" id="L571">    return features;</span>
+  }
+
+  private static int earliestMention(Cluster c, ClustererDoc doc) {
+<span class="nc" id="L575">    int earliest = -1;</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">    for (int m : c.mentions) {</span>
+<span class="nc" id="L577">      int pos = doc.mentionIndices.get(m);</span>
+<span class="nc bnc" id="L578" title="All 4 branches missed.">      if (earliest == -1 || pos &lt; doc.mentionIndices.get(earliest)) {</span>
+<span class="nc" id="L579">        earliest = m;</span>
+      }
+<span class="nc" id="L581">    }</span>
+<span class="nc" id="L582">    return earliest;</span>
+  }
+
+  private static Counter&lt;String&gt; getFeatures(ClustererDoc doc, Cluster c1, Cluster c2, GlobalFeatures gf) {
+<span class="nc" id="L586">    MergeKey key = new MergeKey(c1, c2, gf.currentIndex);</span>
+<span class="nc" id="L587">    CompressedFeatureVector cfv = featuresCache.get(key);</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">    Counter&lt;String&gt; features = cfv == null ? null : compressor.uncompress(cfv);</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">    if (features != null) {</span>
+<span class="nc" id="L590">      featuresCacheHits += isTraining;</span>
+<span class="nc" id="L591">      return features;</span>
+    }
+<span class="nc" id="L593">    featuresCacheMisses += isTraining;</span>
+
+<span class="nc" id="L595">    features = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">    if (gf.anaphorSeen) {</span>
+<span class="nc" id="L597">      features.incrementCount(&quot;anaphorSeen&quot;);</span>
+    }
+<span class="nc" id="L599">    features.incrementCount(&quot;docSize&quot;, gf.docSize);</span>
+<span class="nc" id="L600">    features.incrementCount(&quot;percentComplete&quot;, gf.currentIndex / (double) gf.size);</span>
+<span class="nc" id="L601">    features.incrementCount(&quot;bias&quot;, 1.0);</span>
+
+<span class="nc" id="L603">    int earliest1 = earliestMention(c1, doc);</span>
+<span class="nc" id="L604">    int earliest2 = earliestMention(c2, doc);</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">    if (doc.mentionIndices.get(earliest1) &gt; doc.mentionIndices.get(earliest2)) {</span>
+<span class="nc" id="L606">      int tmp = earliest1;</span>
+<span class="nc" id="L607">      earliest1 = earliest2;</span>
+<span class="nc" id="L608">      earliest2 = tmp;</span>
+    }
+<span class="nc" id="L610">    features.incrementCount(&quot;anaphoricity&quot;, doc.anaphoricityScores.getCount(earliest2));</span>
+
+<span class="nc bnc" id="L612" title="All 4 branches missed.">    if (c1.mentions.size() == 1 &amp;&amp; c2.mentions.size() == 1) {</span>
+<span class="nc" id="L613">      Pair&lt;Integer, Integer&gt; mentionPair = new Pair&lt;&gt;(c1.mentions.get(0),</span>
+<span class="nc" id="L614">          c2.mentions.get(0));</span>
+
+      if (USE_CLASSIFICATION) {
+<span class="nc" id="L617">        features.addAll(addSuffix(getFeatures(doc, mentionPair, doc.classificationScores),</span>
+            &quot;-classification&quot;));
+      }
+      if (USE_RANKING) {
+<span class="nc" id="L621">        features.addAll(addSuffix(getFeatures(doc, mentionPair, doc.rankingScores),</span>
+            &quot;-ranking&quot;));
+      }
+
+<span class="nc" id="L625">      features = addSuffix(features, &quot;-single&quot;);</span>
+<span class="nc" id="L626">    } else {</span>
+<span class="nc" id="L627">      List&lt;Pair&lt;Integer, Integer&gt;&gt; between = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">      for (int m1 : c1.mentions) {</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        for (int m2 : c2.mentions) {</span>
+<span class="nc" id="L630">          between.add(new Pair&lt;&gt;(m1, m2));</span>
+<span class="nc" id="L631">        }</span>
+<span class="nc" id="L632">      }</span>
+
+      if (USE_CLASSIFICATION) {
+<span class="nc" id="L635">        features.addAll(addSuffix(getFeatures(doc, between, doc.classificationScores),</span>
+            &quot;-classification&quot;));
+      }
+      if (USE_RANKING) {
+<span class="nc" id="L639">        features.addAll(addSuffix(getFeatures(doc, between, doc.rankingScores),</span>
+            &quot;-ranking&quot;));
+      }
+    }
+
+<span class="nc" id="L644">    featuresCache.put(key, compressor.compress(features));</span>
+<span class="nc" id="L645">    return features;</span>
+  }
+
+  private static Counter&lt;String&gt; addSuffix(Counter&lt;String&gt; features, String suffix) {
+<span class="nc" id="L649">    Counter&lt;String&gt; withSuffix = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">    for (Map.Entry&lt;String, Double&gt; e : features.entrySet()) {</span>
+<span class="nc" id="L651">      withSuffix.incrementCount(e.getKey() + suffix, e.getValue());</span>
+<span class="nc" id="L652">    }</span>
+<span class="nc" id="L653">    return withSuffix;</span>
+  }
+
+  private static double cappedLog(double x) {
+<span class="nc" id="L657">    return Math.log(Math.max(x, 1e-8));</span>
+  }
+
+  private static class ClustererClassifier extends SimpleLinearClassifier {
+    public ClustererClassifier(double learningRate) {
+<span class="nc" id="L662">      super(SimpleLinearClassifier.risk(),</span>
+<span class="nc" id="L663">          SimpleLinearClassifier.constant(learningRate),</span>
+          0);
+<span class="nc" id="L665">    }</span>
+
+    public ClustererClassifier(String modelFile, double learningRate) {
+<span class="nc" id="L668">      super(SimpleLinearClassifier.risk(),</span>
+<span class="nc" id="L669">          SimpleLinearClassifier.constant(learningRate),</span>
+          0,
+          modelFile);
+<span class="nc" id="L672">    }</span>
+
+    public CandidateAction bestAction(Pair&lt;CandidateAction, CandidateAction&gt; actions) {
+<span class="nc" id="L675">      return weightFeatureProduct(actions.first.features) &gt;</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">          weightFeatureProduct(actions.second.features) ? actions.first : actions.second;</span>
+    }
+
+    public void learn(Pair&lt;CandidateAction, CandidateAction&gt; actions) {
+<span class="nc" id="L680">      CandidateAction goodAction = actions.first;</span>
+<span class="nc" id="L681">      CandidateAction badAction = actions.second;</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">      if (badAction.cost == 0) {</span>
+<span class="nc" id="L683">        CandidateAction tmp = goodAction;</span>
+<span class="nc" id="L684">        goodAction = badAction;</span>
+<span class="nc" id="L685">        badAction = tmp;</span>
+      }
+<span class="nc" id="L687">      Counter&lt;String&gt; features = new ClassicCounter&lt;&gt;(goodAction.features);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">      for (Map.Entry&lt;String, Double&gt; e : badAction.features.entrySet()) {</span>
+<span class="nc" id="L689">        features.decrementCount(e.getKey(), e.getValue());</span>
+<span class="nc" id="L690">      }</span>
+<span class="nc" id="L691">      learn(features, 0, badAction.cost);</span>
+<span class="nc" id="L692">    }</span>
+  }
+
+  private static class CandidateAction {
+    public final Counter&lt;String&gt; features;
+    public final double cost;
+
+<span class="nc" id="L699">    public CandidateAction(Counter&lt;String&gt; features, double cost) {</span>
+<span class="nc" id="L700">      this.features = features;</span>
+<span class="nc" id="L701">      this.cost = cost;</span>
+<span class="nc" id="L702">    }</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

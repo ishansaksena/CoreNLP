@@ -1,0 +1,1414 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ScorePhrasesLearnFeatWt.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.patterns</a> &gt; <span class="el_source">ScorePhrasesLearnFeatWt.java</span></div><h1>ScorePhrasesLearnFeatWt.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.patterns;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import edu.stanford.nlp.classify.*;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.ling.BasicDatum;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.RVFDatum;
+import edu.stanford.nlp.patterns.ConstantsAndVariables.ScorePhraseMeasures;
+import edu.stanford.nlp.patterns.dep.DataInstanceDep;
+import edu.stanford.nlp.patterns.dep.ExtractPhraseFromPattern;
+import edu.stanford.nlp.patterns.dep.ExtractedPhrase;
+import edu.stanford.nlp.semgraph.SemanticGraph;
+import edu.stanford.nlp.stats.*;
+import edu.stanford.nlp.util.*;
+import edu.stanford.nlp.util.ArgumentParser.Option;
+import edu.stanford.nlp.util.concurrent.AtomicDouble;
+import edu.stanford.nlp.util.concurrent.ConcurrentHashCounter;
+import edu.stanford.nlp.util.logging.Redwood;
+
+
+/**
+ * Learn a logistic regression classifier to combine weights to score a phrase
+ * @author Sonal Gupta (sonalg@stanford.edu)
+ *
+ */
+<span class="nc bnc" id="L37" title="All 2 branches missed.">public class ScorePhrasesLearnFeatWt&lt;E extends Pattern&gt; extends PhraseScorer&lt;E&gt; {</span>
+
+<span class="nc" id="L39">  @Option(name = &quot;scoreClassifierType&quot;)</span>
+  ClassifierType scoreClassifierType = ClassifierType.LR;
+
+
+<span class="nc" id="L43">  static Map&lt;String, double[]&gt; wordVectors = null;</span>
+
+  public ScorePhrasesLearnFeatWt(ConstantsAndVariables constvar) {
+<span class="nc" id="L46">    super(constvar);</span>
+<span class="nc bnc" id="L47" title="All 12 branches missed.">    if(constvar.useWordVectorsToComputeSim &amp;&amp; (constvar.subsampleUnkAsNegUsingSim|| constvar.expandPositivesWhenSampling || constvar.expandNegativesWhenSampling || constVars.usePhraseEvalWordVector) &amp;&amp; wordVectors == null) {</span>
+<span class="nc bnc" id="L48" title="All 2 branches missed.">      if(Data.rawFreq == null){</span>
+<span class="nc" id="L49">          Data.rawFreq = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L50">          Data.computeRawFreqIfNull(PatternFactory.numWordsCompoundMax, constvar.batchProcessSents);</span>
+      }
+<span class="nc" id="L52">      Redwood.log(Redwood.DBG, &quot;Reading word vectors&quot;);</span>
+<span class="nc" id="L53">      wordVectors = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">      for (String line : IOUtils.readLines(constVars.wordVectorFile)) {</span>
+<span class="nc" id="L55">        String[] tok = line.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L56">        String word = tok[0];</span>
+<span class="nc" id="L57">        CandidatePhrase p = CandidatePhrase.createOrGet(word);</span>
+
+        //save the vector if it occurs in the rawFreq, seed set, stop words, english words
+<span class="nc bnc" id="L60" title="All 8 branches missed.">        if (Data.rawFreq.containsKey(p) || constvar.getStopWords().contains(p) || constvar.getEnglishWords().contains(word) || constvar.hasSeedWordOrOtherSem(p)) {</span>
+<span class="nc" id="L61">          double[] d = new double[tok.length - 1];</span>
+<span class="nc bnc" id="L62" title="All 2 branches missed.">          for (int i = 1; i &lt; tok.length; i++) {</span>
+<span class="nc" id="L63">            d[i - 1] = Double.valueOf(tok[i]);</span>
+          }
+<span class="nc" id="L65">          wordVectors.put(word, d);</span>
+<span class="nc" id="L66">        } else</span>
+<span class="nc" id="L67">          CandidatePhrase.deletePhrase(p);</span>
+<span class="nc" id="L68">      }</span>
+<span class="nc" id="L69">      Redwood.log(Redwood.DBG, &quot;Read &quot; + wordVectors.size() + &quot; word vectors&quot;);</span>
+    }
+<span class="nc" id="L71">    OOVExternalFeatWt = 0;</span>
+<span class="nc" id="L72">    OOVdictOdds = 0;</span>
+<span class="nc" id="L73">    OOVDomainNgramScore = 0;</span>
+<span class="nc" id="L74">    OOVGoogleNgramScore = 0;</span>
+<span class="nc" id="L75">  }</span>
+
+
+<span class="nc" id="L78">  public enum ClassifierType {</span>
+<span class="nc" id="L79">    DT, LR, RF, SVM, SHIFTLR, LINEAR</span>
+  }
+
+<span class="nc" id="L82">  public TwoDimensionalCounter&lt;CandidatePhrase, ScorePhraseMeasures&gt; phraseScoresRaw = new TwoDimensionalCounter&lt;&gt;();</span>
+
+
+  public edu.stanford.nlp.classify.Classifier learnClassifier(String label, boolean forLearningPatterns,
+      TwoDimensionalCounter&lt;CandidatePhrase, E&gt; wordsPatExtracted, Counter&lt;E&gt; allSelectedPatterns) throws IOException, ClassNotFoundException {
+<span class="nc" id="L87">    phraseScoresRaw.clear();</span>
+<span class="nc" id="L88">    learnedScores.clear();</span>
+
+<span class="nc bnc" id="L90" title="All 2 branches missed.">    if(Data.domainNGramsFile != null)</span>
+<span class="nc" id="L91">      Data.loadDomainNGrams();</span>
+
+<span class="nc" id="L93">    boolean computeRawFreq = false;</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">    if (Data.rawFreq == null) {</span>
+<span class="nc" id="L95">      Data.rawFreq = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L96">      computeRawFreq = true;</span>
+    }
+
+<span class="nc" id="L99">    GeneralDataset&lt;String, ScorePhraseMeasures&gt; dataset = choosedatums(forLearningPatterns, label, wordsPatExtracted, allSelectedPatterns, computeRawFreq);</span>
+
+    edu.stanford.nlp.classify.Classifier classifier;
+
+<span class="nc bnc" id="L103" title="All 2 branches missed.">    if (scoreClassifierType.equals(ClassifierType.LR)) {</span>
+<span class="nc" id="L104">      LogisticClassifierFactory&lt;String, ScorePhraseMeasures&gt; logfactory = new LogisticClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L105">      LogPrior lprior = new LogPrior();</span>
+<span class="nc" id="L106">      lprior.setSigma(constVars.LRSigma);</span>
+<span class="nc" id="L107">      classifier = logfactory.trainClassifier(dataset, lprior, false);</span>
+<span class="nc" id="L108">      LogisticClassifier logcl = ((LogisticClassifier) classifier);</span>
+
+<span class="nc" id="L110">      String l = (String) logcl.getLabelForInternalPositiveClass();</span>
+<span class="nc" id="L111">      Counter&lt;String&gt; weights = logcl.weightsAsCounter();</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">      if (l.equals(Boolean.FALSE.toString())) {</span>
+<span class="nc" id="L113">        Counters.multiplyInPlace(weights, -1);</span>
+      }
+<span class="nc" id="L115">      List&lt;Pair&lt;String, Double&gt;&gt; wtd = Counters.toDescendingMagnitudeSortedListWithCounts(weights);</span>
+<span class="nc" id="L116">      Redwood.log(ConstantsAndVariables.minimaldebug, &quot;The weights are &quot; + StringUtils.join(wtd.subList(0, Math.min(wtd.size(), 600)), &quot;\n&quot;));</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">    } else if(scoreClassifierType.equals(ClassifierType.SVM)){</span>
+<span class="nc" id="L118">      SVMLightClassifierFactory&lt;String, ScorePhraseMeasures&gt; svmcf = new SVMLightClassifierFactory&lt;&gt;(true);</span>
+<span class="nc" id="L119">      classifier = svmcf.trainClassifier(dataset);</span>
+<span class="nc" id="L120">      Set&lt;String&gt; labels = Generics.newHashSet(Arrays.asList(&quot;true&quot;));</span>
+<span class="nc" id="L121">      List&lt;Triple&lt;ScorePhraseMeasures, String, Double&gt;&gt; topfeatures = ((SVMLightClassifier&lt;String, ScorePhraseMeasures&gt;) classifier).getTopFeatures(labels, 0, true, 600, true);</span>
+<span class="nc" id="L122">      Redwood.log(ConstantsAndVariables.minimaldebug, &quot;The weights are &quot; + StringUtils.join(topfeatures, &quot;\n&quot;));</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">    }else if(scoreClassifierType.equals(ClassifierType.SHIFTLR)){</span>
+
+      //change the dataset to basic dataset because currently ShiftParamsLR doesn't support RVFDatum
+<span class="nc" id="L126">      GeneralDataset&lt;String, ScorePhraseMeasures&gt; newdataset = new Dataset&lt;&gt;();</span>
+<span class="nc" id="L127">      Iterator&lt;RVFDatum&lt;String, ScorePhraseMeasures&gt;&gt; iter = dataset.iterator();</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">      while(iter.hasNext()){</span>
+<span class="nc" id="L129">        RVFDatum&lt;String, ScorePhraseMeasures&gt; inst = iter.next();</span>
+<span class="nc" id="L130">        newdataset.add(new BasicDatum&lt;&gt;(inst.asFeatures(), inst.label()));</span>
+<span class="nc" id="L131">      }</span>
+<span class="nc" id="L132">      ShiftParamsLogisticClassifierFactory&lt;String, ScorePhraseMeasures&gt; factory = new ShiftParamsLogisticClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L133">      classifier =  factory.trainClassifier(newdataset);</span>
+
+      //print weights
+<span class="nc" id="L136">      MultinomialLogisticClassifier&lt;String, ScorePhraseMeasures&gt; logcl = ((MultinomialLogisticClassifier) classifier);</span>
+<span class="nc" id="L137">      Counter&lt;ScorePhraseMeasures&gt; weights = logcl.weightsAsGenericCounter().get(&quot;true&quot;);</span>
+
+<span class="nc" id="L139">      List&lt;Pair&lt;ScorePhraseMeasures, Double&gt;&gt; wtd = Counters.toDescendingMagnitudeSortedListWithCounts(weights);</span>
+<span class="nc" id="L140">      Redwood.log(ConstantsAndVariables.minimaldebug, &quot;The weights are &quot; + StringUtils.join(wtd.subList(0, Math.min(wtd.size(), 600)), &quot;\n&quot;));</span>
+
+<span class="nc bnc" id="L142" title="All 2 branches missed.">    } else if(scoreClassifierType.equals(ClassifierType.LINEAR)){</span>
+<span class="nc" id="L143">      LinearClassifierFactory&lt;String, ScorePhraseMeasures&gt; lcf = new LinearClassifierFactory&lt;&gt;();</span>
+<span class="nc" id="L144">      classifier = lcf.trainClassifier(dataset);</span>
+<span class="nc" id="L145">      Set&lt;String&gt; labels = Generics.newHashSet(Arrays.asList(&quot;true&quot;));</span>
+<span class="nc" id="L146">      List&lt;Triple&lt;ScorePhraseMeasures, String, Double&gt;&gt; topfeatures = ((LinearClassifier&lt;String, ScorePhraseMeasures&gt;) classifier).getTopFeatures(labels, 0, true, 600, true);</span>
+<span class="nc" id="L147">      Redwood.log(ConstantsAndVariables.minimaldebug, &quot;The weights are &quot; + StringUtils.join(topfeatures, &quot;\n&quot;));</span>
+<span class="nc" id="L148">    }else</span>
+<span class="nc" id="L149">      throw new RuntimeException(&quot;cannot identify classifier &quot; + scoreClassifierType);</span>
+
+//    else if (scoreClassifierType.equals(ClassifierType.RF)) {
+//      ClassifierFactory wekaFactory = new WekaDatumClassifierFactory&lt;String, ScorePhraseMeasures&gt;(&quot;weka.classifiers.trees.RandomForest&quot;, constVars.wekaOptions);
+//      classifier = wekaFactory.trainClassifier(dataset);
+//      Classifier cls = ((WekaDatumClassifier) classifier).getClassifier();
+//      RandomForest rf = (RandomForest) cls;
+//    }
+
+<span class="nc" id="L158">    BufferedWriter w = new BufferedWriter(new FileWriter(&quot;tempscorestrainer.txt&quot;));</span>
+<span class="nc" id="L159">    System.out.println(&quot;size of learned scores is &quot; + phraseScoresRaw.size());</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">    for (CandidatePhrase s : phraseScoresRaw.firstKeySet()) {</span>
+<span class="nc" id="L161">      w.write(s + &quot;\t&quot; + phraseScoresRaw.getCounter(s) + &quot;\n&quot;);</span>
+<span class="nc" id="L162">    }</span>
+<span class="nc" id="L163">    w.close();</span>
+
+<span class="nc" id="L165">    return classifier;</span>
+
+  }
+
+  @Override
+  public void printReasonForChoosing(Counter&lt;CandidatePhrase&gt; phrases){
+<span class="nc" id="L171">    Redwood.log(Redwood.DBG, &quot;Features of selected phrases&quot;);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">    for(Entry&lt;CandidatePhrase, Double&gt; pEn: phrases.entrySet())</span>
+<span class="nc" id="L173">      Redwood.log(Redwood.DBG, pEn.getKey().getPhrase() + &quot;\t&quot; + pEn.getValue() + &quot;\t&quot; +  phraseScoresRaw.getCounter(pEn.getKey()));</span>
+<span class="nc" id="L174">  }</span>
+
+  @Override
+  public Counter&lt;CandidatePhrase&gt; scorePhrases(String label, TwoDimensionalCounter&lt;CandidatePhrase, E&gt; terms,
+      TwoDimensionalCounter&lt;CandidatePhrase, E&gt; wordsPatExtracted, Counter&lt;E&gt; allSelectedPatterns,
+      Set&lt;CandidatePhrase&gt; alreadyIdentifiedWords, boolean forLearningPatterns) throws IOException, ClassNotFoundException {
+<span class="nc" id="L180">    getAllLabeledWordsCluster();</span>
+<span class="nc" id="L181">    Counter&lt;CandidatePhrase&gt; scores = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L182">    edu.stanford.nlp.classify.Classifier classifier = learnClassifier(label, forLearningPatterns, wordsPatExtracted, allSelectedPatterns);</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">    for (Entry&lt;CandidatePhrase, ClassicCounter&lt;E&gt;&gt; en : terms.entrySet()) {</span>
+<span class="nc" id="L184">      Double score = this.scoreUsingClassifer(classifier, en.getKey(), label, forLearningPatterns, en.getValue(), allSelectedPatterns);</span>
+<span class="nc bnc" id="L185" title="All 4 branches missed.">      if(!score.isNaN() &amp;&amp; !score.isInfinite()){</span>
+<span class="nc" id="L186">        scores.setCount(en.getKey(), score);</span>
+      }else
+<span class="nc" id="L188">       Redwood.log(Redwood.DBG, &quot;Ignoring &quot; + en.getKey() + &quot; because score is &quot; + score);</span>
+<span class="nc" id="L189">    }</span>
+<span class="nc" id="L190">    return scores;</span>
+  }
+
+  @Override
+  public Counter&lt;CandidatePhrase&gt; scorePhrases(String label, Set&lt;CandidatePhrase&gt; terms, boolean forLearningPatterns) throws IOException, ClassNotFoundException {
+<span class="nc" id="L195">    getAllLabeledWordsCluster();</span>
+<span class="nc" id="L196">    Counter&lt;CandidatePhrase&gt; scores = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L197">    edu.stanford.nlp.classify.Classifier classifier = learnClassifier(label, forLearningPatterns, null, null);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">    for (CandidatePhrase en : terms) {</span>
+<span class="nc" id="L199">      double score = this.scoreUsingClassifer(classifier, en, label, forLearningPatterns,null, null);</span>
+<span class="nc" id="L200">      scores.setCount(en, score);</span>
+<span class="nc" id="L201">    }</span>
+<span class="nc" id="L202">    return scores;</span>
+  }
+
+  public static boolean getRandomBoolean(Random random, double p) {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    return random.nextFloat() &lt; p;</span>
+  }
+
+  static double logistic(double d) {
+<span class="nc" id="L210">    return 1 / (1 + Math.exp(-1 * d));</span>
+  }
+
+<span class="nc" id="L213">  ConcurrentHashMap&lt;CandidatePhrase, Counter&lt;Integer&gt;&gt; wordClassClustersForPhrase = new ConcurrentHashMap&lt;&gt;();</span>
+
+
+
+  Counter&lt;Integer&gt; wordClass(String phrase, String phraseLemma){
+<span class="nc" id="L218">    Counter&lt;Integer&gt; cl = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L219">    String[] phl = null;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">    if(phraseLemma!=null)</span>
+<span class="nc" id="L221">      phl = phraseLemma.split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L222">    int i =0;</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    for(String w: phrase.split(&quot;\\s+&quot;)) {</span>
+
+<span class="nc" id="L225">      Integer cluster = constVars.getWordClassClusters().get(w);</span>
+<span class="nc bnc" id="L226" title="All 4 branches missed.">      if (cluster == null &amp;&amp; phl!=null)</span>
+<span class="nc" id="L227">          cluster = constVars.getWordClassClusters().get(phl[i]);</span>
+
+      //try lowercase
+<span class="nc bnc" id="L230" title="All 2 branches missed.">      if(cluster == null){</span>
+<span class="nc" id="L231">        cluster = constVars.getWordClassClusters().get(w.toLowerCase());</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">        if (cluster == null &amp;&amp; phl!=null)</span>
+<span class="nc" id="L233">          cluster = constVars.getWordClassClusters().get(phl[i].toLowerCase());</span>
+      }
+
+
+<span class="nc bnc" id="L237" title="All 2 branches missed.">      if(cluster != null)</span>
+<span class="nc" id="L238">        cl.incrementCount(cluster);</span>
+<span class="nc" id="L239">      i++;</span>
+    }
+<span class="nc" id="L241">    return cl;</span>
+  }
+
+  void getAllLabeledWordsCluster(){
+<span class="nc bnc" id="L245" title="All 2 branches missed.">    for(String label: constVars.getLabels()){</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">    for(Map.Entry&lt;CandidatePhrase, Double&gt; p : constVars.getLearnedWords(label).entrySet()){</span>
+<span class="nc" id="L247">      wordClassClustersForPhrase.put(p.getKey(), wordClass(p.getKey().getPhrase(), p.getKey().getPhraseLemma()));</span>
+<span class="nc" id="L248">    }</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    for(CandidatePhrase p : constVars.getSeedLabelDictionary().get(label)){</span>
+<span class="nc" id="L251">      wordClassClustersForPhrase.put(p, wordClass(p.getPhrase(), p.getPhraseLemma()));</span>
+<span class="nc" id="L252">    }</span>
+<span class="nc" id="L253">    }</span>
+<span class="nc" id="L254">  }</span>
+
+  private Counter&lt;CandidatePhrase&gt; computeSimWithWordVectors(Collection&lt;CandidatePhrase&gt; candidatePhrases, Collection&lt;CandidatePhrase&gt; otherPhrases, boolean ignoreWordRegex, String label){
+<span class="nc" id="L257">    Counter&lt;CandidatePhrase&gt; sims = new ClassicCounter&lt;&gt;(candidatePhrases.size());</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">    for(CandidatePhrase p : candidatePhrases) {</span>
+
+<span class="nc" id="L260">      Map&lt;String, double[]&gt; simsAvgMaxAllLabels = similaritiesWithLabeledPhrases.get(p.getPhrase());</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">      if(simsAvgMaxAllLabels == null)</span>
+<span class="nc" id="L262">        simsAvgMaxAllLabels = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L263">      double[] simsAvgMax = simsAvgMaxAllLabels.get(label);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      if (simsAvgMax == null) {</span>
+<span class="nc" id="L265">        simsAvgMax = new double[Similarities.values().length];</span>
+        // Arrays.fill(simsAvgMax, 0); // not needed; Java arrays zero initialized
+      }
+
+<span class="nc bnc" id="L269" title="All 6 branches missed.">      if(wordVectors.containsKey(p.getPhrase()) &amp;&amp; (! ignoreWordRegex || !PatternFactory.ignoreWordRegex.matcher(p.getPhrase()).matches())){</span>
+
+<span class="nc" id="L271">        double[] d1 = wordVectors.get(p.getPhrase());</span>
+
+<span class="nc" id="L273">        BinaryHeapPriorityQueue&lt;CandidatePhrase&gt; topSimPhs = new BinaryHeapPriorityQueue&lt;&gt;(constVars.expandPhrasesNumTopSimilar);</span>
+<span class="nc" id="L274">        double allsum = 0;</span>
+<span class="nc" id="L275">        double max = Double.MIN_VALUE;</span>
+
+<span class="nc" id="L277">        boolean donotuse = false;</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        for (CandidatePhrase other : otherPhrases) {</span>
+
+<span class="nc bnc" id="L281" title="All 2 branches missed.">          if (p.equals(other)) {</span>
+<span class="nc" id="L282">            donotuse = true;</span>
+<span class="nc" id="L283">            break;</span>
+          }
+
+<span class="nc bnc" id="L286" title="All 2 branches missed.">          if (!wordVectors.containsKey(other.getPhrase()))</span>
+<span class="nc" id="L287">            continue;</span>
+
+          double sim;
+
+<span class="nc" id="L291">          PhrasePair pair = new PhrasePair(p.getPhrase(), other.getPhrase());</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">          if (cacheSimilarities.containsKey(pair))</span>
+<span class="nc" id="L293">            sim = cacheSimilarities.getCount(pair);</span>
+          else {
+<span class="nc" id="L295">            double[] d2 = wordVectors.get(other.getPhrase());</span>
+
+<span class="nc" id="L297">            double sum = 0;</span>
+<span class="nc" id="L298">            double d1sq = 0;</span>
+<span class="nc" id="L299">            double d2sq = 0;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            for (int i = 0; i &lt; d1.length; i++) {</span>
+<span class="nc" id="L301">              sum += d1[i] * d2[i];</span>
+<span class="nc" id="L302">              d1sq += d1[i] * d1[i];</span>
+<span class="nc" id="L303">              d2sq += d2[i] * d2[i];</span>
+            }
+<span class="nc" id="L305">            sim = sum / (Math.sqrt(d1sq) * Math.sqrt(d2sq));</span>
+<span class="nc" id="L306">            cacheSimilarities.setCount(pair, sim);</span>
+          }
+
+<span class="nc" id="L309">          topSimPhs.add(other, sim);</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">          if(topSimPhs.size() &gt; constVars.expandPhrasesNumTopSimilar)</span>
+<span class="nc" id="L311">            topSimPhs.removeLastEntry();</span>
+
+          //avgSim /= otherPhrases.size();
+<span class="nc" id="L314">          allsum += sim;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">          if(sim &gt; max)</span>
+<span class="nc" id="L316">            max = sim;</span>
+<span class="nc" id="L317">        }</span>
+
+<span class="nc" id="L319">        double finalSimScore = 0;</span>
+<span class="nc" id="L320">        int numEl = 0;</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        while(topSimPhs.hasNext()) {</span>
+<span class="nc" id="L322">          finalSimScore += topSimPhs.getPriority();</span>
+<span class="nc" id="L323">          topSimPhs.next();</span>
+<span class="nc" id="L324">          numEl++;</span>
+        }
+<span class="nc" id="L326">        finalSimScore /= numEl;</span>
+
+<span class="nc" id="L328">        double prevNumItems = simsAvgMax[Similarities.NUMITEMS.ordinal()];</span>
+<span class="nc" id="L329">        double prevAvg = simsAvgMax[Similarities.AVGSIM.ordinal()];</span>
+<span class="nc" id="L330">        double prevMax = simsAvgMax[Similarities.MAXSIM.ordinal()];</span>
+<span class="nc" id="L331">        double newNumItems = prevNumItems + otherPhrases.size();</span>
+<span class="nc" id="L332">        double newAvg = (prevAvg*prevNumItems + allsum) /(newNumItems);</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        double newMax = prevMax &gt; max ? prevMax: max;</span>
+<span class="nc" id="L334">        simsAvgMax[Similarities.NUMITEMS.ordinal()] = newNumItems;</span>
+<span class="nc" id="L335">        simsAvgMax[Similarities.AVGSIM.ordinal()] = newAvg;</span>
+<span class="nc" id="L336">        simsAvgMax[Similarities.MAXSIM.ordinal()] = newMax;</span>
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if(!donotuse){</span>
+<span class="nc" id="L339">          sims.setCount(p, finalSimScore);</span>
+        }
+<span class="nc" id="L341">      }else{</span>
+<span class="nc" id="L342">        sims.setCount(p, Double.MIN_VALUE);</span>
+      }
+<span class="nc" id="L344">      simsAvgMaxAllLabels.put(label, simsAvgMax);</span>
+<span class="nc" id="L345">      similaritiesWithLabeledPhrases.put(p.getPhrase(), simsAvgMaxAllLabels);</span>
+<span class="nc" id="L346">    }</span>
+<span class="nc" id="L347">    return sims;</span>
+  }
+
+  private Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt; computeSimWithWordVectors(List&lt;CandidatePhrase&gt; candidatePhrases, Collection&lt;CandidatePhrase&gt; positivePhrases,
+                                                                                             Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; allPossibleNegativePhrases, String label) {
+<span class="nc bnc" id="L352" title="All 4 branches missed.">    assert wordVectors != null : &quot;Why are word vectors null?&quot;;</span>
+<span class="nc" id="L353">    Counter&lt;CandidatePhrase&gt; posSims = computeSimWithWordVectors(candidatePhrases, positivePhrases, true, label);</span>
+<span class="nc" id="L354">    Counter&lt;CandidatePhrase&gt; negSims = new ClassicCounter&lt;&gt;();</span>
+
+<span class="nc bnc" id="L356" title="All 2 branches missed.">    for(Map.Entry&lt;String, Collection&lt;CandidatePhrase&gt;&gt; en: allPossibleNegativePhrases.entrySet())</span>
+<span class="nc" id="L357">      negSims.addAll(computeSimWithWordVectors(candidatePhrases, en.getValue(), true, en.getKey()));</span>
+
+<span class="nc" id="L359">    Function&lt;CandidatePhrase, Boolean&gt; retainPhrasesNotCloseToNegative = candidatePhrase -&gt; {</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">      if(negSims.getCount(candidatePhrase) &gt; posSims.getCount(candidatePhrase))</span>
+<span class="nc" id="L361">        return false;</span>
+      else
+<span class="nc" id="L363">        return true;</span>
+    };
+<span class="nc" id="L365">    Counters.retainKeys(posSims, retainPhrasesNotCloseToNegative);</span>
+<span class="nc" id="L366">    return new Pair(posSims, negSims);</span>
+  }
+
+  Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt; computeSimWithWordCluster(Collection&lt;CandidatePhrase&gt; candidatePhrases, Collection&lt;CandidatePhrase&gt; positivePhrases, AtomicDouble allMaxSim){
+
+<span class="nc" id="L371">    Counter&lt;CandidatePhrase&gt; sims = new ClassicCounter&lt;&gt;(candidatePhrases.size());</span>
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">    for(CandidatePhrase p : candidatePhrases) {</span>
+<span class="nc" id="L374">      Counter&lt;Integer&gt; feat = wordClassClustersForPhrase.get(p);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">      if(feat == null){</span>
+<span class="nc" id="L376">        feat = wordClass(p.getPhrase(), p.getPhraseLemma());</span>
+<span class="nc" id="L377">        wordClassClustersForPhrase.put(p, feat);</span>
+      }
+
+<span class="nc" id="L380">      double avgSim = 0;// Double.MIN_VALUE;</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      if(feat.size() &gt; 0) {</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        for (CandidatePhrase pos : positivePhrases) {</span>
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">          if(p.equals(pos))</span>
+<span class="nc" id="L385">            continue;</span>
+
+<span class="nc" id="L387">          Counter&lt;Integer&gt; posfeat = wordClassClustersForPhrase.get(pos);</span>
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">          if(posfeat == null){</span>
+<span class="nc" id="L390">            posfeat = wordClass(pos.getPhrase(), pos.getPhraseLemma());</span>
+<span class="nc" id="L391">            wordClassClustersForPhrase.put(pos, feat);</span>
+          }
+
+<span class="nc bnc" id="L394" title="All 2 branches missed.">          if(posfeat.size() &gt; 0){</span>
+<span class="nc" id="L395">            Double j = Counters.jaccardCoefficient(posfeat, feat);</span>
+            //System.out.println(&quot;clusters for positive phrase &quot; + pos + &quot; is &quot; +wordClassClustersForPhrase.get(pos) + &quot; and the features for unknown are &quot;  + feat + &quot; for phrase &quot; + p);
+<span class="nc bnc" id="L397" title="All 4 branches missed.">            if(!j.isInfinite() &amp;&amp; !j.isNaN()){</span>
+<span class="nc" id="L398">              avgSim += j;</span>
+            }
+            //if (j &gt; maxSim)
+            //  maxSim = j;
+          }
+<span class="nc" id="L403">        }</span>
+<span class="nc" id="L404">        avgSim /= positivePhrases.size();</span>
+      }
+
+<span class="nc" id="L407">      sims.setCount(p, avgSim);</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">      if(allMaxSim.get() &lt; avgSim)</span>
+<span class="nc" id="L409">        allMaxSim.set(avgSim);</span>
+<span class="nc" id="L410">    }</span>
+    //TODO: compute similarity with neg phrases
+<span class="nc" id="L412">    return new Pair(sims, null);</span>
+  }
+
+  class ComputeSim implements Callable&lt;Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt;&gt;{
+
+    List&lt;CandidatePhrase&gt; candidatePhrases;
+    String label;
+    AtomicDouble allMaxSim;
+    Collection&lt;CandidatePhrase&gt; positivePhrases;
+    Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; knownNegativePhrases;
+
+<span class="nc" id="L423">    public ComputeSim(String label, List&lt;CandidatePhrase&gt; candidatePhrases, AtomicDouble allMaxSim, Collection&lt;CandidatePhrase&gt; positivePhrases, Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; knownNegativePhrases){</span>
+<span class="nc" id="L424">      this.label = label;</span>
+<span class="nc" id="L425">      this.candidatePhrases = candidatePhrases;</span>
+<span class="nc" id="L426">      this.allMaxSim = allMaxSim;</span>
+<span class="nc" id="L427">      this.positivePhrases = positivePhrases;</span>
+<span class="nc" id="L428">      this.knownNegativePhrases = knownNegativePhrases;</span>
+<span class="nc" id="L429">    }</span>
+
+    @Override
+    public Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt; call() throws Exception {
+
+<span class="nc bnc" id="L434" title="All 2 branches missed.">      if(constVars.useWordVectorsToComputeSim){</span>
+<span class="nc" id="L435">        Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt; phs = computeSimWithWordVectors(candidatePhrases, positivePhrases, knownNegativePhrases, label);</span>
+<span class="nc" id="L436">        Redwood.log(Redwood.DBG, &quot;Computed similarities with positive and negative phrases&quot;);</span>
+<span class="nc" id="L437">        return phs;</span>
+      }
+      else
+      //TODO: knownnegaitvephrases
+<span class="nc" id="L441">        return computeSimWithWordCluster(candidatePhrases, positivePhrases, allMaxSim);</span>
+    }
+  }
+
+
+
+  //this chooses the ones that are not close to the positive phrases!
+  Set&lt;CandidatePhrase&gt; chooseUnknownAsNegatives(Set&lt;CandidatePhrase&gt; candidatePhrases, String label, Collection&lt;CandidatePhrase&gt; positivePhrases, Map&lt;String,
+    Collection&lt;CandidatePhrase&gt;&gt; knownNegativePhrases, BufferedWriter logFile) throws IOException {
+
+<span class="nc" id="L451">    List&lt;List&lt;CandidatePhrase&gt;&gt; threadedCandidates = GetPatternsFromDataMultiClass.getThreadBatches(CollectionUtils.toList(candidatePhrases), constVars.numThreads);</span>
+
+<span class="nc" id="L453">    Counter&lt;CandidatePhrase&gt; sims = new ClassicCounter&lt;&gt;();</span>
+
+<span class="nc" id="L455">    AtomicDouble allMaxSim = new AtomicDouble(Double.MIN_VALUE);</span>
+
+<span class="nc" id="L457">    ExecutorService executor = Executors.newFixedThreadPool(constVars.numThreads);</span>
+<span class="nc" id="L458">    List&lt;Future&lt;Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt;&gt;&gt; list = new ArrayList&lt;&gt;();</span>
+
+    //multi-threaded choose positive, negative and unknown
+<span class="nc bnc" id="L461" title="All 2 branches missed.">    for (List&lt;CandidatePhrase&gt; keys : threadedCandidates) {</span>
+<span class="nc" id="L462">      Callable&lt;Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt;&gt; task = new ComputeSim(label, keys, allMaxSim, positivePhrases, knownNegativePhrases);</span>
+<span class="nc" id="L463">      Future&lt;Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt;&gt; submit = executor.submit(task);</span>
+<span class="nc" id="L464">      list.add(submit);</span>
+<span class="nc" id="L465">    }</span>
+
+    // Now retrieve the result
+<span class="nc bnc" id="L468" title="All 2 branches missed.">    for (Future&lt;Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt;&gt; future : list) {</span>
+      try {
+<span class="nc" id="L470">        sims.addAll(future.get().first());</span>
+<span class="nc" id="L471">      } catch (Exception e) {</span>
+<span class="nc" id="L472">        executor.shutdownNow();</span>
+<span class="nc" id="L473">        throw new RuntimeException(e);</span>
+<span class="nc" id="L474">      }</span>
+<span class="nc" id="L475">    }</span>
+<span class="nc" id="L476">    executor.shutdown();</span>
+
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">    if(allMaxSim.get() == Double.MIN_VALUE){</span>
+<span class="nc" id="L480">      Redwood.log(Redwood.DBG, &quot;No similarity recorded between the positives and the unknown!&quot;);</span>
+    }
+
+<span class="nc" id="L483">    CandidatePhrase k = Counters.argmax(sims);</span>
+<span class="nc" id="L484">    System.out.println(&quot;Maximum similarity was &quot; + sims.getCount(k) + &quot; for word &quot; + k);</span>
+
+<span class="nc" id="L486">    Counter&lt;CandidatePhrase&gt; removed = Counters.retainBelow(sims, constVars.positiveSimilarityThresholdLowPrecision);</span>
+<span class="nc" id="L487">    System.out.println(&quot;removing phrases as negative phrases that were higher that positive similarity threshold of &quot; + constVars.positiveSimilarityThresholdLowPrecision + removed);</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">    if(logFile != null &amp;&amp; wordVectors != null){</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">      for(Entry&lt;CandidatePhrase, Double&gt; en: removed.entrySet())</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">        if(wordVectors.containsKey(en.getKey().getPhrase()))</span>
+<span class="nc" id="L491">          logFile.write(en.getKey()+&quot;-PN &quot; + ArrayUtils.toString(wordVectors.get(en.getKey().getPhrase()), &quot; &quot;)+&quot;\n&quot;);</span>
+    }
+    //Collection&lt;CandidatePhrase&gt; removed = Counters.retainBottom(sims, (int) (sims.size() * percentage));
+    //System.out.println(&quot;not choosing &quot; + removed + &quot; as the negative phrases. percentage is &quot; + percentage + &quot; and allMaxsim was &quot; + allMaxSim);
+
+<span class="nc" id="L496">    return sims.keySet();</span>
+  }
+
+
+
+  Set&lt;CandidatePhrase&gt; chooseUnknownPhrases(DataInstance sent, Random random, double perSelect, Class positiveClass, String label, int maxNum){
+
+<span class="nc" id="L503">    Set&lt;CandidatePhrase&gt; unknownSamples = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    if(maxNum == 0)</span>
+<span class="nc" id="L506">      return unknownSamples;</span>
+
+<span class="nc" id="L508">    Function&lt;CoreLabel, Boolean&gt; acceptWord = coreLabel -&gt; {</span>
+<span class="nc bnc" id="L509" title="All 4 branches missed.">      if(coreLabel.get(positiveClass).equals(label) || constVars.functionWords.contains(coreLabel.word()))</span>
+<span class="nc" id="L510">        return false;</span>
+      else
+<span class="nc" id="L512">        return true;</span>
+    };
+
+<span class="nc" id="L515">    Random r = new Random(0);</span>
+<span class="nc" id="L516">    List&lt;Integer&gt; lengths = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">    for(int i = 1;i &lt;= PatternFactory.numWordsCompoundMapped.get(label); i++)</span>
+<span class="nc" id="L518">      lengths.add(i);</span>
+<span class="nc" id="L519">    int length = CollectionUtils.sample(lengths, r);</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">    if(constVars.patternType.equals(PatternFactory.PatternType.DEP)){</span>
+
+<span class="nc" id="L523">    ExtractPhraseFromPattern extract = new ExtractPhraseFromPattern(true, length);</span>
+<span class="nc" id="L524">    SemanticGraph g = ((DataInstanceDep) sent).getGraph();</span>
+<span class="nc" id="L525">    Collection&lt;CoreLabel&gt; sampledHeads = CollectionUtils.sampleWithoutReplacement(sent.getTokens(), Math.min(maxNum, (int) (perSelect * sent.getTokens().size())), random);</span>
+
+    //TODO: change this for more efficient implementation
+<span class="nc" id="L528">    List&lt;String&gt; textTokens = sent.getTokens().stream().map(x -&gt; x.word()).collect(Collectors.toList());</span>
+
+<span class="nc bnc" id="L530" title="All 2 branches missed.">    for(CoreLabel l: sampledHeads) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">      if(!acceptWord.apply(l))</span>
+<span class="nc" id="L532">        continue;</span>
+<span class="nc" id="L533">      IndexedWord w = g.getNodeByIndex(l.index());</span>
+<span class="nc" id="L534">      List&lt;String&gt; outputPhrases = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L535">      List&lt;ExtractedPhrase&gt; extractedPhrases = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L536">      List&lt;IntPair&gt; outputIndices = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L538">      extract.printSubGraph(g, w, new ArrayList&lt;&gt;(), textTokens, outputPhrases, outputIndices, new ArrayList&lt;&gt;(), new ArrayList&lt;&gt;(),</span>
+        false, extractedPhrases, null, acceptWord);
+<span class="nc bnc" id="L540" title="All 2 branches missed.">      for(ExtractedPhrase p :extractedPhrases){</span>
+<span class="nc" id="L541">        unknownSamples.add(CandidatePhrase.createOrGet(p.getValue(), null, p.getFeatures()));</span>
+<span class="nc" id="L542">      }</span>
+<span class="nc" id="L543">    }</span>
+
+<span class="nc bnc" id="L545" title="All 2 branches missed.">    }else if(constVars.patternType.equals(PatternFactory.PatternType.SURFACE)){</span>
+<span class="nc" id="L546">      CoreLabel[] tokens = sent.getTokens().toArray(new CoreLabel[0]);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">      for(int i =0; i &lt; tokens.length; i++){</span>
+
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if(random.nextDouble() &lt; perSelect){</span>
+
+<span class="nc" id="L551">          int left = (int)((length -1) /2.0);</span>
+<span class="nc" id="L552">          int right = length -1 -left;</span>
+<span class="nc" id="L553">          String ph = &quot;&quot;;</span>
+<span class="nc" id="L554">          boolean haspositive = false;</span>
+<span class="nc bnc" id="L555" title="All 4 branches missed.">          for(int j = Math.max(0, i - left); j &lt; tokens.length &amp;&amp; j &lt;= i+right; j++){</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">            if(tokens[j].get(positiveClass).equals(label)){</span>
+<span class="nc" id="L557">              haspositive = true;</span>
+<span class="nc" id="L558">              break;</span>
+            }
+<span class="nc" id="L560">            ph += &quot; &quot; + tokens[j].word();</span>
+          }
+<span class="nc" id="L562">          ph = ph.trim();</span>
+<span class="nc bnc" id="L563" title="All 6 branches missed.">          if(!haspositive &amp;&amp; !ph.trim().isEmpty() &amp;&amp; !constVars.functionWords.contains(ph)){</span>
+<span class="nc" id="L564">            unknownSamples.add(CandidatePhrase.createOrGet(ph));</span>
+          }
+        }
+      }
+
+<span class="nc" id="L569">    } else</span>
+<span class="nc" id="L570">    throw new RuntimeException(&quot;not yet implemented&quot;);</span>
+
+
+<span class="nc" id="L573">    return unknownSamples;</span>
+
+  }
+
+  static&lt;E,F&gt; boolean hasElement(Map&lt;E, Collection&lt;F&gt;&gt; values, F value, E ignoreLabel){
+<span class="nc bnc" id="L578" title="All 2 branches missed.">      for(Map.Entry&lt;E, Collection&lt;F&gt;&gt; en: values.entrySet()){</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">        if(en.getKey().equals(ignoreLabel))</span>
+<span class="nc" id="L580">          continue;</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">        if(en.getValue().contains(value))</span>
+<span class="nc" id="L582">          return true;</span>
+<span class="nc" id="L583">      }</span>
+<span class="nc" id="L584">    return false;</span>
+  }
+
+  Counter&lt;String&gt; numLabeledTokens(){
+<span class="nc" id="L588">    Counter&lt;String&gt; counter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L589">    ConstantsAndVariables.DataSentsIterator data = new ConstantsAndVariables.DataSentsIterator(constVars.batchProcessSents);</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">    while(data.hasNext()){</span>
+<span class="nc" id="L591">      Map&lt;String, DataInstance&gt; sentsf = data.next().first();</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">      for(Entry&lt;String, DataInstance&gt; en: sentsf.entrySet()){</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">        for(CoreLabel l : en.getValue().getTokens()){</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">          for(Entry&lt;String, Class&lt;? extends TypesafeMap.Key&lt;String&gt;&gt;&gt; enc: constVars.getAnswerClass().entrySet()){</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            if(l.get(enc.getValue()).equals(enc.getKey())){</span>
+<span class="nc" id="L596">              counter.incrementCount(enc.getKey());</span>
+            }
+<span class="nc" id="L598">          }</span>
+<span class="nc" id="L599">        }</span>
+<span class="nc" id="L600">      }</span>
+<span class="nc" id="L601">    }</span>
+<span class="nc" id="L602">    return counter;</span>
+  }
+
+<span class="nc" id="L605">  Counter&lt;CandidatePhrase&gt; closeToPositivesFirstIter = null;</span>
+<span class="nc" id="L606">  Counter&lt;CandidatePhrase&gt; closeToNegativesFirstIter = null;</span>
+
+<span class="nc bnc" id="L608" title="All 2 branches missed.">  public class ChooseDatumsThread implements Callable {</span>
+
+    Collection&lt;String&gt; keys;
+    Map&lt;String, DataInstance&gt; sents;
+    Class answerClass;
+    String answerLabel;
+    TwoDimensionalCounter&lt;CandidatePhrase, E&gt; wordsPatExtracted;
+    Counter&lt;E&gt; allSelectedPatterns;
+    Counter&lt;Integer&gt; wordClassClustersOfPositive;
+    Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; allPossiblePhrases;
+    boolean expandPos;
+    boolean expandNeg;
+
+    public ChooseDatumsThread(String label, Map&lt;String, DataInstance&gt; sents, Collection&lt;String&gt; keys, TwoDimensionalCounter&lt;CandidatePhrase, E&gt; wordsPatExtracted, Counter&lt;E&gt; allSelectedPatterns,
+<span class="nc" id="L622">                              Counter&lt;Integer&gt; wordClassClustersOfPositive, Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; allPossiblePhrases, boolean expandPos, boolean expandNeg){</span>
+<span class="nc" id="L623">      this.answerLabel = label;</span>
+<span class="nc" id="L624">      this.sents = sents;</span>
+<span class="nc" id="L625">      this.keys = keys;</span>
+<span class="nc" id="L626">      this.wordsPatExtracted = wordsPatExtracted;</span>
+<span class="nc" id="L627">      this.allSelectedPatterns = allSelectedPatterns;</span>
+<span class="nc" id="L628">      this.wordClassClustersOfPositive = wordClassClustersOfPositive;</span>
+<span class="nc" id="L629">      this.allPossiblePhrases = allPossiblePhrases;</span>
+<span class="nc" id="L630">      answerClass = constVars.getAnswerClass().get(answerLabel);</span>
+<span class="nc" id="L631">      this.expandNeg = expandNeg;</span>
+<span class="nc" id="L632">      this.expandPos = expandPos;</span>
+<span class="nc" id="L633">    }</span>
+
+    @Override
+    public Quintuple&lt;Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt; call() throws Exception {
+
+<span class="nc" id="L638">      Random r = new Random(10);</span>
+<span class="nc" id="L639">      Random rneg = new Random(10);</span>
+<span class="nc" id="L640">      Set&lt;CandidatePhrase&gt; allPositivePhrases = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L641">      Set&lt;CandidatePhrase&gt; allNegativePhrases = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L642">      Set&lt;CandidatePhrase&gt; allUnknownPhrases = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L643">      Counter&lt;CandidatePhrase&gt; allCloseToPositivePhrases = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L644">      Counter&lt;CandidatePhrase&gt; allCloseToNegativePhrases = new ClassicCounter&lt;&gt;();</span>
+
+
+<span class="nc" id="L647">      Set&lt;CandidatePhrase&gt; knownPositivePhrases = CollectionUtils.unionAsSet(constVars.getLearnedWords(answerLabel).keySet(), constVars.getSeedLabelDictionary().get(answerLabel));</span>
+
+<span class="nc" id="L649">      Set&lt;CandidatePhrase&gt; allConsideredPhrases = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L651">      Map&lt;Class, Object&gt; otherIgnoreClasses = constVars.getIgnoreWordswithClassesDuringSelection().get(answerLabel);</span>
+<span class="nc" id="L652">      int numlabeled = 0;</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">      for (String sentid : keys) {</span>
+<span class="nc" id="L654">        DataInstance sentInst = sents.get(sentid);</span>
+<span class="nc" id="L655">        List&lt;CoreLabel&gt; value = sentInst.getTokens();</span>
+<span class="nc" id="L656">        CoreLabel[] sent = value.toArray(new CoreLabel[value.size()]);</span>
+
+<span class="nc bnc" id="L658" title="All 2 branches missed.">        for (int i = 0; i &lt; sent.length; i++) {</span>
+<span class="nc" id="L659">          CoreLabel l = sent[i];</span>
+
+<span class="nc bnc" id="L661" title="All 2 branches missed.">          if (l.get(answerClass).equals(answerLabel)) {</span>
+<span class="nc" id="L662">            numlabeled++;</span>
+<span class="nc" id="L663">            CandidatePhrase candidate = l.get(PatternsAnnotations.LongestMatchedPhraseForEachLabel.class).get(answerLabel);</span>
+
+<span class="nc bnc" id="L665" title="All 2 branches missed.">            if (candidate == null) {</span>
+<span class="nc" id="L666">              throw new RuntimeException(&quot;for sentence id &quot; + sentid + &quot; and token id &quot; + i + &quot; candidate is null for &quot; + l.word() + &quot; and longest matching&quot; + l.get(PatternsAnnotations.LongestMatchedPhraseForEachLabel.class) + &quot; and matched phrases are &quot; + l.get(PatternsAnnotations.MatchedPhrases.class));</span>
+              //candidate = CandidatePhrase.createOrGet(l.word());
+            }
+
+            //If the phrase does not exist in its form in the datset (happens when fuzzy matching etc).
+<span class="nc bnc" id="L671" title="All 2 branches missed.">            if(!Data.rawFreq.containsKey(candidate)){</span>
+<span class="nc" id="L672">              candidate = CandidatePhrase.createOrGet(l.word());</span>
+            }
+
+            //Do not add to positive if the word is a &quot;negative&quot; (stop word, english word, ...)
+
+<span class="nc bnc" id="L677" title="All 4 branches missed.">            if(hasElement(allPossiblePhrases, candidate, answerLabel) || PatternFactory.ignoreWordRegex.matcher(candidate.getPhrase()).matches())</span>
+<span class="nc" id="L678">              continue;</span>
+
+<span class="nc" id="L680">            allPositivePhrases.add(candidate);</span>
+
+<span class="nc" id="L682">          } else {</span>
+
+<span class="nc" id="L684">            Map&lt;String, CandidatePhrase&gt; longestMatching = l.get(PatternsAnnotations.LongestMatchedPhraseForEachLabel.class);</span>
+
+<span class="nc" id="L686">            boolean ignoreclass = false;</span>
+<span class="nc" id="L687">            CandidatePhrase candidate =  CandidatePhrase.createOrGet(l.word());</span>
+
+<span class="nc bnc" id="L689" title="All 2 branches missed.">            for (Class cl : otherIgnoreClasses.keySet()) {</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">              if ((Boolean) l.get(cl)) {</span>
+<span class="nc" id="L691">                ignoreclass = true;</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">                candidate = longestMatching.containsKey(&quot;OTHERSEM&quot;)? longestMatching.get(&quot;OTHERSEM&quot;) : candidate;</span>
+<span class="nc" id="L693">                break;</span>
+              }
+<span class="nc" id="L695">            }</span>
+
+<span class="nc bnc" id="L697" title="All 2 branches missed.">            if(!ignoreclass) {</span>
+<span class="nc" id="L698">              ignoreclass = constVars.functionWords.contains(l.word());</span>
+            }
+
+
+<span class="nc" id="L702">            boolean negative = false;</span>
+<span class="nc" id="L703">            boolean add= false;</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            for (Map.Entry&lt;String, CandidatePhrase&gt; lo : longestMatching.entrySet()) {</span>
+              //assert !lo.getValue().getPhrase().isEmpty() : &quot;How is the longestmatching phrase for &quot; + l.word() + &quot; empty &quot;;
+<span class="nc bnc" id="L706" title="All 4 branches missed.">              if (!lo.getKey().equals(answerLabel) &amp;&amp; lo.getValue() != null) {</span>
+<span class="nc" id="L707">                negative = true;</span>
+<span class="nc" id="L708">                add = true;</span>
+                //If the phrase does not exist in its form in the datset (happens when fuzzy matching etc).
+<span class="nc bnc" id="L710" title="All 2 branches missed.">                if(Data.rawFreq.containsKey(lo.getValue())){</span>
+<span class="nc" id="L711">                  candidate = lo.getValue();</span>
+                }
+              }
+<span class="nc" id="L714">            }</span>
+
+
+<span class="nc bnc" id="L717" title="All 4 branches missed.">            if (!negative &amp;&amp; ignoreclass) {</span>
+<span class="nc" id="L718">              add = true;</span>
+            }
+
+<span class="nc bnc" id="L721" title="All 4 branches missed.">            if(add &amp;&amp; rneg.nextDouble() &lt; constVars.perSelectNeg){</span>
+<span class="nc bnc" id="L722" title="All 4 branches missed.">              assert !candidate.getPhrase().isEmpty();</span>
+<span class="nc" id="L723">              allNegativePhrases.add(candidate);</span>
+            }
+
+<span class="nc bnc" id="L726" title="All 12 branches missed.">            if(!negative &amp;&amp; !ignoreclass &amp;&amp; (expandPos || expandNeg) &amp;&amp; !hasElement(allPossiblePhrases, candidate, answerLabel) &amp;&amp; !PatternFactory.ignoreWordRegex.matcher(candidate.getPhrase()).matches()) {</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">              if (!allConsideredPhrases.contains(candidate)) {</span>
+                Pair&lt;Counter&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;&gt; sims;
+<span class="nc bnc" id="L729" title="All 4 branches missed.">                assert candidate != null;</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">                if(constVars.useWordVectorsToComputeSim)</span>
+<span class="nc" id="L731">                  sims = computeSimWithWordVectors(Arrays.asList(candidate), knownPositivePhrases, allPossiblePhrases, answerLabel);</span>
+                else
+<span class="nc" id="L733">                  sims = computeSimWithWordCluster(Arrays.asList(candidate), knownPositivePhrases, new AtomicDouble());</span>
+
+<span class="nc" id="L735">                boolean addedAsPos = false;</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">                if(expandPos)</span>
+                {
+<span class="nc" id="L738">                  double sim = sims.first().getCount(candidate);</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                  if (sim &gt; constVars.similarityThresholdHighPrecision){</span>
+<span class="nc" id="L740">                    allCloseToPositivePhrases.setCount(candidate, sim);</span>
+<span class="nc" id="L741">                    addedAsPos = true;</span>
+                  }
+                }
+<span class="nc bnc" id="L744" title="All 4 branches missed.">                if(expandNeg &amp;&amp;  !addedAsPos) {</span>
+<span class="nc" id="L745">                  double simneg = sims.second().getCount(candidate);</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                  if (simneg &gt; constVars.similarityThresholdHighPrecision)</span>
+<span class="nc" id="L747">                    allCloseToNegativePhrases.setCount(candidate, simneg);</span>
+                }
+<span class="nc" id="L749">                allConsideredPhrases.add(candidate);</span>
+              }
+            }
+          }
+        }
+
+<span class="nc" id="L755">        allUnknownPhrases.addAll(chooseUnknownPhrases(sentInst, r, constVars.perSelectRand, constVars.getAnswerClass().get(answerLabel), answerLabel, Math.max(0, Integer.MAX_VALUE)));</span>
+//
+//        if (negative &amp;&amp; getRandomBoolean(rneg, perSelectNeg)) {
+//          numneg++;
+//        } else if (getRandomBoolean(r, perSelectRand)) {
+//          candidate = CandidatePhrase.createOrGet(l.word());
+//          numneg++;
+//        } else {
+//          continue;
+//        }
+//
+//
+//          chosen.add(new Pair&lt;String, Integer&gt;(en.getKey(), i));
+<span class="nc" id="L768">      }</span>
+
+<span class="nc" id="L770">    return new Quintuple(allPositivePhrases, allNegativePhrases, allUnknownPhrases, allCloseToPositivePhrases, allCloseToNegativePhrases);</span>
+    }
+  }
+
+  static private class PhrasePair{
+    final String p1;
+    final String p2;
+    final int hashCode;
+
+<span class="nc" id="L779">    public PhrasePair(String p1, String p2) {</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">      if(p1.compareTo(p2) &lt;=0)</span>
+      {
+<span class="nc" id="L782">        this.p1 = p1;</span>
+<span class="nc" id="L783">        this.p2 = p2;</span>
+      }else
+      {
+<span class="nc" id="L786">        this.p1 = p2;</span>
+<span class="nc" id="L787">        this.p2 = p1;</span>
+      }
+
+<span class="nc" id="L790">      this.hashCode = p1.hashCode() + p2.hashCode() + 331;</span>
+<span class="nc" id="L791">    }</span>
+
+    @Override
+    public int hashCode(){
+<span class="nc" id="L795">      return hashCode;</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L800" title="All 2 branches missed.">      if (!(o instanceof PhrasePair))</span>
+<span class="nc" id="L801">        return false;</span>
+<span class="nc" id="L802">      PhrasePair p = (PhrasePair) o;</span>
+<span class="nc bnc" id="L803" title="All 4 branches missed.">      if (p.getPhrase1().equals(this.getPhrase1()) &amp;&amp; p.getPhrase2().equals(this.getPhrase2()))</span>
+<span class="nc" id="L804">        return true;</span>
+<span class="nc" id="L805">      return false;</span>
+    }
+
+    public String getPhrase1() {
+<span class="nc" id="L809">      return p1;</span>
+    }
+
+
+    public String getPhrase2() {
+<span class="nc" id="L814">      return p2;</span>
+    }
+  }
+
+<span class="nc" id="L818">  static Counter&lt;PhrasePair&gt; cacheSimilarities = new ConcurrentHashCounter&lt;&gt;();</span>
+
+  //First map is phrase, second map is label to similarity stats
+<span class="nc" id="L821">  static Map&lt;String, Map&lt;String, double[]&gt;&gt; similaritiesWithLabeledPhrases = new ConcurrentHashMap&lt;&gt;();</span>
+
+  Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; getAllPossibleNegativePhrases(String answerLabel){
+
+    //make all possible negative phrases
+<span class="nc" id="L826">    Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; allPossiblePhrases = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L827">    Collection&lt;CandidatePhrase&gt; negPhrases = new HashSet&lt;&gt;();</span>
+    //negPhrases.addAll(constVars.getOtherSemanticClassesWords());
+<span class="nc" id="L829">    negPhrases.addAll(constVars.getStopWords());</span>
+<span class="nc" id="L830">    negPhrases.addAll(CandidatePhrase.convertStringPhrases(constVars.functionWords));</span>
+<span class="nc" id="L831">    negPhrases.addAll(CandidatePhrase.convertStringPhrases(constVars.getEnglishWords()));</span>
+<span class="nc" id="L832">    allPossiblePhrases.put(&quot;NEGATIVE&quot;, negPhrases);</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">    for(String label: constVars.getLabels()) {</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">      if (!label.equals(answerLabel)){</span>
+<span class="nc" id="L835">        allPossiblePhrases.put(label, new HashSet&lt;&gt;());</span>
+
+<span class="nc bnc" id="L837" title="All 2 branches missed.">        if(constVars.getLearnedWordsEachIter().containsKey(label))</span>
+<span class="nc" id="L838">          allPossiblePhrases.get(label).addAll(constVars.getLearnedWords(label).keySet());</span>
+<span class="nc" id="L839">        allPossiblePhrases.get(label).addAll(constVars.getSeedLabelDictionary().get(label));</span>
+      }
+<span class="nc" id="L841">    }</span>
+<span class="nc" id="L842">    allPossiblePhrases.put(&quot;OTHERSEM&quot;, constVars.getOtherSemanticClassesWords());</span>
+<span class="nc" id="L843">    return allPossiblePhrases;</span>
+  }
+
+  public GeneralDataset&lt;String, ScorePhraseMeasures&gt; choosedatums(boolean forLearningPattern, String answerLabel,
+      TwoDimensionalCounter&lt;CandidatePhrase, E&gt; wordsPatExtracted,
+      Counter&lt;E&gt; allSelectedPatterns, boolean computeRawFreq) throws IOException {
+
+<span class="nc" id="L850">    boolean expandNeg = false;</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">    if(closeToNegativesFirstIter == null){</span>
+<span class="nc" id="L852">      closeToNegativesFirstIter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">      if(constVars.expandNegativesWhenSampling)</span>
+<span class="nc" id="L854">        expandNeg = true;</span>
+    }
+
+<span class="nc" id="L857">    boolean expandPos = false;</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">    if(closeToPositivesFirstIter == null) {</span>
+<span class="nc" id="L859">      closeToPositivesFirstIter = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L860" title="All 2 branches missed.">      if(constVars.expandPositivesWhenSampling)</span>
+<span class="nc" id="L861">        expandPos = true;</span>
+    }
+
+
+<span class="nc" id="L865">    Counter&lt;Integer&gt; distSimClustersOfPositive = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L866" title="All 6 branches missed.">    if((expandPos || expandNeg) &amp;&amp; !constVars.useWordVectorsToComputeSim){</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">      for(CandidatePhrase s: CollectionUtils.union(constVars.getLearnedWords(answerLabel).keySet(), constVars.getSeedLabelDictionary().get(answerLabel))){</span>
+<span class="nc" id="L868">        String[] toks = s.getPhrase().split(&quot;\\s+&quot;);</span>
+<span class="nc" id="L869">        Integer num = constVars.getWordClassClusters().get(s.getPhrase());</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">        if(num  == null)</span>
+<span class="nc" id="L871">          num = constVars.getWordClassClusters().get(s.getPhrase().toLowerCase());</span>
+<span class="nc bnc" id="L872" title="All 2 branches missed.">        if(num == null){</span>
+<span class="nc bnc" id="L873" title="All 2 branches missed.">          for(String tok: toks){</span>
+<span class="nc" id="L874">            Integer toknum =constVars.getWordClassClusters().get(tok);</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">            if(toknum == null)</span>
+<span class="nc" id="L876">              toknum =constVars.getWordClassClusters().get(tok.toLowerCase());</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">            if(toknum != null){</span>
+<span class="nc" id="L878">              distSimClustersOfPositive.incrementCount(toknum);</span>
+            }
+          }
+        } else
+<span class="nc" id="L882">        distSimClustersOfPositive.incrementCount(num);</span>
+<span class="nc" id="L883">      }</span>
+    }
+
+    //computing this regardless of expandpos and expandneg because we reject all positive words that occur in negatives (can happen in multi word phrases etc)
+<span class="nc" id="L887">    Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; allPossibleNegativePhrases  = getAllPossibleNegativePhrases(answerLabel);</span>
+
+<span class="nc" id="L889">    GeneralDataset&lt;String, ScorePhraseMeasures&gt; dataset = new RVFDataset&lt;&gt;();</span>
+<span class="nc" id="L890">    int numpos = 0;</span>
+<span class="nc" id="L891">    Set&lt;CandidatePhrase&gt; allNegativePhrases = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L892">    Set&lt;CandidatePhrase&gt; allUnknownPhrases = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L893">    Set&lt;CandidatePhrase&gt; allPositivePhrases = new HashSet&lt;&gt;();</span>
+    //Counter&lt;CandidatePhrase&gt; allCloseToPositivePhrases = new ClassicCounter&lt;CandidatePhrase&gt;();
+    //Counter&lt;CandidatePhrase&gt; allCloseToNegativePhrases = new ClassicCounter&lt;CandidatePhrase&gt;();
+
+    //for all sentences brtch
+<span class="nc" id="L898">    ConstantsAndVariables.DataSentsIterator sentsIter = new ConstantsAndVariables.DataSentsIterator(constVars.batchProcessSents);</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">    while(sentsIter.hasNext()) {</span>
+<span class="nc" id="L900">      Pair&lt;Map&lt;String, DataInstance&gt;, File&gt; sentsf = sentsIter.next();</span>
+<span class="nc" id="L901">      Map&lt;String, DataInstance&gt; sents = sentsf.first();</span>
+<span class="nc" id="L902">      Redwood.log(Redwood.DBG, &quot;Sampling datums from &quot; + sentsf.second());</span>
+<span class="nc bnc" id="L903" title="All 2 branches missed.">      if (computeRawFreq)</span>
+<span class="nc" id="L904">        Data.computeRawFreqIfNull(sents, PatternFactory.numWordsCompoundMax);</span>
+
+<span class="nc" id="L906">      List&lt;List&lt;String&gt;&gt; threadedSentIds = GetPatternsFromDataMultiClass.getThreadBatches(new ArrayList&lt;&gt;(sents.keySet()), constVars.numThreads);</span>
+<span class="nc" id="L907">      ExecutorService executor = Executors.newFixedThreadPool(constVars.numThreads);</span>
+<span class="nc" id="L908">      List&lt;Future&lt;Quintuple&lt;Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;,  Counter&lt;CandidatePhrase&gt;&gt;&gt;&gt; list = new ArrayList&lt;&gt;();</span>
+
+      //multi-threaded choose positive, negative and unknown
+<span class="nc bnc" id="L911" title="All 2 branches missed.">      for (List&lt;String&gt; keys : threadedSentIds) {</span>
+<span class="nc" id="L912">        Callable&lt;Quintuple&lt;Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;,  Counter&lt;CandidatePhrase&gt;&gt;&gt; task = new ChooseDatumsThread(answerLabel, sents, keys,</span>
+           wordsPatExtracted, allSelectedPatterns, distSimClustersOfPositive, allPossibleNegativePhrases, expandPos, expandNeg);
+<span class="nc" id="L914">        Future&lt;Quintuple&lt;Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;,  Counter&lt;CandidatePhrase&gt;&gt;&gt; submit = executor.submit(task);</span>
+<span class="nc" id="L915">        list.add(submit);</span>
+<span class="nc" id="L916">      }</span>
+
+      // Now retrieve the result
+<span class="nc bnc" id="L919" title="All 2 branches missed.">      for (Future&lt;Quintuple&lt;Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;,  Counter&lt;CandidatePhrase&gt;&gt;&gt; future : list) {</span>
+        try {
+<span class="nc" id="L921">          Quintuple&lt;Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Set&lt;CandidatePhrase&gt;, Counter&lt;CandidatePhrase&gt;,  Counter&lt;CandidatePhrase&gt;&gt; result = future.get();</span>
+<span class="nc" id="L922">          allPositivePhrases.addAll(result.first());</span>
+<span class="nc" id="L923">          allNegativePhrases.addAll(result.second());</span>
+<span class="nc" id="L924">          allUnknownPhrases.addAll(result.third());</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">          if(expandPos)</span>
+<span class="nc bnc" id="L926" title="All 2 branches missed.">            for(Entry&lt;CandidatePhrase, Double&gt; en : result.fourth().entrySet())</span>
+<span class="nc" id="L927">              closeToPositivesFirstIter.setCount(en.getKey(), en.getValue());</span>
+<span class="nc bnc" id="L928" title="All 2 branches missed.">          if(expandNeg)</span>
+<span class="nc bnc" id="L929" title="All 2 branches missed.">            for(Entry&lt;CandidatePhrase, Double&gt; en : result.fifth().entrySet())</span>
+<span class="nc" id="L930">             closeToNegativesFirstIter.setCount(en.getKey(), en.getValue());</span>
+
+<span class="nc" id="L932">        } catch (Exception e) {</span>
+<span class="nc" id="L933">          executor.shutdownNow();</span>
+<span class="nc" id="L934">          throw new RuntimeException(e);</span>
+<span class="nc" id="L935">        }</span>
+<span class="nc" id="L936">      }</span>
+<span class="nc" id="L937">      executor.shutdown();</span>
+<span class="nc" id="L938">    }</span>
+
+    //Set&lt;CandidatePhrase&gt; knownPositivePhrases = CollectionUtils.unionAsSet(constVars.getLearnedWords().get(answerLabel).keySet(), constVars.getSeedLabelDictionary().get(answerLabel));
+    //TODO: this is kinda not nice; how is allpositivephrases different from positivephrases again?
+<span class="nc" id="L942">    allPositivePhrases.addAll(constVars.getLearnedWords(answerLabel).keySet());</span>
+    //allPositivePhrases.addAll(knownPositivePhrases);
+
+<span class="nc" id="L945">    BufferedWriter logFile = null;</span>
+<span class="nc" id="L946">    BufferedWriter logFileFeat = null;</span>
+
+<span class="nc bnc" id="L948" title="All 2 branches missed.">    if(constVars.logFileVectorSimilarity != null){</span>
+<span class="nc" id="L949">      logFile = new BufferedWriter(new FileWriter(constVars.logFileVectorSimilarity));</span>
+<span class="nc" id="L950">      logFileFeat = new BufferedWriter(new FileWriter(constVars.logFileVectorSimilarity+&quot;_feat&quot;));</span>
+
+<span class="nc bnc" id="L952" title="All 2 branches missed.">      if(wordVectors != null){</span>
+<span class="nc bnc" id="L953" title="All 2 branches missed.">      for(CandidatePhrase p : allPositivePhrases){</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        if(wordVectors.containsKey(p.getPhrase())){</span>
+<span class="nc" id="L955">          logFile.write(p.getPhrase()+&quot;-P &quot; + ArrayUtils.toString(wordVectors.get(p.getPhrase()), &quot; &quot;)+&quot;\n&quot;);</span>
+        }
+<span class="nc" id="L957">      }</span>
+      }
+    }
+
+<span class="nc bnc" id="L961" title="All 2 branches missed.">    if(constVars.expandPositivesWhenSampling){</span>
+      //TODO: patwtbyfrew
+      //Counters.retainTop(allCloseToPositivePhrases, (int) (allCloseToPositivePhrases.size()*constVars.subSampleUnkAsPosUsingSimPercentage));
+<span class="nc" id="L964">      Redwood.log(&quot;Expanding positives by adding &quot; + Counters.toSortedString(closeToPositivesFirstIter, closeToPositivesFirstIter.size(),&quot;%1$s:%2$f&quot;, &quot;\t&quot;)+ &quot; phrases&quot;);</span>
+
+<span class="nc" id="L966">      allPositivePhrases.addAll(closeToPositivesFirstIter.keySet());</span>
+
+      //write log
+<span class="nc bnc" id="L969" title="All 6 branches missed.">      if(logFile != null &amp;&amp; wordVectors != null &amp;&amp; expandNeg){</span>
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        for(CandidatePhrase p : closeToPositivesFirstIter.keySet()){</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">          if(wordVectors.containsKey(p.getPhrase())){</span>
+<span class="nc" id="L972">            logFile.write(p.getPhrase()+&quot;-PP &quot; + ArrayUtils.toString(wordVectors.get(p.getPhrase()), &quot; &quot;)+&quot;\n&quot;);</span>
+          }
+<span class="nc" id="L974">        }</span>
+      }
+    }
+
+<span class="nc bnc" id="L978" title="All 2 branches missed.">    if(constVars.expandNegativesWhenSampling){</span>
+      //TODO: patwtbyfrew
+      //Counters.retainTop(allCloseToPositivePhrases, (int) (allCloseToPositivePhrases.size()*constVars.subSampleUnkAsPosUsingSimPercentage));
+<span class="nc" id="L981">      Redwood.log(&quot;Expanding negatives by adding &quot; + Counters.toSortedString(closeToNegativesFirstIter , closeToNegativesFirstIter.size(), &quot;%1$s:%2$f&quot;,&quot;\t&quot;)+ &quot; phrases&quot;);</span>
+<span class="nc" id="L982">      allNegativePhrases.addAll(closeToNegativesFirstIter.keySet());</span>
+
+      //write log
+<span class="nc bnc" id="L985" title="All 6 branches missed.">      if(logFile != null &amp;&amp; wordVectors != null &amp;&amp; expandNeg){</span>
+<span class="nc bnc" id="L986" title="All 2 branches missed.">        for(CandidatePhrase p : closeToNegativesFirstIter.keySet()){</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">          if(wordVectors.containsKey(p.getPhrase())){</span>
+<span class="nc" id="L988">            logFile.write(p.getPhrase()+&quot;-NN &quot; + ArrayUtils.toString(wordVectors.get(p.getPhrase()), &quot; &quot;)+&quot;\n&quot;);</span>
+          }
+<span class="nc" id="L990">        }</span>
+      }
+    }
+
+
+
+
+<span class="nc" id="L997">    System.out.println(&quot;all positive phrases of size &quot; + allPositivePhrases.size() + &quot; are  &quot; + allPositivePhrases);</span>
+<span class="nc bnc" id="L998" title="All 2 branches missed.">    for(CandidatePhrase candidate: allPositivePhrases) {</span>
+      Counter&lt;ScorePhraseMeasures&gt; feat;
+      //CandidatePhrase candidate = new CandidatePhrase(l.word());
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">      if (forLearningPattern) {</span>
+<span class="nc" id="L1002">        feat = getPhraseFeaturesForPattern(answerLabel, candidate);</span>
+      } else {
+<span class="nc" id="L1004">        feat = getFeatures(answerLabel, candidate, wordsPatExtracted.getCounter(candidate), allSelectedPatterns);</span>
+      }
+<span class="nc" id="L1006">      RVFDatum&lt;String, ScorePhraseMeasures&gt; datum = new RVFDatum&lt;&gt;(feat, &quot;true&quot;);</span>
+<span class="nc" id="L1007">      dataset.add(datum);</span>
+<span class="nc" id="L1008">      numpos += 1;</span>
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">      if(logFileFeat !=null){</span>
+<span class="nc" id="L1010">        logFileFeat.write(&quot;POSITIVE &quot; + candidate.getPhrase() +&quot;\t&quot; + Counters.toSortedByKeysString(feat,&quot;%1$s:%2$.0f&quot;,&quot;;&quot;,&quot;%s&quot;)+&quot;\n&quot;);</span>
+      }
+<span class="nc" id="L1012">    }</span>
+
+<span class="nc" id="L1014">    Redwood.log(Redwood.DBG, &quot;Number of pure negative phrases is &quot; + allNegativePhrases.size());</span>
+<span class="nc" id="L1015">    Redwood.log(Redwood.DBG, &quot;Number of unknown phrases is &quot; + allUnknownPhrases.size());</span>
+
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">    if(constVars.subsampleUnkAsNegUsingSim){</span>
+<span class="nc" id="L1018">      Set&lt;CandidatePhrase&gt; chosenUnknown = chooseUnknownAsNegatives(allUnknownPhrases, answerLabel, allPositivePhrases, allPossibleNegativePhrases, logFile);</span>
+<span class="nc" id="L1019">      Redwood.log(Redwood.DBG, &quot;Choosing &quot; + chosenUnknown.size() + &quot; unknowns as negative based to their similarity to the positive phrases&quot;);</span>
+<span class="nc" id="L1020">      allNegativePhrases.addAll(chosenUnknown);</span>
+<span class="nc" id="L1021">    }</span>
+    else{
+<span class="nc" id="L1023">        allNegativePhrases.addAll(allUnknownPhrases);</span>
+    }
+
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">    if(allNegativePhrases.size() &gt; numpos) {</span>
+<span class="nc" id="L1027">      Redwood.log(Redwood.WARN, &quot;Num of negative (&quot; + allNegativePhrases.size() + &quot;) is higher than number of positive phrases (&quot; + numpos + &quot;) = &quot; +</span>
+<span class="nc" id="L1028">        (allNegativePhrases.size() / (double)numpos) + &quot;. &quot; +</span>
+        &quot;Capping the number by taking the first numPositives as negative. Consider decreasing perSelectRand&quot;);
+<span class="nc" id="L1030">      int i = 0;</span>
+<span class="nc" id="L1031">      Set&lt;CandidatePhrase&gt; selectedNegPhrases = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">      for(CandidatePhrase p : allNegativePhrases){</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        if (i &gt;= numpos)</span>
+<span class="nc" id="L1034">          break;</span>
+<span class="nc" id="L1035">        selectedNegPhrases.add(p);</span>
+<span class="nc" id="L1036">        i++;</span>
+<span class="nc" id="L1037">      }</span>
+<span class="nc" id="L1038">      allNegativePhrases.clear();</span>
+<span class="nc" id="L1039">      allNegativePhrases = selectedNegPhrases;</span>
+    }
+
+<span class="nc" id="L1042">    System.out.println(&quot;all negative phrases are &quot; + allNegativePhrases);</span>
+<span class="nc bnc" id="L1043" title="All 2 branches missed.">    for(CandidatePhrase negative: allNegativePhrases){</span>
+      Counter&lt;ScorePhraseMeasures&gt; feat;
+      //CandidatePhrase candidate = new CandidatePhrase(l.word());
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">      if (forLearningPattern) {</span>
+<span class="nc" id="L1047">        feat = getPhraseFeaturesForPattern(answerLabel, negative);</span>
+      } else {
+<span class="nc" id="L1049">        feat = getFeatures(answerLabel, negative, wordsPatExtracted.getCounter(negative), allSelectedPatterns);</span>
+      }
+<span class="nc" id="L1051">      RVFDatum&lt;String, ScorePhraseMeasures&gt; datum = new RVFDatum&lt;&gt;(feat, &quot;false&quot;);</span>
+<span class="nc" id="L1052">      dataset.add(datum);</span>
+
+<span class="nc bnc" id="L1054" title="All 6 branches missed.">      if(logFile!=null &amp;&amp; wordVectors != null &amp;&amp; wordVectors.containsKey(negative.getPhrase())){</span>
+<span class="nc" id="L1055">        logFile.write(negative.getPhrase()+&quot;-N&quot;+&quot; &quot; + ArrayUtils.toString(wordVectors.get(negative.getPhrase()), &quot; &quot;)+&quot;\n&quot;);</span>
+      }
+
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">      if(logFileFeat !=null)</span>
+<span class="nc" id="L1059">        logFileFeat.write(&quot;NEGATIVE &quot; + negative.getPhrase() +&quot;\t&quot; + Counters.toSortedByKeysString(feat,&quot;%1$s:%2$.0f&quot;,&quot;;&quot;,&quot;%s&quot;)+&quot;\n&quot;);</span>
+
+<span class="nc" id="L1061">    }</span>
+
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">    if(logFile!=null){</span>
+<span class="nc" id="L1064">      logFile.close();</span>
+    }
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">    if(logFileFeat != null){</span>
+<span class="nc" id="L1067">      logFileFeat.close();</span>
+    }
+
+<span class="nc" id="L1070">    System.out.println(&quot;Before feature count threshold, dataset stats are &quot;);</span>
+<span class="nc" id="L1071">    dataset.summaryStatistics();</span>
+
+
+<span class="nc" id="L1074">    dataset.applyFeatureCountThreshold(constVars.featureCountThreshold);</span>
+<span class="nc" id="L1075">    System.out.println(&quot;AFTER feature count threshold of &quot; + constVars.featureCountThreshold + &quot;, dataset stats are &quot;);</span>
+<span class="nc" id="L1076">    dataset.summaryStatistics();</span>
+
+<span class="nc" id="L1078">    Redwood.log(Redwood.DBG, &quot;Eventually, number of positive datums:  &quot; + numpos + &quot; and number of negative datums: &quot; + allNegativePhrases.size());</span>
+<span class="nc" id="L1079">    return dataset;</span>
+  }
+
+
+  //Map of label to an array of values -- num_items, avg similarity, max similarity
+  public Map&lt;String, double[]&gt; getSimilarities(String phrase){
+<span class="nc" id="L1085">    return similaritiesWithLabeledPhrases.get(phrase);</span>
+  }
+
+
+  Counter&lt;ScorePhraseMeasures&gt; getPhraseFeaturesForPattern(String label, CandidatePhrase word) {
+
+<span class="nc bnc" id="L1091" title="All 2 branches missed.">    if (phraseScoresRaw.containsFirstKey(word))</span>
+<span class="nc" id="L1092">      return phraseScoresRaw.getCounter(word);</span>
+
+<span class="nc" id="L1094">    Counter&lt;ScorePhraseMeasures&gt; scoreslist = new ClassicCounter&lt;&gt;();</span>
+
+    //Add features on the word, if any!
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">    if(word.getFeatures()!= null){</span>
+<span class="nc" id="L1098">      scoreslist.addAll(Counters.transform(word.getFeatures(), x -&gt; ScorePhraseMeasures.create(x)));</span>
+    } else{
+<span class="nc" id="L1100">      Redwood.log(ConstantsAndVariables.extremedebug, &quot;features are null for &quot; + word);</span>
+    }
+
+
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">    if (constVars.usePatternEvalSemanticOdds) {</span>
+<span class="nc" id="L1105">      double dscore = this.getDictOddsScore(word, label, 0);</span>
+<span class="nc" id="L1106">      scoreslist.setCount(ScorePhraseMeasures.SEMANTICODDS, dscore);</span>
+    }
+
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">    if (constVars.usePatternEvalGoogleNgram) {</span>
+<span class="nc" id="L1110">      Double gscore = getGoogleNgramScore(word);</span>
+<span class="nc bnc" id="L1111" title="All 4 branches missed.">      if (gscore.isInfinite() || gscore.isNaN()) {</span>
+<span class="nc" id="L1112">        throw new RuntimeException(&quot;how is the google ngrams score &quot; + gscore + &quot; for &quot; + word);</span>
+      }
+<span class="nc" id="L1114">      scoreslist.setCount(ScorePhraseMeasures.GOOGLENGRAM, gscore);</span>
+    }
+
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">    if (constVars.usePatternEvalDomainNgram) {</span>
+<span class="nc" id="L1118">      Double gscore = getDomainNgramScore(word.getPhrase());</span>
+<span class="nc bnc" id="L1119" title="All 4 branches missed.">      if (gscore.isInfinite() || gscore.isNaN()) {</span>
+<span class="nc" id="L1120">        throw new RuntimeException(&quot;how is the domain ngrams score &quot; + gscore + &quot; for &quot; + word + &quot; when domain raw freq is &quot; + Data.domainNGramRawFreq.getCount(word)</span>
+<span class="nc" id="L1121">          + &quot; and raw freq is &quot; + Data.rawFreq.getCount(word));</span>
+
+      }
+<span class="nc" id="L1124">      scoreslist.setCount(ScorePhraseMeasures.DOMAINNGRAM, gscore);</span>
+    }
+
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">    if (constVars.usePatternEvalWordClass) {</span>
+<span class="nc" id="L1128">      Integer wordclass = constVars.getWordClassClusters().get(word.getPhrase());</span>
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">      if(wordclass == null){</span>
+<span class="nc" id="L1130">        wordclass = constVars.getWordClassClusters().get(word.getPhrase().toLowerCase());</span>
+      }
+<span class="nc" id="L1132">      scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.DISTSIM.toString()+&quot;-&quot;+wordclass), 1.0);</span>
+    }
+
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">    if (constVars.usePatternEvalEditDistSame) {</span>
+<span class="nc" id="L1136">      double ed = constVars.getEditDistanceScoresThisClass(label, word.getPhrase());</span>
+<span class="nc bnc" id="L1137" title="All 4 branches missed.">      assert ed &lt;= 1 : &quot; how come edit distance from the true class is &quot; + ed  + &quot; for word &quot; + word;</span>
+<span class="nc" id="L1138">      scoreslist.setCount(ScorePhraseMeasures.EDITDISTSAME,  ed);</span>
+    }
+<span class="nc bnc" id="L1140" title="All 2 branches missed.">    if (constVars.usePatternEvalEditDistOther) {</span>
+<span class="nc" id="L1141">      double ed = constVars.getEditDistanceScoresOtherClass(label, word.getPhrase());</span>
+<span class="nc bnc" id="L1142" title="All 4 branches missed.">      assert ed &lt;= 1 : &quot; how come edit distance from the true class is &quot; + ed  + &quot; for word &quot; + word;;</span>
+<span class="nc" id="L1143">      scoreslist.setCount(ScorePhraseMeasures.EDITDISTOTHER, ed);</span>
+    }
+
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">    if(constVars.usePatternEvalWordShape){</span>
+<span class="nc" id="L1147">      scoreslist.setCount(ScorePhraseMeasures.WORDSHAPE, this.getWordShapeScore(word.getPhrase(), label));</span>
+    }
+
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">    if(constVars.usePatternEvalWordShapeStr){</span>
+<span class="nc" id="L1151">      scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.WORDSHAPESTR + &quot;-&quot; + this.wordShape(word.getPhrase())), 1.0);</span>
+    }
+
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">    if(constVars.usePatternEvalFirstCapital){</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">      scoreslist.setCount(ScorePhraseMeasures.ISFIRSTCAPITAL, StringUtils.isCapitalized(word.getPhrase())? 1.0 :0);</span>
+    }
+
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">    if(constVars.usePatternEvalBOW){</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">      for(String s: word.getPhrase().split(&quot;\\s+&quot;))</span>
+<span class="nc" id="L1160">        scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.BOW +&quot;-&quot;+ s), 1.0);</span>
+    }
+
+<span class="nc" id="L1163">    phraseScoresRaw.setCounter(word, scoreslist);</span>
+    //System.out.println(&quot;scores for &quot; + word + &quot; are &quot; + scoreslist);
+<span class="nc" id="L1165">    return scoreslist;</span>
+  }
+/*
+  Counter&lt;ScorePhraseMeasures&gt; getPhraseFeaturesForPattern(String label, CandidatePhrase word) {
+
+    if (phraseScoresRaw.containsFirstKey(word))
+      return phraseScoresRaw.getCounter(word);
+
+    Counter&lt;ScorePhraseMeasures&gt; scoreslist = new ClassicCounter&lt;ScorePhraseMeasures&gt;();
+
+    if (constVars.usePatternEvalSemanticOdds) {
+      assert constVars.dictOddsWeights != null : &quot;usePatternEvalSemanticOdds is true but dictOddsWeights is null for the label &quot; + label;
+      double dscore = this.getDictOddsScore(word, label, 0);
+      dscore = logistic(dscore);
+      scoreslist.setCount(ScorePhraseMeasures.SEMANTICODDS, dscore);
+    }
+
+    if (constVars.usePatternEvalGoogleNgram) {
+      Double gscore = getGoogleNgramScore(word);
+      if (gscore.isInfinite() || gscore.isNaN()) {
+        throw new RuntimeException(&quot;how is the google ngrams score &quot; + gscore + &quot; for &quot; + word);
+      }
+      gscore = logistic(gscore);
+      scoreslist.setCount(ScorePhraseMeasures.GOOGLENGRAM, gscore);
+    }
+
+    if (constVars.usePatternEvalDomainNgram) {
+      Double gscore = getDomainNgramScore(word.getPhrase());
+      if (gscore.isInfinite() || gscore.isNaN()) {
+        throw new RuntimeException(&quot;how is the domain ngrams score &quot; + gscore + &quot; for &quot; + word + &quot; when domain raw freq is &quot; + Data.domainNGramRawFreq.getCount(word)
+            + &quot; and raw freq is &quot; + Data.rawFreq.getCount(word));
+
+      }
+      gscore = logistic(gscore);
+      scoreslist.setCount(ScorePhraseMeasures.DOMAINNGRAM, gscore);
+    }
+
+    if (constVars.usePatternEvalWordClass) {
+      double distSimWt = getDistSimWtScore(word.getPhrase(), label);
+      distSimWt = logistic(distSimWt);
+      scoreslist.setCount(ScorePhraseMeasures.DISTSIM, distSimWt);
+    }
+
+    if (constVars.usePatternEvalEditDistSame) {
+      scoreslist.setCount(ScorePhraseMeasures.EDITDISTSAME, constVars.getEditDistanceScoresThisClass(label, word.getPhrase()));
+    }
+    if (constVars.usePatternEvalEditDistOther)
+      scoreslist.setCount(ScorePhraseMeasures.EDITDISTOTHER, constVars.getEditDistanceScoresOtherClass(label, word.getPhrase()));
+
+    if(constVars.usePatternEvalWordShape){
+      scoreslist.setCount(ScorePhraseMeasures.WORDSHAPE, this.getWordShapeScore(word.getPhrase(), label));
+    }
+
+    if(constVars.usePatternEvalWordShapeStr){
+      scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.WORDSHAPE +&quot;-&quot;+ this.wordShape(word.getPhrase())), 1.0);
+    }
+
+    if(constVars.usePatternEvalFirstCapital){
+      scoreslist.setCount(ScorePhraseMeasures.ISFIRSTCAPITAL, StringUtils.isCapitalized(word.getPhrase())?1.0:0.0);
+    }
+
+    if(constVars.usePatternEvalBOW){
+      for(String s: word.getPhrase().split(&quot;\\s+&quot;))
+        scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.BOW +&quot;-&quot;+ s.toLowerCase()), 1.0);
+    }
+
+    phraseScoresRaw.setCounter(word, scoreslist);
+    return scoreslist;
+  }
+*/
+
+  public double scoreUsingClassifer(edu.stanford.nlp.classify.Classifier classifier, CandidatePhrase word, String label, boolean forLearningPatterns,
+      Counter&lt;E&gt; patternsThatExtractedPat, Counter&lt;E&gt; allSelectedPatterns) {
+
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">    if (learnedScores.containsKey(word))</span>
+<span class="nc" id="L1240">      return learnedScores.getCount(word);</span>
+    double score;
+<span class="nc bnc" id="L1242" title="All 2 branches missed.">    if (scoreClassifierType.equals(ClassifierType.DT)) {</span>
+<span class="nc" id="L1243">      Counter&lt;ScorePhraseMeasures&gt; feat = null;</span>
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">      if (forLearningPatterns)</span>
+<span class="nc" id="L1245">        feat = getPhraseFeaturesForPattern(label, word);</span>
+      else
+<span class="nc" id="L1247">        feat = this.getFeatures(label, word, patternsThatExtractedPat, allSelectedPatterns);</span>
+
+<span class="nc" id="L1249">      RVFDatum&lt;String, ScorePhraseMeasures&gt; d = new RVFDatum&lt;&gt;(feat, Boolean.FALSE.toString());</span>
+<span class="nc" id="L1250">      Counter&lt;String&gt; sc = classifier.scoresOf(d);</span>
+<span class="nc" id="L1251">      score = sc.getCount(Boolean.TRUE.toString());</span>
+
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">    } else if (scoreClassifierType.equals(ClassifierType.LR)) {</span>
+
+<span class="nc" id="L1255">      LogisticClassifier logcl = ((LogisticClassifier) classifier);</span>
+
+<span class="nc" id="L1257">      String l = (String) logcl.getLabelForInternalPositiveClass();</span>
+      Counter&lt;ScorePhraseMeasures&gt; feat;
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">      if (forLearningPatterns)</span>
+<span class="nc" id="L1260">        feat = getPhraseFeaturesForPattern(label, word);</span>
+      else
+<span class="nc" id="L1262">        feat = this.getFeatures(label, word, patternsThatExtractedPat, allSelectedPatterns);</span>
+
+<span class="nc" id="L1264">      RVFDatum&lt;String, ScorePhraseMeasures&gt; d = new RVFDatum&lt;&gt;(feat, Boolean.TRUE.toString());</span>
+<span class="nc" id="L1265">      score = logcl.probabilityOf(d);</span>
+
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">    } else if( scoreClassifierType.equals(ClassifierType.SHIFTLR)){</span>
+      //convert to basicdatum -- restriction of ShiftLR right now
+      Counter&lt;ScorePhraseMeasures&gt; feat;
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">      if (forLearningPatterns)</span>
+<span class="nc" id="L1271">        feat = getPhraseFeaturesForPattern(label, word);</span>
+      else
+<span class="nc" id="L1273">        feat = this.getFeatures(label, word, patternsThatExtractedPat, allSelectedPatterns);</span>
+<span class="nc" id="L1274">      BasicDatum&lt;String, ScorePhraseMeasures&gt; d = new BasicDatum&lt;&gt;(feat.keySet(), Boolean.FALSE.toString());</span>
+<span class="nc" id="L1275">      Counter&lt;String&gt; sc = ((MultinomialLogisticClassifier)classifier).probabilityOf(d);</span>
+<span class="nc" id="L1276">      score = sc.getCount(Boolean.TRUE.toString());</span>
+
+<span class="nc bnc" id="L1278" title="All 6 branches missed.">    }else if (scoreClassifierType.equals(ClassifierType.SVM) || scoreClassifierType.equals(ClassifierType.RF) ||scoreClassifierType.equals(ClassifierType.LINEAR)) {</span>
+
+<span class="nc" id="L1280">      Counter&lt;ScorePhraseMeasures&gt; feat = null;</span>
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">      if (forLearningPatterns)</span>
+<span class="nc" id="L1282">        feat = getPhraseFeaturesForPattern(label, word);</span>
+      else
+<span class="nc" id="L1284">        feat = this.getFeatures(label, word, patternsThatExtractedPat, allSelectedPatterns);</span>
+
+<span class="nc" id="L1286">      RVFDatum&lt;String, ScorePhraseMeasures&gt; d = new RVFDatum&lt;&gt;(feat, Boolean.FALSE.toString());</span>
+<span class="nc" id="L1287">      Counter&lt;String&gt; sc = classifier.scoresOf(d);</span>
+<span class="nc" id="L1288">      score = sc.getCount(Boolean.TRUE.toString());</span>
+
+<span class="nc" id="L1290">    } else</span>
+<span class="nc" id="L1291">      throw new RuntimeException(&quot;cannot identify classifier &quot; + scoreClassifierType);</span>
+
+<span class="nc" id="L1293">    this.learnedScores.setCount(word, score);</span>
+<span class="nc" id="L1294">    return score;</span>
+  }
+
+  Counter&lt;ScorePhraseMeasures&gt; getFeatures(String label, CandidatePhrase word, Counter&lt;E&gt; patThatExtractedWord, Counter&lt;E&gt; allSelectedPatterns) {
+
+<span class="nc bnc" id="L1299" title="All 2 branches missed.">    if (phraseScoresRaw.containsFirstKey(word))</span>
+<span class="nc" id="L1300">      return phraseScoresRaw.getCounter(word);</span>
+
+<span class="nc" id="L1302">    Counter&lt;ScorePhraseMeasures&gt; scoreslist = new ClassicCounter&lt;&gt;();</span>
+
+    //Add features on the word, if any!
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">    if(word.getFeatures()!= null){</span>
+<span class="nc" id="L1306">      scoreslist.addAll(Counters.transform(word.getFeatures(), x -&gt; ScorePhraseMeasures.create(x)));</span>
+    } else{
+<span class="nc" id="L1308">      Redwood.log(ConstantsAndVariables.extremedebug, &quot;features are null for &quot; + word);</span>
+    }
+
+
+<span class="nc bnc" id="L1312" title="All 2 branches missed.">    if (constVars.usePhraseEvalPatWtByFreq) {</span>
+<span class="nc" id="L1313">      double tfscore = getPatTFIDFScore(word, patThatExtractedWord, allSelectedPatterns);</span>
+<span class="nc" id="L1314">      scoreslist.setCount(ScorePhraseMeasures.PATWTBYFREQ, tfscore);</span>
+    }
+
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">    if (constVars.usePhraseEvalSemanticOdds) {</span>
+<span class="nc" id="L1318">      double dscore = this.getDictOddsScore(word, label, 0);</span>
+<span class="nc" id="L1319">      scoreslist.setCount(ScorePhraseMeasures.SEMANTICODDS, dscore);</span>
+    }
+
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">    if (constVars.usePhraseEvalGoogleNgram) {</span>
+<span class="nc" id="L1323">      Double gscore = getGoogleNgramScore(word);</span>
+<span class="nc bnc" id="L1324" title="All 4 branches missed.">      if (gscore.isInfinite() || gscore.isNaN()) {</span>
+<span class="nc" id="L1325">        throw new RuntimeException(&quot;how is the google ngrams score &quot; + gscore + &quot; for &quot; + word);</span>
+      }
+<span class="nc" id="L1327">      scoreslist.setCount(ScorePhraseMeasures.GOOGLENGRAM, gscore);</span>
+    }
+
+<span class="nc bnc" id="L1330" title="All 2 branches missed.">    if (constVars.usePhraseEvalDomainNgram) {</span>
+<span class="nc" id="L1331">      Double gscore = getDomainNgramScore(word.getPhrase());</span>
+<span class="nc bnc" id="L1332" title="All 4 branches missed.">      if (gscore.isInfinite() || gscore.isNaN()) {</span>
+<span class="nc" id="L1333">        throw new RuntimeException(&quot;how is the domain ngrams score &quot; + gscore + &quot; for &quot; + word + &quot; when domain raw freq is &quot; + Data.domainNGramRawFreq.getCount(word)</span>
+<span class="nc" id="L1334">            + &quot; and raw freq is &quot; + Data.rawFreq.getCount(word));</span>
+
+      }
+<span class="nc" id="L1337">      scoreslist.setCount(ScorePhraseMeasures.DOMAINNGRAM, gscore);</span>
+    }
+
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">    if (constVars.usePhraseEvalWordClass) {</span>
+<span class="nc" id="L1341">      Integer wordclass = constVars.getWordClassClusters().get(word.getPhrase());</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">      if(wordclass == null){</span>
+<span class="nc" id="L1343">        wordclass = constVars.getWordClassClusters().get(word.getPhrase().toLowerCase());</span>
+      }
+<span class="nc" id="L1345">      scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.DISTSIM.toString()+&quot;-&quot;+wordclass), 1.0);</span>
+    }
+
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">    if(constVars.usePhraseEvalWordVector){</span>
+<span class="nc" id="L1349">      Map&lt;String, double[]&gt; sims = getSimilarities(word.getPhrase());</span>
+<span class="nc bnc" id="L1350" title="All 2 branches missed.">      if(sims == null){</span>
+        //TODO: make more efficient
+<span class="nc" id="L1352">        Map&lt;String, Collection&lt;CandidatePhrase&gt;&gt; allPossibleNegativePhrases = getAllPossibleNegativePhrases(label);</span>
+<span class="nc" id="L1353">        Set&lt;CandidatePhrase&gt; knownPositivePhrases = CollectionUtils.unionAsSet(constVars.getLearnedWords(label).keySet(), constVars.getSeedLabelDictionary().get(label));</span>
+<span class="nc" id="L1354">        computeSimWithWordVectors(Arrays.asList(word), knownPositivePhrases, allPossibleNegativePhrases, label);</span>
+<span class="nc" id="L1355">        sims = getSimilarities(word.getPhrase());</span>
+      }
+<span class="nc bnc" id="L1357" title="All 4 branches missed.">      assert sims != null : &quot; Why are there no similarities for &quot; + word;</span>
+
+<span class="nc" id="L1359">      double avgPosSim = sims.get(label)[Similarities.AVGSIM.ordinal()];</span>
+<span class="nc" id="L1360">      double maxPosSim = sims.get(label)[Similarities.MAXSIM.ordinal()];</span>
+<span class="nc" id="L1361">      double sumNeg = 0, maxNeg = Double.MIN_VALUE;</span>
+<span class="nc" id="L1362">      double allNumItems =0;</span>
+<span class="nc bnc" id="L1363" title="All 2 branches missed.">      for(Entry&lt;String, double[]&gt; simEn: sims.entrySet()){</span>
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">        if(simEn.getKey().equals(label))</span>
+<span class="nc" id="L1365">          continue;</span>
+<span class="nc" id="L1366">        double numItems = simEn.getValue()[Similarities.NUMITEMS.ordinal()];</span>
+<span class="nc" id="L1367">        sumNeg += simEn.getValue()[Similarities.AVGSIM.ordinal()]*numItems;</span>
+<span class="nc" id="L1368">        allNumItems += numItems;</span>
+<span class="nc" id="L1369">        double maxNegLabel =simEn.getValue()[Similarities.MAXSIM.ordinal()];</span>
+<span class="nc bnc" id="L1370" title="All 2 branches missed.">        if(maxNeg &lt; maxNegLabel)</span>
+<span class="nc" id="L1371">          maxNeg = maxNegLabel;</span>
+<span class="nc" id="L1372">      }</span>
+<span class="nc" id="L1373">      double avgNegSim = sumNeg / allNumItems;</span>
+<span class="nc" id="L1374">      scoreslist.setCount(ScorePhraseMeasures.WORDVECPOSSIMAVG, avgPosSim);</span>
+<span class="nc" id="L1375">      scoreslist.setCount(ScorePhraseMeasures.WORDVECPOSSIMMAX, maxPosSim);</span>
+<span class="nc" id="L1376">      scoreslist.setCount(ScorePhraseMeasures.WORDVECNEGSIMAVG, avgNegSim);</span>
+<span class="nc" id="L1377">      scoreslist.setCount(ScorePhraseMeasures.WORDVECNEGSIMAVG, maxNeg);</span>
+    }
+
+<span class="nc bnc" id="L1380" title="All 2 branches missed.">    if (constVars.usePhraseEvalEditDistSame) {</span>
+<span class="nc" id="L1381">      double ed = constVars.getEditDistanceScoresThisClass(label, word.getPhrase());</span>
+<span class="nc bnc" id="L1382" title="All 4 branches missed.">      assert ed &lt;= 1 : &quot; how come edit distance from the true class is &quot; + ed  + &quot; for word &quot; + word;</span>
+<span class="nc" id="L1383">      scoreslist.setCount(ScorePhraseMeasures.EDITDISTSAME,  ed);</span>
+    }
+<span class="nc bnc" id="L1385" title="All 2 branches missed.">    if (constVars.usePhraseEvalEditDistOther) {</span>
+<span class="nc" id="L1386">      double ed = constVars.getEditDistanceScoresOtherClass(label, word.getPhrase());</span>
+<span class="nc bnc" id="L1387" title="All 4 branches missed.">      assert ed &lt;= 1 : &quot; how come edit distance from the true class is &quot; + ed  + &quot; for word &quot; + word;;</span>
+<span class="nc" id="L1388">      scoreslist.setCount(ScorePhraseMeasures.EDITDISTOTHER, ed);</span>
+    }
+
+<span class="nc bnc" id="L1391" title="All 2 branches missed.">    if(constVars.usePhraseEvalWordShape){</span>
+<span class="nc" id="L1392">      scoreslist.setCount(ScorePhraseMeasures.WORDSHAPE, this.getWordShapeScore(word.getPhrase(), label));</span>
+    }
+
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">    if(constVars.usePhraseEvalWordShapeStr){</span>
+<span class="nc" id="L1396">      scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.WORDSHAPESTR + &quot;-&quot; + this.wordShape(word.getPhrase())), 1.0);</span>
+    }
+
+<span class="nc bnc" id="L1399" title="All 2 branches missed.">    if(constVars.usePhraseEvalFirstCapital){</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">      scoreslist.setCount(ScorePhraseMeasures.ISFIRSTCAPITAL, StringUtils.isCapitalized(word.getPhrase())? 1.0 :0);</span>
+    }
+
+<span class="nc bnc" id="L1403" title="All 2 branches missed.">    if(constVars.usePhraseEvalBOW){</span>
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">      for(String s: word.getPhrase().split(&quot;\\s+&quot;))</span>
+<span class="nc" id="L1405">        scoreslist.setCount(ScorePhraseMeasures.create(ScorePhraseMeasures.BOW +&quot;-&quot;+ s), 1.0);</span>
+    }
+
+<span class="nc" id="L1408">    phraseScoresRaw.setCounter(word, scoreslist);</span>
+    //System.out.println(&quot;scores for &quot; + word + &quot; are &quot; + scoreslist);
+<span class="nc" id="L1410">    return scoreslist;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NBLinearClassifierFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.classify</a> &gt; <span class="el_source">NBLinearClassifierFactory.java</span></div><h1>NBLinearClassifierFactory.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.classify;
+
+import edu.stanford.nlp.ling.BasicDatum;
+import edu.stanford.nlp.optimization.GoldenSectionLineSearch;
+
+import java.util.function.Function;
+
+
+import edu.stanford.nlp.util.logging.Redwood;
+
+/**
+ * Provides a medium-weight implementation of Bernoulli (or binary)
+ * Naive Bayes via a linear classifier.  It's medium weight in that
+ * it uses dense arrays for counts and calculation (but, hey, NB is
+ * efficient to estimate).  Each feature is treated as an independent
+ * binary variable.
+ * &lt;p&gt;
+ * CDM Jun 2003: I added a dirty trick so that if there is a feature
+ * that is always on in input examples, then its weight is turned into
+ * a prior feature!  (This will work well iff it is also always on at
+ * test time.)  In fact, this is done for each such feature, so by
+ * having several such features, one can even get an integral prior
+ * boost out of this.
+ *
+ * @author Dan Klein
+ * @author Sarah Spikes (sdspikes@cs.stanford.edu) (Templatization)
+ *
+ * @param &lt;L&gt; The type of the labels in the Classifier
+ * @param &lt;F&gt; The type of the features in the Classifier
+ */
+public class NBLinearClassifierFactory&lt;L, F&gt; extends AbstractLinearClassifierFactory&lt;L, F&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L34">  private static Redwood.RedwoodChannels log = Redwood.channels(NBLinearClassifierFactory.class);</span>
+
+  private static final boolean VERBOSE = false;
+
+  private double sigma;     // amount of add-k smoothing of evidence
+  private final boolean interpretAlwaysOnFeatureAsPrior;
+  private static final double epsilon = 1e-30;   // fudge to keep nonzero
+<span class="nc" id="L41">  private boolean tuneSigma = false;</span>
+  private int folds;
+
+<span class="nc" id="L44">  final static Redwood.RedwoodChannels logger = Redwood.channels(NBLinearClassifierFactory.class);</span>
+
+
+  @Override
+  protected double[][] trainWeights(GeneralDataset&lt;L, F&gt; data) {
+<span class="nc" id="L49">    return trainWeights(data.getDataArray(), data.getLabelsArray());</span>
+  }
+
+  /**
+   * Train weights.
+   * If tuneSigma is true, the optimal sigma value is found using cross-validation:
+   * the number of folds is determined by the &lt;code&gt;folds&lt;/code&gt; variable,
+   * if there are less training examples than folds,
+   * leave-one-out is used.
+   */
+  double[][] trainWeights(int[][] data, int[] labels) {
+<span class="nc bnc" id="L60" title="All 2 branches missed.">    if (tuneSigma) {</span>
+<span class="nc" id="L61">      tuneSigma(data, labels);</span>
+    }
+    if (VERBOSE) {
+      logger.info(&quot;NB CF: &quot; + data.length + &quot; data items &quot;);
+      for (int i = 0; i &lt; data.length; i++) {
+        log.info(&quot;Datum &quot; + i + &quot;: &quot; + labels[i] + &quot;:&quot;);
+        for (int j = 0; j &lt; data[i].length; j++) {
+          log.info(&quot; &quot; + data[i][j]);
+        }
+        logger.info(&quot;&quot;);
+      }
+    }
+<span class="nc" id="L73">    int numFeatures = numFeatures();</span>
+<span class="nc" id="L74">    int numClasses = numClasses();</span>
+<span class="nc" id="L75">    double[][] weights = new double[numFeatures][numClasses];</span>
+    // find P(C|F)/P(C)
+<span class="nc" id="L77">    int num = 0;</span>
+<span class="nc" id="L78">    double[] numc = new double[numClasses];</span>
+<span class="nc" id="L79">    double n = 0;   // num active features in whole dataset</span>
+<span class="nc" id="L80">    double[] n_c = new double[numClasses];  // num active features in class c items</span>
+<span class="nc" id="L81">    double[] n_f = new double[numFeatures]; // num data items for which feature is active</span>
+<span class="nc" id="L82">    double[][] n_fc = new double[numFeatures][numClasses];  // num times feature active in class c</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">    for (int d = 0; d &lt; data.length; d++) {</span>
+<span class="nc" id="L84">      num++;</span>
+<span class="nc" id="L85">      numc[labels[d]]++;</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">      for (int i = 0; i &lt; data[d].length; i++) {</span>
+<span class="nc" id="L87">        n++;</span>
+<span class="nc" id="L88">        n_c[labels[d]]++;</span>
+<span class="nc" id="L89">        n_f[data[d][i]]++;</span>
+<span class="nc" id="L90">        n_fc[data[d][i]][labels[d]]++;</span>
+      }
+    }
+<span class="nc bnc" id="L93" title="All 2 branches missed.">    for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">      for (int f = 0; f &lt; numFeatures; f++) {</span>
+<span class="nc bnc" id="L95" title="All 4 branches missed.">        if (interpretAlwaysOnFeatureAsPrior &amp;&amp; n_f[f] == data.length) {</span>
+          // interpret always on feature as prior!
+<span class="nc" id="L97">          weights[f][c] = Math.log(numc[c] / num);</span>
+        } else {
+          // p_c_f = (N(f,c)+k)/(N(f)+|C|k) = Paddk(c|f)
+          // set lambda = log (P()/P())
+<span class="nc" id="L101">          double p_c = (n_c[c] + epsilon) / (n + numClasses * epsilon);</span>
+<span class="nc" id="L102">          double p_c_f = (n_fc[f][c] + sigma) / (n_f[f] + sigma * numClasses);</span>
+          if (VERBOSE) {
+            logger.info(&quot;Prob ratio(f=&quot; + f + &quot;,c=&quot; + c + &quot;) = &quot; + p_c_f / p_c + &quot; (nc=&quot; + n_c[c] + &quot;, nf=&quot; + n_f[f] + &quot;, nfc=&quot; + n_fc[f][c] + &quot;)&quot;);
+          }
+<span class="nc" id="L106">          weights[f][c] = Math.log(p_c_f / p_c);</span>
+        }
+      }
+    }
+<span class="nc" id="L110">    return weights;</span>
+  }
+
+  double[][] weights(int[][] data, int[] labels, int testMin, int testMax, double trialSigma, int foldSize) {
+<span class="nc" id="L114">    int numFeatures = numFeatures();</span>
+<span class="nc" id="L115">    int numClasses = numClasses();</span>
+<span class="nc" id="L116">    double[][] weights = new double[numFeatures][numClasses];</span>
+    // find P(C|F)/P(C)
+<span class="nc" id="L118">    int num = 0;</span>
+<span class="nc" id="L119">    double[] numc = new double[numClasses];</span>
+<span class="nc" id="L120">    double n = 0;   // num active features in whole dataset</span>
+<span class="nc" id="L121">    double[] n_c = new double[numClasses];  // num active features in class c items</span>
+<span class="nc" id="L122">    double[] n_f = new double[numFeatures]; // num data items for which feature is active</span>
+<span class="nc" id="L123">    double[][] n_fc = new double[numFeatures][numClasses];  // num times feature active in class c</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">    for (int d = 0; d &lt; data.length; d++) {</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">      if (d == testMin) {</span>
+<span class="nc" id="L126">        d = testMax - 1;</span>
+<span class="nc" id="L127">        continue;</span>
+      }
+<span class="nc" id="L129">      num++;</span>
+<span class="nc" id="L130">      numc[labels[d]]++;</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">      for (int i = 0; i &lt; data[d].length; i++) {</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (i == testMin) {</span>
+<span class="nc" id="L133">          i = testMax - 1;</span>
+<span class="nc" id="L134">          continue;</span>
+        }
+<span class="nc" id="L136">        n++;</span>
+<span class="nc" id="L137">        n_c[labels[d]]++;</span>
+<span class="nc" id="L138">        n_f[data[d][i]]++;</span>
+<span class="nc" id="L139">        n_fc[data[d][i]][labels[d]]++;</span>
+      }
+    }
+<span class="nc bnc" id="L142" title="All 2 branches missed.">    for (int c = 0; c &lt; numClasses; c++) {</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">      for (int f = 0; f &lt; numFeatures; f++) {</span>
+<span class="nc bnc" id="L144" title="All 4 branches missed.">        if (interpretAlwaysOnFeatureAsPrior &amp;&amp; n_f[f] == data.length - foldSize) {</span>
+          // interpret always on feature as prior!
+<span class="nc" id="L146">          weights[f][c] = Math.log(numc[c] / num);</span>
+        } else {
+          // p_c_f = (N(f,c)+k)/(N(f)+|C|k) = Paddk(c|f)
+          // set lambda = log (P()/P())
+<span class="nc" id="L150">          double p_c = (n_c[c] + epsilon) / (n + numClasses * epsilon);</span>
+<span class="nc" id="L151">          double p_c_f = (n_fc[f][c] + trialSigma) / (n_f[f] + trialSigma * numClasses);</span>
+<span class="nc" id="L152">          weights[f][c] = Math.log(p_c_f / p_c);</span>
+        }
+      }
+    }
+<span class="nc" id="L156">    return weights;</span>
+  }
+
+
+  private void tuneSigma(final int[][] data, final int[] labels) {
+
+<span class="nc" id="L162">    Function&lt;Double, Double&gt; CVSigmaToPerplexity = trialSigma -&gt; {</span>
+<span class="nc" id="L163">      double score = 0.0;</span>
+<span class="nc" id="L164">      double sumScore = 0.0;</span>
+      int foldSize, nbCV;
+<span class="nc" id="L166">      logger.info(&quot;Trying sigma = &quot; + trialSigma);</span>
+      //test if enough training data
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      if (data.length &gt;= folds) {</span>
+<span class="nc" id="L169">        foldSize = data.length / folds;</span>
+<span class="nc" id="L170">        nbCV = folds;</span>
+      } else { //leave-one-out
+<span class="nc" id="L172">        foldSize = 1;</span>
+<span class="nc" id="L173">        nbCV = data.length;</span>
+      }
+
+<span class="nc bnc" id="L176" title="All 2 branches missed.">      for (int j = 0; j &lt; nbCV; j++) {</span>
+        //System.out.println(&quot;CV j: &quot;+ j);
+<span class="nc" id="L178">        int testMin = j * foldSize;</span>
+<span class="nc" id="L179">        int testMax = testMin + foldSize;</span>
+
+<span class="nc" id="L181">        LinearClassifier&lt;L, F&gt; c = new LinearClassifier&lt;&gt;(weights(data, labels, testMin, testMax, trialSigma, foldSize), featureIndex, labelIndex);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        for (int i = testMin; i &lt; testMax; i++) {</span>
+          //System.out.println(&quot;test i: &quot;+ i + &quot; &quot;+ new BasicDatum(featureIndex.objects(data[i])));
+<span class="nc" id="L184">          score -= c.logProbabilityOf(new BasicDatum&lt;&gt;(featureIndex.objects(data[i]))).getCount(labelIndex.get(labels[i]));</span>
+        }
+        //System.err.printf(&quot;%d: %8g%n&quot;, j, score);
+<span class="nc" id="L187">        sumScore += score;</span>
+      }
+<span class="nc" id="L189">      System.err.printf(&quot;: %8g%n&quot;, sumScore);</span>
+<span class="nc" id="L190">      return sumScore;</span>
+    };
+
+<span class="nc" id="L193">    GoldenSectionLineSearch gsls = new GoldenSectionLineSearch(true);</span>
+<span class="nc" id="L194">    sigma = gsls.minimize(CVSigmaToPerplexity, 0.01, 0.0001, 2.0);</span>
+<span class="nc" id="L195">    System.out.println(&quot;Sigma used: &quot; + sigma);</span>
+<span class="nc" id="L196">  }</span>
+
+  /**
+   * Create a ClassifierFactory.
+   */
+  public NBLinearClassifierFactory() {
+<span class="nc" id="L202">    this(1.0);</span>
+<span class="nc" id="L203">  }</span>
+
+  /**
+   * Create a ClassifierFactory.
+   *
+   * @param sigma The amount of add-sigma smoothing of evidence
+   */
+  public NBLinearClassifierFactory(double sigma) {
+<span class="nc" id="L211">    this(sigma, false);</span>
+<span class="nc" id="L212">  }</span>
+
+  /**
+   * Create a ClassifierFactory.
+   *
+   * @param sigma The amount of add-sigma smoothing of evidence
+   * @param interpretAlwaysOnFeatureAsPrior If true, a feature that is in every
+   *              data item is interpreted as an indication to include a prior
+   *              factor over classes.  (If there are multiple such features, an
+   *              integral &quot;prior boost&quot; will occur.)  If false, an always on
+   *              feature is interpreted as an evidence feature (and, following
+   *              the standard math) will have no effect on the model.
+
+   */
+<span class="nc" id="L226">  public NBLinearClassifierFactory(double sigma, boolean interpretAlwaysOnFeatureAsPrior) {</span>
+<span class="nc" id="L227">    this.sigma = sigma;</span>
+<span class="nc" id="L228">    this.interpretAlwaysOnFeatureAsPrior = interpretAlwaysOnFeatureAsPrior;</span>
+<span class="nc" id="L229">  }</span>
+
+  /**
+   * setTuneSigmaCV sets the &lt;code&gt;tuneSigma&lt;/code&gt; flag: when turned on,
+   * the sigma is tuned by cross-validation.
+   * If there is less data than the number of folds, leave-one-out is used.
+   * The default for tuneSigma is false.
+   *
+   * @param folds Number of folds for cross validation
+   */
+  public void setTuneSigmaCV(int folds) {
+<span class="nc" id="L240">    tuneSigma = true;</span>
+<span class="nc" id="L241">    this.folds = folds;</span>
+<span class="nc" id="L242">  }</span>
+
+  private static final long serialVersionUID = 1;
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

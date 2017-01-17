@@ -1,0 +1,755 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CRFCliqueTree.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.crf</a> &gt; <span class="el_source">CRFCliqueTree.java</span></div><h1>CRFCliqueTree.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.crf; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.sequences.ListeningSequenceModel;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.GeneralizedCounter;
+import edu.stanford.nlp.util.Index;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Builds a CliqueTree (an array of FactorTable) and does message passing
+ * inference along it.
+ *
+ * @param &lt;E&gt; The type of the label (usually String in our uses)
+ * @author Jenny Finkel
+ */
+public class CRFCliqueTree&lt;E&gt; implements ListeningSequenceModel  {
+
+  /** A logger for this class */
+<span class="nc" id="L25">  private static Redwood.RedwoodChannels log = Redwood.channels(CRFCliqueTree.class);</span>
+
+  private final FactorTable[] factorTables;
+  private final double z; // norm constant
+  private final Index&lt;E&gt; classIndex;
+  private final E backgroundSymbol;
+  private final int backgroundIndex;
+  // the window size, which is also the clique size
+  private final int windowSize;
+  // the number of possible classes for each label
+  private final int numClasses;
+  private final int[] possibleValues;
+
+  /** Initialize a clique tree. */
+  public CRFCliqueTree(FactorTable[] factorTables, Index&lt;E&gt; classIndex, E backgroundSymbol) {
+<span class="nc" id="L40">    this(factorTables, classIndex, backgroundSymbol, factorTables[0].totalMass());</span>
+<span class="nc" id="L41">  }</span>
+
+  /** This extra constructor was added to support the CRFCliqueTreeForPartialLabels. */
+<span class="nc" id="L44">  CRFCliqueTree(FactorTable[] factorTables, Index&lt;E&gt; classIndex, E backgroundSymbol, double z) {</span>
+<span class="nc" id="L45">    this.factorTables = factorTables;</span>
+<span class="nc" id="L46">    this.z = z;</span>
+<span class="nc" id="L47">    this.classIndex = classIndex;</span>
+<span class="nc" id="L48">    this.backgroundSymbol = backgroundSymbol;</span>
+<span class="nc" id="L49">    backgroundIndex = classIndex.indexOf(backgroundSymbol);</span>
+<span class="nc" id="L50">    windowSize = factorTables[0].windowSize();</span>
+<span class="nc" id="L51">    numClasses = classIndex.size();</span>
+<span class="nc" id="L52">    possibleValues = new int[numClasses];</span>
+<span class="nc bnc" id="L53" title="All 2 branches missed.">    for (int i = 0; i &lt; numClasses; i++) {</span>
+<span class="nc" id="L54">      possibleValues[i] = i;</span>
+    }
+
+    // Debug only
+    // System.out.println(&quot;CRFCliqueTree constructed::numClasses: &quot; +
+    // numClasses);
+<span class="nc" id="L60">  }</span>
+
+  public FactorTable[] getFactorTables() {
+<span class="nc" id="L63">    return this.factorTables;</span>
+  }
+
+  public Index&lt;E&gt; classIndex() {
+<span class="nc" id="L67">    return classIndex;</span>
+  }
+
+  // SEQUENCE MODEL METHODS
+
+  @Override
+  public int length() {
+<span class="nc" id="L74">    return factorTables.length;</span>
+  }
+
+  @Override
+  public int leftWindow() {
+<span class="nc" id="L79">    return windowSize;</span>
+  }
+
+  @Override
+  public int rightWindow() {
+<span class="nc" id="L84">    return 0;</span>
+  }
+
+  @Override
+  public int[] getPossibleValues(int position) {
+<span class="nc" id="L89">    return possibleValues;</span>
+  }
+
+  @Override
+  public double scoreOf(int[] sequence, int pos) {
+<span class="nc" id="L94">    return scoresOf(sequence, pos)[sequence[pos]];</span>
+  }
+
+  /**
+   * Computes the unnormalized log conditional distribution over values of the
+   * element at position pos in the sequence, conditioned on the values of the
+   * elements in all other positions of the provided sequence.
+   *
+   * @param sequence
+   *          the sequence containing the rest of the values to condition on
+   * @param position
+   *          the position of the element to give a distribution for
+   * @return an array of type double, representing a probability distribution;
+   *         sums to 1.0
+   */
+  @Override
+  public double[] scoresOf(int[] sequence, int position) {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    if (position &gt;= factorTables.length) throw new RuntimeException(&quot;Index out of bounds: &quot; + position);</span>
+    // DecimalFormat nf = new DecimalFormat(&quot;#0.000&quot;);
+    // if (position&gt;0 &amp;&amp; position&lt;sequence.length-1) System.out.println(position
+    // + &quot;: asking about &quot; +sequence[position-1] + &quot;(&quot; + sequence[position] +
+    // &quot;)&quot; + sequence[position+1]);
+<span class="nc" id="L116">    double[] probThisGivenPrev = new double[numClasses];</span>
+<span class="nc" id="L117">    double[] probNextGivenThis = new double[numClasses];</span>
+    // double[] marginal = new double[numClasses]; // for debugging only
+
+    // compute prob of this tag given the window-1 previous tags, normalized
+    // extract the window-1 previous tags, pad left with background if necessary
+<span class="nc" id="L122">    int prevLength = windowSize - 1;</span>
+<span class="nc" id="L123">    int[] prev = new int[prevLength + 1]; // leave an extra element for the</span>
+    // label at this position
+<span class="nc" id="L125">    int i = 0;</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">    for (; i &lt; prevLength - position; i++) { // will only happen if</span>
+      // position-prevLength &lt; 0
+<span class="nc" id="L128">      prev[i] = classIndex.indexOf(backgroundSymbol);</span>
+    }
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    for (; i &lt; prevLength; i++) {</span>
+<span class="nc" id="L131">      prev[i] = sequence[position - prevLength + i];</span>
+    }
+<span class="nc bnc" id="L133" title="All 2 branches missed.">    for (int label = 0; label &lt; numClasses; label++) {</span>
+<span class="nc" id="L134">      prev[prev.length - 1] = label;</span>
+<span class="nc" id="L135">      probThisGivenPrev[label] = factorTables[position].unnormalizedLogProb(prev);</span>
+      // marginal[label] = factorTables[position].logProbEnd(label); // remove:
+      // for debugging only
+    }
+
+    // ArrayMath.logNormalize(probThisGivenPrev);
+
+    // compute the prob of the window-1 next tags given this tag
+    // extract the window-1 next tags
+<span class="nc" id="L144">    int nextLength = windowSize - 1;</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">    if (position + nextLength &gt;= length()) {</span>
+<span class="nc" id="L146">      nextLength = length() - position - 1;</span>
+    }
+<span class="nc" id="L148">    FactorTable nextFactorTable = factorTables[position + nextLength];</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">    if (nextLength != windowSize - 1) {</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">      for (int j = 0; j &lt; windowSize - 1 - nextLength; j++) {</span>
+<span class="nc" id="L151">        nextFactorTable = nextFactorTable.sumOutFront();</span>
+      }
+    }
+<span class="nc bnc" id="L154" title="All 2 branches missed.">    if (nextLength == 0) { // we are asking about the prob of no sequence</span>
+<span class="nc" id="L155">      Arrays.fill(probNextGivenThis, 1.0);</span>
+    } else {
+<span class="nc" id="L157">      int[] next = new int[nextLength];</span>
+<span class="nc" id="L158">      System.arraycopy(sequence, position + 1, next, 0, nextLength);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">      for (int label = 0; label &lt; numClasses; label++) {</span>
+        // ask the factor table such that pos is the first position in the
+        // window
+        // probNextGivenThis[label] =
+        // factorTables[position+nextLength].conditionalLogProbGivenFirst(label,
+        // next);
+        // probNextGivenThis[label] =
+        // nextFactorTable.conditionalLogProbGivenFirst(label, next);
+<span class="nc" id="L167">        probNextGivenThis[label] = nextFactorTable.unnormalizedConditionalLogProbGivenFirst(label, next);</span>
+      }
+    }
+
+    // pointwise multiply
+<span class="nc" id="L172">    return ArrayMath.pairwiseAdd(probThisGivenPrev, probNextGivenThis);</span>
+  }
+
+  /**
+   * Returns the log probability of this sequence given the CRF. Does so by
+   * computing the marginal of the first windowSize tags, and then computing the
+   * conditional probability for the rest of them, conditioned on the previous
+   * tags.
+   *
+   * @param sequence The sequence to compute a score for
+   * @return the score for the sequence
+   */
+  @Override
+  public double scoreOf(int[] sequence) {
+
+<span class="nc" id="L187">    int[] given = new int[window() - 1];</span>
+<span class="nc" id="L188">    Arrays.fill(given, classIndex.indexOf(backgroundSymbol));</span>
+<span class="nc" id="L189">    double logProb = 0.0;</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">    for (int i = 0, length = length(); i &lt; length; i++) {</span>
+<span class="nc" id="L191">      int label = sequence[i];</span>
+<span class="nc" id="L192">      logProb += condLogProbGivenPrevious(i, label, given);</span>
+<span class="nc" id="L193">      System.arraycopy(given, 1, given, 0, given.length - 1);</span>
+<span class="nc" id="L194">      given[given.length - 1] = label;</span>
+    }
+<span class="nc" id="L196">    return logProb;</span>
+  }
+
+  // OTHER
+
+  public int window() {
+<span class="nc" id="L202">    return windowSize;</span>
+  }
+
+  public int getNumClasses() {
+<span class="nc" id="L206">    return numClasses;</span>
+  }
+
+  public double totalMass() {
+<span class="nc" id="L210">    return z;</span>
+  }
+
+  public int backgroundIndex() {
+<span class="nc" id="L214">    return backgroundIndex;</span>
+  }
+
+  public E backgroundSymbol() {
+<span class="nc" id="L218">    return backgroundSymbol;</span>
+  }
+
+  //
+  // MARGINAL PROB OF TAG AT SINGLE POSITION
+  //
+
+  public double[][] logProbTable() {
+<span class="nc" id="L226">    double[][] result = new double[length()][classIndex.size()];</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">    for (int i = 0; i &lt; length(); i++) {</span>
+<span class="nc" id="L228">      result[i] = new double[classIndex.size()];</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">      for (int j = 0; j &lt; classIndex.size(); j++) {</span>
+<span class="nc" id="L230">        result[i][j] = logProb(i, j);</span>
+      }
+    }
+
+<span class="nc" id="L234">    return result;</span>
+  }
+
+  /*
+  * TODO(mengqiu) this function is buggy, should make sure label converts properly into int[] in cases where it's not 0-order label
+  */
+  public double logProbStartPos() {
+<span class="nc" id="L241">    double u = factorTables[0].unnormalizedLogProbFront(backgroundIndex);</span>
+<span class="nc" id="L242">    return u - z;</span>
+  }
+
+  public double logProb(int position, int label) {
+<span class="nc" id="L246">    double u = factorTables[position].unnormalizedLogProbEnd(label);</span>
+<span class="nc" id="L247">    return u - z;</span>
+  }
+
+  public double prob(int position, int label) {
+<span class="nc" id="L251">    return Math.exp(logProb(position, label));</span>
+  }
+
+  public double logProb(int position, E label) {
+<span class="nc" id="L255">    return logProb(position, classIndex.indexOf(label));</span>
+  }
+
+  public double prob(int position, E label) {
+<span class="nc" id="L259">    return Math.exp(logProb(position, label));</span>
+  }
+
+  public double[] probsToDoubleArr(int position) {
+<span class="nc" id="L263">    double[] probs = new double[classIndex.size()];</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L265">      probs[i] = prob(position, i);</span>
+    }
+<span class="nc" id="L267">    return probs;</span>
+  }
+
+  public double[] logProbsToDoubleArr(int position) {
+<span class="nc" id="L271">    double[] probs = new double[classIndex.size()];</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L273">      probs[i] = logProb(position, i);</span>
+    }
+<span class="nc" id="L275">    return probs;</span>
+  }
+
+  public Counter&lt;E&gt; probs(int position) {
+<span class="nc" id="L279">    Counter&lt;E&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L281">      E label = classIndex.get(i);</span>
+<span class="nc" id="L282">      c.incrementCount(label, prob(position, i));</span>
+    }
+<span class="nc" id="L284">    return c;</span>
+  }
+
+  public Counter&lt;E&gt; logProbs(int position) {
+<span class="nc" id="L288">    Counter&lt;E&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L290">      E label = classIndex.get(i);</span>
+<span class="nc" id="L291">      c.incrementCount(label, logProb(position, i));</span>
+    }
+<span class="nc" id="L293">    return c;</span>
+  }
+
+  //
+  // MARGINAL PROBS OF TAGS AT MULTIPLE POSITIONS
+  //
+
+  /**
+   * returns the log probability for the given labels (indexed using
+   * classIndex), where the last label corresponds to the label at the specified
+   * position. For instance if you called logProb(5, {1,2,3}) it will return the
+   * marginal log prob that the label at position 3 is 1, the label at position
+   * 4 is 2 and the label at position 5 is 3.
+   */
+  public double logProb(int position, int[] labels) {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">    if (labels.length &lt; windowSize) {</span>
+<span class="nc" id="L309">      return factorTables[position].unnormalizedLogProbEnd(labels) - z;</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">    } else if (labels.length == windowSize) {</span>
+<span class="nc" id="L311">      return factorTables[position].unnormalizedLogProb(labels) - z;</span>
+    } else {
+<span class="nc" id="L313">      int[] l = new int[windowSize];</span>
+<span class="nc" id="L314">      System.arraycopy(labels, 0, l, 0, l.length);</span>
+<span class="nc" id="L315">      int position1 = position - labels.length + windowSize;</span>
+<span class="nc" id="L316">      double p = factorTables[position1].unnormalizedLogProb(l) - z;</span>
+<span class="nc" id="L317">      l = new int[windowSize - 1];</span>
+<span class="nc" id="L318">      System.arraycopy(labels, 1, l, 0, l.length);</span>
+<span class="nc" id="L319">      position1++;</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">      for (int i = windowSize; i &lt; labels.length; i++) {</span>
+<span class="nc" id="L321">        p += condLogProbGivenPrevious(position1++, labels[i], l);</span>
+<span class="nc" id="L322">        System.arraycopy(l, 1, l, 0, l.length - 1);</span>
+<span class="nc" id="L323">        l[windowSize - 2] = labels[i];</span>
+      }
+<span class="nc" id="L325">      return p;</span>
+    }
+  }
+
+  /**
+   * Returns the probability for the given labels (indexed using classIndex),
+   * where the last label corresponds to the label at the specified position.
+   * For instance if you called prob(5, {1,2,3}) it will return the marginal
+   * prob that the label at position 3 is 1, the label at position 4 is 2 and
+   * the label at position 5 is 3.
+   */
+  public double prob(int position, int[] labels) {
+<span class="nc" id="L337">    return Math.exp(logProb(position, labels));</span>
+  }
+
+  /**
+   * returns the log probability for the given labels, where the last label
+   * corresponds to the label at the specified position. For instance if you
+   * called logProb(5, {&quot;O&quot;, &quot;PER&quot;, &quot;ORG&quot;}) it will return the marginal log prob
+   * that the label at position 3 is &quot;O&quot;, the label at position 4 is &quot;PER&quot; and
+   * the label at position 5 is &quot;ORG&quot;.
+   */
+  public double logProb(int position, E[] labels) {
+<span class="nc" id="L348">    return logProb(position, objectArrayToIntArray(labels));</span>
+  }
+
+  /**
+   * returns the probability for the given labels, where the last label
+   * corresponds to the label at the specified position. For instance if you
+   * called logProb(5, {&quot;O&quot;, &quot;PER&quot;, &quot;ORG&quot;}) it will return the marginal prob
+   * that the label at position 3 is &quot;O&quot;, the label at position 4 is &quot;PER&quot; and
+   * the label at position 5 is &quot;ORG&quot;.
+   */
+  public double prob(int position, E[] labels) {
+<span class="nc" id="L359">    return Math.exp(logProb(position, labels));</span>
+  }
+
+  public GeneralizedCounter logProbs(int position, int window) {
+<span class="nc" id="L363">    GeneralizedCounter&lt;E&gt; gc = new GeneralizedCounter&lt;&gt;(window);</span>
+<span class="nc" id="L364">    int[] labels = new int[window];</span>
+    // cdm july 2005: below array initialization isn't necessary: JLS (3rd ed.)
+    // 4.12.5
+    // Arrays.fill(labels, 0);
+
+    OUTER: while (true) {
+<span class="nc" id="L370">      List&lt;E&gt; labelsList = intArrayToListE(labels);</span>
+<span class="nc" id="L371">      gc.incrementCount(labelsList, logProb(position, labels));</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">      for (int i = 0; i &lt; labels.length; i++) {</span>
+<span class="nc" id="L373">        labels[i]++;</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        if (labels[i] &lt; numClasses) {</span>
+<span class="nc" id="L375">          break;</span>
+        }
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (i == labels.length - 1) {</span>
+<span class="nc" id="L378">          break OUTER;</span>
+        }
+<span class="nc" id="L380">        labels[i] = 0;</span>
+      }
+<span class="nc" id="L382">    }</span>
+<span class="nc" id="L383">    return gc;</span>
+  }
+
+  public GeneralizedCounter probs(int position, int window) {
+<span class="nc" id="L387">    GeneralizedCounter&lt;E&gt; gc = new GeneralizedCounter&lt;&gt;(window);</span>
+<span class="nc" id="L388">    int[] labels = new int[window];</span>
+    // cdm july 2005: below array initialization isn't necessary: JLS (3rd ed.)
+    // 4.12.5
+    // Arrays.fill(labels, 0);
+
+    OUTER: while (true) {
+<span class="nc" id="L394">      List&lt;E&gt; labelsList = intArrayToListE(labels);</span>
+<span class="nc" id="L395">      gc.incrementCount(labelsList, prob(position, labels));</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">      for (int i = 0; i &lt; labels.length; i++) {</span>
+<span class="nc" id="L397">        labels[i]++;</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (labels[i] &lt; numClasses) {</span>
+<span class="nc" id="L399">          break;</span>
+        }
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (i == labels.length - 1) {</span>
+<span class="nc" id="L402">          break OUTER;</span>
+        }
+<span class="nc" id="L404">        labels[i] = 0;</span>
+      }
+<span class="nc" id="L406">    }</span>
+<span class="nc" id="L407">    return gc;</span>
+  }
+
+  //
+  // HELPER METHODS
+  //
+
+  private int[] objectArrayToIntArray(E[] os) {
+<span class="nc" id="L415">    int[] is = new int[os.length];</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">    for (int i = 0; i &lt; os.length; i++) {</span>
+<span class="nc" id="L417">      is[i] = classIndex.indexOf(os[i]);</span>
+    }
+<span class="nc" id="L419">    return is;</span>
+  }
+
+  private List&lt;E&gt; intArrayToListE(int[] is) {
+<span class="nc" id="L423">    List&lt;E&gt; os = new ArrayList&lt;&gt;(is.length);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">    for (int i : is) {</span>
+<span class="nc" id="L425">      os.add(classIndex.get(i));</span>
+    }
+<span class="nc" id="L427">    return os;</span>
+  }
+
+  /**
+   * Gives the probability of a tag at a single position conditioned on a
+   * sequence of previous labels.
+   *
+   * @param position Index in sequence
+   * @param label Label of item at index
+   * @param prevLabels Indices of labels in previous positions
+   * @return conditional log probability
+   */
+  public double condLogProbGivenPrevious(int position, int label, int[] prevLabels) {
+<span class="nc bnc" id="L440" title="All 2 branches missed.">    if (prevLabels.length + 1 == windowSize) {</span>
+<span class="nc" id="L441">      return factorTables[position].conditionalLogProbGivenPrevious(prevLabels, label);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    } else if (prevLabels.length + 1 &lt; windowSize) {</span>
+<span class="nc" id="L443">      FactorTable ft = factorTables[position].sumOutFront();</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">      while (ft.windowSize() &gt; prevLabels.length + 1) {</span>
+<span class="nc" id="L445">        ft = ft.sumOutFront();</span>
+      }
+<span class="nc" id="L447">      return ft.conditionalLogProbGivenPrevious(prevLabels, label);</span>
+    } else {
+<span class="nc" id="L449">      int[] p = new int[windowSize - 1];</span>
+<span class="nc" id="L450">      System.arraycopy(prevLabels, prevLabels.length - p.length, p, 0, p.length);</span>
+<span class="nc" id="L451">      return factorTables[position].conditionalLogProbGivenPrevious(p, label);</span>
+    }
+  }
+
+  public double condLogProbGivenPrevious(int position, E label, E[] prevLabels) {
+<span class="nc" id="L456">    return condLogProbGivenPrevious(position, classIndex.indexOf(label), objectArrayToIntArray(prevLabels));</span>
+  }
+
+  public double condProbGivenPrevious(int position, int label, int[] prevLabels) {
+<span class="nc" id="L460">    return Math.exp(condLogProbGivenPrevious(position, label, prevLabels));</span>
+  }
+
+  public double condProbGivenPrevious(int position, E label, E[] prevLabels) {
+<span class="nc" id="L464">    return Math.exp(condLogProbGivenPrevious(position, label, prevLabels));</span>
+  }
+
+  public Counter&lt;E&gt; condLogProbsGivenPrevious(int position, int[] prevlabels) {
+<span class="nc" id="L468">    Counter&lt;E&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L470">      E label = classIndex.get(i);</span>
+<span class="nc" id="L471">      c.incrementCount(label, condLogProbGivenPrevious(position, i, prevlabels));</span>
+    }
+<span class="nc" id="L473">    return c;</span>
+  }
+
+  public Counter&lt;E&gt; condLogProbsGivenPrevious(int position, E[] prevlabels) {
+<span class="nc" id="L477">    Counter&lt;E&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L479">      E label = classIndex.get(i);</span>
+<span class="nc" id="L480">      c.incrementCount(label, condLogProbGivenPrevious(position, label, prevlabels));</span>
+    }
+<span class="nc" id="L482">    return c;</span>
+  }
+
+  //
+  // PROB OF TAG AT SINGLE POSITION CONDITIONED ON FOLLOWING SEQUENCE OF LABELS
+  //
+
+  public double condLogProbGivenNext(int position, int label, int[] nextLabels) {
+<span class="nc" id="L490">    position = position + nextLabels.length;</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">    if (nextLabels.length + 1 == windowSize) {</span>
+<span class="nc" id="L492">      return factorTables[position].conditionalLogProbGivenNext(nextLabels, label);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">    } else if (nextLabels.length + 1 &lt; windowSize) {</span>
+<span class="nc" id="L494">      FactorTable ft = factorTables[position].sumOutFront();</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">      while (ft.windowSize() &gt; nextLabels.length + 1) {</span>
+<span class="nc" id="L496">        ft = ft.sumOutFront();</span>
+      }
+<span class="nc" id="L498">      return ft.conditionalLogProbGivenPrevious(nextLabels, label);</span>
+    } else {
+<span class="nc" id="L500">      int[] p = new int[windowSize - 1];</span>
+<span class="nc" id="L501">      System.arraycopy(nextLabels, 0, p, 0, p.length);</span>
+<span class="nc" id="L502">      return factorTables[position].conditionalLogProbGivenPrevious(p, label);</span>
+    }
+  }
+
+  public double condLogProbGivenNext(int position, E label, E[] nextLabels) {
+<span class="nc" id="L507">    return condLogProbGivenNext(position, classIndex.indexOf(label), objectArrayToIntArray(nextLabels));</span>
+  }
+
+  public double condProbGivenNext(int position, int label, int[] nextLabels) {
+<span class="nc" id="L511">    return Math.exp(condLogProbGivenNext(position, label, nextLabels));</span>
+  }
+
+  public double condProbGivenNext(int position, E label, E[] nextLabels) {
+<span class="nc" id="L515">    return Math.exp(condLogProbGivenNext(position, label, nextLabels));</span>
+  }
+
+  public Counter&lt;E&gt; condLogProbsGivenNext(int position, int[] nextlabels) {
+<span class="nc" id="L519">    Counter&lt;E&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L521">      E label = classIndex.get(i);</span>
+<span class="nc" id="L522">      c.incrementCount(label, condLogProbGivenNext(position, i, nextlabels));</span>
+    }
+<span class="nc" id="L524">    return c;</span>
+  }
+
+  public Counter&lt;E&gt; condLogProbsGivenNext(int position, E[] nextlabels) {
+<span class="nc" id="L528">    Counter&lt;E&gt; c = new ClassicCounter&lt;&gt;();</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">    for (int i = 0, sz = classIndex.size(); i &lt; sz; i++) {</span>
+<span class="nc" id="L530">      E label = classIndex.get(i);</span>
+<span class="nc" id="L531">      c.incrementCount(label, condLogProbGivenNext(position, label, nextlabels));</span>
+    }
+<span class="nc" id="L533">    return c;</span>
+  }
+
+  //
+  // PROB OF TAG AT SINGLE POSITION CONDITIONED ON PREVIOUS AND FOLLOWING
+  // SEQUENCE OF LABELS
+  //
+
+  // public double condProbGivenPreviousAndNext(int position, int label, int[]
+  // prevLabels, int[] nextLabels) {
+
+  // }
+
+
+
+  //
+  // JOINT CONDITIONAL PROBS
+  //
+  /**
+   * @return a new CRFCliqueTree for the weights on the data
+   */
+  public static &lt;E&gt; CRFCliqueTree&lt;E&gt; getCalibratedCliqueTree(int[][][] data, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices,
+      int numClasses, Index&lt;E&gt; classIndex, E backgroundSymbol, CliquePotentialFunction cliquePotentialFunc, double[][][] featureVals) {
+
+<span class="nc" id="L557">    FactorTable[] factorTables = new FactorTable[data.length];</span>
+<span class="nc" id="L558">    FactorTable[] messages = new FactorTable[data.length - 1];</span>
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">    for (int i = 0; i &lt; data.length; i++) {</span>
+<span class="nc" id="L561">      double[][] featureValByCliqueSize = null;</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">      if (featureVals != null)</span>
+<span class="nc" id="L563">        featureValByCliqueSize = featureVals[i];</span>
+<span class="nc" id="L564">      factorTables[i] = getFactorTable(data[i], labelIndices, numClasses, cliquePotentialFunc, featureValByCliqueSize, i);</span>
+
+      // log.info(&quot;before calibration,FT[&quot;+i+&quot;] = &quot; + factorTables[i].toProbString());
+
+<span class="nc bnc" id="L568" title="All 2 branches missed.">      if (i &gt; 0) {</span>
+<span class="nc" id="L569">        messages[i - 1] = factorTables[i - 1].sumOutFront();</span>
+        // log.info(&quot;forward message, message[&quot;+(i-1)+&quot;] = &quot; + messages[i-1].toProbString());
+<span class="nc" id="L571">        factorTables[i].multiplyInFront(messages[i - 1]);</span>
+        // log.info(&quot;after forward calibration, FT[&quot;+i+&quot;] = &quot; + factorTables[i].toProbString());
+      }
+    }
+
+<span class="nc bnc" id="L576" title="All 2 branches missed.">    for (int i = factorTables.length - 2; i &gt;= 0; i--) {</span>
+<span class="nc" id="L577">      FactorTable summedOut = factorTables[i + 1].sumOutEnd();</span>
+<span class="nc" id="L578">      summedOut.divideBy(messages[i]);</span>
+      // log.info(&quot;backward summedOut, summedOut= &quot; + summedOut.toProbString());
+<span class="nc" id="L580">      factorTables[i].multiplyInEnd(summedOut);</span>
+      // log.info(&quot;after backward calibration, FT[&quot;+i+&quot;] = &quot; + factorTables[i].toProbString());
+    }
+
+<span class="nc" id="L584">    return new CRFCliqueTree&lt;&gt;(factorTables, classIndex, backgroundSymbol);</span>
+  }
+
+  /**
+   * This function assumes a LinearCliquePotentialFunction is used for wrapping the weights
+   * @return a new CRFCliqueTree for the weights on the data
+   */
+  public static &lt;E&gt; CRFCliqueTree&lt;E&gt; getCalibratedCliqueTree(double[] weights, double wscale, int[][] weightIndices,
+      int[][][] data, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int numClasses, Index&lt;E&gt; classIndex, E backgroundSymbol) {
+
+<span class="nc" id="L594">    FactorTable[] factorTables = new FactorTable[data.length];</span>
+<span class="nc" id="L595">    FactorTable[] messages = new FactorTable[data.length - 1];</span>
+
+<span class="nc bnc" id="L597" title="All 2 branches missed.">    for (int i = 0; i &lt; data.length; i++) {</span>
+
+<span class="nc" id="L599">      factorTables[i] = getFactorTable(weights, wscale, weightIndices, data[i], labelIndices, numClasses);</span>
+
+<span class="nc bnc" id="L601" title="All 2 branches missed.">      if (i &gt; 0) {</span>
+<span class="nc" id="L602">        messages[i - 1] = factorTables[i - 1].sumOutFront();</span>
+<span class="nc" id="L603">        factorTables[i].multiplyInFront(messages[i - 1]);</span>
+      }
+    }
+
+<span class="nc bnc" id="L607" title="All 2 branches missed.">    for (int i = factorTables.length - 2; i &gt;= 0; i--) {</span>
+
+<span class="nc" id="L609">      FactorTable summedOut = factorTables[i + 1].sumOutEnd();</span>
+<span class="nc" id="L610">      summedOut.divideBy(messages[i]);</span>
+<span class="nc" id="L611">      factorTables[i].multiplyInEnd(summedOut);</span>
+    }
+
+<span class="nc" id="L614">    return new CRFCliqueTree&lt;&gt;(factorTables, classIndex, backgroundSymbol);</span>
+  }
+
+  private static FactorTable getFactorTable(double[] weights, double wScale, int[][] weightIndices, int[][] data,
+      List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int numClasses) {
+
+<span class="nc" id="L620">    FactorTable factorTable = null;</span>
+
+<span class="nc bnc" id="L622" title="All 2 branches missed.">    for (int j = 0, sz = labelIndices.size(); j &lt; sz; j++) {</span>
+<span class="nc" id="L623">      Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+<span class="nc" id="L624">      FactorTable ft = new FactorTable(numClasses, j + 1);</span>
+
+      // ... and each possible labeling for that clique
+<span class="nc bnc" id="L627" title="All 2 branches missed.">      for (int k = 0, liSize = labelIndex.size(); k &lt; liSize; k++) {</span>
+<span class="nc" id="L628">        int[] label = labelIndex.get(k).getLabel();</span>
+<span class="nc" id="L629">        double weight = 0.0;</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">        for (int m = 0; m &lt; data[j].length; m++) {</span>
+<span class="nc" id="L631">          int wi = weightIndices[data[j][m]][k];</span>
+<span class="nc" id="L632">          weight += wScale * weights[wi];</span>
+        }
+        // try{
+<span class="nc" id="L635">        ft.setValue(label, weight);</span>
+        // } catch (Exception e) {
+        // System.out.println(&quot;CRFCliqueTree::getFactorTable&quot;);
+        // System.out.println(&quot;NumClasses: &quot; + numClasses + &quot; j+1: &quot; + (j+1));
+        // System.out.println(&quot;k: &quot; + k+&quot; label: &quot; +label+&quot; labelIndexSize: &quot; +
+        // labelIndex.size());
+        // throw new RunTimeException(e.toString());
+        // }
+
+      }
+<span class="nc bnc" id="L645" title="All 2 branches missed.">      if (j &gt; 0) {</span>
+<span class="nc" id="L646">        ft.multiplyInEnd(factorTable);</span>
+      }
+<span class="nc" id="L648">      factorTable = ft;</span>
+
+    }
+
+<span class="nc" id="L652">    return factorTable;</span>
+  }
+
+  // static FactorTable getFactorTable(double[][] weights, int[][] data, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int numClasses, int posInSent) {
+  //   CliquePotentialFunction cliquePotentialFunc = new LinearCliquePotentialFunction(weights);
+  //   return getFactorTable(data, labelIndices, numClasses, cliquePotentialFunc, null, posInSent);
+  // }
+
+  static FactorTable getFactorTable(int[][] data, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int numClasses,
+      CliquePotentialFunction cliquePotentialFunc, double[][] featureValByCliqueSize, int posInSent) {
+<span class="nc" id="L662">    FactorTable factorTable = null;</span>
+
+<span class="nc bnc" id="L664" title="All 2 branches missed.">    for (int j = 0, sz = labelIndices.size(); j &lt; sz; j++) {</span>
+<span class="nc" id="L665">      Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+<span class="nc" id="L666">      FactorTable ft = new FactorTable(numClasses, j + 1);</span>
+<span class="nc" id="L667">      double[] featureVal = null;</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">      if (featureValByCliqueSize != null)</span>
+<span class="nc" id="L669">        featureVal = featureValByCliqueSize[j];</span>
+
+      // ... and each possible labeling for that clique
+<span class="nc bnc" id="L672" title="All 2 branches missed.">      for (int k = 0, liSize = labelIndex.size(); k &lt; liSize; k++) {</span>
+<span class="nc" id="L673">        int[] label = labelIndex.get(k).getLabel();</span>
+<span class="nc" id="L674">        double cliquePotential = cliquePotentialFunc.computeCliquePotential(j+1, k, data[j], featureVal, posInSent);</span>
+        // for (int m = 0; m &lt; data[j].length; m++) {
+        //   weight += weights[data[j][m]][k];
+        // }
+        // try{
+<span class="nc" id="L679">        ft.setValue(label, cliquePotential);</span>
+        // } catch (Exception e) {
+        // System.out.println(&quot;CRFCliqueTree::getFactorTable&quot;);
+        // System.out.println(&quot;NumClasses: &quot; + numClasses + &quot; j+1: &quot; + (j+1));
+        // System.out.println(&quot;k: &quot; + k+&quot; label: &quot; +label+&quot; labelIndexSize: &quot; +
+        // labelIndex.size());
+        // throw new RunTimeException(e.toString());
+        // }
+
+      }
+<span class="nc bnc" id="L689" title="All 2 branches missed.">      if (j &gt; 0) {</span>
+<span class="nc" id="L690">        ft.multiplyInEnd(factorTable);</span>
+      }
+<span class="nc" id="L692">      factorTable = ft;</span>
+
+    }
+
+<span class="nc" id="L696">    return factorTable;</span>
+  }
+
+
+  // SEQUENCE MODEL METHODS
+
+  /**
+   * Computes the distribution over values of the element at position pos in the
+   * sequence, conditioned on the values of the elements in all other positions
+   * of the provided sequence.
+   *
+   * @param sequence
+   *          the sequence containing the rest of the values to condition on
+   * @param position
+   *          the position of the element to give a distribution for
+   * @return an array of type double, representing a probability distribution;
+   *         sums to 1.0
+   */
+  public double[] getConditionalDistribution(int[] sequence, int position) {
+<span class="nc" id="L715">    double[] result = scoresOf(sequence, position);</span>
+<span class="nc" id="L716">    ArrayMath.logNormalize(result);</span>
+    // System.out.println(&quot;marginal:          &quot; + ArrayMath.toString(marginal,
+    // nf));
+    // System.out.println(&quot;conditional:       &quot; + ArrayMath.toString(result,
+    // nf));
+<span class="nc" id="L721">    result = ArrayMath.exp(result);</span>
+    // System.out.println(&quot;conditional:       &quot; + ArrayMath.toString(result,
+    // nf));
+<span class="nc" id="L724">    return result;</span>
+  }
+
+  /**
+   * Informs this sequence model that the value of the element at position pos
+   * has changed. This allows this sequence model to update its internal model
+   * if desired.
+   */
+  @Override
+  public void updateSequenceElement(int[] sequence, int pos, int oldVal) {
+    // do nothing; we don't change this model
+<span class="nc" id="L735">  }</span>
+
+  /**
+   * Informs this sequence model that the value of the whole sequence is
+   * initialized to sequence
+   */
+  @Override
+  public void setInitialSequence(int[] sequence) {
+    // do nothing
+<span class="nc" id="L744">  }</span>
+
+  /**
+   * @return the number of possible values for each element; it is assumed to be
+   *         the same for the element at each position
+   */
+  public int getNumValues() {
+<span class="nc" id="L751">    return numClasses;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

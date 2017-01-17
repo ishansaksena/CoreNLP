@@ -1,0 +1,957 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SpanishTreeNormalizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees.international.spanish</a> &gt; <span class="el_source">SpanishTreeNormalizer.java</span></div><h1>SpanishTreeNormalizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.trees.international.spanish;
+
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import edu.stanford.nlp.international.spanish.process.AnCoraPronounDisambiguator;
+import edu.stanford.nlp.international.spanish.SpanishVerbStripper;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.HasTag;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.trees.*;
+import edu.stanford.nlp.trees.tregex.TregexMatcher;
+import edu.stanford.nlp.trees.tregex.TregexPattern;
+import edu.stanford.nlp.trees.tregex.tsurgeon.Tsurgeon;
+import edu.stanford.nlp.trees.tregex.tsurgeon.TsurgeonPattern;
+import java.util.function.Predicate;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.StringUtils;
+
+/**
+ * Normalize trees read from the AnCora Spanish corpus.
+ */
+public class SpanishTreeNormalizer extends BobChrisTreeNormalizer {
+
+  /**
+   * Tag provided to words which are extracted from a multi-word token
+   * into their own independent nodes
+   */
+  public static final String MW_TAG = &quot;MW?&quot;;
+
+  /**
+   * Tag provided to constituents which contain words from MW tokens
+   */
+  public static final String MW_PHRASE_TAG = &quot;MW_PHRASE?&quot;;
+
+  public static final String EMPTY_LEAF_VALUE = &quot;=NONE=&quot;;
+  public static final String LEFT_PARENTHESIS = &quot;=LRB=&quot;;
+  public static final String RIGHT_PARENTHESIS = &quot;=RRB=&quot;;
+
+<span class="nc" id="L42">  private static final Map&lt;String, String&gt; spellingFixes = new HashMap&lt;&gt;();</span>
+  static {
+<span class="nc" id="L44">    spellingFixes.put(&quot;embargp&quot;, &quot;embargo&quot;); // 18381_20000322.tbf-4</span>
+<span class="nc" id="L45">    spellingFixes.put(&quot;jucio&quot;, &quot;juicio&quot;); // 4800_2000406.tbf-5</span>
+<span class="nc" id="L46">    spellingFixes.put(&quot;méxico&quot;, &quot;México&quot;); // 111_C-3.tbf-17</span>
+<span class="nc" id="L47">    spellingFixes.put(&quot;reirse&quot;, &quot;reírse&quot;); // 140_20011102.tbf-13</span>
+<span class="nc" id="L48">    spellingFixes.put(&quot;tambien&quot;, &quot;también&quot;); // 41_19991002.tbf-8</span>
+
+<span class="nc" id="L50">    spellingFixes.put(&quot;Intitute&quot;, &quot;Institute&quot;); // 22863_20001129.tbf-16</span>
+
+    // Hack: these aren't exactly spelling mistakes, but we need to
+    // run a search-and-replace across the entire corpus with them, so
+    // they should be treated just like spelling mistakes for our
+    // purposes
+<span class="nc" id="L56">    spellingFixes.put(&quot;(&quot;, LEFT_PARENTHESIS);</span>
+<span class="nc" id="L57">    spellingFixes.put(&quot;)&quot;, RIGHT_PARENTHESIS);</span>
+  }
+
+  /**
+   * A filter which rejects preterminal nodes that contain &quot;empty&quot; leaf
+   * nodes.
+   */
+<span class="nc" id="L64">  private static final Predicate&lt;Tree&gt; emptyFilter = new Predicate&lt;Tree&gt;() {</span>
+    public boolean test(Tree tree) {
+<span class="nc bnc" id="L66" title="All 2 branches missed.">      if (tree.isPreTerminal()</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">          &amp;&amp; tree.firstChild().value().equals(EMPTY_LEAF_VALUE))</span>
+<span class="nc" id="L68">        return false;</span>
+<span class="nc" id="L69">      return true;</span>
+    }
+  };
+
+  /**
+   * Resolves some inconsistencies in constituent naming:
+   *
+   * - &quot;sa&quot; and &quot;s.a&quot; are equivalent -- merge to &quot;s.a&quot;
+   */
+<span class="nc" id="L78">  private static final TreeTransformer constituentRenamer = new TreeTransformer() {</span>
+    @Override
+    public Tree transformTree(Tree t) {
+<span class="nc bnc" id="L81" title="All 2 branches missed.">      if (t.isLeaf())</span>
+<span class="nc" id="L82">        return t;</span>
+
+<span class="nc" id="L84">      String value = t.value();</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">      if (value == null)</span>
+<span class="nc" id="L86">        return t;</span>
+
+<span class="nc bnc" id="L88" title="All 2 branches missed.">      if (value.equals(&quot;sa&quot;))</span>
+<span class="nc" id="L89">        t.setValue(&quot;s.a&quot;);</span>
+
+<span class="nc" id="L91">      return t;</span>
+    }
+  };
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L96">  private static final Pair&lt;String, String&gt;[] cleanupStrs = new Pair[] {</span>
+    new Pair(&quot;sp &lt; (sp=sp &lt;: prep=prep)&quot;, &quot;replace sp prep&quot;),
+
+    // Left and right parentheses should be at same depth
+    new Pair(&quot;fpa &gt; __=grandparent $++ (__=ancestor &lt;&lt;` fpt=fpt &gt;` =grandparent)&quot;,
+      &quot;move fpt $- ancestor&quot;),
+
+    // Nominal groups where adjectival groups belong
+    new Pair(&quot;/^s\\.a$/ &lt;: (/^grup\\.nom$/=gn &lt;: /^a/)&quot;,
+      &quot;relabel gn /grup.a/&quot;),
+
+    // Adverbial phrases should always have adverb group children
+    // -- we see about 50 exceptions in the corpus..
+    new Pair(&quot;sadv !&lt; /^grup\\.adv$/ &lt;: /^(rg|neg)$/=adv&quot;,
+      &quot;adjoinF (grup.adv foot@) adv&quot;),
+
+    // 'z' tag should be 'z0'
+    new Pair(&quot;z=z &lt;: (__ !&lt; __)&quot;, &quot;relabel z z0&quot;),
+
+    // Conjunction groups aren't necessary if they head single
+    // prepositional phrases (we already see a `conj &lt; sp` pattern;
+    // replicate that
+    new Pair(&quot;/^grup\\.c/=grup &gt; conj &lt;: sp=sp&quot;, &quot;replace grup sp&quot;),
+
+    // &quot;Lift up&quot; sentence-final periods which have been nested within
+    // constituents (convention in AnCora is to have sentence-final
+    // periods as final right children of the `sentence` constituent)
+    new Pair(&quot;__=N &lt;&lt;` (fp|fs=fp &lt;: (/^\\.$/ !. __)) &gt; sentence=sentence&quot;,
+             &quot;move fp $- N&quot;),
+
+    // AnCora has a few weird parses of &quot;nada que ver&quot; and related
+    // phrases. Normalize them:
+    //
+    //     (grup.nom (pi000000 X) (S (relatiu (pr000000 que))
+    //                               (infinitiu (vmn0000 Y))))
+    new Pair(&quot;(pi000000 &lt;: __ !$+ S &gt;` (/^grup\\.nom/=gn &gt;` sn=sn))&quot; +
+               &quot;. ((que &gt;: (__=queTag $- =sn)) . (__=vb !&lt; __ &gt;&gt;: (__=vbContainer $- =queTag)))&quot;,
+
+             &quot;[insert (S (relatiu (pr000000 que)) (infinitiu vmn0000=vbFoot)) &gt;-1 gn]&quot; +
+               &quot;[move vb &gt;0 vbFoot]&quot; +
+               &quot;[delete queTag]&quot; +
+               &quot;[delete vbContainer]&quot;),
+
+    // One more bizarre &quot;nada que ver&quot;
+    new Pair(&quot;sn=sn &lt;: (/^grup\\.nom/=gn &lt;&lt;: Nada)&quot; +
+               &quot;$+ (infinitiu=inf &lt;&lt;, que=que &lt;&lt;` (ver , =que) $+ sp=sp)&quot;,
+
+             &quot;[delete inf] [insert (S (relatiu (pr000000 que)) (infinitiu (vmn0000 ver))) &gt;-1 gn]&quot; +
+               &quot;[move sp &gt;-1 sn]&quot;),
+
+    // Remove date lead-ins
+    new Pair(&quot;sentence &lt;&lt;, (sn=sn &lt;, (/^grup\\.w$/ $+ fp))&quot;,
+             &quot;delete sn&quot;),
+
+    // Shed &quot;conj&quot; parents of periods in the middle of trees so that
+    // our splitter can identify sentence boundaries properly
+    new Pair(&quot;conj=conj &lt;: fp=fp&quot;, &quot;replace conj fp&quot;),
+
+    // Fix mis-tagging of inverted question mark
+    new Pair(&quot;fit=fit &lt;: ¿&quot;, &quot;relabel fit fia&quot;),
+  };
+
+<span class="nc" id="L158">  private static final List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; cleanup</span>
+<span class="nc" id="L159">    = compilePatterns(cleanupStrs);</span>
+
+  /**
+   * If one of the constituents in this set has a single child has a
+   * multi-word token, it should be replaced by a node heading the
+   * expanded word leaves rather than simply receive that node as a
+   * child.
+   *
+   * Note that this is only the case for constituents with a *single*
+   * child which is a multi-word token.
+   */
+<span class="nc" id="L170">  private static final Set&lt;String&gt; mergeWithConstituentWhenPossible = new HashSet&lt;&gt;(</span>
+<span class="nc" id="L171">          Arrays.asList(</span>
+                  &quot;grup.adv&quot;,
+                  &quot;grup.nom&quot;,
+                  &quot;grup.nom.loc&quot;,
+                  &quot;grup.nom.org&quot;,
+                  &quot;grup.nom.otros&quot;,
+                  &quot;grup.nom.pers&quot;,
+                  &quot;grup.verb&quot;,
+                  &quot;spec&quot;
+          ));
+
+  // Customization
+  private boolean simplifiedTagset;
+  private boolean aggressiveNormalization;
+  private boolean retainNER;
+
+  public SpanishTreeNormalizer() {
+<span class="nc" id="L188">    this(true, false, false);</span>
+<span class="nc" id="L189">  }</span>
+
+  public SpanishTreeNormalizer(boolean simplifiedTagset,
+                               boolean aggressiveNormalization,
+                               boolean retainNER) {
+<span class="nc" id="L194">    super(new SpanishTreebankLanguagePack());</span>
+
+<span class="nc bnc" id="L196" title="All 4 branches missed.">    if (retainNER &amp;&amp; !simplifiedTagset)</span>
+<span class="nc" id="L197">      throw new IllegalArgumentException(&quot;retainNER argument only valid when &quot; +</span>
+                                         &quot;simplified tagset is used&quot;);
+
+<span class="nc" id="L200">    this.simplifiedTagset = simplifiedTagset;</span>
+<span class="nc" id="L201">    this.aggressiveNormalization = aggressiveNormalization;</span>
+<span class="nc" id="L202">    this.retainNER = retainNER;</span>
+<span class="nc" id="L203">  }</span>
+
+  @Override
+  public Tree normalizeWholeTree(Tree tree, TreeFactory tf) {
+    // Begin with some basic transformations
+<span class="nc" id="L208">    tree = tree.prune(emptyFilter).spliceOut(aOverAFilter)</span>
+<span class="nc" id="L209">      .transform(constituentRenamer);</span>
+
+    // Now start some simple cleanup
+<span class="nc" id="L212">    tree = Tsurgeon.processPatternsOnTree(cleanup, tree);</span>
+
+    // That might've produced some more A-over-As
+<span class="nc" id="L215">    tree = tree.spliceOut(aOverAFilter);</span>
+
+    // Find all named entities which are not multi-word tokens and nest
+    // them within named entity NP groups
+<span class="nc bnc" id="L219" title="All 2 branches missed.">    if (retainNER)</span>
+<span class="nc" id="L220">      markSimpleNamedEntities(tree);</span>
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">    for (Tree t : tree) {</span>
+<span class="nc bnc" id="L223" title="All 4 branches missed.">      if (simplifiedTagset &amp;&amp; t.isPreTerminal()) {</span>
+        // This is a part of speech tag. Remove extra morphological
+        // information.
+<span class="nc" id="L226">        CoreLabel label = (CoreLabel) t.label();</span>
+<span class="nc" id="L227">        String pos = label.value();</span>
+
+<span class="nc" id="L229">        pos = simplifyPOSTag(pos).intern();</span>
+<span class="nc" id="L230">        label.setValue(pos);</span>
+<span class="nc" id="L231">        label.setTag(pos);</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">      } else if (aggressiveNormalization &amp;&amp; isMultiWordCandidate(t)) {</span>
+        // Expand multi-word token if necessary
+<span class="nc" id="L234">        normalizeForMultiWord(t, tf);</span>
+      }
+<span class="nc" id="L236">    }</span>
+
+    // More tregex-powered fixes
+<span class="nc" id="L239">    tree = expandElisions(tree);</span>
+<span class="nc" id="L240">    tree = expandConmigo(tree);</span>
+<span class="nc" id="L241">    tree = expandCliticPronouns(tree);</span>
+
+    // Make sure the tree has a top-level unary rewrite; the root
+    // should have a proper root label
+<span class="nc" id="L245">    String rootLabel = tlp.startSymbol();</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">    if (!tree.value().equals(rootLabel))</span>
+<span class="nc" id="L247">      tree = tf.newTreeNode(rootLabel, Collections.singletonList(tree));</span>
+
+<span class="nc" id="L249">    return tree;</span>
+  }
+
+  @Override
+  public String normalizeTerminal(String word) {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    if (spellingFixes.containsKey(word))</span>
+<span class="nc" id="L255">      return spellingFixes.get(word);</span>
+<span class="nc" id="L256">    return word;</span>
+  }
+
+  /**
+   * Return a &quot;simplified&quot; version of an original AnCora part-of-speech
+   * tag, with much morphological annotation information removed.
+   */
+  private String simplifyPOSTag(String pos) {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    if (pos.length() == 0)</span>
+<span class="nc" id="L265">      return pos;</span>
+
+<span class="nc bnc" id="L267" title="All 7 branches missed.">    switch (pos.charAt(0)) {</span>
+    case 'd':
+      // determinant (d)
+      //   retain category, type
+      //   drop person, gender, number, possessor
+<span class="nc" id="L272">      return pos.substring(0, 2) + &quot;0000&quot;;</span>
+    case 's':
+      // preposition (s)
+      //   retain category, type
+      //   drop form, gender, number
+<span class="nc" id="L277">      return pos.substring(0, 2) + &quot;000&quot;;</span>
+    case 'p':
+      // pronoun (p)
+      //   retain category, type
+      //   drop person, gender, number, case, possessor, politeness
+<span class="nc" id="L282">      return pos.substring(0, 2) + &quot;000000&quot;;</span>
+    case 'a':
+      // adjective
+      //   retain category, type, grade
+      //   drop gender, number, function
+<span class="nc" id="L287">      return pos.substring(0, 3) + &quot;000&quot;;</span>
+    case 'n':
+      // noun
+      //   retain category, type, number, NER label
+      //   drop type, gender, classification
+
+<span class="nc bnc" id="L293" title="All 4 branches missed.">      char ner = retainNER &amp;&amp; pos.length() == 7 ? pos.charAt(6) : '0';</span>
+<span class="nc" id="L294">      return pos.substring(0, 2) + '0' + pos.charAt(3) + &quot;00&quot; + ner;</span>
+    case 'v':
+      // verb
+      //   retain category, type, mood, tense
+      //   drop person, number, gender
+<span class="nc" id="L299">      return pos.substring(0, 4) + &quot;000&quot;;</span>
+    default:
+      // adverb
+      //   retain all
+      // punctuation
+      //   retain all
+      // numerals
+      //   retain all
+      // date and time
+      //   retain all
+      // conjunction
+      //   retain all
+<span class="nc" id="L311">      return pos;</span>
+    }
+  }
+
+  /**
+   * Matches a verb with attached pronouns; used in several following
+   * Tregex expressions
+   */
+  private static final String VERB_LEAF_WITH_PRONOUNS_TREGEX =
+    // Match a leaf that looks like it has a clitic pronoun
+
+    // Match suffixes of regular forms which may carry attached
+    // pronouns (imperative, gerund, infinitive)
+    &quot;/(?:(?:[aeiáéí]r|[áé]ndo|[aeáé]n?|[aeiáéí](?:d(?!os)|(?=os)))&quot; +
+      // Match irregular imperative stems
+      &quot;|^(?:d[ií]|h[aá]z|v[eé]|p[oó]n|s[aá]l|sé|t[eé]n|v[eé]n|(?:id(?=os$))))&quot; +
+      // Match attached pronouns
+      &quot;(?:(?:(?:[mts]e|n?os|les?)(?:l[oa]s?)?)|l[oa]s?)$/=vb &quot; +
+      // It should actually be a verb (gerund, imperative or
+      // infinitive)
+      //
+      // (Careful: other code that uses this pattern requires that this
+      // node be at the end, with parens so that it can be named /
+      // modified. See e.g. #verbWithCliticPronounAndSiblings)
+      &quot;&gt; (/^vm[gmn]0000$/&quot;;
+
+  /**
+   * Matches verbs (infinitives, gerunds and imperatives) which have
+   * attached pronouns, and the clauses which contain them
+   */
+<span class="nc" id="L341">  private static final TregexPattern verbWithCliticPronouns =</span>
+<span class="nc" id="L342">    TregexPattern.compile(VERB_LEAF_WITH_PRONOUNS_TREGEX +</span>
+                          // Verb tag should not have siblings in verb
+                          // phrase
+                          &quot; !$ __)&quot; +
+                          // Locate the clause which contains it, and
+                          // the child just below that clause
+                          &quot;&gt;+(/^[^S]/) (/^(infinitiu|gerundi|grup\\.verb)$/=target &quot; +
+                          &quot;&gt; /^(sentence|S|grup\\.verb|infinitiu|gerundi)$/=clause &lt;&lt; =vb &quot; +
+                          // Make sure we're not up too far in the tree:
+                          // there should be no infinitive / gerund /
+                          // verb phrase between the located ancestor
+                          // and the verb
+                          &quot;!&lt;&lt; (/^(infinitiu|gerundi|grup\\.verb)$/ &lt;&lt; =vb))&quot;);
+
+  /**
+   * Matches verbs (infinitives, gerunds and imperatives) which have
+   * attached pronouns and siblings within their containing verb
+   * phrases
+   */
+<span class="nc" id="L361">  private static final TregexPattern verbWithCliticPronounsAndSiblings =</span>
+<span class="nc" id="L362">    TregexPattern.compile(VERB_LEAF_WITH_PRONOUNS_TREGEX +</span>
+        // Name the matched verb tag as the target for insertion;
+        // require that it have siblings
+        &quot;=target $ __) &quot; +
+        // Locate the clause which contains it, and
+        // the child just below that clause
+        &quot;&gt;+(/^[^S]/) (/^(infinitiu|gerundi|grup\\.verb)$/ &quot; +
+        &quot;&gt; /^(sentence|S|grup\\.verb|infinitiu|gerundi)$/=clause &lt;&lt; =vb &quot; +
+        // Make sure we're not up too far in the tree:
+        // there should be no infinitive / gerund /
+        // verb phrase between the located ancestor
+        // and the verb
+        &quot;!&lt;&lt; (/^(infinitiu|gerundi|grup\\.verb)$/ &lt;&lt; =vb))&quot;);
+
+  /**
+   * Matches verbs which really should be in a clause, but were
+   * squeezed into an infinitive constituent (because the pronoun was
+   * attached to the verb, we could just pretend it wasn't a clause..
+   * not anymore!)
+   */
+<span class="nc" id="L382">  private static final TregexPattern clauselessVerbWithCliticPronouns = TregexPattern.compile(</span>
+    VERB_LEAF_WITH_PRONOUNS_TREGEX +
+      &quot;) &gt; (/^vmn/ &gt; (/^infinitiu$/=target &gt; /^sp$/))&quot;
+  );
+<span class="nc" id="L386">  private static final TsurgeonPattern clausifyVerbWithCliticPronouns =</span>
+<span class="nc" id="L387">    Tsurgeon.parseOperation(&quot;adjoinF (S foot@) target&quot;);</span>
+
+<span class="nc" id="L389">  private static final SpanishVerbStripper verbStripper = SpanishVerbStripper.getInstance();</span>
+
+  /**
+   * Separate clitic pronouns into their own tokens in the given tree.
+   * (The clitic pronouns are attached under new `grup.nom` constituents
+   * which follow the verbs to which they were formerly attached.)
+   */
+  private static Tree expandCliticPronouns(Tree t) {
+    // Perform some cleanup first -- we want to match as many
+    // clitic-attached verbs as possible..
+<span class="nc" id="L399">    t = Tsurgeon.processPattern(clauselessVerbWithCliticPronouns,</span>
+      clausifyVerbWithCliticPronouns, t);
+
+    // Run two separate stages: one for only-child VPs, then another
+    // for VP children which have siblings
+<span class="nc" id="L404">    t = expandCliticPronounsInner(t, verbWithCliticPronouns);</span>
+<span class="nc" id="L405">    t = expandCliticPronounsInner(t, verbWithCliticPronounsAndSiblings);</span>
+
+<span class="nc" id="L407">    return t;</span>
+  }
+
+  /**
+   * Expand clitic pronouns on verbs matching the given pattern.
+   */
+  private static Tree expandCliticPronounsInner(Tree t, TregexPattern pattern) {
+<span class="nc" id="L414">    TregexMatcher matcher = pattern.matcher(t);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">    while (matcher.find()) {</span>
+<span class="nc" id="L416">      Tree verbNode = matcher.getNode(&quot;vb&quot;);</span>
+<span class="nc" id="L417">      String verb = verbNode.value();</span>
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">      if (!SpanishVerbStripper.isStrippable(verb))</span>
+<span class="nc" id="L420">        continue;</span>
+
+<span class="nc" id="L422">      SpanishVerbStripper.StrippedVerb split = verbStripper.separatePronouns(verb);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">      if (split == null)</span>
+<span class="nc" id="L424">        continue;</span>
+
+      // Retrieve some context for the pronoun disambiguator: take the
+      // matched clause and walk (at most) two constituents up
+<span class="nc" id="L428">      StringBuilder clauseYieldBuilder = new StringBuilder();</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">      for (Label label : matcher.getNode(&quot;clause&quot;).yield())</span>
+<span class="nc" id="L430">        clauseYieldBuilder.append(label.value()).append(&quot; &quot;);</span>
+<span class="nc" id="L431">      String clauseYield = clauseYieldBuilder.toString();</span>
+<span class="nc" id="L432">      clauseYield = clauseYield.substring(0, clauseYield.length() - 1);</span>
+
+      // Insert clitic pronouns as leaves of pronominal phrases which are
+      // siblings of `target`. Iterate in reverse order since pronouns are
+      // attached to immediate right of `target`
+<span class="nc" id="L437">      List&lt;String&gt; pronouns = split.getPronouns();</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      for (int i = pronouns.size() - 1; i &gt;= 0; i--) {</span>
+<span class="nc" id="L439">        String pronoun = pronouns.get(i);</span>
+
+<span class="nc" id="L441">        String newTreeStr = null;</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        if (AnCoraPronounDisambiguator.isAmbiguous(pronoun)) {</span>
+<span class="nc" id="L443">          AnCoraPronounDisambiguator.PersonalPronounType type =</span>
+<span class="nc" id="L444">            AnCoraPronounDisambiguator.disambiguatePersonalPronoun(split, i, clauseYield);</span>
+
+<span class="nc bnc" id="L446" title="All 4 branches missed.">          switch (type) {</span>
+            case OBJECT:
+<span class="nc" id="L448">              newTreeStr = &quot;(sn (grup.nom (pp000000 %s)))&quot;; break;</span>
+            case REFLEXIVE:
+<span class="nc" id="L450">              newTreeStr = &quot;(morfema.pronominal (pp000000 %s))&quot;; break;</span>
+            case UNKNOWN:
+              // Mark for manual disambiguation
+<span class="nc" id="L453">              newTreeStr = &quot;(PRONOUN? (pp000000 %s))&quot;; break;</span>
+          }
+<span class="nc" id="L455">        } else {</span>
+          // Unambiguous clitic pronouns are all indirect / direct
+          // object pronouns.. convenient!
+<span class="nc" id="L458">          newTreeStr = &quot;(sn (grup.nom (pp000000 %s)))&quot;;</span>
+        }
+
+<span class="nc" id="L461">        String patternString = &quot;[insert &quot; + String.format(newTreeStr, pronoun) + &quot; $- target]&quot;;</span>
+<span class="nc" id="L462">        TsurgeonPattern insertPattern = Tsurgeon.parseOperation(patternString);</span>
+<span class="nc" id="L463">        t = insertPattern.matcher().evaluate(t, matcher);</span>
+      }
+
+<span class="nc" id="L466">      TsurgeonPattern relabelOperation =</span>
+<span class="nc" id="L467">        Tsurgeon.parseOperation(String.format(&quot;[relabel vb /%s/]&quot;, split.getStem()));</span>
+<span class="nc" id="L468">      t = relabelOperation.matcher().evaluate(t, matcher);</span>
+<span class="nc" id="L469">    }</span>
+
+<span class="nc" id="L471">    return t;</span>
+  }
+
+  private static final List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; markSimpleNEs;
+
+  // Generate some reusable patterns for four different NE groups
+  static {
+    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L479">    Pair&lt;String, String&gt;[] patternTemplates = new Pair[] {</span>
+      // NE as only child of a `grup.nom`
+      new Pair(&quot;/^grup\\.nom$/=target &lt;: (/np0000%c/ &lt; __)&quot;,
+               &quot;[relabel target /grup.nom.%s/]&quot;),
+
+      // NE as child with a right sibling in a `grup.nom`
+      new Pair(&quot;/^grup\\.nom$/ &lt; ((/np0000%c/=target &lt; __) $+ __)&quot;,
+               &quot;[adjoinF (grup.nom.%s foot@) target]&quot;),
+
+      // NE as child with a left sibling in a `grup.nom`
+      new Pair(&quot;/^grup\\.nom$/ &lt; ((/np0000%c/=target &lt; __) $- __)&quot;,
+               &quot;[adjoinF (grup.nom.%s foot@) target]&quot;)
+    };
+
+    // Pairs tagset annotation codes with the annotations used in our
+    // constituents
+    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L496">    Pair&lt;Character, String&gt;[] namedEntityTypes = new Pair[] {</span>
+<span class="nc" id="L497">      new Pair('0', &quot;otros&quot;), // other</span>
+<span class="nc" id="L498">      new Pair('l', &quot;lug&quot;), // place</span>
+<span class="nc" id="L499">      new Pair('o', &quot;org&quot;), // location</span>
+<span class="nc" id="L500">      new Pair('p', &quot;pers&quot;), // person</span>
+    };
+
+<span class="nc" id="L503">    markSimpleNEs =</span>
+            new ArrayList&lt;&gt;(patternTemplates.length * namedEntityTypes.length);
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    for (Pair&lt;String, String&gt; template : patternTemplates) {</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">      for (Pair&lt;Character, String&gt; namedEntityType : namedEntityTypes) {</span>
+<span class="nc" id="L507">        String tregex = String.format(template.first(), namedEntityType.first());</span>
+<span class="nc" id="L508">        String tsurgeon = String.format(template.second(), namedEntityType.second());</span>
+
+<span class="nc" id="L510">        markSimpleNEs.add(new Pair&lt;&gt;(TregexPattern.compile(tregex),</span>
+<span class="nc" id="L511">                Tsurgeon.parseOperation(tsurgeon)));</span>
+      }
+    }
+  };
+
+  /**
+   * Find all named entities which are not multi-word tokens and nest
+   * them in named entity NP groups (`grup.nom.{lug,org,pers,otros}`).
+   *
+   * Do this only for &quot;simple&quot; NEs: the multi-word NEs have to be done
+   * at a later step in `MultiWordPreprocessor`.
+   */
+  void markSimpleNamedEntities(Tree t) {
+<span class="nc" id="L524">    Tsurgeon.processPatternsOnTree(markSimpleNEs, t);</span>
+<span class="nc" id="L525">  }</span>
+
+  /**
+   * Determine whether the given tree node is a multi-word token
+   * expansion candidate. (True if the node has at least one grandchild
+   * which is a leaf node.)
+   */
+  boolean isMultiWordCandidate(Tree t) {
+<span class="nc bnc" id="L533" title="All 2 branches missed.">    for (Tree child : t.children())</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">      for (Tree grandchild : child.children())</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (grandchild.isLeaf())</span>
+<span class="nc" id="L536">          return true;</span>
+
+<span class="nc" id="L538">    return false;</span>
+  }
+
+  /**
+   * Normalize a pre-pre-terminal tree node by accounting for multi-word
+   * tokens.
+   *
+   * Detects multi-word tokens in leaves below this pre-pre-terminal and
+   * expands their constituent words into separate leaves.
+   */
+  void normalizeForMultiWord(Tree t, TreeFactory tf) {
+<span class="nc" id="L549">    Tree[] preterminals = t.children();</span>
+
+<span class="nc bnc" id="L551" title="All 2 branches missed.">    for (int i = 0; i &lt; preterminals.length; i++) {</span>
+      // This particular child is not actually a preterminal --- skip
+<span class="nc bnc" id="L553" title="All 2 branches missed.">      if (!preterminals[i].isPreTerminal())</span>
+<span class="nc" id="L554">        continue;</span>
+
+<span class="nc" id="L556">      Tree leaf = preterminals[i].firstChild();</span>
+<span class="nc" id="L557">      String leafValue = ((CoreLabel) leaf.label()).value();</span>
+
+<span class="nc" id="L559">      String[] words = getMultiWords(leafValue);</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">      if (words.length == 1)</span>
+<span class="nc" id="L561">        continue;</span>
+
+      // Leaf is a multi-word token; build new nodes for each of its
+      // constituent words
+<span class="nc" id="L565">      List&lt;Tree&gt; newNodes = new ArrayList&lt;&gt;(words.length);</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">      for (String word1 : words) {</span>
+<span class="nc" id="L567">        String word = normalizeTerminal(word1);</span>
+
+<span class="nc" id="L569">        Tree newLeaf = tf.newLeaf(word);</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        if (newLeaf.label() instanceof HasWord)</span>
+<span class="nc" id="L571">          ((HasWord) newLeaf.label()).setWord(word);</span>
+
+<span class="nc" id="L573">        Tree newNode = tf.newTreeNode(MW_TAG, Arrays.asList(newLeaf));</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">        if (newNode.label() instanceof HasTag)</span>
+<span class="nc" id="L575">          ((HasTag) newNode.label()).setTag(MW_TAG);</span>
+
+<span class="nc" id="L577">        newNodes.add(newNode);</span>
+      }
+
+      // Value of the phrase which should head these preterminals. Mark
+      // that this was created from a multiword token, and also retain
+      // the original parts of speech.
+<span class="nc" id="L583">      String phraseValue = MW_PHRASE_TAG + &quot;_&quot;</span>
+<span class="nc" id="L584">        + simplifyPOSTag(preterminals[i].value());</span>
+
+      // Should we insert these new nodes as children of the parent `t`
+      // (i.e., &quot;merge&quot; the multi-word token phrase into its parent), or
+      // head them with a new node and set that as a child of the
+      // parent?
+<span class="nc bnc" id="L590" title="All 2 branches missed.">      boolean shouldMerge = preterminals.length == 1</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">        &amp;&amp; mergeWithConstituentWhenPossible.contains(t.value());</span>
+
+<span class="nc bnc" id="L593" title="All 2 branches missed.">      if (shouldMerge) {</span>
+<span class="nc" id="L594">        t.setChildren(newNodes);</span>
+<span class="nc" id="L595">        t.setValue(phraseValue);</span>
+      } else {
+<span class="nc" id="L597">        Tree newHead = tf.newTreeNode(phraseValue, newNodes);</span>
+<span class="nc" id="L598">        t.setChild(i, newHead);</span>
+      }
+    }
+<span class="nc" id="L601">  }</span>
+
+<span class="nc" id="L603">  private static final Pattern pQuoted = Pattern.compile(&quot;\&quot;(.+)\&quot;&quot;);</span>
+
+  /**
+   * Strings of punctuation which should remain a single token.
+   */
+<span class="nc" id="L608">  private static final Pattern pPunct = Pattern.compile(&quot;[.,!?:/'=()-]+&quot;);</span>
+
+  /**
+   * Characters which may separate words in a single token.
+   */
+  private static final String WORD_SEPARATORS = &quot;,-_¡!¿?()/%&quot;;
+
+  /**
+   * Word separators which should not be treated as separate &quot;words&quot; and
+   * dropped from a multi-word token.
+   */
+  private static final String WORD_SEPARATORS_DROP = &quot;_&quot;;
+
+  /**
+   * These bound morphemes should not be separated from the words with
+   * which they are joined by hyphen.
+   */
+  // TODO how to handle clitics? chino-japonés
+<span class="nc" id="L626">  private static final Set&lt;String&gt; hyphenBoundMorphemes = new HashSet&lt;&gt;(Arrays.asList(</span>
+          &quot;anti&quot;, // anti-Gil
+          &quot;co&quot;, // co-promotora
+          &quot;ex&quot;, // ex-diputado
+          &quot;meso&quot;, // meso-americano
+          &quot;neo&quot;, // neo-proteccionismo
+          &quot;pre&quot;, // pre-presidencia
+          &quot;pro&quot;, // pro-indonesias
+          &quot;quasi&quot;, // quasi-unidimensional
+          &quot;re&quot;, // re-flotamiento
+          &quot;semi&quot;, // semi-negro
+          &quot;sub&quot; // sub-18
+  ));
+
+  /**
+   * Prepare the given token for multi-word detection / extraction.
+   *
+   * This method makes up for some various oddities in corpus annotations.
+   */
+  private String prepareForMultiWordExtraction(String token) {
+<span class="nc" id="L646">    return token.replaceAll(&quot;-fpa-&quot;, &quot;(&quot;).replaceAll(&quot;-fpt-&quot;, &quot;)&quot;);</span>
+  }
+
+  /**
+   * Return the (single or multiple) words which make up the given
+   * token.
+   *
+   * TODO can't SpanishTokenizer handle most of this?
+   */
+  private String[] getMultiWords(String token) {
+<span class="nc" id="L656">    token = prepareForMultiWordExtraction(token);</span>
+
+<span class="nc" id="L658">    Matcher punctMatcher = pPunct.matcher(token);</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">    if (punctMatcher.matches())</span>
+<span class="nc" id="L660">      return new String[] {token};</span>
+
+<span class="nc" id="L662">    Matcher quoteMatcher = pQuoted.matcher(token);</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">    if (quoteMatcher.matches()) {</span>
+<span class="nc" id="L664">      String[] ret = new String[3];</span>
+<span class="nc" id="L665">      ret[0] = &quot;\&quot;&quot;;</span>
+<span class="nc" id="L666">      ret[1] = quoteMatcher.group(1);</span>
+<span class="nc" id="L667">      ret[2] = &quot;\&quot;&quot;;</span>
+
+<span class="nc" id="L669">      return ret;</span>
+    }
+
+    // Confusing: we are using a tokenizer to split a token into its
+    // constituent words
+<span class="nc" id="L674">    StringTokenizer splitter = new StringTokenizer(token, WORD_SEPARATORS,</span>
+                                                   true);
+<span class="nc" id="L676">    int remainingTokens = splitter.countTokens();</span>
+
+<span class="nc" id="L678">    List&lt;String&gt; words = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L680" title="All 2 branches missed.">    while (splitter.hasMoreTokens()) {</span>
+<span class="nc" id="L681">      String word = splitter.nextToken();</span>
+<span class="nc" id="L682">      remainingTokens--;</span>
+
+<span class="nc bnc" id="L684" title="All 2 branches missed.">      if (shouldDropWord(word))</span>
+        // This is a delimiter that we should drop
+<span class="nc" id="L686">        continue;</span>
+
+<span class="nc bnc" id="L688" title="All 4 branches missed.">      if (remainingTokens &gt;= 2 &amp;&amp; hyphenBoundMorphemes.contains(word)) {</span>
+<span class="nc" id="L689">        String hyphen = splitter.nextToken();</span>
+<span class="nc" id="L690">        remainingTokens--;</span>
+
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        if (!hyphen.equals(&quot;-&quot;)) {</span>
+          // Ouch. We expected a hyphen here. Clean things up and keep
+          // moving.
+<span class="nc" id="L695">          words.add(word);</span>
+
+<span class="nc bnc" id="L697" title="All 2 branches missed.">          if (!shouldDropWord(hyphen))</span>
+<span class="nc" id="L698">            words.add(hyphen);</span>
+
+          continue;
+        }
+
+<span class="nc" id="L703">        String freeMorpheme = splitter.nextToken();</span>
+<span class="nc" id="L704">        remainingTokens--;</span>
+
+<span class="nc" id="L706">        words.add(word + hyphen + freeMorpheme);</span>
+<span class="nc" id="L707">        continue;</span>
+<span class="nc bnc" id="L708" title="All 6 branches missed.">      } else if (word.equals(&quot;,&quot;) &amp;&amp; remainingTokens &gt;= 1 &amp;&amp; words.size() &gt; 0) {</span>
+<span class="nc" id="L709">        int prevIndex = words.size() - 1;</span>
+<span class="nc" id="L710">        String prevWord = words.get(prevIndex);</span>
+
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if (StringUtils.isNumeric(prevWord)) {</span>
+<span class="nc" id="L713">          String nextWord = splitter.nextToken();</span>
+<span class="nc" id="L714">          remainingTokens--;</span>
+
+<span class="nc bnc" id="L716" title="All 2 branches missed.">          if (StringUtils.isNumeric(nextWord)) {</span>
+<span class="nc" id="L717">            words.set(prevIndex, prevWord + ',' + nextWord);</span>
+          } else {
+            // Expected a number here.. clean up and move on
+<span class="nc" id="L720">            words.add(word);</span>
+<span class="nc" id="L721">            words.add(nextWord);</span>
+          }
+
+<span class="nc" id="L724">          continue;</span>
+        }
+      }
+
+      // Otherwise..
+<span class="nc" id="L729">      words.add(word);</span>
+<span class="nc" id="L730">    }</span>
+
+<span class="nc" id="L732">    return words.toArray(new String[words.size()]);</span>
+  }
+
+  /**
+   * Determine if the given &quot;word&quot; which is part of a multiword token
+   * should be dropped.
+   */
+  private boolean shouldDropWord(String word) {
+<span class="nc bnc" id="L740" title="All 2 branches missed.">    return word.length() == 1</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">      &amp;&amp; WORD_SEPARATORS_DROP.indexOf(word.charAt(0)) != -1;</span>
+  }
+
+  /**
+   * Expand grandchild tokens which are elided forms of multi-word
+   * expressions ('al,' 'del').
+   *
+   * We perform this expansion separately from multi-word expansion
+   * because we follow special rules about where the expanded tokens
+   * should be placed in the case of elision.
+   *
+   * @param t Tree representing an entire sentence
+   */
+  private Tree expandElisions(Tree t) {
+<span class="nc" id="L755">    return Tsurgeon.processPatternsOnTree(elisionExpansions, t);</span>
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L759">  private static final Pair&lt;String, String&gt;[] elisionExpansionStrs = new Pair[] {</span>
+    // Elided forms with a `prep` ancestor which has an `sn` phrase as a
+    // right sibling
+
+    new Pair(// Search for `sn` which is right sibling of closest `prep`
+             // ancestor to the elided node; cascade down tree to lowest `sn`
+             &quot;/^(prep|sadv|conj)$/ &lt;+(/^(prep|grup\\.(adv|cc|prep))$/) (sp000=sp &lt; /(?i)^(del|al)$/=elided) &lt;&lt;` =sp &quot; +
+               &quot;$+ (sn &gt; (__ &lt;+(sn) (sn=sn !&lt; sn) &lt;&lt; =sn) !$- sn)&quot;,
+
+             // Insert the 'el' specifier as a constituent in adjacent
+             // noun phrase
+             &quot;[relabel elided /(?i)l//] [insert (spec (da0000 el)) &gt;0 sn]&quot;),
+
+    // Prepositional forms with a `prep` grandparent which has a
+    // `grup.nom` phrase as a right sibling
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^(del|al)$/=elided) $+ /grup\\.nom/=target&quot;,
+
+             &quot;[relabel elided /(?i)l//] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) foot@) target]&quot;),
+
+    // Elided forms with a `prep` ancestor which has an adjectival
+    // phrase as a right sibling ('al segundo', etc.)
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^(del|al)$/=elided) $+ /s\\.a/=target&quot;,
+
+             &quot;[relabel elided /(?i)l//] &quot; +
+             // Turn neighboring adjectival phrase into a noun phrase,
+             // adjoining original adj phrase beneath a `grup.nom`
+             &quot;[adjoinF (sn (spec (da0000 el)) (grup.nom foot@)) target]&quot;),
+
+    // &quot;del que golpea:&quot; insert 'el' as specifier into adjacent relative
+    // phrase
+    new Pair(&quot;sp &lt; (prep=prep &lt; (sp000 &lt; /(?i)^(a|de)l$/=elided) $+ &quot; +
+      &quot;(S=S &lt;&lt;, relatiu))&quot;,
+
+             // Build a noun phrase in the neighboring relative clause
+             // containing the 'el' specifier
+             &quot;[relabel elided /(?i)l//] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) (grup.nom foot@)) S]&quot;),
+
+    // &quot;al&quot; + infinitive phrase
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^(al|del)$/=elided) $+ &quot; +
+             // Looking for an infinitive directly to the right of the
+             // &quot;al&quot; token, nested within one or more clause
+             // constituents
+             &quot;(S=target &lt;+(S) infinitiu=inf &lt;&lt;, =inf)&quot;,
+
+             &quot;[relabel elided /(?i)l//] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) foot@) target]&quot;),
+
+    // &quot;al no&quot; + infinitive phrase
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^al$/=elided) $+ (S=target &lt;, neg &lt;2 infinitiu)&quot;,
+
+             &quot;[relabel elided a] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) foot@) target]&quot;),
+
+    // &quot;al que quisimos tanto&quot;
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^al$/=elided) $+ relatiu=target&quot;,
+
+             &quot;[relabel elided a] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) foot@) target]&quot;),
+
+    // &quot;al de&quot; etc.
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^al$/=elided) $+ (sp=target &lt;, prep)&quot;,
+
+             &quot;[relabel elided a] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) (grup.nom foot@)) target]&quot;),
+
+    // leading adjective in sibling: &quot;al chileno Fernando&quot;
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^(del|al)$/=elided) $+ &quot; +
+             &quot;(/grup\\.nom/=target &lt;, /s\\.a/ &lt;2 /sn|nc0[sp]000/)&quot;,
+
+             &quot;[relabel elided /(?i)l//] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 el)) foot@) target]&quot;),
+
+    // &quot;al&quot; + phrase begun by participle -&gt; &quot;a lo &lt;participle&gt;&quot;
+    // e.g. &quot;al conseguido&quot; -&gt; &quot;a lo conseguido&quot;
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^(al|del)$/=elided) $+ (S=target &lt; participi)&quot;,
+
+             &quot;[relabel elided /(?i)l//] &quot; +
+             &quot;[adjoinF (sn (spec (da0000 lo)) foot@) target]&quot;),
+
+    // &quot;del&quot; used within specifier; e.g. &quot;más del 30 por ciento&quot;
+    new Pair(&quot;spec &lt; (sp000=target &lt; /(?i)^del$/=elided) &gt; sn $+ /grup\\.nom/&quot;,
+
+             &quot;[relabel elided /(?i)l//] &quot; +
+             &quot;[insert (da0000 el) $- target]&quot;),
+
+    // &quot;del,&quot; &quot;al&quot; in date phrases: &quot;1 de enero del 2001&quot;
+    new Pair(&quot;sp000=kill &lt; /(?i)^(del|al)$/ $+ w=target&quot;,
+
+             &quot;[delete kill] &quot; +
+             &quot;[adjoinF (sp (prep (sp000 de)) (sn (spec (da0000 el)) foot@)) target]&quot;),
+
+    // &quot;a favor del X,&quot; &quot;en torno al Y&quot;: very common (and somewhat
+    // complex) phrase structure that we can match
+    new Pair(&quot;sp000 &lt; /(?i)^(a|de)l$/=contraction &gt;: (prep &gt;` (/^grup\\.prep$/ &quot; +
+      &quot;&gt;` (prep=prep &gt; sp $+ (sn=sn &lt;, /^grup\\.(nom|[wz])/))))&quot;,
+
+      &quot;[relabel contraction /(?i)l//] [insert (spec (da0000 el)) &gt;0 sn]&quot;),
+
+    // &quot;en vez del X&quot;: same as above, except prepositional phrase
+    // functions as conjunction (and is labeled as such)
+    new Pair(&quot;sp000 &lt; /(?i)^(a|de)l$/=contraction &gt;: (prep &gt;` (sp &gt;: (conj $+ (sn=sn &lt;, /^grup\\.(nom|[wz])/))))&quot;,
+
+      &quot;[relabel contraction /(?i)l//] [insert (spec (da0000 el)) &gt;0 sn]&quot;),
+
+    // &quot;a favor del X,&quot; &quot;en torno al Y&quot; where X, Y are doubly nested
+    // substantives
+    new Pair(&quot;sp000 &lt; /(?i)^(a|de)l$/=contraction &gt;: (prep &gt;` (/^grup\\.prep$/ &quot; +
+      &quot;&gt;` (prep=prep &gt; sp $+ (sn &lt;, (sn=sn &lt;, /^grup\\.(nom|[wz])/)))))&quot;,
+
+      &quot;[relabel contraction /(?i)l//] [insert (spec (da0000 el)) &gt;0 sn]&quot;),
+
+    // &quot;a favor del X,&quot; &quot;en torno al Y&quot; where X, Y already have
+    // leading specifiers
+    new Pair(&quot;sp000 &lt; /(?i)^(a|de)l$/=contraction &gt;: (prep &gt;` (/^grup\\.prep$/ &quot; +
+      &quot;&gt;` (prep &gt; sp $+ (sn=sn &lt;, spec=spec))))&quot;,
+
+      &quot;[relabel contraction /(?i)l//] [insert (da0000 el) &gt;0 spec]&quot;),
+
+    // &quot;a favor del X,&quot; &quot;en torno al Y&quot; where X, Y are nominal
+    // groups (not substantives)
+    new Pair(&quot;sp000 &lt; /(?i)^(a|de)l$/=contraction &gt;: (prep &gt;` (/^grup\\.prep$/ &quot; +
+      &quot;&gt;` (prep &gt; sp $+ /^grup\\.(nom|[wz])$/=ng)))&quot;,
+
+      &quot;[adjoinF (sn (spec (da0000 el)) foot@) ng] [relabel contraction /(?i)l//]&quot;),
+
+    // &quot;al,&quot; &quot;del&quot; as part of coordinating conjunction: &quot;frente al,&quot;
+    // &quot;además del&quot;
+    //
+    // (nearby noun phrase labeled as nominal group)
+    new Pair(&quot;sp000 &lt; /(?i)^(de|a)l$/=elided &gt;` (/^grup\\.cc$/ &gt;: (conj $+ /^grup\\.nom/=gn))&quot;,
+      &quot;[relabel elided /(?i)l//] [adjoinF (sn (spec (da0000 el)) foot@) gn]&quot;),
+
+    // &quot;al&quot; + participle in adverbial phrase: &quot;al contado,&quot; &quot;al descubierto&quot;
+    new Pair(&quot;sp000=sp &lt; /(?i)^al$/=elided $+ /^vmp/&quot;,
+      &quot;[relabel elided /(?i)l//] [insert (da0000 el) $- sp]&quot;),
+
+    // über-special case: 15021_20000218.tbf-5
+    //
+    // intentional: article should bind all of quoted phrase, even
+    // though there are multiple clauses (kind of a crazy sentence)
+    new Pair(&quot;prep &lt; (sp000 &lt; /(?i)^(al|del)$/=elided) $+ (S=S &lt;+(S) (/^f/=punct $+ (S &lt;+(S) (S &lt;, infinitiu))))&quot;,
+      &quot;[relabel elided /(?i)l//] [adjoinF (sn (spec (da0000 el)) (grup.nom foot@)) S]&quot;),
+
+    // special case: &quot;del todo&quot; -&gt; &quot;de el todo&quot; (flat)
+    new Pair(&quot;__=sp &lt; del=contraction &gt;, __=parent $+ (__ &lt; todo &gt;` =parent)&quot;,
+      &quot;[relabel contraction de] [insert (da0000 el) $- sp]&quot;),
+  };
+
+<span class="nc" id="L909">  private static final List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; elisionExpansions =</span>
+<span class="nc" id="L910">    compilePatterns(elisionExpansionStrs);</span>
+
+<span class="nc" id="L912">  private static TregexPattern conmigoPattern =</span>
+<span class="nc" id="L913">    TregexPattern.compile(&quot;/(?i)^con[mst]igo$/=conmigo &gt; (/^pp/ &gt; (/^grup\\.nom$/ &gt; sn=sn))&quot;);</span>
+
+  /**
+   * ¡Venga, expand conmigo!
+   */
+  private static Tree expandConmigo(Tree t) {
+<span class="nc" id="L919">    TregexMatcher matcher = conmigoPattern.matcher(t);</span>
+
+<span class="nc bnc" id="L921" title="All 2 branches missed.">    while (matcher.find()) {</span>
+<span class="nc" id="L922">      Tree conmigoNode = matcher.getNode(&quot;conmigo&quot;);</span>
+<span class="nc" id="L923">      String word = conmigoNode.value();</span>
+
+<span class="nc" id="L925">      String newPronoun = null;</span>
+<span class="nc bnc" id="L926" title="All 2 branches missed.">      if (word.equalsIgnoreCase(&quot;conmigo&quot;))</span>
+<span class="nc" id="L927">        newPronoun = &quot;mí&quot;;</span>
+<span class="nc bnc" id="L928" title="All 2 branches missed.">      else if (word.equalsIgnoreCase(&quot;contigo&quot;))</span>
+<span class="nc" id="L929">        newPronoun = &quot;ti&quot;;</span>
+<span class="nc bnc" id="L930" title="All 2 branches missed.">      else if (word.equalsIgnoreCase(&quot;consigo&quot;))</span>
+<span class="nc" id="L931">        newPronoun = &quot;sí&quot;;</span>
+
+<span class="nc bnc" id="L933" title="All 2 branches missed.">      if (word.charAt(0) == 'C')</span>
+<span class="nc" id="L934">        newPronoun = newPronoun.toUpperCase();</span>
+
+<span class="nc" id="L936">      String tsurgeon = String.format(</span>
+        &quot;[relabel conmigo /%s/]&quot; +
+          &quot;[adjoinF (sp (prep (sp000 con)) foot@) sn]&quot;,
+        newPronoun);
+<span class="nc" id="L940">      TsurgeonPattern pattern = Tsurgeon.parseOperation(tsurgeon);</span>
+<span class="nc" id="L941">      t = pattern.matcher().evaluate(t, matcher);</span>
+<span class="nc" id="L942">    }</span>
+
+<span class="nc" id="L944">    return t;</span>
+  }
+
+  private static List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; compilePatterns(Pair&lt;String, String&gt;[] patterns) {
+<span class="nc" id="L948">    List&lt;Pair&lt;TregexPattern, TsurgeonPattern&gt;&gt; ret = new ArrayList&lt;&gt;(patterns.length);</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">    for (Pair&lt;String, String&gt; pattern : patterns)</span>
+<span class="nc" id="L950">      ret.add(new Pair&lt;&gt;(TregexPattern.compile(pattern.first()),</span>
+<span class="nc" id="L951">              Tsurgeon.parseOperation(pattern.second())));</span>
+
+<span class="nc" id="L953">    return ret;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

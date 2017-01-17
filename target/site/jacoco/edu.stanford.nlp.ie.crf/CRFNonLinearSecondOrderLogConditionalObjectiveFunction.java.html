@@ -1,0 +1,826 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CRFNonLinearSecondOrderLogConditionalObjectiveFunction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.crf</a> &gt; <span class="el_source">CRFNonLinearSecondOrderLogConditionalObjectiveFunction.java</span></div><h1>CRFNonLinearSecondOrderLogConditionalObjectiveFunction.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.crf; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.optimization.AbstractCachingDiffFunction;
+import edu.stanford.nlp.sequences.SeqClassifierFlags;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Quadruple;
+
+import java.util.*;
+
+/**
+ * @author Mengqiu Wang
+ */
+
+<span class="nc bnc" id="L16" title="All 2 branches missed.">public class CRFNonLinearSecondOrderLogConditionalObjectiveFunction extends AbstractCachingDiffFunction implements HasCliquePotentialFunction  {</span>
+
+  /** A logger for this class */
+<span class="nc" id="L19">  private static Redwood.RedwoodChannels log = Redwood.channels(CRFNonLinearSecondOrderLogConditionalObjectiveFunction.class);</span>
+
+  public static final int NO_PRIOR = 0;
+  public static final int QUADRATIC_PRIOR = 1;
+  /* Use a Huber robust regression penalty (L1 except very near 0) not L2 */
+  public static final int HUBER_PRIOR = 2;
+  public static final int QUARTIC_PRIOR = 3;
+
+  boolean useOutputLayer;
+  boolean useHiddenLayer;
+  boolean useSigmoid;
+  SeqClassifierFlags flags;
+
+<span class="nc" id="L32">  int count = 0;</span>
+  protected int prior;
+  protected double sigma;
+  protected double epsilon;
+<span class="nc" id="L36">  Random random = new Random(2147483647L);</span>
+  /** label indices - for all possible label sequences - for each feature */
+  List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices;
+  Index&lt;String&gt; classIndex;  // didn't have &lt;String&gt; before. Added since that's what is assumed everywhere.
+  double[][] Ehat; // empirical counts of all the linear features [feature][class]
+  double[][] Uhat; // empirical counts of all the output layer features [num of class][input layer size]
+  double[][] What; // empirical counts of all the input layer features [input layer size][featureIndex.size()]
+  int window;
+  int numClasses;
+  // hidden layer number of neuron = numHiddenUnits * numClasses
+  int numHiddenUnits;
+  int[] map;
+  int[][][][] data;  // data[docIndex][tokenIndex][][]
+  int[][] docWindowLabels;
+
+  int[][] labels;    // labels[docIndex][tokenIndex]
+<span class="nc" id="L52">  int domainDimension = -1;</span>
+<span class="nc" id="L53">  int inputLayerSize = -1;</span>
+<span class="nc" id="L54">  int outputLayerSize = -1;</span>
+<span class="nc" id="L55">  int inputLayerSize4Edge= -1;</span>
+<span class="nc" id="L56">  int outputLayerSize4Edge = -1;</span>
+
+<span class="nc" id="L58">  int edgeParamCount = -1;</span>
+<span class="nc" id="L59">  int numNodeFeatures = -1;</span>
+<span class="nc" id="L60">  int numEdgeFeatures = -1;</span>
+<span class="nc" id="L61">  int beforeOutputWeights = -1;</span>
+
+  // for debugging
+<span class="nc" id="L64">  int originalFeatureCount = -1;</span>
+
+  int[][] weightIndices;
+
+<span class="nc" id="L68">  String crfType = &quot;maxent&quot;;</span>
+  String backgroundSymbol;
+
+<span class="nc" id="L71">  public static boolean VERBOSE = false;</span>
+
+  public static int getPriorType(String priorTypeStr)
+  {
+<span class="nc bnc" id="L75" title="All 2 branches missed.">    if (priorTypeStr == null) return QUADRATIC_PRIOR;  // default</span>
+<span class="nc bnc" id="L76" title="All 2 branches missed.">    if (&quot;QUADRATIC&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L77">      return QUADRATIC_PRIOR;</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">    } else if (&quot;HUBER&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L79">      return HUBER_PRIOR;</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">    } else if (&quot;QUARTIC&quot;.equalsIgnoreCase(priorTypeStr)) {</span>
+<span class="nc" id="L81">      return QUARTIC_PRIOR;</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">    } else if (priorTypeStr.equalsIgnoreCase(&quot;NONE&quot;)) {</span>
+<span class="nc" id="L83">      return NO_PRIOR;</span>
+    } else {
+<span class="nc" id="L85">      throw new IllegalArgumentException(&quot;Unknown prior type: &quot; + priorTypeStr);</span>
+    }
+  }
+
+  CRFNonLinearSecondOrderLogConditionalObjectiveFunction(int[][][][] data, int[][] labels, int window, Index classIndex, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, SeqClassifierFlags flags, int numNodeFeatures, int numEdgeFeatures) {
+<span class="nc" id="L90">    this(data, labels, window, classIndex, labelIndices, map, QUADRATIC_PRIOR, flags, numNodeFeatures, numEdgeFeatures);</span>
+<span class="nc" id="L91">  }</span>
+
+<span class="nc" id="L93">  CRFNonLinearSecondOrderLogConditionalObjectiveFunction(int[][][][] data, int[][] labels, int window, Index&lt;String&gt; classIndex, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, int prior, SeqClassifierFlags flags, int numNodeFeatures, int numEdgeFeatures) {</span>
+<span class="nc" id="L94">    this.window = window;</span>
+<span class="nc" id="L95">    this.classIndex = classIndex;</span>
+<span class="nc" id="L96">    this.numClasses = classIndex.size();</span>
+<span class="nc" id="L97">    this.labelIndices = labelIndices;</span>
+<span class="nc" id="L98">    this.data = data;</span>
+<span class="nc" id="L99">    this.flags = flags;</span>
+<span class="nc" id="L100">    this.map = map;</span>
+<span class="nc" id="L101">    this.labels = labels;</span>
+<span class="nc" id="L102">    this.prior = prior;</span>
+<span class="nc" id="L103">    this.backgroundSymbol = flags.backgroundSymbol;</span>
+<span class="nc" id="L104">    this.sigma = flags.sigma;</span>
+<span class="nc" id="L105">    this.outputLayerSize = numClasses;</span>
+<span class="nc" id="L106">    this.outputLayerSize4Edge = numClasses * numClasses;</span>
+<span class="nc" id="L107">    this.numHiddenUnits = flags.numHiddenUnits;</span>
+<span class="nc" id="L108">    this.inputLayerSize = numHiddenUnits * numClasses;</span>
+<span class="nc" id="L109">    this.inputLayerSize4Edge = numHiddenUnits * numClasses * numClasses;</span>
+<span class="nc" id="L110">    this.numNodeFeatures = numNodeFeatures;</span>
+<span class="nc" id="L111">    this.numEdgeFeatures = numEdgeFeatures;</span>
+<span class="nc" id="L112">    this.useOutputLayer = flags.useOutputLayer;</span>
+<span class="nc" id="L113">    this.useHiddenLayer = flags.useHiddenLayer;</span>
+<span class="nc" id="L114">    this.useSigmoid = flags.useSigmoid;</span>
+<span class="nc" id="L115">    this.docWindowLabels = new int[data.length][];</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">    if (!useOutputLayer) {</span>
+<span class="nc" id="L117">      log.info(&quot;Output layer not activated, inputLayerSize must be equal to numClasses, setting it to &quot; + numClasses);</span>
+<span class="nc" id="L118">      this.inputLayerSize = numClasses;</span>
+<span class="nc" id="L119">      this.inputLayerSize4Edge = numClasses * numClasses;</span>
+<span class="nc bnc" id="L120" title="All 6 branches missed.">    } else if (flags.softmaxOutputLayer &amp;&amp; !(flags.sparseOutputLayer || flags.tieOutputLayer)) {</span>
+<span class="nc" id="L121">      throw new RuntimeException(&quot;flags.softmaxOutputLayer == true, but neither flags.sparseOutputLayer or flags.tieOutputLayer is true&quot;);</span>
+    }
+    // empiricalCounts();
+<span class="nc" id="L124">  }</span>
+
+  @Override
+  public int domainDimension() {
+<span class="nc bnc" id="L128" title="All 2 branches missed.">    if (domainDimension &lt; 0) {</span>
+<span class="nc" id="L129">      originalFeatureCount = 0;</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">      for (int aMap : map) {</span>
+<span class="nc" id="L131">        int s = labelIndices.get(aMap).size();</span>
+<span class="nc" id="L132">        originalFeatureCount += s;</span>
+      }
+<span class="nc" id="L134">      domainDimension = 0;</span>
+<span class="nc" id="L135">      domainDimension += inputLayerSize4Edge * numEdgeFeatures;</span>
+<span class="nc" id="L136">      domainDimension += inputLayerSize * numNodeFeatures;</span>
+<span class="nc" id="L137">      beforeOutputWeights = domainDimension;</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">      if (useOutputLayer) {</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (flags.sparseOutputLayer) {</span>
+<span class="nc" id="L140">          domainDimension += outputLayerSize4Edge * numHiddenUnits;</span>
+<span class="nc" id="L141">          domainDimension += outputLayerSize * numHiddenUnits;</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        } else if (flags.tieOutputLayer) {</span>
+<span class="nc" id="L143">          domainDimension += 1 * numHiddenUnits;</span>
+<span class="nc" id="L144">          domainDimension += 1 * numHiddenUnits;</span>
+        } else {
+<span class="nc" id="L146">          domainDimension += outputLayerSize4Edge * inputLayerSize4Edge;</span>
+<span class="nc" id="L147">          domainDimension += outputLayerSize * inputLayerSize;</span>
+        }
+      }
+<span class="nc" id="L150">      log.info(&quot;originalFeatureCount: &quot;+originalFeatureCount);</span>
+<span class="nc" id="L151">      log.info(&quot;beforeOutputWeights: &quot;+beforeOutputWeights);</span>
+<span class="nc" id="L152">      log.info(&quot;domainDimension: &quot;+domainDimension);</span>
+    }
+<span class="nc" id="L154">    return domainDimension;</span>
+  }
+
+  @Override
+  public double[] initial() {
+<span class="nc" id="L159">    double[] initial = new double[domainDimension()];</span>
+    // randomly initialize weights
+<span class="nc bnc" id="L161" title="All 4 branches missed.">    if (useHiddenLayer || useOutputLayer) {</span>
+<span class="nc" id="L162">      double epsilon = 0.1;</span>
+<span class="nc" id="L163">      double twoEpsilon = epsilon * 2;</span>
+<span class="nc" id="L164">      int count = 0;</span>
+<span class="nc" id="L165">      double val = 0;</span>
+
+<span class="nc bnc" id="L167" title="All 2 branches missed.">      if (flags.blockInitialize) {</span>
+<span class="nc" id="L168">        int interval4Edge = numEdgeFeatures / numHiddenUnits;</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        for (int i = 0; i &lt; numHiddenUnits; i++) {</span>
+<span class="nc" id="L170">          int lower = i * interval4Edge;</span>
+<span class="nc" id="L171">          int upper = (i + 1) * interval4Edge;</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">          if (i == numHiddenUnits - 1)</span>
+<span class="nc" id="L173">            upper = numEdgeFeatures;</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">          for (int j = 0; j &lt; outputLayerSize4Edge; j++) {</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            for (int k = 0; k &lt; numEdgeFeatures; k++) {</span>
+<span class="nc" id="L176">              val = 0;</span>
+<span class="nc bnc" id="L177" title="All 4 branches missed.">              if (k &gt;= lower &amp;&amp; k &lt; upper) {</span>
+<span class="nc" id="L178">                val = random.nextDouble() * twoEpsilon - epsilon;</span>
+              }
+<span class="nc" id="L180">              initial[count++] = val;</span>
+            }
+          }
+        }
+
+<span class="nc" id="L185">        int interval = numNodeFeatures / numHiddenUnits;</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        for (int i = 0; i &lt; numHiddenUnits; i++) {</span>
+<span class="nc" id="L187">          int lower = i * interval;</span>
+<span class="nc" id="L188">          int upper = (i + 1) * interval;</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">          if (i == numHiddenUnits - 1)</span>
+<span class="nc" id="L190">            upper = numNodeFeatures;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">          for (int j = 0; j &lt; outputLayerSize; j++) {</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            for (int k = 0; k &lt; numNodeFeatures; k++) {</span>
+<span class="nc" id="L193">              val = 0;</span>
+<span class="nc bnc" id="L194" title="All 4 branches missed.">              if (k &gt;= lower &amp;&amp; k &lt; upper) {</span>
+<span class="nc" id="L195">                val = random.nextDouble() * twoEpsilon - epsilon;</span>
+              }
+<span class="nc" id="L197">              initial[count++] = val;</span>
+            }
+          }
+        }
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        if (count != beforeOutputWeights) {</span>
+<span class="nc" id="L202">          throw new RuntimeException(&quot;after blockInitialize, param Index (&quot; + count + &quot;) not equal to beforeOutputWeights (&quot; + beforeOutputWeights + &quot;)&quot;);</span>
+        }
+<span class="nc" id="L204">      } else {</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        for (int i = 0; i &lt; beforeOutputWeights; i++) {</span>
+<span class="nc" id="L206">          val = random.nextDouble() * twoEpsilon - epsilon;</span>
+<span class="nc" id="L207">          initial[count++] = val;</span>
+        }
+      }
+
+<span class="nc bnc" id="L211" title="All 2 branches missed.">      if (flags.sparseOutputLayer) {</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        for (int i = 0; i &lt; outputLayerSize4Edge; i++) {</span>
+<span class="nc" id="L213">          double total = 1;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">          for (int j = 0; j &lt; numHiddenUnits-1; j++) {</span>
+<span class="nc" id="L215">            val = random.nextDouble() * total;</span>
+<span class="nc" id="L216">            initial[count++] = val;</span>
+<span class="nc" id="L217">            total -= val;</span>
+          }
+<span class="nc" id="L219">          initial[count++] = total;</span>
+        }
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        for (int i = 0; i &lt; outputLayerSize; i++) {</span>
+<span class="nc" id="L222">          double total = 1;</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">          for (int j = 0; j &lt; numHiddenUnits-1; j++) {</span>
+<span class="nc" id="L224">            val = random.nextDouble() * total;</span>
+<span class="nc" id="L225">            initial[count++] = val;</span>
+<span class="nc" id="L226">            total -= val;</span>
+          }
+<span class="nc" id="L228">          initial[count++] = total;</span>
+        }
+<span class="nc bnc" id="L230" title="All 2 branches missed.">      } else if (flags.tieOutputLayer) {</span>
+<span class="nc" id="L231">        double total = 1;</span>
+<span class="nc" id="L232">        double sum = 0;</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        for (int j = 0; j &lt; numHiddenUnits-1; j++) {</span>
+<span class="nc" id="L234">          val = random.nextDouble() * total;</span>
+<span class="nc" id="L235">          initial[count++] = val;</span>
+<span class="nc" id="L236">          total -= val;</span>
+        }
+<span class="nc" id="L238">        initial[count++] = total;</span>
+<span class="nc" id="L239">        total = 1;</span>
+<span class="nc" id="L240">        sum = 0;</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        for (int j = 0; j &lt; numHiddenUnits-1; j++) {</span>
+<span class="nc" id="L242">          val = random.nextDouble() * total;</span>
+<span class="nc" id="L243">          initial[count++] = val;</span>
+<span class="nc" id="L244">          total -= val;</span>
+        }
+<span class="nc" id="L246">        initial[count++] = total;</span>
+<span class="nc" id="L247">      } else {</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        for (int i = beforeOutputWeights; i &lt; domainDimension(); i++) {</span>
+<span class="nc" id="L249">          val = random.nextDouble() * twoEpsilon - epsilon;</span>
+<span class="nc" id="L250">          initial[count++] = val;</span>
+        }
+      }
+<span class="nc bnc" id="L253" title="All 2 branches missed.">      if (count != domainDimension()) {</span>
+<span class="nc" id="L254">        throw new RuntimeException(&quot;after param initialization, param Index (&quot; + count + &quot;) not equal to domainDimension (&quot; + domainDimension() + &quot;)&quot;);</span>
+      }
+    }
+<span class="nc" id="L257">    return initial;</span>
+  }
+
+  private double[][] emptyU4Edge() {
+<span class="nc" id="L261">    int innerSize = inputLayerSize4Edge;</span>
+<span class="nc bnc" id="L262" title="All 4 branches missed.">    if (flags.sparseOutputLayer || flags.tieOutputLayer) {</span>
+<span class="nc" id="L263">      innerSize = numHiddenUnits;</span>
+    }
+<span class="nc" id="L265">    int outerSize = outputLayerSize4Edge;</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    if (flags.tieOutputLayer) {</span>
+<span class="nc" id="L267">      outerSize = 1;</span>
+    }
+
+<span class="nc" id="L270">    double[][] temp = new double[outerSize][innerSize];</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">    for (int i = 0; i &lt; outerSize; i++) {</span>
+<span class="nc" id="L272">      temp[i] = new double[innerSize];</span>
+    }
+<span class="nc" id="L274">    return temp;</span>
+  }
+
+  private double[][] emptyW4Edge() {
+<span class="nc" id="L278">    double[][] temp = new double[inputLayerSize4Edge][numEdgeFeatures];</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">    for (int i = 0; i &lt; inputLayerSize; i++) {</span>
+<span class="nc" id="L280">      temp[i] = new double[numEdgeFeatures];</span>
+    }
+<span class="nc" id="L282">    return temp;</span>
+  }
+
+  private double[][] emptyU() {
+<span class="nc" id="L286">    int innerSize = inputLayerSize;</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">    if (flags.sparseOutputLayer || flags.tieOutputLayer) {</span>
+<span class="nc" id="L288">      innerSize = numHiddenUnits;</span>
+    }
+<span class="nc" id="L290">    int outerSize = outputLayerSize;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">    if (flags.tieOutputLayer) {</span>
+<span class="nc" id="L292">      outerSize = 1;</span>
+    }
+
+<span class="nc" id="L295">    double[][] temp = new double[outerSize][innerSize];</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">    for (int i = 0; i &lt; outerSize; i++) {</span>
+<span class="nc" id="L297">      temp[i] = new double[innerSize];</span>
+    }
+<span class="nc" id="L299">    return temp;</span>
+  }
+
+  private double[][] emptyW() {
+<span class="nc" id="L303">    double[][] temp = new double[inputLayerSize][numNodeFeatures];</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">    for (int i = 0; i &lt; inputLayerSize; i++) {</span>
+<span class="nc" id="L305">      temp[i] = new double[numNodeFeatures];</span>
+    }
+<span class="nc" id="L307">    return temp;</span>
+  }
+
+  public Quadruple&lt;double[][], double[][], double[][], double[][]&gt; separateWeights(double[] x) {
+<span class="nc" id="L311">    int index = 0;</span>
+<span class="nc" id="L312">    double[][] inputLayerWeights4Edge = emptyW4Edge();</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    for (int i = 0; i &lt; inputLayerWeights4Edge.length; i++) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">      for (int j = 0; j &lt; inputLayerWeights4Edge[i].length; j++) {</span>
+<span class="nc" id="L315">        inputLayerWeights4Edge[i][j] = x[index++];</span>
+      }
+    }
+
+<span class="nc" id="L319">    double[][] inputLayerWeights = emptyW();</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    for (int i = 0; i &lt; inputLayerWeights.length; i++) {</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">      for (int j = 0; j &lt; inputLayerWeights[i].length; j++) {</span>
+<span class="nc" id="L322">        inputLayerWeights[i][j] = x[index++];</span>
+      }
+    }
+
+<span class="nc" id="L326">    double[][] outputLayerWeights4Edge = emptyU4Edge();</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">    for (int i = 0; i &lt; outputLayerWeights4Edge.length; i++) {</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">      for (int j = 0; j &lt; outputLayerWeights4Edge[i].length; j++) {</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if (useOutputLayer)</span>
+<span class="nc" id="L330">          outputLayerWeights4Edge[i][j] = x[index++];</span>
+        else
+<span class="nc" id="L332">          outputLayerWeights4Edge[i][j] = 1;</span>
+      }
+    }
+
+<span class="nc" id="L336">    double[][] outputLayerWeights = emptyU();</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">    for (int i = 0; i &lt; outputLayerWeights.length; i++) {</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">      for (int j = 0; j &lt; outputLayerWeights[i].length; j++) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (useOutputLayer)</span>
+<span class="nc" id="L340">          outputLayerWeights[i][j] = x[index++];</span>
+        else
+<span class="nc" id="L342">          outputLayerWeights[i][j] = 1;</span>
+      }
+    }
+<span class="nc bnc" id="L345" title="All 4 branches missed.">    assert(index == x.length);</span>
+<span class="nc" id="L346">    return new Quadruple&lt;&gt;(inputLayerWeights4Edge, outputLayerWeights4Edge, inputLayerWeights, outputLayerWeights);</span>
+  }
+
+  public CliquePotentialFunction getCliquePotentialFunction(double[] x) {
+<span class="nc" id="L350">    Quadruple&lt;double[][], double[][], double[][], double[][]&gt; allParams = separateWeights(x);</span>
+<span class="nc" id="L351">    double[][] W4Edge = allParams.first(); // inputLayerWeights4Edge</span>
+<span class="nc" id="L352">    double[][] U4Edge = allParams.second(); // outputLayerWeights4Edge</span>
+<span class="nc" id="L353">    double[][] W = allParams.third(); // inputLayerWeights</span>
+<span class="nc" id="L354">    double[][] U = allParams.fourth(); // outputLayerWeights</span>
+<span class="nc" id="L355">    return new NonLinearSecondOrderCliquePotentialFunction(W4Edge, U4Edge, W, U, flags);</span>
+  }
+
+
+  // todo [cdm]: Below data[m] --&gt; docData
+  /**
+   * Calculates both value and partial derivatives at the point x, and save them internally.
+   */
+  @Override
+  public void calculate(double[] x) {
+
+<span class="nc" id="L366">    double prob = 0.0; // the log prob of the sequence given the model, which is the negation of value at this point</span>
+<span class="nc" id="L367">    Quadruple&lt;double[][], double[][], double[][], double[][]&gt; allParams = separateWeights(x);</span>
+<span class="nc" id="L368">    double[][] W4Edge = allParams.first(); // inputLayerWeights4Edge</span>
+<span class="nc" id="L369">    double[][] U4Edge = allParams.second(); // outputLayerWeights4Edge</span>
+<span class="nc" id="L370">    double[][] W = allParams.third(); // inputLayerWeights</span>
+<span class="nc" id="L371">    double[][] U = allParams.fourth(); // outputLayerWeights</span>
+
+<span class="nc" id="L373">    double[][] Y4Edge = null;</span>
+<span class="nc" id="L374">    double[][] Y = null;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">    if (flags.softmaxOutputLayer) {</span>
+<span class="nc" id="L376">      Y4Edge = new double[U4Edge.length][];</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">      for (int i = 0; i &lt; U4Edge.length; i++) {</span>
+<span class="nc" id="L378">        Y4Edge[i] = ArrayMath.softmax(U4Edge[i]);</span>
+      }
+<span class="nc" id="L380">      Y = new double[U.length][];</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      for (int i = 0; i &lt; U.length; i++) {</span>
+<span class="nc" id="L382">        Y[i] = ArrayMath.softmax(U[i]);</span>
+      }
+    }
+
+<span class="nc" id="L386">    double[][] What4Edge = emptyW4Edge();</span>
+<span class="nc" id="L387">    double[][] Uhat4Edge = emptyU4Edge();</span>
+<span class="nc" id="L388">    double[][] What = emptyW();</span>
+<span class="nc" id="L389">    double[][] Uhat = emptyU();</span>
+
+    // the expectations over counts
+    // first index is feature index, second index is of possible labeling
+<span class="nc" id="L393">    double[][] eW4Edge = emptyW4Edge();</span>
+<span class="nc" id="L394">    double[][] eU4Edge = emptyU4Edge();</span>
+<span class="nc" id="L395">    double[][] eW = emptyW();</span>
+<span class="nc" id="L396">    double[][] eU = emptyU();</span>
+
+    // iterate over all the documents
+<span class="nc bnc" id="L399" title="All 2 branches missed.">    for (int m = 0; m &lt; data.length; m++) {</span>
+<span class="nc" id="L400">      int[][][] docData = data[m];</span>
+<span class="nc" id="L401">      int[] docLabels = labels[m];</span>
+
+<span class="nc" id="L403">      NonLinearSecondOrderCliquePotentialFunction cliquePotentialFunction = new NonLinearSecondOrderCliquePotentialFunction(W4Edge, U4Edge, W, U, flags);</span>
+
+      // make a clique tree for this document
+<span class="nc" id="L406">      CRFCliqueTree cliqueTree = CRFCliqueTree.getCalibratedCliqueTree(docData, labelIndices, numClasses, classIndex,</span>
+        backgroundSymbol, cliquePotentialFunction, null);
+
+      // compute the log probability of the document given the model with the parameters x
+<span class="nc" id="L410">      int[] given = new int[window - 1];</span>
+<span class="nc" id="L411">      Arrays.fill(given, classIndex.indexOf(backgroundSymbol));</span>
+<span class="nc" id="L412">      int[] windowLabels = new int[window];</span>
+<span class="nc" id="L413">      Arrays.fill(windowLabels, classIndex.indexOf(backgroundSymbol));</span>
+
+<span class="nc bnc" id="L415" title="All 2 branches missed.">      if (docLabels.length&gt;docData.length) { // only true for self-training</span>
+        // fill the given array with the extra docLabels
+<span class="nc" id="L417">        System.arraycopy(docLabels, 0, given, 0, given.length);</span>
+<span class="nc" id="L418">        System.arraycopy(docLabels, 0, windowLabels, 0, windowLabels.length);</span>
+        // shift the docLabels array left
+<span class="nc" id="L420">        int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L421">        System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L422">        docLabels = newDocLabels;</span>
+      }
+      // iterate over the positions in this document
+<span class="nc bnc" id="L425" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L426">        int label = docLabels[i];</span>
+<span class="nc" id="L427">        double p = cliqueTree.condLogProbGivenPrevious(i, label, given);</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L429">          log.info(&quot;P(&quot; + label + &quot;|&quot; + ArrayMath.toString(given) + &quot;)=&quot; + p);</span>
+        }
+<span class="nc" id="L431">        prob += p;</span>
+<span class="nc" id="L432">        System.arraycopy(given, 1, given, 0, given.length - 1);</span>
+<span class="nc" id="L433">        given[given.length - 1] = label;</span>
+      }
+
+      // compute the expected counts for this document, which we will need to compute the derivative
+      // iterate over the positions in this document
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+        // for each possible clique at this position
+<span class="nc" id="L440">        System.arraycopy(windowLabels, 1, windowLabels, 0, window - 1);</span>
+<span class="nc" id="L441">        windowLabels[window - 1] = docLabels[i];</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        for (int j = 0; j &lt; docData[i].length; j++) {</span>
+<span class="nc" id="L443">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+          // for each possible labeling for that clique
+<span class="nc" id="L445">          int[] cliqueFeatures = docData[i][j];</span>
+<span class="nc" id="L446">          double[] As = null;</span>
+<span class="nc" id="L447">          double[] fDeriv = null;</span>
+<span class="nc" id="L448">          double[][] yTimesA = null;</span>
+<span class="nc" id="L449">          double[] sumOfYTimesA = null;</span>
+
+<span class="nc" id="L451">          int inputSize, outputSize = -1;</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">          if (j == 0) {</span>
+<span class="nc" id="L453">            inputSize = inputLayerSize;</span>
+<span class="nc" id="L454">            outputSize = outputLayerSize;</span>
+<span class="nc" id="L455">            As = cliquePotentialFunction.hiddenLayerOutput(W, cliqueFeatures, flags, null, j+1);</span>
+          } else {
+<span class="nc" id="L457">            inputSize = inputLayerSize4Edge;</span>
+<span class="nc" id="L458">            outputSize = outputLayerSize4Edge;</span>
+<span class="nc" id="L459">            As = cliquePotentialFunction.hiddenLayerOutput(W4Edge, cliqueFeatures, flags, null, j+1);</span>
+          }
+
+<span class="nc" id="L462">          fDeriv = new double[inputSize];</span>
+<span class="nc" id="L463">          double fD = 0;</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">          for (int q = 0; q &lt; inputSize; q++) {</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (useSigmoid) {</span>
+<span class="nc" id="L466">              fD = As[q] * (1 - As[q]);</span>
+            } else {
+<span class="nc" id="L468">              fD = 1 - As[q] * As[q];</span>
+            }
+<span class="nc" id="L470">            fDeriv[q] = fD;</span>
+          }
+
+          // calculating yTimesA for softmax
+<span class="nc bnc" id="L474" title="All 2 branches missed.">          if (flags.softmaxOutputLayer) {</span>
+<span class="nc" id="L475">            double val = 0;</span>
+
+<span class="nc" id="L477">            yTimesA = new double[outputSize][numHiddenUnits];</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            for (int ii = 0; ii &lt; outputSize; ii++) {</span>
+<span class="nc" id="L479">              yTimesA[ii] = new double[numHiddenUnits];</span>
+            }
+<span class="nc" id="L481">            sumOfYTimesA = new double[outputSize];</span>
+
+<span class="nc bnc" id="L483" title="All 2 branches missed.">            for (int k = 0; k &lt; outputSize; k++) {</span>
+<span class="nc" id="L484">              double[] Yk = null;</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">              if (flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">                if (j == 0) {</span>
+<span class="nc" id="L487">                  Yk = Y[0];</span>
+                } else {
+<span class="nc" id="L489">                  Yk = Y4Edge[0];</span>
+                }
+              } else {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                if (j == 0) {</span>
+<span class="nc" id="L493">                  Yk = Y[k];</span>
+                } else {
+<span class="nc" id="L495">                  Yk = Y4Edge[k];</span>
+                }
+              }
+<span class="nc" id="L498">              double sum = 0;</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">              for (int q = 0; q &lt; inputSize; q++) {</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                if (q % outputSize == k) {</span>
+<span class="nc" id="L501">                  int hiddenUnitNo = q / outputSize;</span>
+<span class="nc" id="L502">                  val = As[q] * Yk[hiddenUnitNo];</span>
+<span class="nc" id="L503">                  yTimesA[k][hiddenUnitNo] = val;</span>
+<span class="nc" id="L504">                  sum += val;</span>
+                }
+              }
+<span class="nc" id="L507">              sumOfYTimesA[k] = sum;</span>
+            }
+          }
+
+          // calculating Uhat What
+<span class="nc" id="L512">          int[] cliqueLabel = new int[j + 1];</span>
+<span class="nc" id="L513">          System.arraycopy(windowLabels, window - 1 - j, cliqueLabel, 0, j + 1);</span>
+
+<span class="nc" id="L515">          CRFLabel crfLabel = new CRFLabel(cliqueLabel);</span>
+<span class="nc" id="L516">          int givenLabelIndex = labelIndex.indexOf(crfLabel);</span>
+<span class="nc" id="L517">          double[] Uk = null;</span>
+<span class="nc" id="L518">          double[] UhatK = null;</span>
+<span class="nc" id="L519">          double[] Yk = null;</span>
+<span class="nc" id="L520">          double[] yTimesAK = null;</span>
+<span class="nc" id="L521">          double sumOfYTimesAK = 0;</span>
+
+<span class="nc bnc" id="L523" title="All 2 branches missed.">          if (flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            if (j == 0) {</span>
+<span class="nc" id="L525">              Uk = U[0];</span>
+<span class="nc" id="L526">              UhatK = Uhat[0];</span>
+            } else {
+<span class="nc" id="L528">              Uk = U4Edge[0];</span>
+<span class="nc" id="L529">              UhatK = Uhat4Edge[0];</span>
+            }
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            if (flags.softmaxOutputLayer) {</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">              if (j == 0) {</span>
+<span class="nc" id="L533">                Yk = Y[0];</span>
+              } else {
+<span class="nc" id="L535">                Yk = Y4Edge[0];</span>
+              }
+            }
+          } else {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            if (j == 0) {</span>
+<span class="nc" id="L540">              Uk = U[givenLabelIndex];</span>
+<span class="nc" id="L541">              UhatK = Uhat[givenLabelIndex];</span>
+            } else {
+<span class="nc" id="L543">              Uk = U4Edge[givenLabelIndex];</span>
+<span class="nc" id="L544">              UhatK = Uhat4Edge[givenLabelIndex];</span>
+            }
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            if (flags.softmaxOutputLayer) {</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">              if (j == 0) {</span>
+<span class="nc" id="L548">                Yk = Y[givenLabelIndex];</span>
+              } else {
+<span class="nc" id="L550">                Yk = Y4Edge[givenLabelIndex];</span>
+              }
+            }
+          }
+
+<span class="nc bnc" id="L555" title="All 2 branches missed.">          if (flags.softmaxOutputLayer) {</span>
+<span class="nc" id="L556">            yTimesAK = yTimesA[givenLabelIndex];</span>
+<span class="nc" id="L557">            sumOfYTimesAK = sumOfYTimesA[givenLabelIndex];</span>
+          }
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">          for (int k = 0; k &lt; inputSize; k++) {</span>
+<span class="nc" id="L561">            double deltaK = 1;</span>
+<span class="nc bnc" id="L562" title="All 4 branches missed.">            if (flags.sparseOutputLayer || flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">              if (k % outputSize == givenLabelIndex) {</span>
+<span class="nc" id="L564">                int hiddenUnitNo = k / outputSize;</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                if (flags.softmaxOutputLayer) {</span>
+<span class="nc" id="L566">                  UhatK[hiddenUnitNo] += (yTimesAK[hiddenUnitNo] - Yk[hiddenUnitNo] * sumOfYTimesAK);</span>
+<span class="nc" id="L567">                  deltaK *= Yk[hiddenUnitNo];</span>
+                } else {
+<span class="nc" id="L569">                  UhatK[hiddenUnitNo] += As[k];</span>
+<span class="nc" id="L570">                  deltaK *= Uk[hiddenUnitNo];</span>
+                }
+<span class="nc" id="L572">              }</span>
+            } else {
+<span class="nc" id="L574">              UhatK[k] += As[k];</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">              if (useOutputLayer) {</span>
+<span class="nc" id="L576">                deltaK *= Uk[k];</span>
+              }
+            }
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (useHiddenLayer)</span>
+<span class="nc" id="L580">              deltaK *= fDeriv[k];</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">            if (useOutputLayer) {</span>
+<span class="nc bnc" id="L582" title="All 4 branches missed.">              if (flags.sparseOutputLayer || flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">                if (k % outputSize == givenLabelIndex) {</span>
+<span class="nc" id="L584">                  double[] WhatK = null;</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">                  if (j == 0) {</span>
+<span class="nc" id="L586">                    WhatK = What[k];</span>
+                  } else {
+<span class="nc" id="L588">                    WhatK = What4Edge[k];</span>
+                  }
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                  for (int cliqueFeature : cliqueFeatures) {</span>
+<span class="nc" id="L591">                    WhatK[cliqueFeature] += deltaK;</span>
+                  }
+<span class="nc" id="L593">                }</span>
+              } else {
+<span class="nc" id="L595">                double[] WhatK = null;</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">                if (j == 0) {</span>
+<span class="nc" id="L597">                  WhatK = What[k];</span>
+                } else {
+<span class="nc" id="L599">                  WhatK = What4Edge[k];</span>
+                }
+<span class="nc bnc" id="L601" title="All 2 branches missed.">                for (int cliqueFeature : cliqueFeatures) {</span>
+<span class="nc" id="L602">                  WhatK[cliqueFeature] += deltaK;</span>
+                }
+<span class="nc" id="L604">              }</span>
+            } else {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">              if (k == givenLabelIndex) {</span>
+<span class="nc" id="L607">                double[] WhatK = null;</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                if (j == 0) {</span>
+<span class="nc" id="L609">                  WhatK = What[k];</span>
+                } else {
+<span class="nc" id="L611">                  WhatK = What4Edge[k];</span>
+                }
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                for (int cliqueFeature : cliqueFeatures) {</span>
+<span class="nc" id="L614">                  WhatK[cliqueFeature] += deltaK;</span>
+                }
+              }
+            }
+          }
+
+<span class="nc bnc" id="L620" title="All 2 branches missed.">          for (int k = 0; k &lt; labelIndex.size(); k++) { // labelIndex.size() == numClasses</span>
+<span class="nc" id="L621">            int[] label = labelIndex.get(k).getLabel();</span>
+<span class="nc" id="L622">            double p = cliqueTree.prob(i, label); // probability of these labels occurring in this clique with these features</span>
+<span class="nc" id="L623">            double[] Uk2 = null;</span>
+<span class="nc" id="L624">            double[] eUK = null;</span>
+<span class="nc" id="L625">            double[] Yk2 = null;</span>
+
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">              if (j == 0) { // for node features</span>
+<span class="nc" id="L629">                Uk2 = U[0];</span>
+<span class="nc" id="L630">                eUK = eU[0];</span>
+              } else {
+<span class="nc" id="L632">                Uk2 = U4Edge[0];</span>
+<span class="nc" id="L633">                eUK = eU4Edge[0];</span>
+              }
+<span class="nc bnc" id="L635" title="All 2 branches missed.">              if (flags.softmaxOutputLayer) {</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">                if (j == 0) {</span>
+<span class="nc" id="L637">                  Yk2 = Y[0];</span>
+                } else {
+<span class="nc" id="L639">                  Yk2 = Y4Edge[0];</span>
+                }
+              }
+            } else {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">              if (j == 0) {</span>
+<span class="nc" id="L644">                Uk2 = U[k];</span>
+<span class="nc" id="L645">                eUK = eU[k];</span>
+              } else {
+<span class="nc" id="L647">                Uk2 = U4Edge[k];</span>
+<span class="nc" id="L648">                eUK = eU4Edge[k];</span>
+              }
+<span class="nc bnc" id="L650" title="All 2 branches missed.">              if (flags.softmaxOutputLayer) {</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">                if (j == 0) {</span>
+<span class="nc" id="L652">                  Yk2 = Y[k];</span>
+                } else {
+<span class="nc" id="L654">                  Yk2 = Y4Edge[k];</span>
+                }
+              }
+            }
+<span class="nc bnc" id="L658" title="All 2 branches missed.">            if (useOutputLayer) {</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">              for (int q = 0; q &lt; inputSize; q++) {</span>
+<span class="nc" id="L660">                double deltaQ = 1;</span>
+<span class="nc bnc" id="L661" title="All 4 branches missed.">                if (flags.sparseOutputLayer || flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">                  if (q % outputSize == k) {</span>
+<span class="nc" id="L663">                    int hiddenUnitNo = q / outputSize;</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">                    if (flags.softmaxOutputLayer) {</span>
+<span class="nc" id="L665">                      eUK[hiddenUnitNo] += (yTimesA[k][hiddenUnitNo] - Yk2[hiddenUnitNo] * sumOfYTimesA[k]) * p;</span>
+<span class="nc" id="L666">                      deltaQ = Yk2[hiddenUnitNo];</span>
+                    } else {
+<span class="nc" id="L668">                      eUK[hiddenUnitNo] += As[q] * p;</span>
+<span class="nc" id="L669">                      deltaQ = Uk2[hiddenUnitNo];</span>
+                    }
+<span class="nc" id="L671">                  }</span>
+                } else {
+<span class="nc" id="L673">                  eUK[q] += As[q] * p;</span>
+<span class="nc" id="L674">                  deltaQ = Uk2[q];</span>
+                }
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                if (useHiddenLayer)</span>
+<span class="nc" id="L677">                  deltaQ *= fDeriv[q];</span>
+<span class="nc bnc" id="L678" title="All 4 branches missed.">                if (flags.sparseOutputLayer || flags.tieOutputLayer) {</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">                  if (q % outputSize == k) {</span>
+<span class="nc" id="L680">                    double[] eWq = null;</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                    if (j == 0) {</span>
+<span class="nc" id="L682">                      eWq = eW[q];</span>
+                    } else {
+<span class="nc" id="L684">                      eWq = eW4Edge[q];</span>
+                    }
+<span class="nc bnc" id="L686" title="All 2 branches missed.">                    for (int cliqueFeature : cliqueFeatures) {</span>
+<span class="nc" id="L687">                      eWq[cliqueFeature] += deltaQ * p;</span>
+                    }
+<span class="nc" id="L689">                  }</span>
+                } else {
+<span class="nc" id="L691">                  double[] eWq = null;</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">                  if (j == 0) {</span>
+<span class="nc" id="L693">                    eWq = eW[q];</span>
+                  } else {
+<span class="nc" id="L695">                    eWq = eW4Edge[q];</span>
+                  }
+<span class="nc bnc" id="L697" title="All 2 branches missed.">                  for (int cliqueFeature : cliqueFeatures) {</span>
+<span class="nc" id="L698">                    eWq[cliqueFeature] += deltaQ * p;</span>
+                  }
+                }
+              }
+            } else {
+<span class="nc" id="L703">              double deltaK = 1;</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">              if (useHiddenLayer)</span>
+<span class="nc" id="L705">                deltaK *= fDeriv[k];</span>
+<span class="nc" id="L706">              double[] eWK = null;</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">              if (j == 0) {</span>
+<span class="nc" id="L708">                eWK = eW[k];</span>
+              } else {
+<span class="nc" id="L710">                eWK = eW4Edge[k];</span>
+              }
+<span class="nc bnc" id="L712" title="All 2 branches missed.">              for (int cliqueFeature : cliqueFeatures) {</span>
+<span class="nc" id="L713">                eWK[cliqueFeature] += deltaK * p;</span>
+              }
+            }
+          }
+        }
+      }
+    }
+
+<span class="nc bnc" id="L721" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L722">      throw new RuntimeException(&quot;Got NaN for prob in CRFNonLinearSecondOrderLogConditionalObjectiveFunction.calculate()&quot;);</span>
+    }
+
+<span class="nc" id="L725">    value = -prob;</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">    if(VERBOSE){</span>
+<span class="nc" id="L727">      log.info(&quot;value is &quot; + value);</span>
+    }
+
+    // compute the partial derivative for each feature by comparing expected counts to empirical counts
+<span class="nc" id="L731">    int index = 0;</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">    for (int i = 0; i &lt; eW4Edge.length; i++) {</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">      for (int j = 0; j &lt; eW4Edge[i].length; j++) {</span>
+<span class="nc" id="L734">        derivative[index++] = (eW4Edge[i][j] - What4Edge[i][j]);</span>
+<span class="nc bnc" id="L735" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L736">          log.info(&quot;inputLayerWeights4Edge deriv(&quot; + i + &quot;,&quot; + j + &quot;) = &quot; + eW4Edge[i][j] + &quot; - &quot; + What4Edge[i][j] + &quot; = &quot; + derivative[index - 1]);</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L741" title="All 2 branches missed.">    for (int i = 0; i &lt; eW.length; i++) {</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">      for (int j = 0; j &lt; eW[i].length; j++) {</span>
+<span class="nc" id="L743">        derivative[index++] = (eW[i][j] - What[i][j]);</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L745">          log.info(&quot;inputLayerWeights deriv(&quot; + i + &quot;,&quot; + j + &quot;) = &quot; + eW[i][j] + &quot; - &quot; + What[i][j] + &quot; = &quot; + derivative[index - 1]);</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L750" title="All 2 branches missed.">    if (index != beforeOutputWeights)</span>
+<span class="nc" id="L751">      throw new RuntimeException(&quot;after W derivative, index(&quot;+index+&quot;) != beforeOutputWeights(&quot;+beforeOutputWeights+&quot;)&quot;);</span>
+
+<span class="nc bnc" id="L753" title="All 2 branches missed.">    if (useOutputLayer) {</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">      for (int i = 0; i &lt; eU4Edge.length; i++) {</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        for (int j = 0; j &lt; eU4Edge[i].length; j++) {</span>
+<span class="nc" id="L756">          derivative[index++] = (eU4Edge[i][j] - Uhat4Edge[i][j]);</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">          if (VERBOSE) {</span>
+<span class="nc" id="L758">            log.info(&quot;outputLayerWeights4Edge deriv(&quot; + i + &quot;,&quot; + j + &quot;) = &quot; + eU4Edge[i][j] + &quot; - &quot; + Uhat4Edge[i][j] + &quot; = &quot; + derivative[index - 1]);</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L762" title="All 2 branches missed.">      for (int i = 0; i &lt; eU.length; i++) {</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">        for (int j = 0; j &lt; eU[i].length; j++) {</span>
+<span class="nc" id="L764">          derivative[index++] = (eU[i][j] - Uhat[i][j]);</span>
+<span class="nc bnc" id="L765" title="All 2 branches missed.">          if (VERBOSE) {</span>
+<span class="nc" id="L766">            log.info(&quot;outputLayerWeights deriv(&quot; + i + &quot;,&quot; + j + &quot;) = &quot; + eU[i][j] + &quot; - &quot; + Uhat[i][j] + &quot; = &quot; + derivative[index - 1]);</span>
+          }
+        }
+      }
+    }
+
+<span class="nc bnc" id="L772" title="All 2 branches missed.">    if (index != x.length)</span>
+<span class="nc" id="L773">      throw new RuntimeException(&quot;after W derivative, index(&quot;+index+&quot;) != x.length(&quot;+x.length+&quot;)&quot;);</span>
+
+<span class="nc" id="L775">    int regSize = x.length;</span>
+<span class="nc bnc" id="L776" title="All 4 branches missed.">    if (flags.skipOutputRegularization || flags.softmaxOutputLayer) {</span>
+<span class="nc" id="L777">      regSize = beforeOutputWeights;</span>
+    }
+
+    // incorporate priors
+<span class="nc bnc" id="L781" title="All 2 branches missed.">    if (prior == QUADRATIC_PRIOR) {</span>
+<span class="nc" id="L782">      double sigmaSq = sigma * sigma;</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">      for (int i = 0; i &lt; regSize; i++) {</span>
+<span class="nc" id="L784">        double k = 1.0;</span>
+<span class="nc" id="L785">        double w = x[i];</span>
+<span class="nc" id="L786">        value += k * w * w / 2.0 / sigmaSq;</span>
+<span class="nc" id="L787">        derivative[i] += k * w / sigmaSq;</span>
+      }
+<span class="nc bnc" id="L789" title="All 2 branches missed.">    } else if (prior == HUBER_PRIOR) {</span>
+<span class="nc" id="L790">      double sigmaSq = sigma * sigma;</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">      for (int i = 0; i &lt; regSize; i++) {</span>
+<span class="nc" id="L792">        double w = x[i];</span>
+<span class="nc" id="L793">        double wabs = Math.abs(w);</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">        if (wabs &lt; epsilon) {</span>
+<span class="nc" id="L795">          value += w * w / 2.0 / epsilon / sigmaSq;</span>
+<span class="nc" id="L796">          derivative[i] += w / epsilon / sigmaSq;</span>
+        } else {
+<span class="nc" id="L798">          value += (wabs - epsilon / 2) / sigmaSq;</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">          derivative[i] += ((w &lt; 0.0) ? -1.0 : 1.0) / sigmaSq;</span>
+        }
+      }
+<span class="nc bnc" id="L802" title="All 2 branches missed.">    } else if (prior == QUARTIC_PRIOR) {</span>
+<span class="nc" id="L803">      double sigmaQu = sigma * sigma * sigma * sigma;</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">      for (int i = 0; i &lt; regSize; i++) {</span>
+<span class="nc" id="L805">        double k = 1.0;</span>
+<span class="nc" id="L806">        double w = x[i];</span>
+<span class="nc" id="L807">        value += k * w * w * w * w / 2.0 / sigmaQu;</span>
+<span class="nc" id="L808">        derivative[i] += k * w / sigmaQu;</span>
+      }
+    }
+<span class="nc" id="L811">  }</span>
+
+  public double[][] emptyFull2D() {
+<span class="nc" id="L814">    double[][] d = new double[map.length][];</span>
+    // int index = 0;
+<span class="nc bnc" id="L816" title="All 2 branches missed.">    for (int i = 0; i &lt; map.length; i++) {</span>
+<span class="nc" id="L817">      d[i] = new double[labelIndices.get(map[i]).size()];</span>
+      // cdm july 2005: below array initialization isn't necessary: JLS (3rd ed.) 4.12.5
+      // Arrays.fill(d[i], 0.0);
+      // index += labelIndices.get(map[i]).size();
+    }
+<span class="nc" id="L822">    return d;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

@@ -1,0 +1,2038 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SequencePattern.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ling.tokensregex</a> &gt; <span class="el_source">SequencePattern.java</span></div><h1>SequencePattern.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ling.tokensregex;
+
+import edu.stanford.nlp.util.*;
+
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.util.*;
+import java.util.function.Function;
+
+/**
+ * Generic Sequence Pattern for regular expressions.
+ *
+ * &lt;p&gt;
+ * Similar to Java's {@link java.util.regex.Pattern} except it is for sequences over arbitrary types T instead
+ *  of just characters.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt; A regular expression must first be compiled into
+ * an instance of this class.  The resulting pattern can then be used to create
+ * a {@link SequenceMatcher} object that can match arbitrary sequences of type T
+ * against the regular expression.  All of the state involved in performing a match
+ * resides in the matcher, so many matchers can share the same pattern.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * To support sequence matching on a new type T, the following is needed:
+ * &lt;ul&gt;
+ *   &lt;li&gt;Implement a {@link NodePattern for matching type T}&lt;/li&gt;
+ *   &lt;li&gt;Optionally define a language for node matches and implement {@link SequencePattern.Parser} to compile a
+ *       regular expression into a SequencePattern.
+ *   &lt;/li&gt;
+ *   &lt;li&gt;Optionally implement a {@link MultiPatternMatcher.NodePatternTrigger}
+ *        for optimizing matches across multiple patterns&lt;/li&gt;
+ *   &lt;li&gt;Optionally implement a {@link NodesMatchChecker} to support backreferences&lt;/li&gt;
+ * &lt;/ul&gt;
+ * See {@link TokenSequencePattern} for an example of how this class can be extended
+ * to support a specific type {@code T}.
+ * &lt;p&gt;
+ * To use
+ * &lt;pre&gt;&lt;code&gt;
+ *   SequencePattern p = SequencePattern.compile(&quot;....&quot;);
+ *   SequenceMatcher m = p.getMatcher(tokens);
+ *   while (m.find()) ....
+ * &lt;/code&gt;&lt;/pre&gt;
+ * &lt;/p&gt;
+ *
+ *
+ * &lt;p&gt;
+ * To support a new type {@code T}:
+ * &lt;ol&gt;
+ * &lt;li&gt; For a type {@code T} to be matchable, it has to have a corresponding &lt;code&gt;NodePattern&lt;T&gt;&lt;/code&gt; that indicates
+ *    whether a node is matched or not  (see &lt;code&gt;CoreMapNodePattern&lt;/code&gt; for example)&lt;/li&gt;
+ * &lt;li&gt; To compile a string into corresponding pattern, will need to create a parser
+ *    (see inner class &lt;code&gt;Parser&lt;/code&gt;, &lt;code&gt;TokenSequencePattern&lt;/code&gt; and &lt;code&gt;TokenSequenceParser.jj&lt;/code&gt;)&lt;/li&gt;
+ * &lt;/ol&gt;
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * SequencePattern supports the following standard regex features:
+ * &lt;ul&gt;
+ *  &lt;li&gt;Concatenation &lt;/li&gt;
+ *  &lt;li&gt;Or &lt;/li&gt;
+ *  &lt;li&gt;Groups  (capturing  / noncapturing )  &lt;/li&gt;
+ *  &lt;li&gt;Quantifiers (greedy / nongreedy) &lt;/li&gt;
+ * &lt;/ul&gt;
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * SequencePattern also supports the following less standard features:
+ * &lt;ol&gt;
+ * &lt;li&gt; Environment (see {@link Env}) with respect to which the patterns are compiled&lt;/li&gt;
+ * &lt;li&gt; Binding of variables
+ * &lt;br&gt;Use {@link Env} to bind variables for use when compiling patterns
+ * &lt;br&gt;Can also bind names to groups (see {@link SequenceMatchResult} for accessor methods to retrieve matched groups)
+ * &lt;/li&gt;
+ * &lt;li&gt; Backreference matches - need to specify how back references are to be matched using {@link NodesMatchChecker} &lt;/li&gt;
+ * &lt;li&gt; Multinode matches - for matching of multiple nodes using non-regex (at least not regex over nodes) patterns
+ *                        (need to have corresponding {@link MultiNodePattern},
+ *                         see {@link MultiCoreMapNodePattern} for example) &lt;/li&gt;
+ * &lt;li&gt; Conjunctions - conjunctions of sequence patterns (works for some cases)&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * &lt;/p&gt;
+ * &lt;p&gt;Note that this and the inherited classes do not implement any custom equals and hashCode functions.
+ * &lt;/p&gt;
+ *
+ * @author Angel Chang
+ * @see SequenceMatcher
+ */
+public class SequencePattern&lt;T&gt; implements Serializable {
+  // TODO:
+  //  1. Validate backref capture groupid
+  //  2. Actions
+  //  3. Inconsistent templating with T
+  //  4. Update TokensSequenceParser to handle backref of other attributes (\9{attr1,attr2,...})
+  //  5. Improve nested capture groups (in matchresult) for other node types such as conjunctions/disjunctions
+  private String patternStr;
+  private PatternExpr patternExpr;
+  private SequenceMatchAction&lt;T&gt; action;
+
+  State root;
+<span class="fc" id="L104">  int totalGroups = 0;</span>
+
+  // binding of group number to variable name
+  VarGroupBindings varGroupBindings;
+
+  // Priority associated with the pattern (higher priority patterns should take precedence over lower priority ones)
+<span class="fc" id="L110">  double priority = 0.0;</span>
+  // Weight associated with the pattern
+<span class="fc" id="L112">  double weight = 0.0;</span>
+
+  protected SequencePattern(SequencePattern.PatternExpr nodeSequencePattern) {
+<span class="nc" id="L115">    this(null, nodeSequencePattern);</span>
+<span class="nc" id="L116">  }</span>
+
+  protected SequencePattern(String patternStr, SequencePattern.PatternExpr nodeSequencePattern) {
+<span class="fc" id="L119">    this(patternStr, nodeSequencePattern, null);</span>
+<span class="fc" id="L120">  }</span>
+
+  protected SequencePattern(String patternStr, SequencePattern.PatternExpr nodeSequencePattern,
+<span class="fc" id="L123">                            SequenceMatchAction&lt;T&gt; action) {</span>
+<span class="fc" id="L124">    this.patternStr = patternStr;</span>
+<span class="fc" id="L125">    this.patternExpr = nodeSequencePattern;</span>
+<span class="fc" id="L126">    this.action = action;</span>
+
+<span class="fc" id="L128">    nodeSequencePattern = new GroupPatternExpr(nodeSequencePattern, true);</span>
+<span class="fc" id="L129">    nodeSequencePattern = nodeSequencePattern.optimize();</span>
+<span class="fc" id="L130">    this.totalGroups = nodeSequencePattern.assignGroupIds(0);</span>
+<span class="fc" id="L131">    Frag f = nodeSequencePattern.build();</span>
+<span class="fc" id="L132">    f.connect(MATCH_STATE);</span>
+<span class="fc" id="L133">    this.root = f.start;</span>
+<span class="fc" id="L134">    varGroupBindings = new VarGroupBindings(totalGroups+1);</span>
+<span class="fc" id="L135">    nodeSequencePattern.updateBindings(varGroupBindings);</span>
+<span class="fc" id="L136">  }</span>
+
+  @Override
+  public String toString() {
+<span class="nc" id="L140">    return this.pattern();</span>
+  }
+
+  public &lt;T2&gt; SequencePattern&lt;T2&gt; transform(NodePatternTransformer&lt;T,T2&gt; transformer) {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">    if (action != null) {</span>
+<span class="nc" id="L145">      throw new UnsupportedOperationException(&quot;transform on actions not yet implemented&quot;);</span>
+    }
+<span class="nc" id="L147">    SequencePattern.PatternExpr transformedPattern = this.patternExpr.transform(transformer);</span>
+    // TODO: Make string unique by indicating this pattern was transformed
+<span class="nc" id="L149">    return new SequencePattern&lt;&gt;(this.patternStr, transformedPattern, null);</span>
+  }
+
+  public String pattern() {
+<span class="nc" id="L153">    return patternStr;</span>
+  }
+
+  protected PatternExpr getPatternExpr() {
+<span class="nc" id="L157">    return patternExpr;</span>
+  }
+
+  public double getPriority() {
+<span class="nc" id="L161">    return priority;</span>
+  }
+
+  public void setPriority(double priority) {
+<span class="nc" id="L165">    this.priority = priority;</span>
+<span class="nc" id="L166">  }</span>
+
+  public double getWeight() {
+<span class="nc" id="L169">    return weight;</span>
+  }
+
+  public void setWeight(double weight) {
+<span class="nc" id="L173">    this.weight = weight;</span>
+<span class="nc" id="L174">  }</span>
+
+  public SequenceMatchAction&lt;T&gt; getAction() {
+<span class="nc" id="L177">    return action;</span>
+  }
+
+  public void setAction(SequenceMatchAction&lt;T&gt; action) {
+<span class="nc" id="L181">    this.action = action;</span>
+<span class="nc" id="L182">  }</span>
+
+  public int getTotalGroups() {
+<span class="nc" id="L185">    return totalGroups;</span>
+  }
+
+  // Compiles string (regex) to NFA for doing pattern simulation
+  public static &lt;T&gt; SequencePattern&lt;T&gt; compile(Env env, String string)
+  {
+    try {
+<span class="nc" id="L192">      Pair&lt;PatternExpr, SequenceMatchAction&lt;T&gt;&gt; p = env.parser.parseSequenceWithAction(env, string);</span>
+<span class="nc" id="L193">      return new SequencePattern&lt;&gt;(string, p.first(), p.second());</span>
+<span class="nc" id="L194">    } catch (Exception ex) {</span>
+<span class="nc" id="L195">      throw new RuntimeException(&quot;Error compiling &quot; + string + &quot; using environment &quot; + env);</span>
+    }
+    //throw new UnsupportedOperationException(&quot;Compile from string not implemented&quot;);
+  }
+
+  protected static &lt;T&gt; SequencePattern&lt;T&gt; compile(SequencePattern.PatternExpr nodeSequencePattern)
+  {
+<span class="nc" id="L202">    return new SequencePattern&lt;&gt;(nodeSequencePattern);</span>
+  }
+
+  public SequenceMatcher&lt;T&gt; getMatcher(List&lt;? extends T&gt; tokens) {
+<span class="nc" id="L206">    return new SequenceMatcher&lt;&gt;(this, tokens);</span>
+  }
+
+  public &lt;OUT&gt; OUT findNodePattern(Function&lt;NodePattern&lt;T&gt;, OUT&gt; filter) {
+<span class="nc" id="L210">    Queue&lt;State&gt; todo = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L211">    Set&lt;State&gt; seen = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L212">    todo.add(root);</span>
+<span class="nc" id="L213">    seen.add(root);</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    while (!todo.isEmpty()) {</span>
+<span class="nc" id="L215">      State state = todo.poll();</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">      if (state instanceof NodePatternState) {</span>
+<span class="nc" id="L217">        NodePattern&lt;T&gt; pattern = ((NodePatternState) state).pattern;</span>
+<span class="nc" id="L218">        OUT res = filter.apply(pattern);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (res != null) return res;</span>
+      }
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      if (state.next != null) {</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        for (State s: state.next) {</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">          if (!seen.contains(s)) { seen.add(s); todo.add(s); }</span>
+<span class="nc" id="L224">        }</span>
+      }
+<span class="nc" id="L226">    }</span>
+<span class="nc" id="L227">    return null;</span>
+  }
+
+  public &lt;OUT&gt; Collection&lt;OUT&gt; findNodePatterns(Function&lt;NodePattern&lt;T&gt;, OUT&gt; filter, boolean allowOptional, boolean allowBranching) {
+<span class="fc" id="L231">    List&lt;OUT&gt; outList = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L232">    Queue&lt;State&gt; todo = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L233">    Set&lt;State&gt; seen = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L234">    todo.add(root);</span>
+<span class="fc" id="L235">    seen.add(root);</span>
+<span class="fc bfc" id="L236" title="All 2 branches covered.">    while (!todo.isEmpty()) {</span>
+<span class="fc" id="L237">      State state = todo.poll();</span>
+<span class="pc bpc" id="L238" title="1 of 6 branches missed.">      if ((allowOptional || !state.isOptional) &amp;&amp; (state instanceof NodePatternState)) {</span>
+<span class="fc" id="L239">        NodePattern&lt;T&gt; pattern = ((NodePatternState) state).pattern;</span>
+<span class="fc" id="L240">        OUT res = filter.apply(pattern);</span>
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">        if (res != null) {</span>
+<span class="fc" id="L242">          outList.add(res);</span>
+        }
+      }
+<span class="fc bfc" id="L245" title="All 2 branches covered.">      if (state.next != null) {</span>
+<span class="pc bpc" id="L246" title="3 of 4 branches missed.">        boolean addNext = allowBranching || state.next.size() == 1;</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">        if (addNext) {</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">          for (State s : state.next) {</span>
+<span class="fc bfc" id="L249" title="All 2 branches covered.">            if (!seen.contains(s)) {</span>
+<span class="fc" id="L250">              seen.add(s);</span>
+<span class="fc" id="L251">              todo.add(s);</span>
+            }
+<span class="fc" id="L253">          }</span>
+        }
+      }
+<span class="fc" id="L256">    }</span>
+<span class="fc" id="L257">    return outList;</span>
+  }
+  // Parses string to PatternExpr
+  public interface Parser&lt;T&gt; {
+    SequencePattern.PatternExpr parseSequence(Env env, String s) throws Exception;
+    Pair&lt;SequencePattern.PatternExpr, SequenceMatchAction&lt;T&gt;&gt; parseSequenceWithAction(Env env, String s) throws Exception;
+    SequencePattern.PatternExpr parseNode(Env env, String s) throws Exception;
+  }
+
+  // Binding of variable names to groups
+  // matches the group indices
+  static class VarGroupBindings {
+
+    final String[] varnames;  // Assumes number of groups low
+
+<span class="fc" id="L272">    protected VarGroupBindings(int size) {</span>
+<span class="fc" id="L273">      varnames = new String[size];</span>
+<span class="fc" id="L274">    }</span>
+
+    protected void set(int index, String name) {
+<span class="fc" id="L277">      varnames[index] = name;</span>
+<span class="fc" id="L278">    }</span>
+  }
+
+  // Interface indicating when two nodes match
+  protected static interface NodesMatchChecker&lt;T&gt; {
+    public boolean matches(T o1, T o2);
+  }
+
+<span class="fc" id="L286">  public static final NodesMatchChecker&lt;Object&gt; NODES_EQUAL_CHECKER = new NodesMatchChecker&lt;Object&gt;() {</span>
+    @Override
+    public boolean matches(Object o1, Object o2) {
+<span class="nc" id="L289">      return o1.equals(o2);</span>
+    }
+  };
+
+<span class="fc" id="L293">  public static final PatternExpr ANY_NODE_PATTERN_EXPR = new NodePatternExpr(NodePattern.ANY_NODE);</span>
+<span class="fc" id="L294">  public static final PatternExpr SEQ_BEGIN_PATTERN_EXPR = new SequenceStartPatternExpr();</span>
+<span class="fc" id="L295">  public static final PatternExpr SEQ_END_PATTERN_EXPR = new SequenceEndPatternExpr();</span>
+
+  /**
+   * Represents a sequence pattern expressions (before translating into NFA).
+   */
+<span class="fc" id="L300">  public abstract static class PatternExpr implements Serializable {</span>
+
+    protected abstract Frag build();
+
+    /**
+     * Assigns group ids to groups embedded in this patterns starting with at the specified number,
+     * returns the next available group id.
+     *
+     * @param start Group id to start with
+     * @return The next available group id
+     */
+    protected abstract int assignGroupIds(int start);
+
+    /**
+     * Make a deep copy of the sequence pattern expressions
+     */
+    protected abstract PatternExpr copy();
+
+    /**
+     * Updates the binding of group to variable name
+     * @param bindings
+     */
+    protected abstract void updateBindings(VarGroupBindings bindings);
+
+<span class="fc" id="L324">    protected Object value() { return null; }</span>
+
+    /** Returns an optimized version of this pattern - default is a noop */
+<span class="fc" id="L327">    protected PatternExpr optimize() { return this; }</span>
+
+    protected abstract PatternExpr transform(NodePatternTransformer transformer);
+  }
+
+  /** Represents one element to be matched. */
+  public static class NodePatternExpr extends PatternExpr {
+
+    final NodePattern nodePattern;
+
+<span class="fc" id="L337">    public NodePatternExpr(NodePattern nodePattern) {</span>
+<span class="fc" id="L338">      this.nodePattern = nodePattern;</span>
+<span class="fc" id="L339">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="fc" id="L344">      State s = new NodePatternState(nodePattern);</span>
+<span class="fc" id="L345">      return new Frag(s);</span>
+    }
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L351">      return new NodePatternExpr(nodePattern);</span>
+    }
+
+    @Override
+<span class="fc" id="L355">    protected int assignGroupIds(int start) { return start; }</span>
+    @Override
+<span class="fc" id="L357">    protected void updateBindings(VarGroupBindings bindings) {}</span>
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer) {
+<span class="nc" id="L361">      return new NodePatternExpr(transformer.transform(nodePattern));</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L365">      return nodePattern.toString();</span>
+    }
+  }
+
+  /** Represents a pattern that can match multiple nodes. */
+  public static class MultiNodePatternExpr extends PatternExpr {
+
+    private final MultiNodePattern multiNodePattern;
+
+<span class="nc" id="L374">    public MultiNodePatternExpr(MultiNodePattern nodePattern) {</span>
+<span class="nc" id="L375">      this.multiNodePattern = nodePattern;</span>
+<span class="nc" id="L376">    }</span>
+
+    @Override
+    protected Frag build() {
+<span class="nc" id="L380">      State s = new MultiNodePatternState(multiNodePattern);</span>
+<span class="nc" id="L381">      return new Frag(s);</span>
+    }
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L387">      return new MultiNodePatternExpr(multiNodePattern);</span>
+    }
+
+    @Override
+<span class="nc" id="L391">    protected int assignGroupIds(int start) { return start; }</span>
+    @Override
+<span class="nc" id="L393">    protected void updateBindings(VarGroupBindings bindings) {}</span>
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer) {
+<span class="nc" id="L396">      return new MultiNodePatternExpr(transformer.transform(multiNodePattern));</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L400">      return multiNodePattern.toString();</span>
+    }
+  }
+
+  /** Represents one element to be matched. */
+  public static class SpecialNodePatternExpr extends PatternExpr {
+
+    private final String name;
+    Factory&lt;State&gt; stateFactory;
+
+<span class="fc" id="L410">    public SpecialNodePatternExpr(String name) {</span>
+<span class="fc" id="L411">      this.name = name;</span>
+<span class="fc" id="L412">    }</span>
+
+<span class="nc" id="L414">    public SpecialNodePatternExpr(String name, Factory&lt;State&gt; stateFactory) {</span>
+<span class="nc" id="L415">      this.name = name;</span>
+<span class="nc" id="L416">      this.stateFactory = stateFactory;</span>
+<span class="nc" id="L417">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="nc" id="L422">      State s = stateFactory.create();</span>
+<span class="nc" id="L423">      return new Frag(s);</span>
+    }
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L429">      return new SpecialNodePatternExpr(name, stateFactory);</span>
+    }
+
+    @Override
+<span class="nc" id="L433">    protected int assignGroupIds(int start) { return start; }</span>
+    @Override
+<span class="nc" id="L435">    protected void updateBindings(VarGroupBindings bindings) {}</span>
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer) {
+<span class="nc" id="L438">      return new SpecialNodePatternExpr(name, stateFactory);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L442">      return name;</span>
+    }
+  }
+
+  public static class SequenceStartPatternExpr extends SpecialNodePatternExpr implements Factory&lt;State&gt; {
+    public SequenceStartPatternExpr() {
+<span class="fc" id="L448">      super(&quot;SEQ_START&quot;);</span>
+<span class="fc" id="L449">      this.stateFactory = this;</span>
+<span class="fc" id="L450">    }</span>
+
+    @Override
+    public State create() {
+<span class="nc" id="L454">      return new SeqStartState();</span>
+    }
+  }
+
+  public static class SequenceEndPatternExpr extends SpecialNodePatternExpr implements Factory&lt;State&gt; {
+    public SequenceEndPatternExpr() {
+<span class="fc" id="L460">      super(&quot;SEQ_END&quot;);</span>
+<span class="fc" id="L461">      this.stateFactory = this;</span>
+<span class="fc" id="L462">    }</span>
+
+    @Override
+    public State create() {
+<span class="nc" id="L466">      return new SeqEndState();</span>
+    }
+  }
+
+  // Represents a sequence of patterns to be matched
+  public static class SequencePatternExpr extends PatternExpr {
+
+    final List&lt;PatternExpr&gt; patterns;
+
+<span class="fc" id="L475">    public SequencePatternExpr(List&lt;PatternExpr&gt; patterns) {</span>
+<span class="fc" id="L476">      this.patterns = patterns;</span>
+<span class="fc" id="L477">    }</span>
+
+<span class="nc" id="L479">    public SequencePatternExpr(PatternExpr... patterns) {</span>
+<span class="nc" id="L480">      this.patterns = Arrays.asList(patterns);</span>
+<span class="nc" id="L481">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="fc" id="L486">      Frag frag = null;</span>
+<span class="pc bpc" id="L487" title="1 of 2 branches missed.">      if (patterns.size() &gt; 0) {</span>
+<span class="fc" id="L488">        PatternExpr first = patterns.get(0);</span>
+<span class="fc" id="L489">        frag = first.build();</span>
+<span class="fc bfc" id="L490" title="All 2 branches covered.">        for (int i = 1; i &lt; patterns.size(); i++) {</span>
+<span class="fc" id="L491">          PatternExpr pattern = patterns.get(i);</span>
+<span class="fc" id="L492">          Frag f = pattern.build();</span>
+<span class="fc" id="L493">          frag.connect(f);</span>
+        }
+      }
+<span class="fc" id="L496">      return frag;</span>
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="fc" id="L501">      int nextId = start;</span>
+<span class="fc bfc" id="L502" title="All 2 branches covered.">      for (PatternExpr pattern : patterns) {</span>
+<span class="fc" id="L503">        nextId = pattern.assignGroupIds(nextId);</span>
+<span class="fc" id="L504">      }</span>
+<span class="fc" id="L505">      return nextId;</span>
+    }
+
+    @Override
+    protected void updateBindings(VarGroupBindings bindings) {
+<span class="fc bfc" id="L510" title="All 2 branches covered.">      for (PatternExpr pattern : patterns) {</span>
+<span class="fc" id="L511">        pattern.updateBindings(bindings);</span>
+<span class="fc" id="L512">      }</span>
+<span class="fc" id="L513">    }</span>
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L518">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L520">        newPatterns.add(p.copy());</span>
+<span class="nc" id="L521">      }</span>
+<span class="nc" id="L522">      return new SequencePatternExpr(newPatterns);</span>
+    }
+
+    @Override
+    public PatternExpr optimize() {
+<span class="fc" id="L527">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="fc bfc" id="L528" title="All 2 branches covered.">      for (PatternExpr p:patterns) {</span>
+<span class="fc" id="L529">        newPatterns.add(p.optimize());</span>
+<span class="fc" id="L530">      }</span>
+<span class="fc" id="L531">      return new SequencePatternExpr(newPatterns);</span>
+    }
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer) {
+<span class="nc" id="L536">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L538">        newPatterns.add(p.transform(transformer));</span>
+<span class="nc" id="L539">      }</span>
+<span class="nc" id="L540">      return new SequencePatternExpr(newPatterns);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L544">      return StringUtils.join(patterns, &quot; &quot;);</span>
+    }
+  }
+
+  // Expression that indicates a back reference
+  // Need to match a previously matched group somehow
+  public static class BackRefPatternExpr extends PatternExpr {
+
+    private NodesMatchChecker matcher; // How a match is determined
+<span class="nc" id="L553">    private int captureGroupId = -1;  // Indicates the previously matched group this need to match</span>
+
+<span class="nc" id="L555">    public BackRefPatternExpr(NodesMatchChecker matcher, int captureGroupId) {</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">      if (captureGroupId &lt;= 0) { throw new IllegalArgumentException(&quot;Invalid captureGroupId=&quot; + captureGroupId); }</span>
+<span class="nc" id="L557">      this.captureGroupId = captureGroupId;</span>
+<span class="nc" id="L558">      this.matcher = matcher;</span>
+<span class="nc" id="L559">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="nc" id="L564">      State s = new BackRefState(matcher, captureGroupId);</span>
+<span class="nc" id="L565">      return new Frag(s);</span>
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="nc" id="L570">      return start;</span>
+    }
+    @Override
+<span class="nc" id="L573">    protected void updateBindings(VarGroupBindings bindings) {}</span>
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L578">      return new BackRefPatternExpr(matcher, captureGroupId);</span>
+    }
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer) {
+      // TODO: Implement me!!!
+<span class="nc" id="L584">      throw new UnsupportedOperationException(&quot;BackRefPatternExpr.transform not implemented yet!!! Please implement me!!!&quot;);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L588">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">      if (captureGroupId &gt;= 0) {</span>
+<span class="nc" id="L590">        sb.append('\\').append(captureGroupId);</span>
+      } else {
+<span class="nc" id="L592">        sb.append('\\');</span>
+      }
+<span class="nc" id="L594">      sb.append('{').append(matcher).append('}');</span>
+<span class="nc" id="L595">      return sb.toString();</span>
+    }
+  }
+
+  public static class ValuePatternExpr extends PatternExpr {
+
+    private final PatternExpr expr;
+    private final Object value;
+
+<span class="nc" id="L604">    public ValuePatternExpr(PatternExpr expr, Object value) {</span>
+<span class="nc" id="L605">      this.expr = expr;</span>
+<span class="nc" id="L606">      this.value = value;</span>
+<span class="nc" id="L607">    }</span>
+
+    @Override
+    protected Frag build() {
+<span class="nc" id="L611">      Frag frag = expr.build();</span>
+<span class="nc" id="L612">      frag.connect(new ValueState(value));</span>
+<span class="nc" id="L613">      return frag;</span>
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="nc" id="L618">      return expr.assignGroupIds(start);</span>
+    }
+
+    @Override
+    protected PatternExpr copy() {
+<span class="nc" id="L623">      return new ValuePatternExpr(expr.copy(), value);</span>
+    }
+
+    @Override
+    protected PatternExpr optimize() {
+<span class="nc" id="L628">      return new ValuePatternExpr(expr.optimize(), value);</span>
+    }
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer) {
+<span class="nc" id="L633">      return new ValuePatternExpr(expr.transform(transformer), value);</span>
+    }
+
+    @Override
+    protected void updateBindings(VarGroupBindings bindings) {
+<span class="nc" id="L638">      expr.updateBindings(bindings);</span>
+<span class="nc" id="L639">    }</span>
+  }
+
+  /** Expression that represents a group. */
+  public static class GroupPatternExpr extends PatternExpr {
+
+    private final PatternExpr pattern;
+    private final boolean capture; // Do capture or not?  If do capture, an capture group id will be assigned
+    private int captureGroupId; // -1 if this pattern is not part of a capture group or capture group not yet assigned,
+                             // otherwise, capture group number
+    private final String varname;  // Alternate variable with which to refer to this group
+
+    public GroupPatternExpr(PatternExpr pattern) {
+<span class="nc" id="L652">      this(pattern, true);</span>
+<span class="nc" id="L653">    }</span>
+
+    public GroupPatternExpr(PatternExpr pattern, boolean capture) {
+<span class="fc" id="L656">      this(pattern, capture, -1, null);</span>
+<span class="fc" id="L657">    }</span>
+
+    public GroupPatternExpr(PatternExpr pattern, String varname) {
+<span class="fc" id="L660">      this(pattern, true, -1, varname);</span>
+<span class="fc" id="L661">    }</span>
+
+<span class="fc" id="L663">    private GroupPatternExpr(PatternExpr pattern, boolean capture, int captureGroupId, String varname) {</span>
+<span class="fc" id="L664">      this.pattern = pattern;</span>
+<span class="fc" id="L665">      this.capture = capture;</span>
+<span class="fc" id="L666">      this.captureGroupId = captureGroupId;</span>
+<span class="fc" id="L667">      this.varname = varname;</span>
+<span class="fc" id="L668">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="fc" id="L673">      Frag f = pattern.build();</span>
+<span class="fc" id="L674">      Frag frag = new Frag(new GroupStartState(captureGroupId, f.start), f.out);</span>
+<span class="fc" id="L675">      frag.connect(new GroupEndState(captureGroupId));</span>
+<span class="fc" id="L676">      return frag;</span>
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="fc" id="L681">      int nextId = start;</span>
+<span class="fc bfc" id="L682" title="All 2 branches covered.">      if (capture) {</span>
+<span class="fc" id="L683">        captureGroupId = nextId;</span>
+<span class="fc" id="L684">        nextId++;</span>
+      }
+<span class="fc" id="L686">      return pattern.assignGroupIds(nextId);</span>
+    }
+    @Override
+    protected void updateBindings(VarGroupBindings bindings) {
+<span class="fc bfc" id="L690" title="All 2 branches covered.">      if (varname != null) {</span>
+<span class="fc" id="L691">        bindings.set(captureGroupId, varname);</span>
+      }
+<span class="fc" id="L693">      pattern.updateBindings(bindings);</span>
+<span class="fc" id="L694">    }</span>
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L699">      return new GroupPatternExpr(pattern.copy(), capture, captureGroupId, varname);</span>
+    }
+
+    @Override
+    protected PatternExpr optimize()
+    {
+<span class="fc" id="L705">      return new GroupPatternExpr(pattern.optimize(), capture, captureGroupId, varname);</span>
+    }
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer)
+    {
+<span class="nc" id="L711">      return new GroupPatternExpr(pattern.transform(transformer), capture, captureGroupId, varname);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L715">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L716">      sb.append('(');</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">      if (!capture) {</span>
+<span class="nc" id="L718">        sb.append(&quot;?: &quot;);</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">      } else if (varname != null) {</span>
+<span class="nc" id="L720">        sb.append('?').append(varname).append(' ');</span>
+      }
+<span class="nc" id="L722">      sb.append(pattern);</span>
+<span class="nc" id="L723">      sb.append(')');</span>
+<span class="nc" id="L724">      return sb.toString();</span>
+    }
+  }
+
+  /**  Expression that represents a pattern that repeats for a number of times. */
+  public static class RepeatPatternExpr extends PatternExpr {
+
+    private final PatternExpr pattern;
+    private final int minMatch;
+    private final int maxMatch;
+    private final boolean greedyMatch;
+
+    public RepeatPatternExpr(PatternExpr pattern, int minMatch, int maxMatch) {
+<span class="nc" id="L737">      this(pattern, minMatch, maxMatch, true);</span>
+<span class="nc" id="L738">    }</span>
+
+<span class="fc" id="L740">    public RepeatPatternExpr(PatternExpr pattern, int minMatch, int maxMatch, boolean greedy) {</span>
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">      if (minMatch &lt; 0) {</span>
+<span class="nc" id="L742">        throw new IllegalArgumentException(&quot;Invalid minMatch=&quot; + minMatch);</span>
+      }
+<span class="pc bpc" id="L744" title="1 of 4 branches missed.">      if (maxMatch &gt;= 0 &amp;&amp; minMatch &gt; maxMatch) {</span>
+<span class="nc" id="L745">        throw new IllegalArgumentException(&quot;Invalid minMatch=&quot; + minMatch + &quot;, maxMatch=&quot; + maxMatch);</span>
+      }
+<span class="fc" id="L747">      this.pattern = pattern;</span>
+<span class="fc" id="L748">      this.minMatch = minMatch;</span>
+<span class="fc" id="L749">      this.maxMatch = maxMatch;</span>
+<span class="fc" id="L750">      this.greedyMatch = greedy;</span>
+<span class="fc" id="L751">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="fc" id="L756">      Frag f = pattern.build();</span>
+<span class="pc bpc" id="L757" title="1 of 4 branches missed.">      if (minMatch == 1 &amp;&amp; maxMatch == 1) {</span>
+<span class="nc" id="L758">        return f;</span>
+<span class="pc bpc" id="L759" title="1 of 6 branches missed.">      } else if (minMatch &lt;= 5 &amp;&amp; maxMatch &lt;= 5 &amp;&amp; greedyMatch) {</span>
+        // Make copies if number of matches is low
+        // Doesn't handle nongreedy matches yet
+        // For non greedy match need to move curOut before the recursive connect
+
+        // Create NFA fragment that
+        // have child pattern repeating for minMatch times
+<span class="fc bfc" id="L766" title="All 2 branches covered.">        if (minMatch &gt; 0) {</span>
+          //  frag.start -&gt; pattern NFA -&gt; pattern NFA -&gt;
+<span class="pc bpc" id="L768" title="1 of 2 branches missed.">          for (int i = 0; i &lt; minMatch-1; i++) {</span>
+<span class="nc" id="L769">            Frag f2 = pattern.build();</span>
+<span class="nc" id="L770">            f.connect(f2);</span>
+          }
+        } else {
+          // minMatch is 0
+          // frag.start -&gt;
+<span class="fc" id="L775">          f = new Frag(new State());</span>
+        }
+<span class="fc bfc" id="L777" title="All 2 branches covered.">        if (maxMatch &lt; 0) {</span>
+          // Unlimited (loop back to self)
+          //        --------
+          //       \|/     |
+          // ---&gt; pattern NFA ---&gt;
+<span class="fc" id="L782">          Set&lt;State&gt; curOut = f.out;</span>
+<span class="fc" id="L783">          Frag f2 = pattern.build();</span>
+<span class="fc" id="L784">          f2.connect(f2);</span>
+<span class="fc" id="L785">          f.connect(f2);</span>
+<span class="fc" id="L786">          f.add(curOut);</span>
+<span class="fc" id="L787">        } else {</span>
+          // Limited number of times this pattern repeat,
+          // just keep add pattern (with option of being done) until maxMatch reached
+          // ----&gt; pattern NFA ----&gt; pattern NFA ---&gt;
+          //   |                |
+          //   --&gt;              ---&gt;
+<span class="fc bfc" id="L793" title="All 2 branches covered.">          for (int i = minMatch; i &lt; maxMatch; i++) {</span>
+<span class="fc" id="L794">            Set&lt;State&gt; curOut = f.out;</span>
+<span class="fc" id="L795">            Frag f2 = pattern.build();</span>
+<span class="fc" id="L796">            f.connect(f2);</span>
+<span class="fc" id="L797">            f.add(curOut);</span>
+          }
+        }
+<span class="fc bfc" id="L800" title="All 2 branches covered.">        if (minMatch == 0) {</span>
+<span class="fc" id="L801">          f.start.markOptional(true);</span>
+        }
+<span class="fc" id="L803">        return f;</span>
+      }  else {
+        // More general but more expensive matching (when branching, need to keep state explicitly)
+<span class="fc" id="L806">        State s = new RepeatState(f.start, minMatch, maxMatch, greedyMatch);</span>
+<span class="fc" id="L807">        f.connect(s);</span>
+<span class="fc" id="L808">        return new Frag(s);</span>
+      }
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="fc" id="L814">      return pattern.assignGroupIds(start);</span>
+    }
+    @Override
+    protected void updateBindings(VarGroupBindings bindings) {
+<span class="fc" id="L818">      pattern.updateBindings(bindings);</span>
+<span class="fc" id="L819">    }</span>
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L824">      return new RepeatPatternExpr(pattern.copy(), minMatch, maxMatch, greedyMatch);</span>
+    }
+    @Override
+    protected PatternExpr optimize()
+    {
+<span class="fc" id="L829">      return new RepeatPatternExpr(pattern.optimize(), minMatch, maxMatch, greedyMatch);</span>
+    }
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer)
+    {
+<span class="nc" id="L834">      return new RepeatPatternExpr(pattern.transform(transformer), minMatch, maxMatch, greedyMatch);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L838">      StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L839">      sb.append(pattern);</span>
+<span class="nc" id="L840">      sb.append('{').append(minMatch).append(',').append(maxMatch).append('}');</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">      if (!greedyMatch) {</span>
+<span class="nc" id="L842">        sb.append('?');</span>
+      }
+<span class="nc" id="L844">      return sb.toString();</span>
+    }
+  }
+
+  /**  Expression that represents a disjunction. */
+  public static class OrPatternExpr extends PatternExpr {
+
+    private final List&lt;PatternExpr&gt; patterns;
+
+<span class="fc" id="L853">    public OrPatternExpr(List&lt;PatternExpr&gt; patterns) {</span>
+<span class="fc" id="L854">      this.patterns = patterns;</span>
+<span class="fc" id="L855">    }</span>
+
+<span class="nc" id="L857">    public OrPatternExpr(PatternExpr... patterns) {</span>
+<span class="nc" id="L858">      this.patterns = Arrays.asList(patterns);</span>
+<span class="nc" id="L859">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="fc" id="L864">      Frag frag = new Frag();</span>
+<span class="fc" id="L865">      frag.start = new State();</span>
+      // Create NFA fragment that
+      // have one starting state that branches out to NFAs created by the children expressions
+      //  ---&gt; pattern 1 ---&gt;
+      //   |
+      //   ---&gt; pattern 2 ---&gt;
+      //   ...
+<span class="fc bfc" id="L872" title="All 2 branches covered.">      for (PatternExpr pattern : patterns) {</span>
+        // Build child NFA
+<span class="fc" id="L874">        Frag f = pattern.build();</span>
+<span class="pc bpc" id="L875" title="1 of 2 branches missed.">        if (pattern.value() != null) {</span>
+          // Add value state to child NFA
+<span class="nc" id="L877">          f.connect(new ValueState(pattern.value()));</span>
+        }
+        // Add child NFA to next states of fragment start
+<span class="fc" id="L880">        frag.start.add(f.start);</span>
+        // Add child NFA out (unlinked) states to out (unlinked) states of this fragment
+<span class="fc" id="L882">        frag.add(f.out);</span>
+<span class="fc" id="L883">      }</span>
+<span class="fc" id="L884">      frag.start.markOptional(true);</span>
+<span class="fc" id="L885">      return frag;</span>
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="fc" id="L890">      int nextId = start;</span>
+      // assign group ids of child expressions
+<span class="fc bfc" id="L892" title="All 2 branches covered.">      for (PatternExpr pattern : patterns) {</span>
+<span class="fc" id="L893">        nextId = pattern.assignGroupIds(nextId);</span>
+<span class="fc" id="L894">      }</span>
+<span class="fc" id="L895">      return nextId;</span>
+    }
+    @Override
+    protected void updateBindings(VarGroupBindings bindings) {
+      // update bindings of child expressions
+<span class="fc bfc" id="L900" title="All 2 branches covered.">      for (PatternExpr pattern : patterns) {</span>
+<span class="fc" id="L901">        pattern.updateBindings(bindings);</span>
+<span class="fc" id="L902">      }</span>
+<span class="fc" id="L903">    }</span>
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L908">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L910">        newPatterns.add(p.copy());</span>
+<span class="nc" id="L911">      }</span>
+<span class="nc" id="L912">      return new OrPatternExpr(newPatterns);</span>
+    }
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer)
+    {
+<span class="nc" id="L918">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L920">        newPatterns.add(p.transform(transformer));</span>
+<span class="nc" id="L921">      }</span>
+<span class="nc" id="L922">      return new OrPatternExpr(newPatterns);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L926">      return StringUtils.join(patterns, &quot; | &quot;);</span>
+    }
+
+    // minimize size of or clauses to trigger optimization
+    private static final int OPTIMIZE_MIN_SIZE = 5;
+    @Override
+    protected PatternExpr optimize()
+    {
+<span class="pc bpc" id="L934" title="1 of 2 branches missed.">      if (patterns.size() &lt;= OPTIMIZE_MIN_SIZE) {</span>
+        // Not enough patterns for fancy optimization
+<span class="fc" id="L936">        List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="fc bfc" id="L937" title="All 2 branches covered.">        for (PatternExpr p:patterns) {</span>
+<span class="fc" id="L938">          newPatterns.add(p.optimize());</span>
+<span class="fc" id="L939">        }</span>
+<span class="fc" id="L940">        return new OrPatternExpr(newPatterns);</span>
+      } else {
+        // More fancy optimization
+<span class="nc" id="L943">        return optimizeOr();</span>
+      }
+    }
+
+    private PatternExpr optimizeOr() {
+<span class="nc" id="L948">      PatternExpr optimizedStringSeqs = optimizeOrStringSeqs();</span>
+      // Go through patterns and get candidate sequences with the same start...
+<span class="nc" id="L950">      return optimizedStringSeqs;</span>
+    }
+
+    private PatternExpr optimizeOrStringSeqs() {
+      // Try to collapse OR of NodePattern with just strings into a StringInSetAnnotationPattern
+<span class="nc" id="L955">      List&lt;PatternExpr&gt; opts = new ArrayList&lt;&gt;(patterns.size());</span>
+      // Map from annotation key (Class), ignoreCase (Boolean) to set of patterns/strings
+<span class="nc" id="L957">      Map&lt;Pair&lt;Class,Boolean&gt;, Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;String&gt;&gt;&gt; stringPatterns =</span>
+              new HashMap&lt;&gt;();
+<span class="nc" id="L959">      Map&lt;Pair&lt;Class,Boolean&gt;, Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;List&lt;String&gt;&gt;&gt;&gt; stringSeqPatterns =</span>
+              new HashMap&lt;&gt;();
+      // Go through patterns and get candidates for optimization
+<span class="nc bnc" id="L962" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L963">        PatternExpr opt = p.optimize();</span>
+<span class="nc" id="L964">        opts.add(opt);</span>
+
+        // Check for special patterns that we can optimize
+<span class="nc bnc" id="L967" title="All 2 branches missed.">        if (opt instanceof NodePatternExpr) {</span>
+<span class="nc" id="L968">          Pair&lt;Class, CoreMapNodePattern.StringAnnotationPattern&gt; pair = _getStringAnnotation_(opt);</span>
+<span class="nc bnc" id="L969" title="All 2 branches missed.">          if (pair != null) {</span>
+<span class="nc" id="L970">            Boolean ignoreCase = pair.second.ignoreCase();</span>
+<span class="nc" id="L971">            String target = pair.second.target;</span>
+<span class="nc" id="L972">            Pair&lt;Class,Boolean&gt; key = Pair.makePair(pair.first, ignoreCase);</span>
+<span class="nc" id="L973">            Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;String&gt;&gt; saved = stringPatterns.get(key);</span>
+<span class="nc bnc" id="L974" title="All 2 branches missed.">            if (saved == null) {</span>
+<span class="nc" id="L975">              saved = new Pair&lt;&gt;(new ArrayList&lt;&gt;(), new HashSet&lt;&gt;());</span>
+<span class="nc" id="L976">              stringPatterns.put(key, saved);</span>
+            }
+<span class="nc" id="L978">            saved.first.add(opt);</span>
+<span class="nc" id="L979">            saved.second.add(target);</span>
+          }
+<span class="nc bnc" id="L981" title="All 2 branches missed.">        } else if (opt instanceof SequencePatternExpr) {</span>
+<span class="nc" id="L982">          SequencePatternExpr seq = (SequencePatternExpr) opt;</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">          if (seq.patterns.size() &gt; 0) {</span>
+<span class="nc" id="L984">            boolean isStringSeq = true;</span>
+<span class="nc" id="L985">            Pair&lt;Class,Boolean&gt; key = null;</span>
+<span class="nc" id="L986">            List&lt;String&gt; strings = null;</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">            for (PatternExpr sp: seq.patterns) {</span>
+              // check if string match over same key
+<span class="nc" id="L989">              Pair&lt;Class, CoreMapNodePattern.StringAnnotationPattern&gt; pair = _getStringAnnotation_(sp);</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">              if (pair != null) {</span>
+<span class="nc bnc" id="L991" title="All 2 branches missed.">                if (key != null) {</span>
+                  // check key
+<span class="nc bnc" id="L993" title="All 4 branches missed.">                  if (key.first.equals(pair.first) &amp;&amp; key.second.equals(pair.second.ignoreCase())) {</span>
+                    // okay
+                  } else {
+<span class="nc" id="L996">                    isStringSeq = false;</span>
+<span class="nc" id="L997">                    break;</span>
+                  }
+                } else {
+<span class="nc" id="L1000">                  key = Pair.makePair(pair.first, pair.second.ignoreCase());</span>
+<span class="nc" id="L1001">                  strings = new ArrayList&lt;&gt;();</span>
+                }
+<span class="nc" id="L1003">                strings.add(pair.second.target);</span>
+              } else {
+<span class="nc" id="L1005">                isStringSeq = false;</span>
+<span class="nc" id="L1006">                break;</span>
+              }
+<span class="nc" id="L1008">            }</span>
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">            if (isStringSeq) {</span>
+<span class="nc" id="L1010">              Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;List&lt;String&gt;&gt;&gt; saved = stringSeqPatterns.get(key);</span>
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">              if (saved == null) {</span>
+<span class="nc" id="L1012">                saved = new Pair&lt;&gt;(new ArrayList&lt;&gt;(), new HashSet&lt;&gt;());</span>
+<span class="nc" id="L1013">                stringSeqPatterns.put(key, saved);</span>
+              }
+<span class="nc" id="L1015">              saved.first.add(opt);</span>
+<span class="nc" id="L1016">              saved.second.add(strings);</span>
+            }
+          }
+        }
+<span class="nc" id="L1020">      }</span>
+
+      // Go over our maps and see if any of these strings should be optimized away
+      // Keep track of things we have optimized away
+<span class="nc" id="L1024">      Map&lt;PatternExpr, Boolean&gt; alreadyOptimized = new IdentityHashMap&lt;&gt;();</span>
+<span class="nc" id="L1025">      List&lt;PatternExpr&gt; finalOptimizedPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+      // optimize strings
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">      for (Map.Entry&lt;Pair&lt;Class, Boolean&gt;, Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;String&gt;&gt;&gt; entry : stringPatterns.entrySet()) {</span>
+<span class="nc" id="L1028">        Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;String&gt;&gt; saved = entry.getValue();</span>
+<span class="nc" id="L1029">        Set&lt;String&gt; set = saved.second;</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">        int flags = (entry.getKey().second)? NodePattern.CASE_INSENSITIVE:0;</span>
+<span class="nc bnc" id="L1031" title="All 2 branches missed.">        if (set.size() &gt; OPTIMIZE_MIN_SIZE) {</span>
+<span class="nc" id="L1032">          PatternExpr optimized = new NodePatternExpr(</span>
+<span class="nc" id="L1033">                  new CoreMapNodePattern(entry.getKey().first, new CoreMapNodePattern.StringInSetAnnotationPattern(set, flags)));</span>
+<span class="nc" id="L1034">          finalOptimizedPatterns.add(optimized);</span>
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">          for (PatternExpr p:saved.first) {</span>
+<span class="nc" id="L1036">            alreadyOptimized.put(p, true);</span>
+<span class="nc" id="L1037">          }</span>
+        }
+<span class="nc" id="L1039">      }</span>
+      // optimize string sequences
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">      for (Map.Entry&lt;Pair&lt;Class, Boolean&gt;, Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;List&lt;String&gt;&gt;&gt;&gt; entry : stringSeqPatterns.entrySet()) {</span>
+<span class="nc" id="L1042">        Pair&lt;Collection&lt;PatternExpr&gt;, Set&lt;List&lt;String&gt;&gt;&gt; saved = entry.getValue();</span>
+<span class="nc" id="L1043">        Set&lt;List&lt;String&gt;&gt; set = saved.second;</span>
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">        if (set.size() &gt; OPTIMIZE_MIN_SIZE) {</span>
+<span class="nc" id="L1045">          Pair&lt;Class, Boolean&gt; key = entry.getKey();</span>
+<span class="nc" id="L1046">          PatternExpr optimized = new MultiNodePatternExpr(</span>
+<span class="nc" id="L1047">                  new MultiCoreMapNodePattern.StringSequenceAnnotationPattern(key.first(), set, key.second()));</span>
+<span class="nc" id="L1048">          finalOptimizedPatterns.add(optimized);</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">          for (PatternExpr p:saved.first) {</span>
+<span class="nc" id="L1050">            alreadyOptimized.put(p, true);</span>
+<span class="nc" id="L1051">          }</span>
+        }
+<span class="nc" id="L1053">      }</span>
+      // Add back original stuff that we didn't optimize
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">      for (PatternExpr p: opts) {</span>
+<span class="nc" id="L1056">        Boolean included = alreadyOptimized.get(p);</span>
+<span class="nc bnc" id="L1057" title="All 4 branches missed.">        if (included == null || !included) {</span>
+<span class="nc" id="L1058">          finalOptimizedPatterns.add(p);</span>
+        }
+<span class="nc" id="L1060">      }</span>
+<span class="nc" id="L1061">      return new OrPatternExpr(finalOptimizedPatterns);</span>
+    }
+
+    private static Pair&lt;Class,CoreMapNodePattern.StringAnnotationPattern&gt; _getStringAnnotation_(PatternExpr p) {
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">      if (p instanceof NodePatternExpr) {</span>
+<span class="nc" id="L1066">        NodePattern nodePattern = ((NodePatternExpr) p).nodePattern;</span>
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">        if (nodePattern instanceof CoreMapNodePattern) {</span>
+<span class="nc" id="L1068">          List&lt;Pair&lt;Class, NodePattern&gt;&gt; annotationPatterns = ((CoreMapNodePattern) nodePattern).getAnnotationPatterns();</span>
+<span class="nc bnc" id="L1069" title="All 2 branches missed.">          if (annotationPatterns.size() == 1) {</span>
+            // Check if it is a string annotation pattern
+<span class="nc" id="L1071">            Pair&lt;Class, NodePattern&gt; pair = annotationPatterns.get(0);</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">            if (pair.second instanceof CoreMapNodePattern.StringAnnotationPattern) {</span>
+<span class="nc" id="L1073">              return Pair.makePair(pair.first, (CoreMapNodePattern.StringAnnotationPattern) pair.second);</span>
+            }
+          }
+        }
+      }
+<span class="nc" id="L1078">      return null;</span>
+    }
+  }
+
+  // Expression that represents a conjunction
+  public static class AndPatternExpr extends PatternExpr {
+
+    private final List&lt;PatternExpr&gt; patterns;
+
+<span class="nc" id="L1087">    public AndPatternExpr(List&lt;PatternExpr&gt; patterns) {</span>
+<span class="nc" id="L1088">      this.patterns = patterns;</span>
+<span class="nc" id="L1089">    }</span>
+
+<span class="nc" id="L1091">    public AndPatternExpr(PatternExpr... patterns) {</span>
+<span class="nc" id="L1092">      this.patterns = Arrays.asList(patterns);</span>
+<span class="nc" id="L1093">    }</span>
+
+    @Override
+    protected Frag build()
+    {
+<span class="nc" id="L1098">      ConjStartState conjStart = new ConjStartState(patterns.size());</span>
+<span class="nc" id="L1099">      Frag frag = new Frag();</span>
+<span class="nc" id="L1100">      frag.start = conjStart;</span>
+      // Create NFA fragment that
+      // have one starting state that branches out to NFAs created by the children expressions
+      // AND START ---&gt; pattern 1 ---&gt;  AND END (0/n)
+      //            |
+      //             ---&gt; pattern 2 ---&gt; AND END (1/n)
+      //             ...
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">      for (int i = 0; i &lt; patterns.size(); i++) {</span>
+<span class="nc" id="L1108">        PatternExpr pattern = patterns.get(i);</span>
+        // Build child NFA
+<span class="nc" id="L1110">        Frag f = pattern.build();</span>
+        // Add child NFA to next states of fragment start
+<span class="nc" id="L1112">        frag.start.add(f.start);</span>
+
+<span class="nc" id="L1114">        f.connect(new ConjEndState(conjStart, i));</span>
+        // Add child NFA out (unlinked) states to out (unlinked) states of this fragment
+<span class="nc" id="L1116">        frag.add(f.out);</span>
+      }
+<span class="nc" id="L1118">      return frag;</span>
+    }
+
+    @Override
+    protected int assignGroupIds(int start) {
+<span class="nc" id="L1123">      int nextId = start;</span>
+      // assign group ids of child expressions
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">      for (PatternExpr pattern : patterns) {</span>
+<span class="nc" id="L1126">        nextId = pattern.assignGroupIds(nextId);</span>
+<span class="nc" id="L1127">      }</span>
+<span class="nc" id="L1128">      return nextId;</span>
+    }
+
+    @Override
+    protected void updateBindings(VarGroupBindings bindings) {
+      // update bindings of child expressions
+<span class="nc bnc" id="L1134" title="All 2 branches missed.">      for (PatternExpr pattern : patterns) {</span>
+<span class="nc" id="L1135">        pattern.updateBindings(bindings);</span>
+<span class="nc" id="L1136">      }</span>
+<span class="nc" id="L1137">    }</span>
+
+    @Override
+    protected PatternExpr copy()
+    {
+<span class="nc" id="L1142">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L1144">        newPatterns.add(p.copy());</span>
+<span class="nc" id="L1145">      }</span>
+<span class="nc" id="L1146">      return new AndPatternExpr(newPatterns);</span>
+    }
+
+    @Override
+    protected PatternExpr optimize()
+    {
+<span class="nc" id="L1152">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L1154">        newPatterns.add(p.optimize());</span>
+<span class="nc" id="L1155">      }</span>
+<span class="nc" id="L1156">      return new AndPatternExpr(newPatterns);</span>
+    }
+
+    @Override
+    protected PatternExpr transform(NodePatternTransformer transformer)
+    {
+<span class="nc" id="L1162">      List&lt;PatternExpr&gt; newPatterns = new ArrayList&lt;&gt;(patterns.size());</span>
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">      for (PatternExpr p:patterns) {</span>
+<span class="nc" id="L1164">        newPatterns.add(p.transform(transformer));</span>
+<span class="nc" id="L1165">      }</span>
+<span class="nc" id="L1166">      return new AndPatternExpr(newPatterns);</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L1170">      return StringUtils.join(patterns, &quot; &amp; &quot;);</span>
+    }
+  }
+
+  /****** NFA states for matching sequences *********/
+
+  // Patterns are converted to the NFA states
+  // Assumes the matcher will step through the NFA states one token at a time
+
+  /**
+   * An accepting matching state
+   */
+<span class="fc" id="L1182">  protected static final State MATCH_STATE = new MatchState();</span>
+
+  /**
+   * Represents a state in the NFA corresponding to a regular expression for matching a sequence
+   */
+  static class State {
+    /**
+     * Set of next states from this current state.
+     * NOTE: Most of the time, next is just one state.
+     */
+    Set&lt;State&gt; next;
+    boolean hasSavedValue;
+    boolean isOptional;    // is this state optional
+
+<span class="fc" id="L1196">    protected State() {}</span>
+
+    /**
+     * Update the set of out states by unlinked states from this state
+     * @param out - Current set of out states (to be updated by this function)
+     */
+    protected void updateOutStates(Set&lt;State&gt; out) {
+<span class="pc bpc" id="L1203" title="1 of 2 branches missed.">      if (next == null) {</span>
+<span class="fc" id="L1204">        out.add(this);</span>
+      } else {
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">        for (State s:next) {</span>
+<span class="nc" id="L1207">          s.updateOutStates(out);</span>
+<span class="nc" id="L1208">        }</span>
+      }
+<span class="fc" id="L1210">    }</span>
+
+    /**
+     * Non-consuming match.
+     * @param bid - Branch id
+     * @param matchedStates - State of the matching so far (to be updated by the matching process)
+     * @return true if match
+     */
+    protected &lt;T&gt; boolean  match0(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates)
+    {
+<span class="fc" id="L1220">      return match(bid, matchedStates, false);</span>
+    }
+
+    /**
+     * Consuming match.
+     * @param bid - Branch id
+     * @param matchedStates - State of the matching so far (to be updated by the matching process)
+     * @return true if match
+     */
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates)
+    {
+<span class="fc" id="L1231">      return match(bid, matchedStates, true);</span>
+    }
+
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume)
+    {
+<span class="fc" id="L1236">      return match(bid, matchedStates, consume, null);</span>
+    }
+
+    /**
+     * Given the current matched states, attempts to run NFA from this state.
+     *  If consuming:  tries to match the next element - goes through states until an element is consumed or match is false
+     *  If non-consuming: does not match the next element - goes through non element consuming states
+     * In both cases, matchedStates should be updated as follows:
+     * - matchedStates should be updated with the next state to be processed
+     * @param bid - Branch id
+     * @param matchedStates - State of the matching so far (to be updated by the matching process)
+     * @param consume - Whether to consume the next element or not
+     * @return true if match
+     */
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+<span class="fc" id="L1252">      boolean match = false;</span>
+<span class="pc bpc" id="L1253" title="1 of 2 branches missed.">      if (next != null) {</span>
+<span class="fc" id="L1254">        int i = 0;</span>
+<span class="fc bfc" id="L1255" title="All 2 branches covered.">        for (State s:next) {</span>
+<span class="fc" id="L1256">          i++;</span>
+<span class="fc" id="L1257">          boolean m = s.match(matchedStates.branchStates.getBranchId(bid,i,next.size()), matchedStates, consume, this);</span>
+<span class="fc bfc" id="L1258" title="All 2 branches covered.">          if (m) {</span>
+            // NOTE: We don't break because other branches may have useful state information
+<span class="fc" id="L1260">            match = true;</span>
+          }
+<span class="fc" id="L1262">        }</span>
+      }
+<span class="fc" id="L1264">      return match;</span>
+    }
+
+    /**
+     * Add state to the set of next states.
+     * @param nextState - state to add
+     */
+    protected void add(State nextState) {
+<span class="fc bfc" id="L1272" title="All 2 branches covered.">      if (next == null) {</span>
+<span class="fc" id="L1273">        next = new LinkedHashSet&lt;&gt;();</span>
+      }
+<span class="fc" id="L1275">      next.add(nextState);</span>
+<span class="fc" id="L1276">    }</span>
+
+    public &lt;T&gt; Object value(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates) {
+<span class="pc bpc" id="L1279" title="1 of 2 branches missed.">      if (hasSavedValue) {</span>
+<span class="nc" id="L1280">        HasInterval&lt;Integer&gt; matchedInterval = matchedStates.getBranchStates().getMatchedInterval(bid, this);</span>
+<span class="nc bnc" id="L1281" title="All 4 branches missed.">        if (matchedInterval != null &amp;&amp; matchedInterval instanceof ValuedInterval) {</span>
+<span class="nc" id="L1282">          return ((ValuedInterval) matchedInterval).getValue();</span>
+        }
+      }
+<span class="fc" id="L1285">      return null;</span>
+    }
+
+    public void markOptional(boolean propagate) {
+<span class="fc" id="L1289">      this.isOptional = true;</span>
+<span class="pc bpc" id="L1290" title="2 of 4 branches missed.">      if (propagate &amp;&amp; next != null) {</span>
+<span class="fc" id="L1291">        Stack&lt;State&gt; todo = new Stack&lt;&gt;();</span>
+<span class="fc" id="L1292">        Set&lt;State&gt; seen = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L1293">        todo.addAll(next);</span>
+<span class="fc bfc" id="L1294" title="All 2 branches covered.">        while (!todo.empty()) {</span>
+<span class="fc" id="L1295">          State s = todo.pop();</span>
+<span class="fc" id="L1296">          s.isOptional = true;</span>
+<span class="fc" id="L1297">          seen.add(s);</span>
+<span class="pc bpc" id="L1298" title="1 of 2 branches missed.">          if (next != null) {</span>
+<span class="fc bfc" id="L1299" title="All 2 branches covered.">            for (State n : next) {</span>
+<span class="fc bfc" id="L1300" title="All 2 branches covered.">              if (!seen.contains(n)) {</span>
+<span class="fc" id="L1301">                todo.push(n);</span>
+              }
+<span class="fc" id="L1303">            }</span>
+          }
+<span class="fc" id="L1305">        }</span>
+      }
+<span class="fc" id="L1307">    }</span>
+  }
+
+  /**
+   * Final accepting state.
+   */
+<span class="fc" id="L1313">  private static class MatchState extends State {</span>
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState) {
+      // Always add this state back (effectively looping forever in this matching state)
+<span class="fc" id="L1317">      matchedStates.addState(bid, this);</span>
+<span class="fc" id="L1318">      return false;</span>
+    }
+  }
+
+  /**
+   * State with associated value.
+   */
+  private static class ValueState extends State {
+    final Object value;
+
+<span class="nc" id="L1328">    private ValueState(Object value) {</span>
+<span class="nc" id="L1329">      this.value = value;</span>
+<span class="nc" id="L1330">    }</span>
+
+    @Override
+<span class="nc" id="L1333">    public &lt;T&gt; Object value(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates) { return value; }</span>
+  }
+
+  /**
+   * State for matching one element/node
+   */
+  private static class NodePatternState extends State {
+    final NodePattern pattern;
+
+<span class="fc" id="L1342">    protected NodePatternState(NodePattern p) {</span>
+<span class="fc" id="L1343">      this.pattern = p;</span>
+<span class="fc" id="L1344">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+<span class="fc bfc" id="L1349" title="All 2 branches covered.">      if (consume) {</span>
+        // Get element and return if it matched or not
+<span class="fc" id="L1351">        T node = matchedStates.get();</span>
+        // TODO: Fix type checking
+<span class="pc bpc" id="L1353" title="1 of 2 branches missed.">        if (matchedStates.matcher.matchWithResult) {</span>
+<span class="nc" id="L1354">          Object obj = pattern.matchWithResult(node);</span>
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">          if (obj != null) {</span>
+<span class="nc bnc" id="L1356" title="All 2 branches missed.">            if (obj != Boolean.TRUE) {</span>
+<span class="nc" id="L1357">              matchedStates.branchStates.setMatchedResult(bid, matchedStates.curPosition, obj);</span>
+            }
+            // If matched, need to add next states to the queue of states to be processed
+<span class="nc" id="L1360">            matchedStates.addStates(bid, next);</span>
+<span class="nc" id="L1361">            return true;</span>
+          } else {
+<span class="nc" id="L1363">            return false;</span>
+          }
+        } else {
+<span class="pc bpc" id="L1366" title="1 of 4 branches missed.">          if (node != null &amp;&amp; pattern.match(node)) {</span>
+            // If matched, need to add next states to the queue of states to be processed
+<span class="fc" id="L1368">            matchedStates.addStates(bid, next);</span>
+<span class="fc" id="L1369">            return true;</span>
+          } else {
+<span class="fc" id="L1371">            return false;</span>
+          }
+        }
+      } else {
+        // Not consuming element - add this state back to queue of states to be processed
+        // This state was not successfully matched
+<span class="fc" id="L1377">        matchedStates.addState(bid, this);</span>
+<span class="fc" id="L1378">        return false;</span>
+      }
+    }
+
+  }
+
+  /**
+   * State for matching multiple elements/nodes.
+   */
+  private static class MultiNodePatternState extends State {
+
+    private final MultiNodePattern pattern;
+
+<span class="nc" id="L1391">    protected MultiNodePatternState(MultiNodePattern p) {</span>
+<span class="nc" id="L1392">      this.pattern = p;</span>
+<span class="nc" id="L1393">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">      if (consume) {</span>
+<span class="nc" id="L1399">        HasInterval&lt;Integer&gt; matchedInterval = matchedStates.getBranchStates().getMatchedInterval(bid, this);</span>
+<span class="nc" id="L1400">        int cur = matchedStates.curPosition;</span>
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">        if (matchedInterval == null) {</span>
+          // Haven't tried to match this node before, try now
+          // Get element and return if it matched or not
+<span class="nc" id="L1404">          List&lt;? extends T&gt; nodes = matchedStates.elements();</span>
+          // TODO: Fix type checking
+<span class="nc" id="L1406">          Collection&lt;HasInterval&lt;Integer&gt;&gt; matched = pattern.match(nodes, cur);</span>
+          // Order matches
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">          if (pattern.isGreedyMatch()) {</span>
+            // Sort from long to short
+<span class="nc" id="L1410">            matched = CollectionUtils.sorted(matched, Interval.LENGTH_GT_COMPARATOR);</span>
+          } else {
+            // Sort from short to long
+<span class="nc" id="L1413">            matched = CollectionUtils.sorted(matched, Interval.LENGTH_LT_COMPARATOR);</span>
+          }
+
+          // TODO: Check intervals are valid?   Start at cur and ends after?
+<span class="nc bnc" id="L1417" title="All 4 branches missed.">          if (matched != null &amp;&amp; matched.size() &gt; 0) {</span>
+<span class="nc" id="L1418">            int nBranches = matched.size();</span>
+<span class="nc" id="L1419">            int i = 0;</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">            for (HasInterval&lt;Integer&gt; interval:matched) {</span>
+<span class="nc" id="L1421">              i++;</span>
+<span class="nc" id="L1422">              int bid2 = matchedStates.getBranchStates().getBranchId(bid, i, nBranches);</span>
+<span class="nc" id="L1423">              matchedStates.getBranchStates().setMatchedInterval(bid2, this, interval);</span>
+              // If matched, need to add next states to the queue of states to be processed
+              // keep in current state until end node reached
+<span class="nc bnc" id="L1426" title="All 2 branches missed.">              if (interval.getInterval().getEnd()-1 &lt;= cur) {</span>
+<span class="nc" id="L1427">                matchedStates.addStates(bid2, next);</span>
+              } else {
+<span class="nc" id="L1429">                matchedStates.addState(bid2, this);</span>
+              }
+<span class="nc" id="L1431">            }</span>
+<span class="nc" id="L1432">            return true;</span>
+          } else {
+<span class="nc" id="L1434">            return false;</span>
+          }
+        } else {
+          // Previously matched this state - just need to step through until we get to end of matched interval
+<span class="nc bnc" id="L1438" title="All 2 branches missed.">          if (matchedInterval.getInterval().getEnd()-1 &lt;= cur) {</span>
+<span class="nc" id="L1439">            matchedStates.addStates(bid, next);</span>
+          } else {
+<span class="nc" id="L1441">            matchedStates.addState(bid, this);</span>
+          }
+<span class="nc" id="L1443">          return true;</span>
+        }
+      } else {
+        // Not consuming element - add this state back to queue of states to be processed
+        // This state was not successfully matched
+<span class="nc" id="L1448">        matchedStates.addState(bid, this);</span>
+<span class="nc" id="L1449">        return false;</span>
+      }
+    }
+
+  }
+
+  /**
+   * State that matches a pattern that can occur multiple times.
+   */
+  private static class RepeatState extends State {
+
+    private final State repeatStart;
+    private final int minMatch;
+    private final int maxMatch;
+    private final boolean greedyMatch;
+
+    public RepeatState(State start, int minMatch, int maxMatch, boolean greedyMatch)
+<span class="fc" id="L1466">    {</span>
+<span class="fc" id="L1467">      this.repeatStart = start;</span>
+<span class="fc" id="L1468">      this.minMatch = minMatch;</span>
+<span class="fc" id="L1469">      this.maxMatch = maxMatch;</span>
+<span class="fc" id="L1470">      this.greedyMatch = greedyMatch;</span>
+<span class="pc bpc" id="L1471" title="1 of 2 branches missed.">      if (minMatch &lt; 0) {</span>
+<span class="nc" id="L1472">        throw new IllegalArgumentException(&quot;Invalid minMatch=&quot; + minMatch);</span>
+      }
+<span class="pc bpc" id="L1474" title="1 of 4 branches missed.">      if (maxMatch &gt;= 0 &amp;&amp; minMatch &gt; maxMatch) {</span>
+<span class="nc" id="L1475">        throw new IllegalArgumentException(&quot;Invalid minMatch=&quot; + minMatch + &quot;, maxMatch=&quot; + maxMatch);</span>
+      }
+<span class="fc bfc" id="L1477" title="All 2 branches covered.">      this.isOptional = this.minMatch &lt;= 0;</span>
+<span class="fc" id="L1478">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+      // Get how many times this states has already been matched
+<span class="fc" id="L1484">      int matchedCount = matchedStates.getBranchStates().endMatchedCountInc(bid, this);</span>
+      // Get the minimum number of times we still need to match this state
+<span class="fc" id="L1486">      int minMatchLeft = minMatch - matchedCount;</span>
+<span class="fc bfc" id="L1487" title="All 2 branches covered.">      if (minMatchLeft &lt; 0) {</span>
+<span class="fc" id="L1488">        minMatchLeft = 0;</span>
+      }
+      // Get the maximum number of times we can match this state
+      int maxMatchLeft;
+<span class="pc bpc" id="L1492" title="1 of 2 branches missed.">      if (maxMatch &lt; 0) {</span>
+        // Indicate unlimited matching
+<span class="fc" id="L1494">        maxMatchLeft = maxMatch;</span>
+      } else {
+<span class="nc" id="L1496">        maxMatchLeft = maxMatch - matchedCount;</span>
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">        if (maxMatch &lt; 0) {</span>
+          // Already exceeded the maximum number of times we can match this state
+          // indicate state not matched
+<span class="nc" id="L1500">          return false;</span>
+        }
+      }
+<span class="fc" id="L1503">      boolean match = false;</span>
+      // See how many branching options there are...
+<span class="fc" id="L1505">      int totalBranches = 0;</span>
+<span class="pc bpc" id="L1506" title="1 of 4 branches missed.">      if (minMatchLeft == 0 &amp;&amp; next != null) {</span>
+<span class="fc" id="L1507">         totalBranches += next.size();</span>
+      }
+<span class="pc bpc" id="L1509" title="1 of 2 branches missed.">      if (maxMatchLeft != 0) {</span>
+<span class="fc" id="L1510">        totalBranches++;</span>
+      }
+<span class="fc" id="L1512">      int i = 0; // branch index</span>
+      // Check if there we have met the minimum number of matches
+      // If so, go ahead and try to match next state
+      //  (if we need to consume an element or end a group)
+<span class="pc bpc" id="L1516" title="1 of 4 branches missed.">      if (minMatchLeft == 0 &amp;&amp; next != null) {</span>
+<span class="fc bfc" id="L1517" title="All 2 branches covered.">        for (State s:next) {</span>
+<span class="fc" id="L1518">          i++;   // Increment branch index</span>
+          // Depending on greedy match or not, different priority to branches
+<span class="pc bpc" id="L1520" title="3 of 4 branches missed.">          int pi = (greedyMatch &amp;&amp; maxMatchLeft != 0)? i+1:i;</span>
+<span class="fc" id="L1521">          int bid2 = matchedStates.getBranchStates().getBranchId(bid,pi,totalBranches);</span>
+<span class="fc" id="L1522">          matchedStates.getBranchStates().clearMatchedCount(bid2, this);</span>
+<span class="fc" id="L1523">          boolean m = s.match(bid2, matchedStates, consume);</span>
+<span class="fc bfc" id="L1524" title="All 2 branches covered.">          if (m) {</span>
+<span class="fc" id="L1525">            match = true;</span>
+          }
+<span class="fc" id="L1527">        }</span>
+      }
+      // Check if we have the option of matching more
+      // (maxMatchLeft &lt; 0 indicate unlimited, maxMatchLeft &gt; 0 indicate we are still allowed more matches)
+<span class="pc bpc" id="L1531" title="1 of 2 branches missed.">      if (maxMatchLeft != 0) {</span>
+<span class="fc" id="L1532">        i++;    // Increment branch index</span>
+        // Depending on greedy match or not, different priority to branches
+<span class="pc bpc" id="L1534" title="1 of 2 branches missed.">        int pi = greedyMatch? 1:i;</span>
+<span class="fc" id="L1535">        int bid2 = matchedStates.getBranchStates().getBranchId(bid,pi,totalBranches);</span>
+<span class="fc bfc" id="L1536" title="All 2 branches covered.">        if (consume) {</span>
+          // Premark many times we have matched this pattern
+<span class="fc" id="L1538">          matchedStates.getBranchStates().startMatchedCountInc(bid2, this);</span>
+          // Consuming - try to see if repeating this pattern does anything
+<span class="fc" id="L1540">          boolean m = repeatStart.match(bid2, matchedStates, consume);</span>
+<span class="fc bfc" id="L1541" title="All 2 branches covered.">          if (m) {</span>
+<span class="fc" id="L1542">            match = true;</span>
+          } else {
+            // Didn't match - decrement how many times we have matched this pattern
+<span class="fc" id="L1545">            matchedStates.getBranchStates().startMatchedCountDec(bid2, this);</span>
+          }
+<span class="fc" id="L1547">        } else {</span>
+          // Not consuming - don't do anything, just add this back to list of states to be processed
+<span class="fc" id="L1549">          matchedStates.addState(bid2, this);</span>
+        }
+      }
+<span class="fc" id="L1552">      return match;</span>
+    }
+  }
+
+  /**
+   * State for matching previously matched group.
+   */
+  static class BackRefState extends State {
+
+    private final NodesMatchChecker matcher;
+    private final int captureGroupId;
+
+    public BackRefState(NodesMatchChecker matcher, int captureGroupId)
+<span class="nc" id="L1565">    {</span>
+<span class="nc" id="L1566">      this.matcher = matcher;</span>
+<span class="nc" id="L1567">      this.captureGroupId = captureGroupId;</span>
+<span class="nc" id="L1568">    }</span>
+
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates,
+                                SequenceMatcher.MatchedGroup matchedGroup, int matchedNodes)
+    {
+<span class="nc" id="L1573">      T node = matchedStates.get();</span>
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">      if (matcher.matches(node, matchedStates.elements().get(matchedGroup.matchBegin+matchedNodes))) {</span>
+<span class="nc" id="L1575">        matchedNodes++;</span>
+<span class="nc" id="L1576">        matchedStates.getBranchStates().setMatchStateInfo(bid, this,</span>
+<span class="nc" id="L1577">                new Pair&lt;&gt;(matchedGroup, matchedNodes));</span>
+<span class="nc" id="L1578">        int len = matchedGroup.matchEnd - matchedGroup.matchBegin;</span>
+<span class="nc bnc" id="L1579" title="All 2 branches missed.">        if (len == matchedNodes) {</span>
+<span class="nc" id="L1580">          matchedStates.addStates(bid, next);</span>
+        } else {
+<span class="nc" id="L1582">          matchedStates.addState(bid, this);</span>
+        }
+<span class="nc" id="L1584">        return true;</span>
+      }
+<span class="nc" id="L1586">      return false;</span>
+    }
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+      // Try to match previous node/nodes exactly
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">      if (consume) {</span>
+        // First element is group that is matched, second is number of nodes matched so far
+<span class="nc" id="L1595">        Pair&lt;SequenceMatcher.MatchedGroup, Integer&gt; backRefState =</span>
+<span class="nc" id="L1596">                (Pair&lt;SequenceMatcher.MatchedGroup, Integer&gt;) matchedStates.getBranchStates().getMatchStateInfo(bid, this);</span>
+<span class="nc bnc" id="L1597" title="All 2 branches missed.">        if (backRefState == null) {</span>
+          // Haven't tried to match this node before, try now
+          // Get element and return if it matched or not
+<span class="nc" id="L1600">          SequenceMatcher.MatchedGroup matchedGroup = matchedStates.getBranchStates().getMatchedGroup(bid, captureGroupId);</span>
+<span class="nc bnc" id="L1601" title="All 2 branches missed.">          if (matchedGroup != null) {</span>
+            // See if the first node matches
+<span class="nc bnc" id="L1603" title="All 2 branches missed.">            if (matchedGroup.matchEnd &gt; matchedGroup.matchBegin) {</span>
+<span class="nc" id="L1604">              boolean matched = match(bid, matchedStates, matchedGroup, 0);</span>
+<span class="nc" id="L1605">              return matched;</span>
+            } else {
+              // TODO: Check handling of previous nodes that are zero elements?
+<span class="nc" id="L1608">              return super.match(bid, matchedStates, consume, prevState);</span>
+            }
+          }
+<span class="nc" id="L1611">          return false;</span>
+        } else {
+<span class="nc" id="L1613">          SequenceMatcher.MatchedGroup matchedGroup = backRefState.first();</span>
+<span class="nc" id="L1614">          int matchedNodes = backRefState.second();</span>
+<span class="nc" id="L1615">          boolean matched = match(bid, matchedStates, matchedGroup, matchedNodes);</span>
+<span class="nc" id="L1616">          return matched;</span>
+        }
+      } else {
+        // Not consuming, just add this state back to list of states to be processed
+<span class="nc" id="L1620">        matchedStates.addState(bid, this);</span>
+<span class="nc" id="L1621">        return false;</span>
+      }
+    }
+  }
+
+  /**
+   * State for matching the start of a group.
+   */
+  static class GroupStartState extends State {
+
+    private final int captureGroupId;
+
+    public GroupStartState(int captureGroupId, State startState)
+<span class="fc" id="L1634">    {</span>
+<span class="fc" id="L1635">      this.captureGroupId = captureGroupId;</span>
+<span class="fc" id="L1636">      add(startState);</span>
+<span class="fc" id="L1637">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+      // We only mark start when about to consume elements
+<span class="fc bfc" id="L1643" title="All 2 branches covered.">      if (consume) {</span>
+        // Start of group, mark start
+<span class="fc" id="L1645">        matchedStates.setGroupStart(bid, captureGroupId);</span>
+<span class="fc" id="L1646">        return super.match(bid, matchedStates, consume, prevState);</span>
+      } else {
+        // Not consuming, just add this state back to list of states to be processed
+<span class="fc" id="L1649">        matchedStates.addState(bid, this);</span>
+<span class="fc" id="L1650">        return false;</span>
+      }
+    }
+  }
+
+  /**
+   * State for matching the end of a group.
+   */
+  static class GroupEndState extends State {
+
+    private final int captureGroupId;
+
+    public GroupEndState(int captureGroupId)
+<span class="fc" id="L1663">    {</span>
+<span class="fc" id="L1664">      this.captureGroupId = captureGroupId;</span>
+<span class="fc" id="L1665">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+      // Opposite of GroupStartState
+      // Mark the end of the group
+<span class="fc bfc" id="L1672" title="All 2 branches covered.">      Object v = (prevState != null) ? prevState.value(bid, matchedStates) : null;</span>
+<span class="fc bfc" id="L1673" title="All 2 branches covered.">      if (consume) {</span>
+        // We are consuming so the curPosition isn't part of our group
+<span class="fc" id="L1675">        matchedStates.setGroupEnd(bid, captureGroupId, matchedStates.curPosition-1, v);</span>
+      } else {
+<span class="fc" id="L1677">        matchedStates.setGroupEnd(bid, captureGroupId, v);</span>
+      }
+<span class="fc" id="L1679">      return super.match(bid, matchedStates, consume, prevState);</span>
+    }
+  }
+
+  static class ConjMatchStateInfo
+  {
+    // A conjunction consists of several child expressions
+    //  When the conjunction state is entered,
+    //    we keep track of the branch id and the node index
+    //     we are on at that time (startBid and startPos)
+
+    /**
+     * The branch id when the conjunction state is entered
+     */
+    private final int startBid;
+
+    /**
+     * The node index when the conjunction state is entered
+     */
+    private final int startPos;
+
+    /**
+     * The number of child expressions making up the conjunction
+     */
+    private final int childCount;
+
+    /**
+     * For each child expression, we keep track of the
+     *   set of branch ids that causes the child expression to
+     *    be satisfied (and their corresponding node index
+     *     when the expression is satisfied)
+     */
+    private final Set&lt;Pair&lt;Integer,Integer&gt;&gt;[] reachableChildBids;
+
+    private ConjMatchStateInfo(int startBid, int childCount, int startPos)
+<span class="nc" id="L1714">    {</span>
+<span class="nc" id="L1715">      this.startBid = startBid;</span>
+<span class="nc" id="L1716">      this.startPos = startPos;</span>
+<span class="nc" id="L1717">      this.childCount = childCount;</span>
+<span class="nc" id="L1718">      this.reachableChildBids = new Set[childCount];</span>
+<span class="nc" id="L1719">    }</span>
+
+    private void addChildBid(int i, int bid, int pos)
+    {
+<span class="nc bnc" id="L1723" title="All 2 branches missed.">      if (reachableChildBids[i] == null) {</span>
+<span class="nc" id="L1724">        reachableChildBids[i] = new ArraySet&lt;&gt;();</span>
+      }
+<span class="nc" id="L1726">      reachableChildBids[i].add(new Pair&lt;&gt;(bid, pos) );</span>
+<span class="nc" id="L1727">    }</span>
+
+    private boolean isAllChildMatched()
+    {
+<span class="nc bnc" id="L1731" title="All 2 branches missed.">      for (Set&lt;Pair&lt;Integer,Integer&gt;&gt; v:reachableChildBids) {</span>
+<span class="nc bnc" id="L1732" title="All 4 branches missed.">        if (v == null || v.isEmpty()) return false;</span>
+      }
+<span class="nc" id="L1734">      return true;</span>
+    }
+
+    /**
+     * Returns true if there is a feasible combination of child branch ids that
+     * causes all child expressions to be satisfied with
+     * respect to the specified child expression
+     *   (assuming satisfaction with the specified branch and node index)
+     * For other child expressions to have a compatible satisfiable branch,
+     *   that branch must also terminate with the same node index as this one.
+     *
+     * @param index - Index of the child expression
+     * @param bid - Branch id that causes the indexed child to be satisfied
+     * @param pos - Node index that causes the indexed child to be satisfied
+     * @return whether there is a feasible combination that causes all
+     *          children to be satisfied with respect to specified child.
+     */
+    private boolean isAllChildMatched(int index, int bid, int pos)
+    {
+<span class="nc bnc" id="L1753" title="All 2 branches missed.">      for (int i = 0; i &lt; reachableChildBids.length; i++) {</span>
+<span class="nc" id="L1754">        Set&lt;Pair&lt;Integer,Integer&gt;&gt; v = reachableChildBids[i];</span>
+<span class="nc bnc" id="L1755" title="All 4 branches missed.">        if (v == null || v.isEmpty()) return false;</span>
+<span class="nc bnc" id="L1756" title="All 2 branches missed.">        if (i != index) {</span>
+<span class="nc" id="L1757">          boolean ok = false;</span>
+<span class="nc bnc" id="L1758" title="All 2 branches missed.">          for (Pair&lt;Integer,Integer&gt; p:v) {</span>
+<span class="nc bnc" id="L1759" title="All 2 branches missed.">            if (p.second() == pos) {</span>
+<span class="nc" id="L1760">              ok = true;</span>
+<span class="nc" id="L1761">              break;</span>
+            }
+<span class="nc" id="L1763">          }</span>
+<span class="nc bnc" id="L1764" title="All 2 branches missed.">          if (!ok) { return false; }</span>
+        }
+      }
+<span class="nc" id="L1767">      return true;</span>
+    }
+
+    /**
+     * Returns array of child branch ids that
+     * causes all child expressions to be satisfied with
+     * respect to the specified child expression
+     *   (assuming satisfaction with the specified branch and node index).
+     * For other child expressions to have a compatible satisfiable branch,
+     *   that branch must also terminate with the same node index as this one.
+     *
+     * @param index - Index of the child expression
+     * @param bid - Branch id that causes the indexed child to be satisfied
+     * @param pos - Node index that causes the indexed child to be satisfied
+     * @return array of child branch ids if there is a valid combination
+     *         null otherwise
+     */
+    private int[] getAllChildMatchedBids(int index, int bid, int pos)
+    {
+<span class="nc" id="L1786">      int[] matchedBids = new int[reachableChildBids.length];</span>
+<span class="nc bnc" id="L1787" title="All 2 branches missed.">      for (int i = 0; i &lt; reachableChildBids.length; i++) {</span>
+<span class="nc" id="L1788">        Set&lt;Pair&lt;Integer,Integer&gt;&gt; v = reachableChildBids[i];</span>
+<span class="nc bnc" id="L1789" title="All 4 branches missed.">        if (v == null || v.isEmpty()) return null;</span>
+<span class="nc bnc" id="L1790" title="All 2 branches missed.">        if (i != index) {</span>
+<span class="nc" id="L1791">          boolean ok = false;</span>
+<span class="nc bnc" id="L1792" title="All 2 branches missed.">          for (Pair&lt;Integer,Integer&gt; p:v) {</span>
+<span class="nc bnc" id="L1793" title="All 2 branches missed.">            if (p.second() == pos) {</span>
+<span class="nc" id="L1794">              ok = true;</span>
+<span class="nc" id="L1795">              matchedBids[i] = p.first();</span>
+<span class="nc" id="L1796">              break;</span>
+            }
+<span class="nc" id="L1798">          }</span>
+<span class="nc bnc" id="L1799" title="All 2 branches missed.">          if (!ok) { return null; }</span>
+<span class="nc" id="L1800">        } else {</span>
+<span class="nc" id="L1801">          matchedBids[i] = bid;</span>
+        }
+      }
+<span class="nc" id="L1804">      return matchedBids;</span>
+    }
+
+    protected void updateKeepBids(BitSet bids) {
+      // TODO: Is there a point when we don't need to keep these bids anymore?
+<span class="nc bnc" id="L1809" title="All 2 branches missed.">      for (Set&lt;Pair&lt;Integer, Integer&gt;&gt; v : reachableChildBids) {</span>
+<span class="nc bnc" id="L1810" title="All 2 branches missed.">        if (v != null) {</span>
+<span class="nc bnc" id="L1811" title="All 2 branches missed.">          for (Pair&lt;Integer, Integer&gt; p : v) {</span>
+<span class="nc" id="L1812">            bids.set(p.first());</span>
+<span class="nc" id="L1813">          }</span>
+        }
+      }
+<span class="nc" id="L1816">    }</span>
+  }
+
+
+
+  private void readObject(ObjectInputStream ois)
+    throws IOException, ClassNotFoundException {
+<span class="nc" id="L1823">    patternStr = (String)ois.readObject();</span>
+
+<span class="nc" id="L1825">    patternExpr = (PatternExpr) ois.readObject();</span>
+    //this.patternStr = patternStr;
+    //this.patternExpr = nodeSequencePattern;
+<span class="nc" id="L1828">    action = (SequenceMatchAction) ois.readObject();</span>
+
+<span class="nc" id="L1830">    patternExpr = new GroupPatternExpr(patternExpr, true);</span>
+<span class="nc" id="L1831">    patternExpr = patternExpr.optimize();</span>
+<span class="nc" id="L1832">    this.totalGroups = patternExpr.assignGroupIds(0);</span>
+<span class="nc" id="L1833">    Frag f = patternExpr.build();</span>
+<span class="nc" id="L1834">    f.connect(MATCH_STATE);</span>
+<span class="nc" id="L1835">    this.root = f.start;</span>
+<span class="nc" id="L1836">    varGroupBindings = new VarGroupBindings(totalGroups+1);</span>
+<span class="nc" id="L1837">    patternExpr.updateBindings(varGroupBindings);</span>
+<span class="nc" id="L1838">  }</span>
+
+
+  private void writeObject(ObjectOutputStream oos)
+    throws IOException {
+<span class="nc" id="L1843">    oos.writeObject(toString());</span>
+<span class="nc" id="L1844">    oos.writeObject(this.getPatternExpr());</span>
+<span class="nc" id="L1845">    oos.writeObject(this.getAction());</span>
+
+<span class="nc" id="L1847">  }  //  public void writeObject()</span>
+
+  // States for matching conjunctions
+  // - Basic, not well tested implementation that may not work for all cases ...
+  // - Can be optimized to terminate earlier if one branch of the conjunction is known not to succeed
+  // - May cause lots of states to be kept (not efficient)
+  // - priority should be specified for conjunction branches (there can be conflicting greedy/nongreedy patterns)
+  //   (should we prioritize by order?) - currently behavior is not well defined
+
+  /**
+   * State for matching a conjunction
+   */
+  static class ConjStartState extends State {
+
+    private final int childCount;  // Number of children that this conjunction consists of
+
+    public ConjStartState(int childCount)
+<span class="nc" id="L1864">    {</span>
+<span class="nc" id="L1865">      this.childCount = childCount;</span>
+<span class="nc" id="L1866">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+<span class="nc" id="L1871">      matchedStates.getBranchStates().setMatchStateInfo(bid, this,</span>
+              new ConjMatchStateInfo(bid, childCount, matchedStates.curPosition));
+      // Start of conjunction, mark start
+<span class="nc" id="L1874">      boolean allMatch = true;</span>
+<span class="nc bnc" id="L1875" title="All 2 branches missed.">      if (next != null) {</span>
+<span class="nc" id="L1876">        int i = 0;</span>
+<span class="nc bnc" id="L1877" title="All 2 branches missed.">        for (State s:next) {</span>
+<span class="nc" id="L1878">          i++;</span>
+<span class="nc" id="L1879">          boolean m = s.match(matchedStates.getBranchStates().getBranchId(bid,i,next.size()), matchedStates, consume);</span>
+<span class="nc bnc" id="L1880" title="All 2 branches missed.">          if (!m) {</span>
+<span class="nc" id="L1881">            allMatch = false;</span>
+<span class="nc" id="L1882">            break;</span>
+          }
+<span class="nc" id="L1884">        }</span>
+      }
+<span class="nc" id="L1886">      return allMatch;</span>
+    }
+  }
+
+  /**
+   * State for matching the end of a conjunction.
+   */
+  static class ConjEndState extends State {
+
+    private final ConjStartState startState;
+    private final int childIndex;
+
+    public ConjEndState(ConjStartState startState, int childIndex)
+<span class="nc" id="L1899">    {</span>
+<span class="nc" id="L1900">      this.startState = startState;</span>
+<span class="nc" id="L1901">      this.childIndex = childIndex;</span>
+<span class="nc" id="L1902">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+      // Opposite of ConjStartState
+      // Don't do anything when we are about to consume an element
+      // Only we are done consuming, and preparing to go on to the next element
+      // do we check if all branches matched
+<span class="nc bnc" id="L1911" title="All 2 branches missed.">      if (consume) {</span>
+<span class="nc" id="L1912">        return false;</span>
+      } else {
+        // NOTE: There is a delayed matched here, in that we actually want to remember
+        //  which of the incoming branches succeeded
+        // Use the bid of the corresponding ConjAndState?
+<span class="nc" id="L1917">        ConjMatchStateInfo stateInfo = (ConjMatchStateInfo) matchedStates.getBranchStates().getMatchStateInfo(bid, startState);</span>
+<span class="nc bnc" id="L1918" title="All 2 branches missed.">        if (stateInfo != null) {</span>
+<span class="nc" id="L1919">          stateInfo.addChildBid(childIndex, bid, matchedStates.curPosition);</span>
+<span class="nc" id="L1920">          int[] matchedBids = stateInfo.getAllChildMatchedBids(childIndex, bid, matchedStates.curPosition);</span>
+<span class="nc bnc" id="L1921" title="All 2 branches missed.">          if (matchedBids != null) {</span>
+<span class="nc" id="L1922">            matchedStates.getBranchStates().addBidsToCollapse(bid, matchedBids);</span>
+<span class="nc" id="L1923">            return super.match(bid, matchedStates, consume, prevState);</span>
+          }
+        }
+<span class="nc" id="L1926">        return false;</span>
+      }
+    }
+  }
+
+  /**
+   * State for matching start of sequence.
+   */
+  static class SeqStartState extends State {
+
+    public SeqStartState()
+<span class="nc" id="L1937">    {</span>
+<span class="nc" id="L1938">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+<span class="nc bnc" id="L1943" title="All 2 branches missed.">      if (consume) {</span>
+<span class="nc bnc" id="L1944" title="All 2 branches missed.">        if (matchedStates.curPosition == 0) {</span>
+          // Okay - try next
+<span class="nc" id="L1946">          return super.match(bid, matchedStates, consume, this);</span>
+        }
+      }
+<span class="nc" id="L1949">      return false;</span>
+    }
+  }
+
+  /**
+   * State for matching end of sequence.
+   */
+  static class SeqEndState extends State {
+
+    public SeqEndState()
+<span class="nc" id="L1959">    {</span>
+<span class="nc" id="L1960">    }</span>
+
+    @Override
+    protected &lt;T&gt; boolean match(int bid, SequenceMatcher.MatchedStates&lt;T&gt; matchedStates, boolean consume, State prevState)
+    {
+<span class="nc bnc" id="L1965" title="All 2 branches missed.">      if (!consume) {</span>
+<span class="nc bnc" id="L1966" title="All 2 branches missed.">        if (matchedStates.curPosition == matchedStates.elements().size()-1) {</span>
+          // Okay - try next
+<span class="nc" id="L1968">          return super.match(bid, matchedStates, consume, this);</span>
+        }
+      }
+<span class="nc" id="L1971">      return false;</span>
+    }
+  }
+
+  /**
+   * Represents a incomplete NFS with start State and a set of unlinked out states.
+   */
+  private static class Frag {
+    State start;
+    Set&lt;State&gt; out;
+
+<span class="fc" id="L1982">    protected Frag() {</span>
+ //     this(new State());
+<span class="fc" id="L1984">    }</span>
+
+<span class="fc" id="L1986">    protected Frag(State start) {</span>
+<span class="fc" id="L1987">      this.start = start;</span>
+<span class="fc" id="L1988">      this.out = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc" id="L1989">      start.updateOutStates(out);</span>
+<span class="fc" id="L1990">    }</span>
+
+<span class="fc" id="L1992">    protected Frag(State start, Set&lt;State&gt; out) {</span>
+<span class="fc" id="L1993">      this.start = start;</span>
+<span class="fc" id="L1994">      this.out = out;</span>
+<span class="fc" id="L1995">    }</span>
+
+    protected void add(State outState) {
+<span class="nc bnc" id="L1998" title="All 2 branches missed.">      if (out == null) {</span>
+<span class="nc" id="L1999">        out = new LinkedHashSet&lt;&gt;();</span>
+      }
+<span class="nc" id="L2001">      out.add(outState);</span>
+<span class="nc" id="L2002">    }</span>
+
+    protected void add(Collection&lt;State&gt; outStates) {
+<span class="fc bfc" id="L2005" title="All 2 branches covered.">      if (out == null) {</span>
+<span class="fc" id="L2006">        out = new LinkedHashSet&lt;&gt;();</span>
+      }
+<span class="fc" id="L2008">      out.addAll(outStates);</span>
+<span class="fc" id="L2009">    }</span>
+
+    // Connect frag f to the out states of this frag
+    // the out states of this frag is updated to be the out states of f
+    protected void connect(Frag f) {
+<span class="fc bfc" id="L2014" title="All 2 branches covered.">      for (State s:out) {</span>
+<span class="fc" id="L2015">        s.add(f.start);</span>
+<span class="fc" id="L2016">      }</span>
+<span class="fc" id="L2017">      out = f.out;</span>
+<span class="fc" id="L2018">    }</span>
+
+    // Connect state to the out states of this frag
+    // the out states of this frag is updated to be the out states of state
+    protected void connect(State state) {
+<span class="fc bfc" id="L2023" title="All 2 branches covered.">      for (State s:out) {</span>
+<span class="fc" id="L2024">        s.add(state);</span>
+<span class="fc" id="L2025">      }</span>
+<span class="fc" id="L2026">      out = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc" id="L2027">      state.updateOutStates(out);</span>
+/*      if (state.next != null) {
+        out.addAll(state.next);
+      } else {
+        out.add(state);
+      } */
+<span class="fc" id="L2033">    }</span>
+
+  } // end static class Frag
+
+} // end class SequencePattern
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

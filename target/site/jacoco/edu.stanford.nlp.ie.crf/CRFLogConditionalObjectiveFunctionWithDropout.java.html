@@ -1,0 +1,817 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CRFLogConditionalObjectiveFunctionWithDropout.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.ie.crf</a> &gt; <span class="el_source">CRFLogConditionalObjectiveFunctionWithDropout.java</span></div><h1>CRFLogConditionalObjectiveFunctionWithDropout.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.ie.crf; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.math.ArrayMath;
+import edu.stanford.nlp.util.concurrent.*;
+import edu.stanford.nlp.util.Index;
+import edu.stanford.nlp.util.Timing;
+import edu.stanford.nlp.util.Pair;
+import edu.stanford.nlp.util.Quadruple;
+
+import java.util.*;
+
+/**
+ * @author Mengqiu Wang
+ */
+
+public class CRFLogConditionalObjectiveFunctionWithDropout extends CRFLogConditionalObjectiveFunction  {
+
+  /** A logger for this class */
+<span class="nc" id="L20">  private static Redwood.RedwoodChannels log = Redwood.channels(CRFLogConditionalObjectiveFunctionWithDropout.class);</span>
+
+  private final double delta;
+  private final double dropoutScale;
+  private double[][] dropoutPriorGradTotal;
+  private final boolean dropoutApprox;
+  private double[][] weightSquare;
+
+  private final int[][][][] totalData;  // data[docIndex][tokenIndex][][]
+  private int unsupDropoutStartIndex;
+  private final double unsupDropoutScale;
+
+  private List&lt;List&lt;Set&lt;Integer&gt;&gt;&gt; dataFeatureHash;
+  private List&lt;Map&lt;Integer, List&lt;Integer&gt;&gt;&gt; condensedMap;
+  private int[][] dataFeatureHashByDoc;
+  private int edgeLabelIndexSize;
+  private int nodeLabelIndexSize;
+  private int[][] edgeLabels;
+  private Map&lt;Integer, List&lt;Integer&gt;&gt; currPrevLabelsMap;
+  private Map&lt;Integer, List&lt;Integer&gt;&gt; currNextLabelsMap;
+
+<span class="nc" id="L41">  private ThreadsafeProcessor&lt;Pair&lt;Integer, Boolean&gt;, Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt;&gt; dropoutPriorThreadProcessor =</span>
+<span class="nc" id="L42">        new ThreadsafeProcessor&lt;Pair&lt;Integer, Boolean&gt;, Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt;&gt;() {</span>
+    @Override
+    public Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt; process(Pair&lt;Integer,Boolean&gt; docIndexUnsup) {
+<span class="nc" id="L45">      return expectedCountsAndValueForADoc(docIndexUnsup.first(), false, docIndexUnsup.second());</span>
+    }
+    @Override
+    public ThreadsafeProcessor&lt;Pair&lt;Integer, Boolean&gt;, Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt;&gt; newInstance() {
+<span class="nc" id="L49">      return this;</span>
+    }
+  };
+
+  //TODO(Mengqiu) Need to figure out what to do with dataDimension() in case of
+  // mixed supervised+unsupervised data for SGD (AdaGrad)
+  CRFLogConditionalObjectiveFunctionWithDropout(int[][][][] data, int[][] labels, int window, Index&lt;String&gt; classIndex, List&lt;Index&lt;CRFLabel&gt;&gt; labelIndices, int[] map, String priorType, String backgroundSymbol, double sigma, double[][][][] featureVal, double delta, double dropoutScale, int multiThreadGrad, boolean dropoutApprox, double unsupDropoutScale, int[][][][] unsupDropoutData) {
+<span class="nc" id="L56">    super(data, labels, window, classIndex, labelIndices, map, priorType, backgroundSymbol, sigma, featureVal, multiThreadGrad);</span>
+<span class="nc" id="L57">    this.delta = delta;</span>
+<span class="nc" id="L58">    this.dropoutScale = dropoutScale;</span>
+<span class="nc" id="L59">    this.dropoutApprox = dropoutApprox;</span>
+<span class="nc" id="L60">    dropoutPriorGradTotal = empty2D();</span>
+<span class="nc" id="L61">    this.unsupDropoutStartIndex = data.length;</span>
+<span class="nc" id="L62">    this.unsupDropoutScale = unsupDropoutScale;</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">    if (unsupDropoutData != null) {</span>
+<span class="nc" id="L64">      this.totalData = new int[data.length + unsupDropoutData.length][][][];</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">      for (int i=0; i&lt;data.length; i++) {</span>
+<span class="nc" id="L66">        this.totalData[i] = data[i];</span>
+      }
+<span class="nc bnc" id="L68" title="All 2 branches missed.">      for (int i=0; i&lt;unsupDropoutData.length; i++) {</span>
+<span class="nc" id="L69">        this.totalData[i+unsupDropoutStartIndex] = unsupDropoutData[i];</span>
+      }
+    } else {
+<span class="nc" id="L72">      this.totalData = data;</span>
+    }
+<span class="nc" id="L74">    initEdgeLabels();</span>
+<span class="nc" id="L75">    initializeDataFeatureHash();</span>
+<span class="nc" id="L76">  }</span>
+
+  private void initEdgeLabels() {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">    if (labelIndices.size() &lt; 2)</span>
+<span class="nc" id="L80">      return;</span>
+<span class="nc" id="L81">    Index&lt;CRFLabel&gt; edgeLabelIndex = labelIndices.get(1);</span>
+<span class="nc" id="L82">    edgeLabelIndexSize = edgeLabelIndex.size();</span>
+<span class="nc" id="L83">    Index&lt;CRFLabel&gt; nodeLabelIndex = labelIndices.get(0);</span>
+<span class="nc" id="L84">    nodeLabelIndexSize = nodeLabelIndex.size();</span>
+<span class="nc" id="L85">    currPrevLabelsMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L86">    currNextLabelsMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L87">    edgeLabels = new int[edgeLabelIndexSize][];</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">    for (int k=0; k &lt; edgeLabelIndexSize; k++) {</span>
+<span class="nc" id="L89">      int[] labelPair = edgeLabelIndex.get(k).getLabel();</span>
+<span class="nc" id="L90">      edgeLabels[k] = labelPair;</span>
+<span class="nc" id="L91">      int curr = labelPair[1];</span>
+<span class="nc" id="L92">      int prev = labelPair[0];</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">      if (!currPrevLabelsMap.containsKey(curr))</span>
+<span class="nc" id="L94">        currPrevLabelsMap.put(curr, new ArrayList&lt;&gt;(numClasses));</span>
+<span class="nc" id="L95">      currPrevLabelsMap.get(curr).add(prev);</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">      if (!currNextLabelsMap.containsKey(prev))</span>
+<span class="nc" id="L97">        currNextLabelsMap.put(prev, new ArrayList&lt;&gt;(numClasses));</span>
+<span class="nc" id="L98">      currNextLabelsMap.get(prev).add(curr);</span>
+    }
+<span class="nc" id="L100">  }</span>
+
+  private Map&lt;Integer, double[]&gt; sparseE(Set&lt;Integer&gt; activeFeatures) {
+<span class="nc" id="L103">    Map&lt;Integer, double[]&gt; aMap = new HashMap&lt;&gt;(activeFeatures.size());</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    for (int f: activeFeatures) {</span>
+      // System.err.printf(&quot;aMap.put(%d, new double[%d])\n&quot;, f, map[f]+1);
+<span class="nc bnc" id="L106" title="All 2 branches missed.">      aMap.put(f,new double[map[f] == 0 ? nodeLabelIndexSize : edgeLabelIndexSize]);</span>
+<span class="nc" id="L107">    }</span>
+<span class="nc" id="L108">    return aMap;</span>
+  }
+
+  private Map&lt;Integer, double[]&gt; sparseE(int[] activeFeatures) {
+<span class="nc" id="L112">    Map&lt;Integer, double[]&gt; aMap = new HashMap&lt;&gt;(activeFeatures.length);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">    for (int f: activeFeatures) {</span>
+      // System.err.printf(&quot;aMap.put(%d, new double[%d])\n&quot;, f, map[f]+1);
+<span class="nc bnc" id="L115" title="All 2 branches missed.">      aMap.put(f,new double[map[f] == 0 ? nodeLabelIndexSize : edgeLabelIndexSize]);</span>
+    }
+<span class="nc" id="L117">    return aMap;</span>
+  }
+
+  private Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt; expectedCountsAndValueForADoc(int docIndex,
+      boolean skipExpectedCountCalc, boolean skipValCalc) {
+
+<span class="nc" id="L123">    int[] activeFeatures = dataFeatureHashByDoc[docIndex];</span>
+<span class="nc" id="L124">    List&lt;Set&lt;Integer&gt;&gt; docDataHash = dataFeatureHash.get(docIndex);</span>
+<span class="nc" id="L125">    Map&lt;Integer, List&lt;Integer&gt;&gt; condensedFeaturesMap = condensedMap.get(docIndex);</span>
+
+<span class="nc" id="L127">    double prob = 0;</span>
+<span class="nc" id="L128">    int[][][] docData = totalData[docIndex];</span>
+<span class="nc" id="L129">    int[] docLabels = null;</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    if (docIndex &lt; labels.length)</span>
+<span class="nc" id="L131">      docLabels = labels[docIndex];</span>
+
+<span class="nc" id="L133">    Timing timer = new Timing();</span>
+<span class="nc" id="L134">    double[][][] featureVal3DArr = null;</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">    if (featureVal != null)</span>
+<span class="nc" id="L136">      featureVal3DArr = featureVal[docIndex];</span>
+
+    // make a clique tree for this document
+<span class="nc" id="L139">    CRFCliqueTree cliqueTree = CRFCliqueTree.getCalibratedCliqueTree(docData, labelIndices, numClasses, classIndex, backgroundSymbol, cliquePotentialFunc, featureVal3DArr);</span>
+
+<span class="nc bnc" id="L141" title="All 2 branches missed.">    if (!skipValCalc) {</span>
+      if (TIMED)
+        timer.start();
+      // compute the log probability of the document given the model with the parameters x
+<span class="nc" id="L145">      int[] given = new int[window - 1];</span>
+<span class="nc" id="L146">      Arrays.fill(given, classIndex.indexOf(backgroundSymbol));</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">      if (docLabels.length&gt;docData.length) { // only true for self-training</span>
+        // fill the given array with the extra docLabels
+<span class="nc" id="L149">        System.arraycopy(docLabels, 0, given, 0, given.length);</span>
+        // shift the docLabels array left
+<span class="nc" id="L151">        int[] newDocLabels = new int[docData.length];</span>
+<span class="nc" id="L152">        System.arraycopy(docLabels, docLabels.length-newDocLabels.length, newDocLabels, 0, newDocLabels.length);</span>
+<span class="nc" id="L153">        docLabels = newDocLabels;</span>
+      }
+
+<span class="nc" id="L156">      double startPosLogProb = cliqueTree.logProbStartPos();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">      if (VERBOSE)</span>
+<span class="nc" id="L158">        System.err.printf(&quot;P_-1(Background) = % 5.3f\n&quot;, startPosLogProb);</span>
+<span class="nc" id="L159">      prob += startPosLogProb;</span>
+
+      // iterate over the positions in this document
+<span class="nc bnc" id="L162" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L163">        int label = docLabels[i];</span>
+<span class="nc" id="L164">        double p = cliqueTree.condLogProbGivenPrevious(i, label, given);</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L166">          log.info(&quot;P(&quot; + label + &quot;|&quot; + ArrayMath.toString(given) + &quot;)=&quot; + Math.exp(p));</span>
+        }
+<span class="nc" id="L168">        prob += p;</span>
+<span class="nc" id="L169">        System.arraycopy(given, 1, given, 0, given.length - 1);</span>
+<span class="nc" id="L170">        given[given.length - 1] = label;</span>
+      }
+      if (TIMED) {
+        long elapsedMs = timer.stop();
+        log.info(&quot;Calculate objective took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+      }
+    }
+
+<span class="nc" id="L178">    Map&lt;Integer, double[]&gt; EForADoc = sparseE(activeFeatures);</span>
+<span class="nc" id="L179">    List&lt;Map&lt;Integer, double[]&gt;&gt; EForADocPos = null;</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">    if (dropoutApprox) {</span>
+<span class="nc" id="L181">      EForADocPos = new ArrayList&lt;&gt;(docData.length);</span>
+    }
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">    if (!skipExpectedCountCalc) {</span>
+      if (TIMED)
+        timer.start();
+      // compute the expected counts for this document, which we will need to compute the derivative
+      // iterate over the positions in this document
+<span class="nc" id="L189">      double fVal = 1.0;</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">      for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L191">        Set&lt;Integer&gt; docDataHashI = docDataHash.get(i);</span>
+<span class="nc" id="L192">        Map&lt;Integer, double[]&gt; EForADocPosAtI = null;</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (dropoutApprox)</span>
+<span class="nc" id="L194">          EForADocPosAtI = sparseE(docDataHashI);</span>
+
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        for (int fIndex: docDataHashI) {</span>
+<span class="nc" id="L197">          int j= map[fIndex];</span>
+<span class="nc" id="L198">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+          // for each possible labeling for that clique
+<span class="nc bnc" id="L200" title="All 2 branches missed.">          for (int k = 0; k &lt; labelIndex.size(); k++) {</span>
+<span class="nc" id="L201">            int[] label = labelIndex.get(k).getLabel();</span>
+<span class="nc" id="L202">            double p = cliqueTree.prob(i, label); // probability of these labels occurring in this clique with these features</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (dropoutApprox)</span>
+<span class="nc" id="L204">              increScore(EForADocPosAtI, fIndex, k, fVal * p);</span>
+<span class="nc" id="L205">            increScore(EForADoc, fIndex, k, fVal * p);</span>
+          }
+<span class="nc" id="L207">        }</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (dropoutApprox) {</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">          for (int fIndex: docDataHashI) {</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (condensedFeaturesMap.containsKey(fIndex)) {</span>
+<span class="nc" id="L211">              List&lt;Integer&gt; aList = condensedFeaturesMap.get(fIndex);</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">              for (int toCopyInto: aList) {</span>
+<span class="nc" id="L213">                double[] arr = EForADocPosAtI.get(fIndex);</span>
+<span class="nc" id="L214">                double[] targetArr = new double[arr.length];</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                for (int q=0; q &lt; arr.length; q++)</span>
+<span class="nc" id="L216">                  targetArr[q] = arr[q];</span>
+<span class="nc" id="L217">                EForADocPosAtI.put(toCopyInto, targetArr);</span>
+<span class="nc" id="L218">              }</span>
+            }
+<span class="nc" id="L220">          }</span>
+<span class="nc" id="L221">          EForADocPos.add(EForADocPosAtI);</span>
+        }
+      }
+
+      // copy for condensedFeaturesMap
+<span class="nc bnc" id="L226" title="All 2 branches missed.">      for (Map.Entry&lt;Integer, List&lt;Integer&gt;&gt; entry: condensedFeaturesMap.entrySet()) {</span>
+<span class="nc" id="L227">        int key = entry.getKey();</span>
+<span class="nc" id="L228">        List&lt;Integer&gt; aList = entry.getValue();</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        for (int toCopyInto: aList) {</span>
+<span class="nc" id="L230">          double[] arr = EForADoc.get(key);</span>
+<span class="nc" id="L231">          double[] targetArr = new double[arr.length];</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">          for (int i=0; i &lt; arr.length; i++)</span>
+<span class="nc" id="L233">            targetArr[i] = arr[i];</span>
+<span class="nc" id="L234">          EForADoc.put(toCopyInto, targetArr);</span>
+<span class="nc" id="L235">        }</span>
+<span class="nc" id="L236">      }</span>
+
+      if (TIMED) {
+        long elapsedMs = timer.stop();
+        log.info(&quot;Expected count took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+      }
+    }
+
+<span class="nc" id="L244">    Map&lt;Integer, double[]&gt; dropoutPriorGrad = null;</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">    if (prior == DROPOUT_PRIOR) {</span>
+      if (TIMED)
+        timer.start();
+      // we can optimize this, this is too large, don't need this big
+<span class="nc" id="L249">      dropoutPriorGrad = sparseE(activeFeatures);</span>
+
+      // log.info(&quot;computing dropout prior for doc &quot; + docIndex + &quot; ... &quot;);
+<span class="nc" id="L252">      prob -= getDropoutPrior(cliqueTree, docData, EForADoc, docDataHash, activeFeatures, dropoutPriorGrad, condensedFeaturesMap, EForADocPos);</span>
+      // log.info(&quot; done!&quot;);
+      if (TIMED) {
+        long elapsedMs = timer.stop();
+        log.info(&quot;Dropout took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+      }
+    }
+
+<span class="nc" id="L260">    return new Quadruple&lt;&gt;(docIndex, prob, EForADoc, dropoutPriorGrad);</span>
+  }
+
+  private void increScore(Map&lt;Integer, double[]&gt; aMap, int fIndex, int k, double val) {
+<span class="nc" id="L264">    aMap.get(fIndex)[k] += val;</span>
+<span class="nc" id="L265">  }</span>
+
+  private void increScoreAllowNull(Map&lt;Integer, double[]&gt; aMap, int fIndex, int k, double val) {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">    if (!aMap.containsKey(fIndex)) {</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">      aMap.put(fIndex, new double[map[fIndex] == 0 ? nodeLabelIndexSize : edgeLabelIndexSize]);</span>
+    }
+<span class="nc" id="L271">    aMap.get(fIndex)[k] += val;</span>
+<span class="nc" id="L272">  }</span>
+
+  private void initializeDataFeatureHash() {
+<span class="nc" id="L275">    int macroActiveFeatureTotalCount = 0;</span>
+<span class="nc" id="L276">    int macroCondensedTotalCount = 0;</span>
+<span class="nc" id="L277">    int macroDocPosCount = 0;</span>
+
+<span class="nc" id="L279">    log.info(&quot;initializing data feature hash, sup-data size: &quot; + data.length + &quot;, unsup data size: &quot; + (totalData.length-data.length));</span>
+<span class="nc" id="L280">    dataFeatureHash = new ArrayList&lt;&gt;(totalData.length);</span>
+<span class="nc" id="L281">    condensedMap = new ArrayList&lt;&gt;(totalData.length);</span>
+<span class="nc" id="L282">    dataFeatureHashByDoc = new int[totalData.length][];</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">    for (int m=0; m &lt; totalData.length; m++) {</span>
+<span class="nc" id="L284">      Map&lt;Integer, Integer&gt; occurPos = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L286">      int[][][] aDoc = totalData[m];</span>
+<span class="nc" id="L287">      List&lt;Set&lt;Integer&gt;&gt; aList = new ArrayList&lt;&gt;(aDoc.length);</span>
+<span class="nc" id="L288">      Set&lt;Integer&gt; setOfFeatures = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">      for (int i=0; i&lt; aDoc.length; i++) { // positions in docI</span>
+<span class="nc" id="L290">        Set&lt;Integer&gt; aSet = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L291">        int[][] dataI = aDoc[i];</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        for (int j=0; j &lt; dataI.length; j++) {</span>
+<span class="nc" id="L293">          int[] dataJ = dataI[j];</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">          for (int item: dataJ) {</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (j == 0) {</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">              if (occurPos.containsKey(item))</span>
+<span class="nc" id="L297">                occurPos.put(item, -1);</span>
+              else
+<span class="nc" id="L299">                occurPos.put(item, i);</span>
+            }
+
+<span class="nc" id="L302">            aSet.add(item);</span>
+          }
+        }
+<span class="nc" id="L305">        aList.add(aSet);</span>
+<span class="nc" id="L306">        setOfFeatures.addAll(aSet);</span>
+      }
+<span class="nc" id="L308">      macroDocPosCount += aDoc.length;</span>
+<span class="nc" id="L309">      macroActiveFeatureTotalCount += setOfFeatures.size();</span>
+
+      if (CONDENSE) {
+        if (DEBUG3)
+          log.info(&quot;Before condense, activeFeatures = &quot; + setOfFeatures.size());
+        // examine all singletons, merge ones in the same position
+<span class="nc" id="L315">        Map&lt;Integer, List&lt;Integer&gt;&gt; condensedFeaturesMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L316">        int[] representFeatures = new int[aDoc.length];</span>
+<span class="nc" id="L317">        Arrays.fill(representFeatures, -1);</span>
+
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        for (Map.Entry&lt;Integer, Integer&gt; entry: occurPos.entrySet()) {</span>
+<span class="nc" id="L320">          int key = entry.getKey();</span>
+<span class="nc" id="L321">          int pos = entry.getValue();</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">          if (pos != -1) {</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            if (representFeatures[pos] == -1) { // use this as representFeatures</span>
+<span class="nc" id="L324">              representFeatures[pos] = key;</span>
+<span class="nc" id="L325">              condensedFeaturesMap.put(key, new ArrayList&lt;&gt;());</span>
+            } else { // condense this one
+<span class="nc" id="L327">              int rep = representFeatures[pos];</span>
+<span class="nc" id="L328">              condensedFeaturesMap.get(rep).add(key);</span>
+              // remove key
+<span class="nc" id="L330">              aList.get(pos).remove(key);</span>
+<span class="nc" id="L331">              setOfFeatures.remove(key);</span>
+            }
+          }
+<span class="nc" id="L334">        }</span>
+<span class="nc" id="L335">        int condensedCount = 0;</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        for(Iterator&lt;Map.Entry&lt;Integer, List&lt;Integer&gt;&gt;&gt; it = condensedFeaturesMap.entrySet().iterator(); it.hasNext(); ) {</span>
+<span class="nc" id="L337">          Map.Entry&lt;Integer, List&lt;Integer&gt;&gt; entry = it.next();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">          if(entry.getValue().size() == 0) {</span>
+<span class="nc" id="L339">            it.remove();</span>
+          } else {
+            if (DEBUG3) {
+              condensedCount += entry.getValue().size();
+              for (int cond: entry.getValue())
+                log.info(&quot;condense &quot; + cond + &quot; to &quot; + entry.getKey());
+            }
+          }
+<span class="nc" id="L347">        }</span>
+        if (DEBUG3)
+          log.info(&quot;After condense, activeFeatures = &quot; + setOfFeatures.size() + &quot;, condensedCount = &quot; + condensedCount);
+<span class="nc" id="L350">        macroCondensedTotalCount += setOfFeatures.size();</span>
+<span class="nc" id="L351">        condensedMap.add(condensedFeaturesMap);</span>
+      }
+
+<span class="nc" id="L354">      dataFeatureHash.add(aList);</span>
+<span class="nc" id="L355">      int[] arrOfIndex = new int[setOfFeatures.size()];</span>
+<span class="nc" id="L356">      int pos2 = 0;</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">      for(Integer ind: setOfFeatures)</span>
+<span class="nc" id="L358">        arrOfIndex[pos2++] = ind;</span>
+<span class="nc" id="L359">      dataFeatureHashByDoc[m] = arrOfIndex;</span>
+    }
+<span class="nc" id="L361">    log.info(&quot;Avg. active features per position: &quot; + (macroActiveFeatureTotalCount/ (macroDocPosCount+0.0)));</span>
+<span class="nc" id="L362">    log.info(&quot;Avg. condensed features per position: &quot; + (macroCondensedTotalCount / (macroDocPosCount+0.0)));</span>
+<span class="nc" id="L363">    log.info(&quot;initializing data feature hash done!&quot;);</span>
+<span class="nc" id="L364">  }</span>
+
+  private double getDropoutPrior(CRFCliqueTree cliqueTree, int[][][] docData,
+      Map&lt;Integer, double[]&gt; EForADoc, List&lt;Set&lt;Integer&gt;&gt; docDataHash, int[] activeFeatures, Map&lt;Integer, double[]&gt; dropoutPriorGrad,
+      Map&lt;Integer, List&lt;Integer&gt;&gt; condensedFeaturesMap, List&lt;Map&lt;Integer, double[]&gt;&gt; EForADocPos) {
+
+<span class="nc" id="L370">    Map&lt;Integer, double[]&gt; dropoutPriorGradFirstHalf = sparseE(activeFeatures);</span>
+
+    if (TIMED)
+      log.info(&quot;activeFeatures size: &quot;+activeFeatures.length + &quot;, dataLen: &quot; + docData.length);
+
+<span class="nc" id="L375">    Timing timer = new Timing();</span>
+    if (TIMED)
+      timer.start();
+
+<span class="nc" id="L379">    double priorValue = 0;</span>
+
+<span class="nc" id="L381">    long elapsedMs = 0;</span>
+<span class="nc" id="L382">    Pair&lt;double[][][], double[][][]&gt; condProbs = getCondProbs(cliqueTree, docData);</span>
+    if (TIMED) {
+      elapsedMs = timer.stop();
+      log.info(&quot;\t cond prob took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+    }
+
+    // first index position is curr index, second index curr-class, third index prev-class
+    // e.g. [1][2][3] means curr is at position 1 with class 2, prev is at position 0 with class 3
+<span class="nc" id="L390">    double[][][] prevGivenCurr = condProbs.first();</span>
+    // first index position is curr index, second index curr-class, third index next-class
+    // e.g. [0][2][3] means curr is at position 0 with class 2, next is at position 1 with class 3
+<span class="nc" id="L393">    double[][][] nextGivenCurr = condProbs.second();</span>
+
+    // first dim is doc length (i)
+    // second dim is numOfFeatures (fIndex)
+    // third dim is numClasses (y)
+    // fourth dim is labelIndexSize (matching the clique type of fIndex, for \theta)
+<span class="nc" id="L399">    double[][][][] FAlpha = null;</span>
+<span class="nc" id="L400">    double[][][][] FBeta  = null;</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">    if (!dropoutApprox) {</span>
+<span class="nc" id="L402">      FAlpha = new double[docData.length][][][];</span>
+<span class="nc" id="L403">      FBeta  = new double[docData.length][][][];</span>
+    }
+<span class="nc bnc" id="L405" title="All 2 branches missed.">    for (int i = 0; i &lt; docData.length; i++) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">      if (!dropoutApprox) {</span>
+<span class="nc" id="L407">        FAlpha[i] = new double[activeFeatures.length][][];</span>
+<span class="nc" id="L408">        FBeta[i]  = new double[activeFeatures.length][][];</span>
+      }
+    }
+
+<span class="nc bnc" id="L412" title="All 2 branches missed.">    if (!dropoutApprox) {</span>
+      if (TIMED) {
+        timer.start();
+      }
+      // computing FAlpha
+<span class="nc" id="L417">      int fIndex = 0;</span>
+<span class="nc" id="L418">      double aa, bb, cc = 0;</span>
+<span class="nc" id="L419">      boolean prevFeaturePresent  = false;</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">      for (int i = 1; i &lt; docData.length; i++) {</span>
+        // for each possible clique at this position
+<span class="nc" id="L422">        Set&lt;Integer&gt; docDataHashIMinusOne = docDataHash.get(i-1);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        for (int fIndexPos = 0; fIndexPos &lt; activeFeatures.length; fIndexPos++) {</span>
+<span class="nc" id="L424">          fIndex = activeFeatures[fIndexPos];</span>
+<span class="nc" id="L425">          prevFeaturePresent = docDataHashIMinusOne.contains(fIndex);</span>
+<span class="nc" id="L426">          int j = map[fIndex];</span>
+<span class="nc" id="L427">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+<span class="nc" id="L428">          int labelIndexSize = labelIndex.size();</span>
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">          if (FAlpha[i-1][fIndexPos] == null) {</span>
+<span class="nc" id="L431">            FAlpha[i-1][fIndexPos] = new double[numClasses][labelIndexSize];</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">            for (int q = 0; q &lt; numClasses; q++)</span>
+<span class="nc" id="L433">              FAlpha[i-1][fIndexPos][q] = new double[labelIndexSize];</span>
+          }
+
+<span class="nc bnc" id="L436" title="All 2 branches missed.">          for (Map.Entry&lt;Integer, List&lt;Integer&gt;&gt; entry : currPrevLabelsMap.entrySet()) {</span>
+<span class="nc" id="L437">            int y = entry.getKey(); // value at i-1</span>
+<span class="nc" id="L438">            double[] sum = new double[labelIndexSize];</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            for (int yPrime: entry.getValue()) { // value at i-2</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">              for (int kk = 0; kk &lt; labelIndexSize; kk++) {</span>
+<span class="nc" id="L441">                int[] prevLabel = labelIndex.get(kk).getLabel();</span>
+<span class="nc" id="L442">                aa = (prevGivenCurr[i-1][y][yPrime]);</span>
+<span class="nc bnc" id="L443" title="All 12 branches missed.">                bb = (prevFeaturePresent &amp;&amp; ((j == 0 &amp;&amp; prevLabel[0] == y) || (j == 1 &amp;&amp; prevLabel[1] == y &amp;&amp; prevLabel[0] == yPrime)) ? 1 : 0);</span>
+<span class="nc" id="L444">                cc = 0;</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">                if (FAlpha[i-1][fIndexPos][yPrime] != null)</span>
+<span class="nc" id="L446">                  cc = FAlpha[i-1][fIndexPos][yPrime][kk];</span>
+<span class="nc" id="L447">                sum[kk] +=  aa * (bb + cc);</span>
+                // sum[kk] += (prevGivenCurr[i-1][y][yPrime]) * ((prevFeaturePresent &amp;&amp; ((j == 0 &amp;&amp; prevLabel[0] == y) || (j == 1 &amp;&amp; prevLabel[1] == y &amp;&amp; prevLabel[0] == yPrime)) ? 1 : 0) + FAlpha[i-1][fIndexPos][yPrime][kk]);
+                if (DEBUG2)
+                  System.err.printf(&quot;alpha[%d][%d][%d][%d] += % 5.3f * (%d + % 5.3f), prevLabel=%s\n&quot;, i, fIndex, y, kk, (prevGivenCurr[i-1][y][yPrime]), (prevFeaturePresent &amp;&amp; ((j == 0 &amp;&amp; prevLabel[0] == y) || (j == 1 &amp;&amp; prevLabel[1] == y &amp;&amp; prevLabel[0] == yPrime)) ? 1 : 0) , FAlpha[i-1][fIndexPos][yPrime][kk], Arrays.toString(prevLabel));
+              }
+<span class="nc" id="L452">            }</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">            if (FAlpha[i][fIndexPos] == null) {</span>
+<span class="nc" id="L454">              FAlpha[i][fIndexPos] = new double[numClasses][];</span>
+            }
+<span class="nc" id="L456">            FAlpha[i][fIndexPos][y] = sum;</span>
+            if (DEBUG2)
+              log.info(&quot;FAlpha[&quot;+i+&quot;][&quot;+fIndexPos+&quot;][&quot;+y+&quot;] = &quot; + Arrays.toString(sum));
+
+<span class="nc" id="L460">          }</span>
+        }
+      }
+      if (TIMED) {
+        elapsedMs = timer.stop();
+        log.info(&quot;\t alpha took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+        timer.start();
+      }
+      // computing FBeta
+<span class="nc" id="L469">      int docDataLen = docData.length;</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">      for (int i = docDataLen-2; i &gt;= 0; i--) {</span>
+<span class="nc" id="L471">        Set&lt;Integer&gt; docDataHashIPlusOne = docDataHash.get(i+1);</span>
+        // for each possible clique at this position
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        for (int fIndexPos = 0; fIndexPos &lt; activeFeatures.length; fIndexPos++) {</span>
+<span class="nc" id="L474">          fIndex = activeFeatures[fIndexPos];</span>
+<span class="nc" id="L475">          boolean nextFeaturePresent = docDataHashIPlusOne.contains(fIndex);</span>
+<span class="nc" id="L476">          int j = map[fIndex];</span>
+<span class="nc" id="L477">          Index&lt;CRFLabel&gt; labelIndex = labelIndices.get(j);</span>
+<span class="nc" id="L478">          int labelIndexSize = labelIndex.size();</span>
+
+<span class="nc bnc" id="L480" title="All 2 branches missed.">          if (FBeta[i+1][fIndexPos] == null) {</span>
+<span class="nc" id="L481">            FBeta[i+1][fIndexPos] = new double[numClasses][labelIndexSize];</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            for (int q = 0; q &lt; numClasses; q++)</span>
+<span class="nc" id="L483">              FBeta[i+1][fIndexPos][q] = new double[labelIndexSize];</span>
+          }
+
+<span class="nc bnc" id="L486" title="All 2 branches missed.">          for (Map.Entry&lt;Integer, List&lt;Integer&gt;&gt; entry : currNextLabelsMap.entrySet()) {</span>
+<span class="nc" id="L487">            int y = entry.getKey(); // value at i</span>
+<span class="nc" id="L488">            double[] sum = new double[labelIndexSize];</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            for (int yPrime: entry.getValue()) { // value at i+1</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">              for (int kk=0; kk &lt; labelIndexSize; kk++) {</span>
+<span class="nc" id="L491">                int[] nextLabel = labelIndex.get(kk).getLabel();</span>
+                // log.info(&quot;labelIndexSize:&quot;+labelIndexSize+&quot;, nextGivenCurr:&quot;+nextGivenCurr+&quot;, nextLabel:&quot;+nextLabel+&quot;, FBeta[&quot;+(i+1)+&quot;][&quot;+ fIndexPos +&quot;][&quot;+yPrime+&quot;] :&quot;+FBeta[i+1][fIndexPos][yPrime]);
+<span class="nc" id="L493">                aa = (nextGivenCurr[i][y][yPrime]);</span>
+<span class="nc bnc" id="L494" title="All 12 branches missed.">                bb = (nextFeaturePresent &amp;&amp; ((j == 0 &amp;&amp; nextLabel[0] == yPrime) || (j == 1 &amp;&amp; nextLabel[0] == y &amp;&amp; nextLabel[1] == yPrime)) ? 1 : 0);</span>
+<span class="nc" id="L495">                cc = 0;</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">                if (FBeta[i+1][fIndexPos][yPrime] != null)</span>
+<span class="nc" id="L497">                  cc = FBeta[i+1][fIndexPos][yPrime][kk];</span>
+<span class="nc" id="L498">                sum[kk] +=  aa * ( bb + cc);</span>
+                // sum[kk] += (nextGivenCurr[i][y][yPrime]) * ( (nextFeaturePresent &amp;&amp; ((j == 0 &amp;&amp; nextLabel[0] == yPrime) || (j == 1 &amp;&amp; nextLabel[0] == y &amp;&amp; nextLabel[1] == yPrime)) ? 1 : 0) + FBeta[i+1][fIndexPos][yPrime][kk]);
+                if (DEBUG2)
+                  System.err.printf(&quot;beta[%d][%d][%d][%d] += % 5.3f * (%d + % 5.3f)\n&quot;, i, fIndex, y, kk, (nextGivenCurr[i][y][yPrime]), (nextFeaturePresent &amp;&amp; ((j == 0 &amp;&amp; nextLabel[0] == yPrime) || (j == 1 &amp;&amp; nextLabel[0] == y &amp;&amp; nextLabel[1] == yPrime)) ? 1 : 0), FBeta[i+1][fIndexPos][yPrime][kk]);
+              }
+<span class="nc" id="L503">            }</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">            if (FBeta[i][fIndexPos] == null) {</span>
+<span class="nc" id="L505">              FBeta[i][fIndexPos] = new double[numClasses][];</span>
+            }
+<span class="nc" id="L507">            FBeta[i][fIndexPos][y] = sum;</span>
+            if (DEBUG2)
+              log.info(&quot;FBeta[&quot;+i+&quot;][&quot;+fIndexPos+&quot;][&quot;+y+&quot;] = &quot; + Arrays.toString(sum));
+<span class="nc" id="L510">          }</span>
+        }
+      }
+      if (TIMED) {
+        elapsedMs = timer.stop();
+        log.info(&quot;\t beta took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+      }
+    }
+    if (TIMED) {
+      timer.start();
+    }
+
+    // derivative equals: VarU' * PtYYp * (1-PtYYp) + VarU * PtYYp' * (1-PtYYp) + VarU * PtYYp * (1-PtYYp)'
+    // derivative equals: VarU' * PtYYp * (1-PtYYp) + VarU * PtYYp' * (1-PtYYp) + VarU * PtYYp * -PtYYp'
+    // derivative equals: VarU' * PtYYp * (1-PtYYp) + VarU * PtYYp' * (1 - 2 * PtYYp)
+
+<span class="nc" id="L526">    double deltaDivByOneMinusDelta = delta / (1.0-delta);</span>
+
+<span class="nc" id="L528">    Timing innerTimer = new Timing();</span>
+<span class="nc" id="L529">    long eTiming = 0;</span>
+<span class="nc" id="L530">    long dropoutTiming= 0;</span>
+
+<span class="nc" id="L532">    boolean containsFeature = false;</span>
+    // iterate over the positions in this document
+<span class="nc bnc" id="L534" title="All 2 branches missed.">    for (int i = 1; i &lt; docData.length; i++) {</span>
+<span class="nc" id="L535">      Set&lt;Integer&gt; docDataHashI = docDataHash.get(i);</span>
+<span class="nc" id="L536">      Map&lt;Integer, double[]&gt; EForADocPosAtI = null;</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">      if (dropoutApprox)</span>
+<span class="nc" id="L538">        EForADocPosAtI = EForADocPos.get(i);</span>
+
+      // for each possible clique at this position
+<span class="nc bnc" id="L541" title="All 2 branches missed.">      for (int k = 0; k &lt; edgeLabelIndexSize; k++) { // sum over (y, y')</span>
+<span class="nc" id="L542">        int[] label = edgeLabels[k];</span>
+<span class="nc" id="L543">        int y = label[0];</span>
+<span class="nc" id="L544">        int yP = label[1];</span>
+
+        if (TIMED)
+          innerTimer.start();
+
+        // important to use label as an int[] for calculating cliqueTree.prob()
+        // if it's a node clique, and label index is 2, if we don't use int[]{2} but just pass 2,
+        // cliqueTree is going to treat it as index of the edge clique labels, and convert 2
+        // into int[]{0,2}, and return the edge prob marginal instead of node marginal
+<span class="nc" id="L553">        double PtYYp = cliqueTree.prob(i, label);</span>
+<span class="nc" id="L554">        double PtYYpTimesOneMinusPtYYp = PtYYp * (1.0 - PtYYp);</span>
+<span class="nc" id="L555">        double oneMinus2PtYYp = (1.0 - 2 * PtYYp);</span>
+<span class="nc" id="L556">        double USum = 0;</span>
+        int fIndex;
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        for (int jjj=0; jjj&lt;labelIndices.size(); jjj++) {</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">          for (int n = 0; n &lt; docData[i][jjj].length; n++) {</span>
+<span class="nc" id="L560">            fIndex = docData[i][jjj][n];</span>
+            int valIndex;
+<span class="nc bnc" id="L562" title="All 2 branches missed.">            if (jjj == 1)</span>
+<span class="nc" id="L563">              valIndex = k;</span>
+            else
+<span class="nc" id="L565">              valIndex = yP;</span>
+            double theta;
+            try {
+<span class="nc" id="L568">              theta = weights[fIndex][valIndex];</span>
+<span class="nc" id="L569">            }catch (Exception ex) {</span>
+<span class="nc" id="L570">              System.err.printf(&quot;weights[%d][%d], map[%d]=%d, labelIndices.get(map[%d]).size() = %d, weights.length=%d\n&quot;, fIndex, valIndex, fIndex, map[fIndex], fIndex, labelIndices.get(map[fIndex]).size(), weights.length);</span>
+<span class="nc" id="L571">              throw new RuntimeException(ex);</span>
+<span class="nc" id="L572">            }</span>
+
+<span class="nc" id="L574">            USum += weightSquare[fIndex][valIndex];</span>
+
+            // first half of derivative: VarU' * PtYYp * (1-PtYYp)
+<span class="nc" id="L577">            double VarUp = deltaDivByOneMinusDelta * theta;</span>
+<span class="nc" id="L578">            increScoreAllowNull(dropoutPriorGradFirstHalf, fIndex, valIndex, VarUp * PtYYpTimesOneMinusPtYYp);</span>
+          }
+        }
+
+        if (TIMED) {
+          eTiming += innerTimer.stop();
+          innerTimer.start();
+        }
+<span class="nc" id="L586">        double VarU = 0.5 * deltaDivByOneMinusDelta * USum;</span>
+
+        // update function objective
+<span class="nc" id="L589">        priorValue += VarU * PtYYpTimesOneMinusPtYYp;</span>
+
+<span class="nc" id="L591">        double VarUTimesOneMinus2PtYYp = VarU * oneMinus2PtYYp;</span>
+
+        // second half of derivative: VarU * PtYYp' * (1 - 2 * PtYYp)
+        // boolean prevFeaturePresent = false;
+        // boolean nextFeaturePresent = false;
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        for (int fIndexPos = 0; fIndexPos &lt; activeFeatures.length; fIndexPos++) {</span>
+<span class="nc" id="L597">          fIndex = activeFeatures[fIndexPos];</span>
+<span class="nc" id="L598">          containsFeature = docDataHashI.contains(fIndex);</span>
+
+          // if (!containsFeature) continue;
+<span class="nc" id="L601">          int jj = map[fIndex];</span>
+<span class="nc" id="L602">          Index&lt;CRFLabel&gt; fLabelIndex = labelIndices.get(jj);</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">          for (int kk = 0; kk &lt; fLabelIndex.size(); kk++) { // for all parameter \theta</span>
+<span class="nc" id="L604">            int[] fLabel = fLabelIndex.get(kk).getLabel();</span>
+            // if (FAlpha[i] != null)
+            //   log.info(&quot;fIndex: &quot; + fIndex+&quot;, FAlpha[i].size:&quot;+FAlpha[i].length);
+<span class="nc bnc" id="L607" title="All 10 branches missed.">            double fCount = containsFeature &amp;&amp; ((jj == 0 &amp;&amp; fLabel[0] == yP) || (jj == 1 &amp;&amp; k == kk)) ? 1 : 0;</span>
+
+            double alpha;
+            double beta;
+            double condE;
+            double PtYYpPrime;
+<span class="nc bnc" id="L613" title="All 2 branches missed.">            if (!dropoutApprox) {</span>
+<span class="nc bnc" id="L614" title="All 4 branches missed.">              alpha = ((FAlpha[i][fIndexPos] == null || FAlpha[i][fIndexPos][y] == null) ? 0 : FAlpha[i][fIndexPos][y][kk]);</span>
+<span class="nc bnc" id="L615" title="All 4 branches missed.">              beta = ((FBeta[i][fIndexPos] == null || FBeta[i][fIndexPos][yP] == null) ? 0 : FBeta[i][fIndexPos][yP][kk]);</span>
+<span class="nc" id="L616">              condE = fCount + alpha + beta;</span>
+              if (DEBUG2)
+                System.err.printf(&quot;fLabel=%s, yP = %d, fCount:%f = ((jj == 0 &amp;&amp; fLabel[0] == yP)=%b || (jj == 1 &amp;&amp; k == kk))=%b\n&quot;, Arrays.toString(fLabel),yP, fCount,(jj == 0 &amp;&amp; fLabel[0] == yP) , (jj == 1 &amp;&amp; k == kk));
+<span class="nc" id="L619">              PtYYpPrime = PtYYp * (condE - EForADoc.get(fIndex)[kk]);</span>
+            } else {
+<span class="nc" id="L621">              double E = 0;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">              if (EForADocPosAtI.containsKey(fIndex))</span>
+<span class="nc" id="L623">                E = EForADocPosAtI.get(fIndex)[kk];</span>
+<span class="nc" id="L624">              condE = fCount;</span>
+<span class="nc" id="L625">              PtYYpPrime = PtYYp * (condE - E);</span>
+            }
+
+            if (DEBUG2)
+              System.err.printf(&quot;for i=%d, k=%d, y=%d, yP=%d, fIndex=%d, kk=%d, PtYYpPrime=% 5.3f, PtYYp=% 3.3f, (condE-E[fIndex][kk])=% 3.3f, condE=% 3.3f, E[fIndex][k]=% 3.3f, alpha=% 3.3f, beta=% 3.3f, fCount=% 3.3f\n&quot;, i, k, y, yP, fIndex, kk, PtYYpPrime, PtYYp, (condE - EForADoc.get(fIndex)[kk]), condE, EForADoc.get(fIndex)[kk], alpha, beta, fCount);
+
+<span class="nc" id="L631">            increScore(dropoutPriorGrad, fIndex, kk, VarUTimesOneMinus2PtYYp * PtYYpPrime);</span>
+          }
+
+          if (DEBUG2)
+            log.info();
+        }
+        if (TIMED)
+          dropoutTiming += innerTimer.stop();
+      }
+    }
+    if (CONDENSE) {
+      // copy for condensedFeaturesMap
+<span class="nc bnc" id="L643" title="All 2 branches missed.">      for (Map.Entry&lt;Integer, List&lt;Integer&gt;&gt; entry: condensedFeaturesMap.entrySet()) {</span>
+<span class="nc" id="L644">        int key = entry.getKey();</span>
+<span class="nc" id="L645">        List&lt;Integer&gt; aList = entry.getValue();</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">        for (int toCopyInto: aList) {</span>
+<span class="nc" id="L647">          double[] arr = dropoutPriorGrad.get(key);</span>
+<span class="nc" id="L648">          double[] targetArr = new double[arr.length];</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">          for (int i=0; i &lt; arr.length; i++)</span>
+<span class="nc" id="L650">            targetArr[i] = arr[i];</span>
+<span class="nc" id="L651">          dropoutPriorGrad.put(toCopyInto, targetArr);</span>
+<span class="nc" id="L652">        }</span>
+<span class="nc" id="L653">      }</span>
+    }
+
+    if (DEBUG3) {
+      log.info(&quot;dropoutPriorGradFirstHalf.keys:[&quot;);
+      for (int key: dropoutPriorGradFirstHalf.keySet())
+        log.info(&quot; &quot;+key);
+      log.info(&quot;]&quot;);
+
+      log.info(&quot;dropoutPriorGrad.keys:[&quot;);
+      for (int key: dropoutPriorGrad.keySet())
+        log.info(&quot; &quot;+key);
+      log.info(&quot;]&quot;);
+    }
+
+<span class="nc bnc" id="L668" title="All 2 branches missed.">    for (Map.Entry&lt;Integer, double[]&gt; entry: dropoutPriorGrad.entrySet()) {</span>
+<span class="nc" id="L669">      Integer key = entry.getKey();</span>
+<span class="nc" id="L670">      double[] target = entry.getValue();</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">      if (dropoutPriorGradFirstHalf.containsKey(key)) {</span>
+<span class="nc" id="L672">        double[] source = dropoutPriorGradFirstHalf.get(key);</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">        for (int i=0; i&lt;target.length; i++) {</span>
+<span class="nc" id="L674">          target[i] += source[i];</span>
+        }
+      }
+<span class="nc" id="L677">    }</span>
+    // for (int i=0;i&lt;dropoutPriorGrad.length;i++)
+    //   for (int j=0; j&lt;dropoutPriorGrad[i].length;j++) {
+    //     if (DEBUG3)
+    //       System.err.printf(&quot;f=%d, k=%d, dropoutPriorGradFirstHalf[%d][%d]=% 5.3f, dropoutPriorGrad[%d][%d]=% 5.3f\n&quot;, i, j, i, j, dropoutPriorGradFirstHalf[i][j], i, j, dropoutPriorGrad[i][j]);
+    //     dropoutPriorGrad[i][j] += dropoutPriorGradFirstHalf[i][j];
+    //   }
+
+    if (TIMED) {
+      elapsedMs = timer.stop();
+      log.info(&quot;\t grad took: &quot; + Timing.toMilliSecondsString(elapsedMs) + &quot; ms&quot;);
+      log.info(&quot;\t\t exp took: &quot; + Timing.toMilliSecondsString(eTiming) + &quot; ms&quot;);
+      log.info(&quot;\t\t dropout took: &quot; + Timing.toMilliSecondsString(dropoutTiming) + &quot; ms&quot;);
+    }
+
+<span class="nc" id="L692">    return dropoutScale * priorValue;</span>
+  }
+
+
+  @Override
+  public void setWeights(double[][] weights) {
+<span class="nc" id="L698">    super.setWeights(weights);</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">    if (weightSquare == null) {</span>
+<span class="nc" id="L700">      weightSquare = new double[weights.length][];</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">      for (int i = 0; i &lt; weights.length; i++)</span>
+<span class="nc" id="L702">        weightSquare[i] = new double[weights[i].length];</span>
+    }
+<span class="nc bnc" id="L704" title="All 2 branches missed.">    for (int i = 0; i &lt; weights.length; i++) {</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">      for (int j=0; j &lt; weights[i].length; j++) {</span>
+<span class="nc" id="L706">        double w = weights[i][j];</span>
+<span class="nc" id="L707">        weightSquare[i][j] = w * w;</span>
+      }
+    }
+<span class="nc" id="L710">  }</span>
+
+  /**
+   * Calculates both value and partial derivatives at the point x, and save them internally.
+   */
+  @Override
+  public void calculate(double[] x) {
+
+<span class="nc" id="L718">    double prob = 0.0; // the log prob of the sequence given the model, which is the negation of value at this point</span>
+    // final double[][] weights = to2D(x);
+<span class="nc" id="L720">    to2D(x, weights);</span>
+
+<span class="nc" id="L722">    setWeights(weights);</span>
+
+    // the expectations over counts
+    // first index is feature index, second index is of possible labeling
+    // double[][] E = empty2D();
+<span class="nc" id="L727">    clear2D(E);</span>
+<span class="nc" id="L728">    clear2D(dropoutPriorGradTotal);</span>
+
+<span class="nc" id="L730">    MulticoreWrapper&lt;Pair&lt;Integer, Boolean&gt;, Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt;&gt; wrapper =</span>
+            new MulticoreWrapper&lt;&gt;(multiThreadGrad, dropoutPriorThreadProcessor);
+    // supervised part
+<span class="nc bnc" id="L733" title="All 2 branches missed.">    for (int m = 0; m &lt; totalData.length; m++) {</span>
+<span class="nc bnc" id="L734" title="All 2 branches missed.">      boolean submitIsUnsup = (m &gt;= unsupDropoutStartIndex);</span>
+<span class="nc" id="L735">      wrapper.put(new Pair&lt;&gt;(m, submitIsUnsup));</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">      while (wrapper.peek()) {</span>
+<span class="nc" id="L737">        Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt; result = wrapper.poll();</span>
+<span class="nc" id="L738">        int docIndex = result.first();</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">        boolean isUnsup = docIndex &gt;= unsupDropoutStartIndex;</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">        if (isUnsup) {</span>
+<span class="nc" id="L741">          prob += unsupDropoutScale * result.second();</span>
+        } else {
+<span class="nc" id="L743">          prob += result.second();</span>
+        }
+
+<span class="nc" id="L746">        Map&lt;Integer, double[]&gt; partialDropout = result.fourth();</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">        if (partialDropout != null) {</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">          if (isUnsup) {</span>
+<span class="nc" id="L749">            combine2DArr(dropoutPriorGradTotal, partialDropout, unsupDropoutScale);</span>
+          } else {
+<span class="nc" id="L751">            combine2DArr(dropoutPriorGradTotal, partialDropout);</span>
+          }
+        }
+
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        if (!isUnsup) {</span>
+<span class="nc" id="L756">          Map&lt;Integer, double[]&gt; partialE = result.third();</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">          if (partialE != null)</span>
+<span class="nc" id="L758">            combine2DArr(E, partialE);</span>
+        }
+<span class="nc" id="L760">      }</span>
+    }
+<span class="nc" id="L762">    wrapper.join();</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">    while (wrapper.peek()) {</span>
+<span class="nc" id="L764">      Quadruple&lt;Integer, Double, Map&lt;Integer, double[]&gt;, Map&lt;Integer, double[]&gt;&gt; result = wrapper.poll();</span>
+<span class="nc" id="L765">      int docIndex = result.first();</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">      boolean isUnsup = docIndex &gt;= unsupDropoutStartIndex;</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">      if (isUnsup) {</span>
+<span class="nc" id="L768">        prob += unsupDropoutScale * result.second();</span>
+      } else {
+<span class="nc" id="L770">        prob += result.second();</span>
+      }
+
+<span class="nc" id="L773">      Map&lt;Integer, double[]&gt; partialDropout = result.fourth();</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">      if (partialDropout != null) {</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        if (isUnsup) {</span>
+<span class="nc" id="L776">          combine2DArr(dropoutPriorGradTotal, partialDropout, unsupDropoutScale);</span>
+        } else {
+<span class="nc" id="L778">          combine2DArr(dropoutPriorGradTotal, partialDropout);</span>
+        }
+      }
+
+<span class="nc bnc" id="L782" title="All 2 branches missed.">      if (!isUnsup) {</span>
+<span class="nc" id="L783">        Map&lt;Integer, double[]&gt; partialE = result.third();</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (partialE != null)</span>
+<span class="nc" id="L785">          combine2DArr(E, partialE);</span>
+      }
+<span class="nc" id="L787">    }</span>
+
+
+<span class="nc bnc" id="L790" title="All 2 branches missed.">    if (Double.isNaN(prob)) { // shouldn't be the case</span>
+<span class="nc" id="L791">      throw new RuntimeException(&quot;Got NaN for prob in CRFLogConditionalObjectiveFunctionWithDropout.calculate()&quot; +</span>
+              &quot; - this may well indicate numeric underflow due to overly long documents.&quot;);
+    }
+
+    // because we minimize -L(\theta)
+<span class="nc" id="L796">    value = -prob;</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">    if (VERBOSE) {</span>
+<span class="nc" id="L798">      log.info(&quot;value is &quot; + Math.exp(-value));</span>
+    }
+
+    // compute the partial derivative for each feature by comparing expected counts to empirical counts
+<span class="nc" id="L802">    int index = 0;</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">    for (int i = 0; i &lt; E.length; i++) {</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">      for (int j = 0; j &lt; E[i].length; j++) {</span>
+        // because we minimize -L(\theta)
+<span class="nc" id="L806">        derivative[index] = (E[i][j] - Ehat[i][j]);</span>
+<span class="nc" id="L807">        derivative[index] += dropoutScale * dropoutPriorGradTotal[i][j];</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">        if (VERBOSE) {</span>
+<span class="nc" id="L809">          log.info(&quot;deriv(&quot; + i + ',' + j + &quot;) = &quot; + E[i][j] + &quot; - &quot; + Ehat[i][j] + &quot; = &quot; + derivative[index]);</span>
+        }
+<span class="nc" id="L811">        index++;</span>
+      }
+    }
+<span class="nc" id="L814">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

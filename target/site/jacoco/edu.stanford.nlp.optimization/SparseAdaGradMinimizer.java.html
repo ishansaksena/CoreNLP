@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SparseAdaGradMinimizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.optimization</a> &gt; <span class="el_source">SparseAdaGradMinimizer.java</span></div><h1>SparseAdaGradMinimizer.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.optimization; 
+import edu.stanford.nlp.util.logging.Redwood;
+
+import edu.stanford.nlp.stats.Counter;
+import edu.stanford.nlp.stats.ClassicCounter;
+import edu.stanford.nlp.util.Timing;
+
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.Random;
+
+/**
+ * AdaGrad optimizer that works online, and use sparse gradients, need a
+ * function that takes a Counter&lt;K&gt; as argument and returns a Counter&lt;K&gt; as
+ * gradient
+ * 
+ * @author Sida Wang
+ */
+public class SparseAdaGradMinimizer&lt;K, F extends SparseOnlineFunction&lt;K&gt;&gt; implements SparseMinimizer&lt;K, F&gt;  {
+
+  /** A logger for this class */
+<span class="nc" id="L22">  private static Redwood.RedwoodChannels log = Redwood.channels(SparseAdaGradMinimizer.class);</span>
+<span class="nc" id="L23">  public boolean quiet = false;</span>
+
+  protected int numPasses;
+  protected int batchSize;
+  protected double eta;
+  protected double lambdaL1;
+  protected double lambdaL2;
+
+  protected Counter&lt;K&gt; sumGradSquare;
+  protected Counter&lt;K&gt; x;
+
+<span class="nc" id="L34">  protected Random randGenerator = new Random(1);</span>
+
+<span class="nc" id="L36">  public final double EPS = 1e-15;</span>
+<span class="nc" id="L37">  public final double soften = 1e-4;</span>
+
+  public SparseAdaGradMinimizer(int numPasses) {
+<span class="nc" id="L40">	this(numPasses, 0.1);</span>
+<span class="nc" id="L41">  }</span>
+
+  public SparseAdaGradMinimizer(int numPasses, double eta) {
+<span class="nc" id="L44">	this(numPasses, eta, 1, 0, 0);</span>
+<span class="nc" id="L45">  }</span>
+
+  // use FOBOS to handle L1 or L2. The alternative is just setting these to 0,
+  // and take any penalty into account through the derivative
+<span class="nc" id="L49">  public SparseAdaGradMinimizer(int numPasses, double eta, int batchSize, double lambdaL1, double lambdaL2) {</span>
+<span class="nc" id="L50">	this.numPasses = numPasses;</span>
+<span class="nc" id="L51">	this.eta = eta;</span>
+<span class="nc" id="L52">	this.batchSize = batchSize;</span>
+<span class="nc" id="L53">	this.lambdaL1 = lambdaL1;</span>
+<span class="nc" id="L54">	this.lambdaL2 = lambdaL2;</span>
+	// can use another counter to make this thread-safe
+<span class="nc" id="L56">	this.sumGradSquare = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L57">  }</span>
+
+  @Override
+  public Counter&lt;K&gt; minimize(F function, Counter&lt;K&gt; initial) {
+<span class="nc" id="L61">	return minimize(function, initial, -1);</span>
+  }
+
+  // Does L1 or L2 using FOBOS and lazy update, so L1 should not be handled in the
+  // objective
+  // Alternatively, you can handle other regularization in the objective,
+  // but then, if the derivative is not sparse, this routine would not be very
+  // efficient. However, might still be okay for CRFs
+  @Override
+  public Counter&lt;K&gt; minimize(F function, Counter&lt;K&gt; x, int maxIterations) {
+
+<span class="nc" id="L72">	sayln(&quot;       Batch size of: &quot; + batchSize);</span>
+<span class="nc" id="L73">	sayln(&quot;       Data dimension of: &quot; + function.dataSize());</span>
+
+<span class="nc" id="L75">	int numBatches = (function.dataSize() - 1) / this.batchSize + 1;</span>
+<span class="nc" id="L76">	sayln(&quot;       Batches per pass through data:  &quot; + numBatches);</span>
+<span class="nc" id="L77">	sayln(&quot;       Number of passes is = &quot; + numPasses);</span>
+<span class="nc" id="L78">	sayln(&quot;       Max iterations is = &quot; + maxIterations);</span>
+
+<span class="nc" id="L80">	Counter&lt;K&gt; lastUpdated = new ClassicCounter&lt;&gt;();</span>
+<span class="nc" id="L81">	int timeStep = 0;</span>
+
+<span class="nc" id="L83">	Timing total = new Timing();</span>
+<span class="nc" id="L84">	total.start();</span>
+
+<span class="nc bnc" id="L86" title="All 2 branches missed.">	for (int iter = 0; iter &lt; numPasses; iter++) {</span>
+<span class="nc" id="L87">	  double totalObjValue = 0;</span>
+
+<span class="nc bnc" id="L89" title="All 2 branches missed.">	  for (int j = 0; j &lt; numBatches; j++) {</span>
+<span class="nc" id="L90">		int[] selectedData = getSample(function, this.batchSize);</span>
+		// the core adagrad
+<span class="nc" id="L92">		Counter&lt;K&gt; gradient = function.derivativeAt(x, selectedData);</span>
+<span class="nc" id="L93">		totalObjValue = totalObjValue + function.valueAt(x, selectedData);</span>
+
+<span class="nc bnc" id="L95" title="All 2 branches missed.">		for (K feature : gradient.keySet()) {</span>
+<span class="nc" id="L96">		  double gradf = gradient.getCount(feature);</span>
+<span class="nc" id="L97">		  double prevrate = eta / (Math.sqrt(sumGradSquare.getCount(feature)) + soften);</span>
+
+<span class="nc" id="L99">		  double sgsValue = sumGradSquare.incrementCount(feature, gradf * gradf);</span>
+<span class="nc" id="L100">		  double currentrate = eta / (Math.sqrt(sgsValue) + soften);</span>
+<span class="nc" id="L101">		  double testupdate = x.getCount(feature) - (currentrate * gradient.getCount(feature));</span>
+<span class="nc" id="L102">		  double lastUpdateTimeStep = lastUpdated.getCount(feature);</span>
+<span class="nc" id="L103">		  double idleinterval = timeStep - lastUpdateTimeStep - 1;</span>
+<span class="nc" id="L104">		  lastUpdated.setCount(feature, (double) timeStep);</span>
+
+		  // does lazy update using idleinterval
+<span class="nc" id="L107">		  double trunc = Math</span>
+<span class="nc" id="L108">			  .max(0.0, (Math.abs(testupdate) - (currentrate + prevrate * idleinterval) * this.lambdaL1));</span>
+<span class="nc" id="L109">		  double trunc2 = trunc * Math.pow(1 - this.lambdaL2, currentrate + prevrate * idleinterval); </span>
+<span class="nc" id="L110">		  double realupdate = Math.signum(testupdate) * trunc2;</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">		  if (realupdate &lt; EPS) {</span>
+<span class="nc" id="L112">			x.remove(feature);</span>
+		  } else {
+<span class="nc" id="L114">			x.setCount(feature, realupdate);</span>
+		  }
+
+		  // reporting
+<span class="nc" id="L118">		  timeStep++;</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">		  if (timeStep &gt; maxIterations) {</span>
+<span class="nc" id="L120">			sayln(&quot;Stochastic Optimization complete.  Stopped after max iterations&quot;);</span>
+<span class="nc" id="L121">			break;</span>
+		  }
+<span class="nc" id="L123">		  sayln(System.out.format(&quot;Iter %d \t batch: %d \t time=%.2f \t obj=%.4f&quot;, iter, timeStep,</span>
+<span class="nc" id="L124">			  total.report() / 1000.0, totalObjValue).toString());</span>
+<span class="nc" id="L125">		}</span>
+	  }
+	}
+<span class="nc" id="L128">	return x;</span>
+  }
+
+  // you do not have to use this, and can handle the data pipeline yourself.
+  // See AbstractStochasticCachingDiffFunction for more minibatching schemes,
+  // but it really
+  // should not matter very much
+  private int[] getSample(F function, int sampleSize) {
+<span class="nc" id="L136">	int[] sample = new int[sampleSize];</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">	for (int i = 0; i &lt; sampleSize; i++) {</span>
+<span class="nc" id="L138">	  sample[i] = randGenerator.nextInt(function.dataSize());</span>
+	}
+<span class="nc" id="L140">	return sample;</span>
+  }
+
+<span class="nc" id="L143">  private static final NumberFormat nf = new DecimalFormat(&quot;0.000E0&quot;);</span>
+
+  protected String getName() {
+<span class="nc" id="L146">	return &quot;SparseAdaGrad_batchsize&quot; + batchSize + &quot;_eta&quot; + nf.format(eta) + &quot;_lambdaL1&quot; + nf.format(lambdaL1)</span>
+<span class="nc" id="L147">		+ &quot;_lambdaL2&quot; + nf.format(lambdaL2);</span>
+  }
+
+  protected void sayln(String s) {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">	if (!quiet) {</span>
+<span class="nc" id="L152">	  log.info(s);</span>
+	}
+<span class="nc" id="L154">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

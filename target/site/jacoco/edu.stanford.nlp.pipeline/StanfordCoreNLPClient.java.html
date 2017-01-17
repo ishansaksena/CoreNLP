@@ -1,0 +1,735 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StanfordCoreNLPClient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.pipeline</a> &gt; <span class="el_source">StanfordCoreNLPClient.java</span></div><h1>StanfordCoreNLPClient.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.pipeline;
+
+import edu.stanford.nlp.io.FileSequentialCollection;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.io.RuntimeIOException;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+import edu.stanford.nlp.util.logging.StanfordRedwoodConfiguration;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static edu.stanford.nlp.util.logging.Redwood.Util.*;
+
+/**
+ * An annotation pipeline in spirit identical to {@link StanfordCoreNLP}, but
+ * with the backend supported by a web server.
+ *
+ * @author Gabor Angeli
+ */
+@SuppressWarnings(&quot;FieldCanBeLocal&quot;)
+public class StanfordCoreNLPClient extends AnnotationPipeline  {
+
+  /** A logger for this class */
+<span class="nc" id="L35">  private static final Redwood.RedwoodChannels log = Redwood.channels(StanfordCoreNLPClient.class);</span>
+
+  /** A simple URL spec, for parsing backend URLs */
+<span class="nc" id="L38">  private static final Pattern URL_PATTERN = Pattern.compile(&quot;(?:(https?)://)?([^:]+):([0-9]+)?&quot;);</span>
+
+  /**
+   * Information on how to connect to a backend.
+   * The semantics of one of these objects is as follows:
+   * &lt;ul&gt;
+   *   &lt;li&gt;It should define a hostname and port to connect to.&lt;/li&gt;
+   *   &lt;li&gt;This represents ONE thread on the remote server. The client should
+   *       treat it as such.&lt;/li&gt;
+   *   &lt;li&gt;Two backends that are .equals() point to the same endpoint, but there can be
+   *       multiple of them if we want to run multiple threads on that endpoint.&lt;/li&gt;
+   * &lt;/ul&gt;
+   */
+  private static class Backend {
+    /** The protocol to connect to the server with. */
+    public final String protocol;
+    /** The hostname of the server running the CoreNLP annotators */
+    public final String host;
+    /** The port of the server running the CoreNLP annotators */
+    public final int port;
+<span class="nc" id="L58">    public Backend(String protocol, String host, int port) {</span>
+<span class="nc" id="L59">      this.protocol = protocol;</span>
+<span class="nc" id="L60">      this.host = host;</span>
+<span class="nc" id="L61">      this.port = port;</span>
+<span class="nc" id="L62">    }</span>
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L65" title="All 2 branches missed.">      if (this == o) return true;</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">      if (!(o instanceof Backend)) return false;</span>
+<span class="nc" id="L67">      Backend backend = (Backend) o;</span>
+<span class="nc bnc" id="L68" title="All 6 branches missed.">      return port == backend.port &amp;&amp; protocol.equals(backend.protocol) &amp;&amp; host.equals(backend.host);</span>
+    }
+    @Override
+    public int hashCode() {
+<span class="nc" id="L72">      throw new IllegalStateException(&quot;Hashing backends is dangerous!&quot;);</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L77">      return protocol + &quot;://&quot; + host + &quot;:&quot; + port;</span>
+    }
+  }
+
+  /**
+   * A special type of {@link Thread}, which is responsible for scheduling jobs
+   * on the backend.
+   */
+  private static class BackendScheduler extends Thread {
+    /**
+     * The list of backends that we can schedule on.
+     * This should not generally be called directly from anywhere
+     */
+    public final List&lt;Backend&gt; backends;
+
+    /**
+     * The queue on requests for the scheduler to handle.
+     * Each element of this queue is a function: calling the function signals
+     * that this backend is available to perform a task on the passed backend.
+     * It is then obligated to call the passed Consumer to signal that it has
+     * released control of the backend, and it can be used for other things.
+     * Remember to lock access to this object with {@link BackendScheduler#stateLock}.
+     */
+    private final Queue&lt;BiConsumer&lt;Backend, Consumer&lt;Backend&gt;&gt;&gt; queue;
+    /**
+     * The lock on access to {@link BackendScheduler#queue}.
+     */
+<span class="nc" id="L104">    private final Lock stateLock = new ReentrantLock();</span>
+    /**
+     * Represents the event that an item has been added to the work queue.
+     * Linked to {@link BackendScheduler#stateLock}.
+     */
+<span class="nc" id="L109">    private final Condition enqueued = stateLock.newCondition();</span>
+    /**
+     * Represents the event that the queue has become empty, and this schedule is no
+     * longer needed.
+     */
+<span class="nc" id="L114">    public final Condition shouldShutdown = stateLock.newCondition();</span>
+
+    /**
+     * The queue of annotators (backends) that are free to be run on.
+     * Remember to lock access to this object with {@link BackendScheduler#stateLock}.
+     */
+    private final Queue&lt;Backend&gt; freeAnnotators;
+    /**
+     * Represents the event that an annotator has freed up and is available for
+     * work on the {@link BackendScheduler#freeAnnotators} queue.
+     * Linked to {@link BackendScheduler#stateLock}.
+     */
+<span class="nc" id="L126">    private final Condition newlyFree = stateLock.newCondition();</span>
+
+    /**
+     * While this is true, continue running the scheduler.
+     */
+<span class="nc" id="L131">    private boolean doRun = true;</span>
+
+    /**
+     * Create a new scheduler from a list of backends.
+     * These can contain duplicates -- in that case, that many concurrent
+     * calls can be made to that backend.
+     */
+    public BackendScheduler(List&lt;Backend&gt; backends) {
+<span class="nc" id="L139">      super();</span>
+<span class="nc" id="L140">      setDaemon(true);</span>
+<span class="nc" id="L141">      this.backends = backends;</span>
+<span class="nc" id="L142">      this.freeAnnotators = new LinkedList&lt;&gt;(backends);</span>
+<span class="nc" id="L143">      this.queue = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L144">    }</span>
+
+    /** {@inheritDoc} */
+    @Override
+    public void run() {
+      try {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        while (doRun) {</span>
+          // Wait for a request
+          BiConsumer&lt;Backend, Consumer&lt;Backend&gt;&gt; request;
+          Backend annotator;
+<span class="nc" id="L154">          stateLock.lock();</span>
+          try {
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            while (queue.isEmpty()) {</span>
+<span class="nc" id="L157">              enqueued.await();</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">              if (!doRun) {</span>
+<span class="nc" id="L159">                return;</span>
+              }
+            }
+            // Get the actual request
+<span class="nc" id="L163">            request = queue.poll();</span>
+            // We have a request
+
+            // Find a free annotator
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            while (freeAnnotators.isEmpty()) {</span>
+<span class="nc" id="L168">              newlyFree.await();</span>
+            }
+<span class="nc" id="L170">            annotator = freeAnnotators.poll();</span>
+          } finally {
+<span class="nc" id="L172">            stateLock.unlock();</span>
+<span class="nc" id="L173">          }</span>
+          // We have an annotator
+
+          // Run the annotation
+<span class="nc" id="L177">          request.accept(annotator, freedAnnotator -&gt; {</span>
+            // ASYNC: we've freed this annotator
+            // add it back to the queue and register it as available
+<span class="nc" id="L180">            stateLock.lock();</span>
+            try {
+<span class="nc" id="L182">              freeAnnotators.add(freedAnnotator);</span>
+
+              // If the queue is empty, and all the annotators have returned, we're done
+<span class="nc bnc" id="L185" title="All 4 branches missed.">              if (queue.isEmpty() &amp;&amp; freeAnnotators.size() == backends.size()) {</span>
+<span class="nc" id="L186">                log.info(&quot;All annotations completed. Signaling for shutdown&quot;);</span>
+<span class="nc" id="L187">                shouldShutdown.signalAll();</span>
+              }
+
+<span class="nc" id="L190">              newlyFree.signal();</span>
+            } finally {
+<span class="nc" id="L192">              stateLock.unlock();</span>
+<span class="nc" id="L193">            }</span>
+<span class="nc" id="L194">          });</span>
+          // Annotator is running (in parallel, most likely)
+<span class="nc" id="L196">        }</span>
+<span class="nc" id="L197">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L198">        throw new RuntimeException(e);</span>
+<span class="nc" id="L199">      }</span>
+<span class="nc" id="L200">    }</span>
+
+    /**
+     * Schedule a new job on the backend
+     * @param annotate A callback, which will be called when a backend is free
+     *                 to do some processing. The implementation of this callback
+     *                 MUST CALL the second argument when it is done processing,
+     *                 to register the backend as free for further work.
+     */
+    public void schedule(BiConsumer&lt;Backend, Consumer&lt;Backend&gt;&gt; annotate) {
+<span class="nc" id="L210">      stateLock.lock();</span>
+      try {
+<span class="nc" id="L212">        queue.add(annotate);</span>
+<span class="nc" id="L213">        enqueued.signal();</span>
+      } finally {
+<span class="nc" id="L215">        stateLock.unlock();</span>
+<span class="nc" id="L216">      }</span>
+<span class="nc" id="L217">    }</span>
+  } // end static class BackEndScheduler
+
+  /** The path on the server to connect to. */
+<span class="nc" id="L221">  private final String path = &quot;&quot;;</span>
+  /** The Properties file to annotate with. */
+  private final Properties properties;
+
+  /** The Properties file to send to the server, serialized as JSON. */
+  private final String propsAsJSON;
+
+  /** The API key to authenticate with, or null */
+  private final String apiKey;
+  /** The API secret to authenticate with, or null */
+  private final String apiSecret;
+
+  /** The scheduler to use when running on multiple backends at a time */
+  private final BackendScheduler scheduler;
+
+  /**
+   * The annotation serializer responsible for translating between the wire format
+   * (protocol buffers) and the {@link Annotation} classes.
+   */
+<span class="nc" id="L240">  private final ProtobufAnnotationSerializer serializer = new ProtobufAnnotationSerializer(true);</span>
+
+  /**
+   * The main constructor. Create a client from a properties file and a list of backends.
+   * Note that this creates at least one Daemon thread.
+   *
+   * @param properties The properties file, as would be passed to {@link StanfordCoreNLP}.
+   * @param backends The backends to run on.
+   * @param apiKey The key to authenticate with as a username
+   * @param apiSecret The key to authenticate with as a password
+   */
+  private StanfordCoreNLPClient(Properties properties, List&lt;Backend&gt; backends,
+<span class="nc" id="L252">                                String apiKey, String apiSecret) {</span>
+    // Save the constructor variables
+<span class="nc" id="L254">    this.properties = properties;</span>
+<span class="nc" id="L255">    Properties serverProperties = new Properties();</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">    for (String key : properties.stringPropertyNames()) {</span>
+<span class="nc" id="L257">      serverProperties.setProperty(key, properties.getProperty(key));</span>
+<span class="nc" id="L258">    }</span>
+<span class="nc" id="L259">    Collections.shuffle(backends, new Random(System.currentTimeMillis()));</span>
+<span class="nc" id="L260">    this.scheduler = new BackendScheduler(backends);</span>
+<span class="nc" id="L261">    this.apiKey = apiKey;</span>
+<span class="nc" id="L262">    this.apiSecret = apiSecret;</span>
+
+    // Set required serverProperties
+<span class="nc" id="L265">    serverProperties.setProperty(&quot;inputFormat&quot;, &quot;serialized&quot;);</span>
+<span class="nc" id="L266">    serverProperties.setProperty(&quot;outputFormat&quot;, &quot;serialized&quot;);</span>
+<span class="nc" id="L267">    serverProperties.setProperty(&quot;inputSerializer&quot;, ProtobufAnnotationSerializer.class.getName());</span>
+<span class="nc" id="L268">    serverProperties.setProperty(&quot;outputSerializer&quot;, ProtobufAnnotationSerializer.class.getName());</span>
+
+    // Create a list of all the properties, as JSON map elements
+<span class="nc" id="L271">    List&lt;String&gt; jsonProperties = serverProperties.stringPropertyNames().stream().map(key -&gt; '&quot;' + JSONOutputter.cleanJSON(key) + &quot;\&quot;: \&quot;&quot; +</span>
+        JSONOutputter
+<span class="nc" id="L273">            .cleanJSON(serverProperties.getProperty(key)) + '&quot;')</span>
+<span class="nc" id="L274">        .collect(Collectors.toList());</span>
+    // Create the JSON object
+<span class="nc" id="L276">    this.propsAsJSON = &quot;{ &quot; + StringUtils.join(jsonProperties, &quot;, &quot;) + &quot; }&quot;;</span>
+
+    // Start 'er up
+<span class="nc" id="L279">    this.scheduler.start();</span>
+<span class="nc" id="L280">  }</span>
+
+
+  /**
+   * The main constructor without credentials.
+   *
+   * @see StanfordCoreNLPClient#StanfordCoreNLPClient(Properties, List, String, String)
+   */
+  private StanfordCoreNLPClient(Properties properties, List&lt;Backend&gt; backends) {
+<span class="nc" id="L289">    this(properties, backends, null, null);</span>
+<span class="nc" id="L290">  }</span>
+
+
+  /**
+   * Run the client, pulling credentials from the environment.
+   * Throws an IllegalStateException if the required environment variables aren't set.
+   * These are:
+   *
+   * &lt;ul&gt;
+   *   &lt;li&gt;CORENLP_HOST&lt;/li&gt;
+   *   &lt;li&gt;CORENLP_KEY&lt;/li&gt;
+   *   &lt;li&gt;CORENLP_SECRET&lt;/li&gt;
+   * &lt;/ul&gt;
+   *
+   * @throws IllegalStateException Thrown if we could not read the required environment variables.
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  public StanfordCoreNLPClient(Properties properties) throws IllegalStateException {
+<span class="nc" id="L308">    this(properties,</span>
+<span class="nc" id="L309">        Optional.ofNullable(System.getenv(&quot;CORENLP_HOST&quot;)).orElseThrow(() -&gt; new IllegalStateException(&quot;Environment variable CORENLP_HOST not specified&quot;)),</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        Optional.ofNullable(System.getenv(&quot;CORENLP_HOST&quot;)).map(x -&gt; x.startsWith(&quot;http://&quot;) ? 80 : 443).orElse(443),</span>
+        1,
+<span class="nc" id="L312">        Optional.ofNullable(System.getenv(&quot;CORENLP_KEY&quot;)).orElse(null),</span>
+<span class="nc" id="L313">        Optional.ofNullable(System.getenv(&quot;CORENLP_SECRET&quot;)).orElse(null)</span>
+      );
+<span class="nc" id="L315">  }</span>
+
+
+  /**
+   * Run on a single backend.
+   *
+   * @see StanfordCoreNLPClient (Properties, List)
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  public StanfordCoreNLPClient(Properties properties, String host, int port) {
+<span class="nc" id="L325">    this(properties, host, port, 1);</span>
+<span class="nc" id="L326">  }</span>
+
+  /**
+   * Run on a single backend, with authentication
+   *
+   * @see StanfordCoreNLPClient (Properties, List)
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  public StanfordCoreNLPClient(Properties properties, String host, int port,
+                               String apiKey, String apiSecret) {
+<span class="nc" id="L336">    this(properties, host, port, 1, apiKey, apiSecret);</span>
+<span class="nc" id="L337">  }</span>
+
+
+  /**
+   * Run on a single backend, with authentication
+   *
+   * @see StanfordCoreNLPClient (Properties, List)
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  public StanfordCoreNLPClient(Properties properties, String host,
+                               String apiKey, String apiSecret) {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    this(properties, host, host.startsWith(&quot;http://&quot;) ? 80 : 443, 1, apiKey, apiSecret);</span>
+<span class="nc" id="L349">  }</span>
+
+  /**
+   * Run on a single backend, but with k threads on each backend.
+   *
+   * @see StanfordCoreNLPClient (Properties, List)
+   */
+  @SuppressWarnings(&quot;unused&quot;)
+  public StanfordCoreNLPClient(Properties properties, String host, int port, int threads) {
+<span class="nc" id="L358">    this(properties, host, port, threads, null, null);</span>
+<span class="nc" id="L359">  }</span>
+
+
+  /**
+   * Run on a single backend, but with k threads on each backend, and with authentication
+   *
+   * @see StanfordCoreNLPClient (Properties, List)
+   */
+  public StanfordCoreNLPClient(Properties properties, String host, int port, int threads,
+                               String apiKey, String apiSecret) {
+<span class="nc" id="L369">    this(properties, new ArrayList&lt;Backend&gt;() {{</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">      for (int i = 0; i &lt; threads; ++i) {</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        add(new Backend(host.startsWith(&quot;http://&quot;) ? &quot;http&quot; : &quot;https&quot;,</span>
+<span class="nc bnc" id="L372" title="All 4 branches missed.">            host.startsWith(&quot;http://&quot;) ? host.substring(&quot;http://&quot;.length()) : (host.startsWith(&quot;https://&quot;) ? host.substring(&quot;https://&quot;.length()) : host),</span>
+            port));
+      }
+<span class="nc" id="L375">    }},</span>
+    apiKey, apiSecret);
+<span class="nc" id="L377">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * This method creates an async call to the server, and blocks until the server
+   * has finished annotating the object.
+   */
+  @Override
+  public void annotate(Annotation annotation) {
+<span class="nc" id="L387">    final Lock lock = new ReentrantLock();</span>
+<span class="nc" id="L388">    final Condition annotationDone = lock.newCondition();</span>
+<span class="nc" id="L389">    annotate(Collections.singleton(annotation), 1, (Annotation annInput) -&gt; {</span>
+      try {
+<span class="nc" id="L391">        lock.lock();</span>
+<span class="nc" id="L392">        annotationDone.signal();</span>
+      } finally {
+<span class="nc" id="L394">        lock.unlock();</span>
+<span class="nc" id="L395">      }</span>
+<span class="nc" id="L396">    });</span>
+    try {
+<span class="nc" id="L398">      lock.lock();</span>
+<span class="nc" id="L399">      annotationDone.await();  // Only wait for one callback to complete; only annotating one document</span>
+<span class="nc" id="L400">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L401">      log.info(&quot;Interrupt while waiting for annotation to return&quot;);</span>
+    } finally {
+<span class="nc" id="L403">      lock.unlock();</span>
+<span class="nc" id="L404">    }</span>
+<span class="nc" id="L405">  }</span>
+
+  /**
+   * This method fires off a request to the server. Upon returning, it calls the provided
+   * callback method.
+   *
+   * @param annotations The input annotations to process
+   * @param numThreads The number of threads to run on. IGNORED in this class.
+   * @param callback A function to be called when an annotation finishes.
+   */
+  @Override
+  public void annotate(final Iterable&lt;Annotation&gt; annotations, int numThreads, final Consumer&lt;Annotation&gt; callback){
+<span class="nc bnc" id="L417" title="All 2 branches missed.">    for (Annotation annotation : annotations) {</span>
+<span class="nc" id="L418">      annotate(annotation, callback);</span>
+<span class="nc" id="L419">    }</span>
+<span class="nc" id="L420">  }</span>
+
+
+  /**
+   * The canonical entry point of the client annotator.
+   * Create an HTTP request, send this annotation to the server, and await a response.
+   *
+   * @param annotation The annotation to annotate.
+   * @param callback Called when the server has returned an annotated document.
+   *                 The input to this callback is the same as the passed Annotation object.
+   */
+  public void annotate(final Annotation annotation, final Consumer&lt;Annotation&gt; callback) {
+<span class="nc" id="L432">    scheduler.schedule((Backend backend, Consumer&lt;Backend&gt; isFinishedCallback) -&gt; new Thread(() -&gt; {</span>
+      try {
+        // 1. Create the input
+        // 1.1 Create a protocol buffer
+<span class="nc" id="L436">        ByteArrayOutputStream os = new ByteArrayOutputStream();</span>
+<span class="nc" id="L437">        serializer.write(annotation, os);</span>
+<span class="nc" id="L438">        os.close();</span>
+<span class="nc" id="L439">        byte[] message = os.toByteArray();</span>
+        // 1.2 Create the query params
+
+<span class="nc" id="L442">        String queryParams = String.format(</span>
+            &quot;properties=%s&quot;,
+<span class="nc" id="L444">            URLEncoder.encode(StanfordCoreNLPClient.this.propsAsJSON, &quot;utf-8&quot;));</span>
+
+        // 2. Create a connection
+<span class="nc" id="L447">        URL serverURL = new URL(backend.protocol, backend.host,</span>
+            backend.port,
+            StanfordCoreNLPClient.this.path + '?' + queryParams);
+
+        // 3. Do the annotation
+        //    This method has two contracts:
+        //    1. It should call the two relevant callbacks
+        //    2. It must not throw an exception
+<span class="nc" id="L455">        doAnnotation(annotation, backend, serverURL, message, 0);</span>
+<span class="nc" id="L456">      } catch (Throwable t) {</span>
+<span class="nc" id="L457">        log.warn(&quot;Could not annotate via server! Trying to annotate locally...&quot;, t);</span>
+<span class="nc" id="L458">        StanfordCoreNLP corenlp = new StanfordCoreNLP(properties);</span>
+<span class="nc" id="L459">        corenlp.annotate(annotation);</span>
+      } finally {
+<span class="nc" id="L461">        callback.accept(annotation);</span>
+<span class="nc" id="L462">        isFinishedCallback.accept(backend);</span>
+<span class="nc" id="L463">      }</span>
+<span class="nc" id="L464">    }).start());</span>
+<span class="nc" id="L465">  }</span>
+
+
+  /**
+   * Actually try to perform the annotation on the server side.
+   * This is factored out so that we can retry up to 3 times.
+   *
+   * @param annotation The annotation we need to fill.
+   * @param backend The backend we are querying against.
+   * @param serverURL The URL of the server we are hitting.
+   * @param message The message we are sending the server (don't need to recompute each retry).
+   * @param tries The number of times we've tried already.
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private void doAnnotation(Annotation annotation, Backend backend, URL serverURL, byte[] message, int tries) {
+
+    try {
+      // 1. Set up the connection
+<span class="nc" id="L483">      URLConnection connection = serverURL.openConnection();</span>
+      // 1.1 Set authentication
+<span class="nc bnc" id="L485" title="All 4 branches missed.">      if (apiKey != null &amp;&amp; apiSecret != null) {</span>
+<span class="nc" id="L486">        String userpass = apiKey + &quot;:&quot; + apiSecret;</span>
+<span class="nc" id="L487">        String basicAuth = &quot;Basic &quot; + new String(Base64.getEncoder().encode(userpass.getBytes()));</span>
+<span class="nc" id="L488">        connection.setRequestProperty(&quot;Authorization&quot;, basicAuth);</span>
+      }
+      // 1.2 Set some protocol-independent properties
+<span class="nc" id="L491">      connection.setDoOutput(true);</span>
+<span class="nc" id="L492">      connection.setRequestProperty(&quot;Content-Type&quot;, &quot;application/x-protobuf&quot;);</span>
+<span class="nc" id="L493">      connection.setRequestProperty(&quot;Content-Length&quot;, Integer.toString(message.length));</span>
+<span class="nc" id="L494">      connection.setRequestProperty(&quot;Accept-Charset&quot;, &quot;utf-8&quot;);</span>
+<span class="nc" id="L495">      connection.setRequestProperty(&quot;User-Agent&quot;, StanfordCoreNLPClient.class.getName());</span>
+      // 1.3 Set some protocol-dependent properties
+<span class="nc bnc" id="L497" title="All 9 branches missed.">      switch (backend.protocol) {</span>
+        case &quot;https&quot;:
+        case &quot;http&quot;:
+<span class="nc" id="L500">          ((HttpURLConnection) connection).setRequestMethod(&quot;POST&quot;);</span>
+<span class="nc" id="L501">          break;</span>
+        default:
+<span class="nc" id="L503">          throw new IllegalStateException(&quot;Haven't implemented protocol: &quot; + backend.protocol);</span>
+      }
+
+      // 2. Annotate
+      // 2.1. Fire off the request
+<span class="nc" id="L508">      connection.connect();</span>
+<span class="nc" id="L509">      connection.getOutputStream().write(message);</span>
+<span class="nc" id="L510">      connection.getOutputStream().flush();</span>
+      // 2.2 Await a response
+      // -- It might be possible to send more than one message, but we are not going to do that.
+<span class="nc" id="L513">      Annotation response = serializer.read(connection.getInputStream()).first;</span>
+      // 2.3. Copy response over to original annotation
+<span class="nc bnc" id="L515" title="All 2 branches missed.">      for (Class key : response.keySet()) {</span>
+<span class="nc" id="L516">        annotation.set(key, response.get(key));</span>
+<span class="nc" id="L517">      }</span>
+
+<span class="nc" id="L519">    } catch (Throwable t) {</span>
+      // 3. We encountered an error -- retry
+<span class="nc bnc" id="L521" title="All 2 branches missed.">      if (tries &lt; 3) {</span>
+<span class="nc" id="L522">        log.warn(t);</span>
+<span class="nc" id="L523">        doAnnotation(annotation, backend, serverURL, message, tries + 1);</span>
+      } else {
+<span class="nc" id="L525">        throw new RuntimeException(t);</span>
+      }
+<span class="nc" id="L527">    }</span>
+<span class="nc" id="L528">  }</span>
+
+
+  /**
+   * Runs the entire pipeline on the content of the given text passed in.
+   * @param text The text to process
+   * @return An Annotation object containing the output of all annotators
+   */
+  public Annotation process(String text) {
+<span class="nc" id="L537">    Annotation annotation = new Annotation(text);</span>
+<span class="nc" id="L538">    annotate(annotation);</span>
+<span class="nc" id="L539">    return annotation;</span>
+  }
+
+
+  /**
+   * Runs an interactive shell where input text is processed with the given pipeline.
+   *
+   * @param pipeline The pipeline to be used
+   * @throws IOException If IO problem with stdin
+   */
+  private static void shell(StanfordCoreNLPClient pipeline) throws IOException {
+<span class="nc" id="L550">    log.info(&quot;Entering interactive shell. Type q RETURN or EOF to quit.&quot;);</span>
+<span class="nc" id="L551">    final StanfordCoreNLP.OutputFormat outputFormat = StanfordCoreNLP.OutputFormat.valueOf(pipeline.properties.getProperty(&quot;outputFormat&quot;, &quot;text&quot;).toUpperCase());</span>
+<span class="nc" id="L552">    IOUtils.console(&quot;NLP&gt; &quot;, line -&gt; {</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">      if ( ! line.isEmpty()) {</span>
+<span class="nc" id="L554">        Annotation anno = pipeline.process(line);</span>
+        try {
+<span class="nc bnc" id="L556" title="All 6 branches missed.">          switch (outputFormat) {</span>
+            case XML:
+<span class="nc" id="L558">              new XMLOutputter().print(anno, System.out);</span>
+<span class="nc" id="L559">              break;</span>
+            case JSON:
+<span class="nc" id="L561">              new JSONOutputter().print(anno, System.out);</span>
+<span class="nc" id="L562">              System.out.println();</span>
+<span class="nc" id="L563">              break;</span>
+            case CONLL:
+<span class="nc" id="L565">              new CoNLLOutputter().print(anno, System.out);</span>
+<span class="nc" id="L566">              System.out.println();</span>
+<span class="nc" id="L567">              break;</span>
+            case TEXT:
+<span class="nc" id="L569">              new TextOutputter().print(anno, System.out);</span>
+<span class="nc" id="L570">              break;</span>
+            case SERIALIZED:
+<span class="nc" id="L572">              warn(&quot;You probably cannot read the serialized output, so printing in text instead&quot;);</span>
+<span class="nc" id="L573">              new TextOutputter().print(anno, System.out);</span>
+<span class="nc" id="L574">              break;</span>
+            default:
+<span class="nc" id="L576">              throw new IllegalArgumentException(&quot;Cannot output in format &quot; + outputFormat + &quot; from the interactive shell&quot;);</span>
+          }
+<span class="nc" id="L578">        } catch (IOException e) {</span>
+<span class="nc" id="L579">          throw new RuntimeIOException(e);</span>
+<span class="nc" id="L580">        }</span>
+      }
+<span class="nc" id="L582">    });</span>
+<span class="nc" id="L583">  }</span>
+
+  /**
+   * The implementation of what to run on a command-line call of CoreNLPWebClient
+   *
+   * @throws IOException If any IO problem
+   */
+  public void run() throws IOException {
+<span class="nc" id="L591">    StanfordRedwoodConfiguration.minimalSetup();</span>
+<span class="nc" id="L592">    StanfordCoreNLP.OutputFormat outputFormat = StanfordCoreNLP.OutputFormat.valueOf(properties.getProperty(&quot;outputFormat&quot;, &quot;text&quot;).toUpperCase());</span>
+
+    //
+    // Process one file or a directory of files
+    //
+<span class="nc bnc" id="L597" title="All 4 branches missed.">    if (properties.containsKey(&quot;file&quot;) || properties.containsKey(&quot;textFile&quot;)) {</span>
+<span class="nc" id="L598">      String fileName = properties.getProperty(&quot;file&quot;);</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">      if (fileName == null) {</span>
+<span class="nc" id="L600">        fileName = properties.getProperty(&quot;textFile&quot;);</span>
+      }
+<span class="nc" id="L602">      Collection&lt;File&gt; files = new FileSequentialCollection(new File(fileName), properties.getProperty(&quot;extension&quot;), true);</span>
+<span class="nc" id="L603">      StanfordCoreNLP.processFiles(null, files, 1, properties, this::annotate,</span>
+<span class="nc" id="L604">          StanfordCoreNLP.createOutputter(properties, new AnnotationOutputter.Options()), outputFormat);</span>
+<span class="nc" id="L605">    }</span>
+
+    //
+    // Process a list of files
+    //
+<span class="nc bnc" id="L610" title="All 2 branches missed.">    else if (properties.containsKey(&quot;filelist&quot;)){</span>
+<span class="nc" id="L611">      String fileName = properties.getProperty(&quot;filelist&quot;);</span>
+<span class="nc" id="L612">      Collection&lt;File&gt; inputFiles = StanfordCoreNLP.readFileList(fileName);</span>
+<span class="nc" id="L613">      Collection&lt;File&gt; files = new ArrayList&lt;&gt;(inputFiles.size());</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">      for (File file : inputFiles) {</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">        if (file.isDirectory()) {</span>
+<span class="nc" id="L616">          files.addAll(new FileSequentialCollection(new File(fileName), properties.getProperty(&quot;extension&quot;), true));</span>
+        } else {
+<span class="nc" id="L618">          files.add(file);</span>
+        }
+<span class="nc" id="L620">      }</span>
+<span class="nc" id="L621">      StanfordCoreNLP.processFiles(null, files, 1, properties, this::annotate,</span>
+<span class="nc" id="L622">          StanfordCoreNLP.createOutputter(properties, new AnnotationOutputter.Options()), outputFormat);</span>
+<span class="nc" id="L623">    }</span>
+
+    //
+    // Run the interactive shell
+    //
+    else {
+<span class="nc" id="L629">      shell(this);</span>
+    }
+<span class="nc" id="L631">  }</span>
+
+  /**
+   * &lt;p&gt;
+   *   Good practice to call after you are done with this object.
+   *   Shuts down the queue of annotations to run and the associated threads.
+   * &lt;/p&gt;
+   *
+   * &lt;p&gt;
+   *   If this is not called, any job which has been scheduled but not run will be
+   *   cancelled.
+   * &lt;/p&gt;
+   */
+  public void shutdown() throws InterruptedException {
+<span class="nc" id="L645">    scheduler.stateLock.lock();</span>
+    try {
+<span class="nc bnc" id="L647" title="All 4 branches missed.">      while (!scheduler.queue.isEmpty() || scheduler.freeAnnotators.size() != scheduler.backends.size()) {</span>
+<span class="nc" id="L648">        scheduler.shouldShutdown.await(5, TimeUnit.SECONDS);</span>
+      }
+<span class="nc" id="L650">      scheduler.doRun = false;</span>
+<span class="nc" id="L651">      scheduler.enqueued.signalAll();  // In case the thread's waiting on this condition</span>
+    } finally {
+<span class="nc" id="L653">      scheduler.stateLock.unlock();</span>
+<span class="nc" id="L654">    }</span>
+<span class="nc" id="L655">  }</span>
+
+
+  /**
+   * This can be used just for testing or for command-line text processing.
+   * This runs the pipeline you specify on the
+   * text in the file that you specify and sends some results to stdout.
+   * The current code in this main method assumes that each line of the file
+   * is to be processed separately as a single sentence.
+   * &lt;p&gt;
+   * Example usage:&lt;br&gt;
+   * java -mx6g edu.stanford.nlp.pipeline.StanfordCoreNLP -props properties -backends site1:port1,site2,port2 &lt;br&gt;
+   *    or just -host name -port number
+   *
+   * @param args List of required properties
+   * @throws java.io.IOException If IO problem
+   * @throws ClassNotFoundException If class loading problem
+   */
+  public static void main(String[] args) throws IOException, ClassNotFoundException {
+    //
+    // process the arguments
+    //
+    // extract all the properties from the command line
+    // if cmd line is empty, set the properties to null. The processor will search for the properties file in the classpath
+    // if (args.length &lt; 2) {
+    //   log.info(&quot;Usage: &quot; + StanfordCoreNLPClient.class.getSimpleName() + &quot; -host &lt;hostname&gt; -port &lt;port&gt; ...&quot;);
+    //   System.exit(1);
+    // }
+<span class="nc" id="L683">    Properties props = StringUtils.argsToProperties(args);</span>
+<span class="nc" id="L684">    boolean hasH = props.containsKey(&quot;h&quot;);</span>
+<span class="nc" id="L685">    boolean hasHelp = props.containsKey(&quot;help&quot;);</span>
+<span class="nc bnc" id="L686" title="All 4 branches missed.">    if (hasH || hasHelp) {</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">      String helpValue = hasH ? props.getProperty(&quot;h&quot;) : props.getProperty(&quot;help&quot;);</span>
+<span class="nc" id="L688">      StanfordCoreNLP.printHelp(System.err, helpValue);</span>
+<span class="nc" id="L689">      return;</span>
+    }
+
+    // Create the backends
+<span class="nc" id="L693">    List&lt;Backend&gt; backends = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L694">    String defaultBack = &quot;http://localhost:9000&quot;;</span>
+<span class="nc" id="L695">    String backStr = props.getProperty(&quot;backends&quot;);</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">    if (backStr == null) {</span>
+<span class="nc" id="L697">      String host = props.getProperty(&quot;host&quot;);</span>
+<span class="nc" id="L698">      String port = props.getProperty(&quot;port&quot;);</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">      if (host != null) {</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">        if (port != null) {</span>
+<span class="nc" id="L701">          defaultBack = host + ':' + port;</span>
+        } else {
+<span class="nc" id="L703">          defaultBack = host;</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L708" title="All 2 branches missed.">    for (String spec : props.getProperty(&quot;backends&quot;, defaultBack).split(&quot;,&quot;)) {</span>
+<span class="nc" id="L709">      Matcher matcher = URL_PATTERN.matcher(spec.trim());</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">      if (matcher.matches()) {</span>
+<span class="nc" id="L711">        String protocol = matcher.group(1);</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if (protocol == null) {</span>
+<span class="nc" id="L713">          protocol = &quot;http&quot;;</span>
+        }
+<span class="nc" id="L715">        String host = matcher.group(2);</span>
+<span class="nc" id="L716">        int port = 80;</span>
+<span class="nc" id="L717">        String portStr = matcher.group(3);</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">        if (portStr != null) {</span>
+<span class="nc" id="L719">          port = Integer.parseInt(portStr);</span>
+        }
+<span class="nc" id="L721">        backends.add(new Backend(protocol, host, port));</span>
+      }
+    }
+<span class="nc" id="L724">    log.info(&quot;Using backends: &quot; + backends);</span>
+
+    // Run the pipeline
+<span class="nc" id="L727">    StanfordCoreNLPClient client = new StanfordCoreNLPClient(props, backends);</span>
+<span class="nc" id="L728">    client.run();</span>
+    try {
+<span class="nc" id="L730">      client.shutdown();  // In case anything is pending on the server</span>
+<span class="nc" id="L731">    } catch (InterruptedException ignored) { }</span>
+<span class="nc" id="L732">  } // end main()</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>

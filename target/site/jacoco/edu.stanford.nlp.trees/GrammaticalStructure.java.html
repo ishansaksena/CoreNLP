@@ -1,0 +1,1195 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GrammaticalStructure.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Stanford CoreNLP</a> &gt; <a href="index.source.html" class="el_package">edu.stanford.nlp.trees</a> &gt; <span class="el_source">GrammaticalStructure.java</span></div><h1>GrammaticalStructure.java</h1><pre class="source lang-java linenums">package edu.stanford.nlp.trees;
+
+import java.io.IOException;
+import java.io.LineNumberReader;
+import java.io.Serializable;
+import java.util.*;
+import java.util.concurrent.locks.Lock;
+import java.util.function.Predicate;
+
+import edu.stanford.nlp.graph.DirectedMultiGraph;
+import edu.stanford.nlp.international.Language;
+import edu.stanford.nlp.io.IOUtils;
+import edu.stanford.nlp.ling.AbstractCoreLabel;
+import edu.stanford.nlp.ling.CoreAnnotations;
+import edu.stanford.nlp.ling.CoreLabel;
+import edu.stanford.nlp.ling.IndexedWord;
+import edu.stanford.nlp.ling.Label;
+import edu.stanford.nlp.ling.Word;
+import edu.stanford.nlp.trees.ud.EnhancementOptions;
+import edu.stanford.nlp.util.Filters;
+import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.StringUtils;
+import edu.stanford.nlp.util.logging.Redwood;
+
+import static edu.stanford.nlp.trees.GrammaticalRelation.DEPENDENT;
+import static edu.stanford.nlp.trees.GrammaticalRelation.ROOT;
+
+
+/**
+ * A {@code GrammaticalStructure} stores dependency relations between
+ * nodes in a tree.  A new {@code GrammaticalStructure} is constructed
+ * from an existing parse tree with the help of {@link
+ * GrammaticalRelation {@code GrammaticalRelation}}, which
+ * defines a hierarchy of grammatical relations, along with
+ * patterns for identifying them in parse trees.  The constructor for
+ * {@code GrammaticalStructure} uses these definitions to
+ * populate the new {@code GrammaticalStructure} with as many
+ * labeled grammatical relations as it can.  Once constructed, the new
+ * {@code GrammaticalStructure} can be printed in various
+ * formats, or interrogated using the interface methods in this
+ * class. Internally, this uses a representation via a {@code TreeGraphNode},
+ * that is, a tree with additional labeled
+ * arcs between nodes, for representing the grammatical relations in a
+ * parse tree.
+ *
+ * @author Bill MacCartney
+ * @author Galen Andrew (refactoring English-specific stuff)
+ * @author Ilya Sherman (dependencies)
+ * @author Daniel Cer
+ * @see EnglishGrammaticalRelations
+ * @see GrammaticalRelation
+ * @see EnglishGrammaticalStructure
+ */
+public abstract class GrammaticalStructure implements Serializable  {
+
+  /** A logger for this class */
+<span class="fc" id="L57">  private static Redwood.RedwoodChannels log = Redwood.channels(GrammaticalStructure.class);</span>
+
+<span class="pc bpc" id="L59" title="1 of 2 branches missed.">  private static final boolean PRINT_DEBUGGING = System.getProperty(&quot;GrammaticalStructure&quot;, null) != null;</span>
+
+  /**
+   * A specification for the types of extra edges to add to the dependency tree.
+   * If you're in doubt, use {@link edu.stanford.nlp.trees.GrammaticalStructure.Extras#NONE}.
+   */
+<span class="pc" id="L65">  public enum Extras {</span>
+    /**
+     * &lt;p&gt; Don't include any additional edges. &lt;/p&gt;
+     * &lt;p&gt;
+     *   Note: In older code (2014 and before) including extras was a boolean flag. This option is the equivalent of
+     *   the {@code false} flag.
+     * &lt;/p&gt;
+     */
+<span class="fc" id="L73">    NONE(false, false, false),</span>
+    /**
+     * Include only the extra reference edges, and save them as reference edges without collapsing.
+     */
+<span class="fc" id="L77">    REF_ONLY_UNCOLLAPSED(true, false, false),</span>
+    /**
+     * Include only the extra reference edges, but collapsing these edges to clone the edge type of the referent.
+     * So, for example, &lt;i&gt;My dog who eats sausage&lt;/i&gt; may have a &quot;ref&quot; edge from &lt;i&gt;who&lt;/i&gt; to &lt;i&gt;dog&lt;/i&gt;
+     * that would be deleted and replaced with an &quot;nsubj&quot; edge from &lt;i&gt;eats&lt;/i&gt; to &lt;i&gt;dog&lt;/i&gt;.
+     */
+<span class="fc" id="L83">    REF_ONLY_COLLAPSED(true, false, true),</span>
+    /**
+     * Add extra subjects only, not adding any of the other extra edge types.
+     */
+<span class="fc" id="L87">    SUBJ_ONLY(false, true, false),</span>
+    /**
+     * @see edu.stanford.nlp.trees.GrammaticalStructure.Extras#SUBJ_ONLY
+     * @see edu.stanford.nlp.trees.GrammaticalStructure.Extras#REF_ONLY_UNCOLLAPSED
+     */
+<span class="fc" id="L92">    REF_UNCOLLAPSED_AND_SUBJ(true, true, false),</span>
+    /**
+     * @see edu.stanford.nlp.trees.GrammaticalStructure.Extras#SUBJ_ONLY
+     * @see edu.stanford.nlp.trees.GrammaticalStructure.Extras#REF_ONLY_COLLAPSED
+     */
+<span class="fc" id="L97">    REF_COLLAPSED_AND_SUBJ(true, true, true),</span>
+    /**
+     * &lt;p&gt;
+     *   Do the maximal amount of extra processing.
+     *   Currently, this is equivalent to {@link edu.stanford.nlp.trees.GrammaticalStructure.Extras#REF_COLLAPSED_AND_SUBJ}.
+     * &lt;/p&gt;
+     * &lt;p&gt;
+     *   Note: In older code (2014 and before) including extras was a boolean flag. This option is the equivalent of
+     *   the {@code true} flag.
+     * &lt;/p&gt;
+     */
+<span class="fc" id="L108">    MAXIMAL(true, true, true);</span>
+
+    /** Add &quot;ref&quot; edges */
+    public final boolean doRef;
+    /** Add extra subject edges */
+    public final boolean doSubj;
+    /** collapse the &quot;ref&quot; edges */
+    public final boolean collapseRef;
+
+    /** Constructor. Nothing exciting here. */
+<span class="fc" id="L118">    Extras(boolean doRef, boolean doSubj, boolean collapseRef) {</span>
+<span class="fc" id="L119">      this.doRef = doRef;</span>
+<span class="fc" id="L120">      this.doSubj = doSubj;</span>
+<span class="fc" id="L121">      this.collapseRef = collapseRef;</span>
+<span class="fc" id="L122">    }</span>
+
+  } // end enum Extras
+
+
+  protected final List&lt;TypedDependency&gt; typedDependencies;
+  protected final List&lt;TypedDependency&gt; allTypedDependencies;
+
+  protected final Predicate&lt;String&gt; puncFilter;
+  protected final Predicate&lt;String&gt; tagFilter;
+
+  /**
+   * The root Tree node for this GrammaticalStructure.
+   */
+  protected final TreeGraphNode root;
+
+  /**
+   * A map from arbitrary integer indices to nodes.
+   */
+<span class="pc" id="L141">  private final Map&lt;Integer, TreeGraphNode&gt; indexMap = Generics.newHashMap();</span>
+
+  /**
+   * Create a new GrammaticalStructure, analyzing the parse tree and
+   * populate the GrammaticalStructure with as many labeled
+   * grammatical relation arcs as possible.
+   *
+   * @param t             A Tree to analyze
+   * @param relations     A set of GrammaticalRelations to consider
+   * @param relationsLock Something needed to make this thread-safe when iterating over relations
+   * @param transformer   A tree transformer to apply to the tree before converting (this argument
+   *                      may be null if no transformer is required)
+   * @param hf            A HeadFinder for analysis
+   * @param puncFilter    A Filter to reject punctuation. To delete punctuation
+   *                      dependencies, this filter should return false on
+   *                      punctuation word strings, and true otherwise.
+   *                      If punctuation dependencies should be kept, you
+   *                      should pass in a {@code Filters.&lt;String&gt;acceptFilter()}.
+   * @param tagFilter     Appears to be unused (filters out tags??)
+   */
+  public GrammaticalStructure(Tree t, Collection&lt;GrammaticalRelation&gt; relations,
+                              Lock relationsLock, TreeTransformer transformer,
+                              HeadFinder hf, Predicate&lt;String&gt; puncFilter,
+<span class="fc" id="L164">                              Predicate&lt;String&gt; tagFilter) {</span>
+<span class="fc" id="L165">    TreeGraphNode treeGraph = new TreeGraphNode(t, (TreeGraphNode) null);</span>
+    // TODO: create the tree and reuse the leaf labels in one pass,
+    // avoiding a wasteful copy of the labels.
+<span class="fc" id="L168">    Trees.setLeafLabels(treeGraph, t.yield());</span>
+<span class="fc" id="L169">    Trees.setLeafTagsIfUnset(treeGraph);</span>
+<span class="fc bfc" id="L170" title="All 2 branches covered.">    if (transformer != null) {</span>
+<span class="fc" id="L171">      Tree transformed = transformer.transformTree(treeGraph);</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">      if (!(transformed instanceof TreeGraphNode)) {</span>
+<span class="nc" id="L173">        throw new RuntimeException(&quot;Transformer did not change TreeGraphNode into another TreeGraphNode: &quot; + transformer);</span>
+      }
+<span class="fc" id="L175">      this.root = (TreeGraphNode) transformed;</span>
+<span class="fc" id="L176">    } else {</span>
+<span class="fc" id="L177">      this.root = treeGraph;</span>
+    }
+<span class="fc" id="L179">    indexNodes(this.root);</span>
+    // add head word and tag to phrase nodes
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">    if (hf == null) {</span>
+<span class="nc" id="L182">      throw new AssertionError(&quot;Cannot use null HeadFinder&quot;);</span>
+    }
+<span class="fc" id="L184">    root.percolateHeads(hf);</span>
+<span class="fc bfc" id="L185" title="All 2 branches covered.">    if (root.value() == null) {</span>
+<span class="fc" id="L186">      root.setValue(&quot;ROOT&quot;);  // todo: cdm: it doesn't seem like this line should be here</span>
+    }
+    // add dependencies, using heads
+<span class="fc" id="L189">    this.puncFilter = puncFilter;</span>
+<span class="fc" id="L190">    this.tagFilter = tagFilter;</span>
+    // NoPunctFilter puncDepFilter = new NoPunctFilter(puncFilter);
+<span class="fc" id="L192">    NoPunctTypedDependencyFilter puncTypedDepFilter = new NoPunctTypedDependencyFilter(puncFilter, tagFilter);</span>
+
+<span class="fc" id="L194">    DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; basicGraph = new DirectedMultiGraph&lt;&gt;();</span>
+<span class="fc" id="L195">    DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; completeGraph = new DirectedMultiGraph&lt;&gt;();</span>
+
+    // analyze the root (and its descendants, recursively)
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">    if (relationsLock != null) {</span>
+<span class="fc" id="L199">      relationsLock.lock();</span>
+    }
+    try {
+<span class="fc" id="L202">      analyzeNode(root, root, relations, hf, puncFilter, tagFilter, basicGraph, completeGraph);</span>
+    }
+    finally {
+<span class="pc bpc" id="L205" title="3 of 4 branches missed.">      if (relationsLock != null) {</span>
+<span class="pc" id="L206">        relationsLock.unlock();</span>
+      }
+    }
+
+<span class="fc" id="L210">    attachStrandedNodes(root, root, false, puncFilter, tagFilter, basicGraph);</span>
+
+    // add typed dependencies
+<span class="fc" id="L213">    typedDependencies = getDeps(puncTypedDepFilter, basicGraph);</span>
+<span class="fc" id="L214">    allTypedDependencies = Generics.newArrayList(typedDependencies);</span>
+<span class="fc" id="L215">    getExtraDeps(allTypedDependencies, puncTypedDepFilter, completeGraph);</span>
+<span class="fc" id="L216">  }</span>
+
+
+  /**
+   * Assign sequential integer indices (starting with 1) to all
+   * nodes of the subtree rooted at this
+   * {@code Tree}.  The leaves are indexed first,
+   * from left to right.  Then the internal nodes are indexed,
+   * using a pre-order tree traversal.
+   */
+  private void indexNodes(TreeGraphNode tree) {
+<span class="fc" id="L227">    indexNodes(tree, indexLeaves(tree, 1));</span>
+<span class="fc" id="L228">  }</span>
+
+  /**
+   * Assign sequential integer indices to the leaves of the subtree
+   * rooted at this {@code TreeGraphNode}, beginning with
+   * {@code startIndex}, and traversing the leaves from left
+   * to right. If node is already indexed, then it uses the existing index.
+   *
+   * @param startIndex index for this node
+   * @return the next index still unassigned
+   */
+  private int indexLeaves(TreeGraphNode tree, int startIndex) {
+<span class="fc bfc" id="L240" title="All 2 branches covered.">    if (tree.isLeaf()) {</span>
+<span class="fc" id="L241">      int oldIndex = tree.index();</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">      if (oldIndex &gt;= 0) {</span>
+<span class="fc" id="L243">        startIndex = oldIndex;</span>
+      } else {
+<span class="nc" id="L245">        tree.setIndex(startIndex);</span>
+      }
+<span class="fc" id="L247">      addNodeToIndexMap(startIndex, tree);</span>
+<span class="fc" id="L248">      startIndex++;</span>
+<span class="fc" id="L249">    } else {</span>
+<span class="fc bfc" id="L250" title="All 2 branches covered.">      for (TreeGraphNode child : tree.children) {</span>
+<span class="fc" id="L251">        startIndex = indexLeaves(child, startIndex);</span>
+      }
+    }
+<span class="fc" id="L254">    return startIndex;</span>
+  }
+
+  /**
+   * Assign sequential integer indices to all nodes of the subtree
+   * rooted at this {@code TreeGraphNode}, beginning with
+   * {@code startIndex}, and doing a pre-order tree traversal.
+   * Any node which already has an index will not be re-indexed
+   * &amp;mdash; this is so that we can index the leaves first, and
+   * then index the rest.
+   *
+   * @param startIndex index for this node
+   * @return the next index still unassigned
+   */
+  private int indexNodes(TreeGraphNode tree, int startIndex) {
+<span class="fc bfc" id="L269" title="All 2 branches covered.">    if (tree.index() &lt; 0) {		// if this node has no index</span>
+<span class="fc" id="L270">      addNodeToIndexMap(startIndex, tree);</span>
+<span class="fc" id="L271">      tree.setIndex(startIndex++);</span>
+    }
+<span class="fc bfc" id="L273" title="All 2 branches covered.">    if (!tree.isLeaf()) {</span>
+<span class="fc bfc" id="L274" title="All 2 branches covered.">      for (TreeGraphNode child : tree.children) {</span>
+<span class="fc" id="L275">        startIndex = indexNodes(child, startIndex);</span>
+      }
+    }
+<span class="fc" id="L278">    return startIndex;</span>
+  }
+
+  /**
+   * Store a mapping from an arbitrary integer index to a node in
+   * this treegraph.  Normally a client shouldn't need to use this,
+   * as the nodes are automatically indexed by the
+   * {@code TreeGraph} constructor.
+   *
+   * @param index the arbitrary integer index
+   * @param node  the {@code TreeGraphNode} to be indexed
+   */
+  private void addNodeToIndexMap(int index, TreeGraphNode node) {
+<span class="fc" id="L291">    indexMap.put(Integer.valueOf(index), node);</span>
+<span class="fc" id="L292">  }</span>
+
+
+  /**
+   * Return the node in the this treegraph corresponding to the
+   * specified integer index.
+   *
+   * @param index the integer index of the node you want
+   * @return the {@code TreeGraphNode} having the specified
+   *         index (or {@code null} if such does not exist)
+   */
+  private TreeGraphNode getNodeByIndex(int index) {
+<span class="nc" id="L304">    return indexMap.get(Integer.valueOf(index));</span>
+  }
+
+  /**
+   * Return the root Tree of this GrammaticalStructure.
+   *
+   * @return the root Tree of this GrammaticalStructure
+   */
+  public TreeGraphNode root() {
+<span class="fc" id="L313">    return root;</span>
+  }
+
+  private static void throwDepFormatException(String dep) {
+<span class="nc" id="L317">     throw new RuntimeException(String.format(&quot;Dependencies should be for the format 'type(arg-idx, arg-idx)'. Could not parse '%s'&quot;, dep));</span>
+  }
+
+  /**
+   * Create a grammatical structure from its string representation.
+   *
+   * Like buildCoNLLXGrammaticalStructure,
+   * this method fakes up the parts of the tree structure that are not
+   * used by the grammatical relation transformation operations.
+   *
+   * &lt;i&gt;Note:&lt;/i&gt; Added by daniel cer
+   *
+   * @param tokens
+   * @param posTags
+   * @param deps
+   */
+  public static GrammaticalStructure fromStringReps(List&lt;String&gt; tokens, List&lt;String&gt; posTags, List&lt;String&gt; deps) {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">    if (tokens.size() != posTags.size()) {</span>
+<span class="nc" id="L335">      throw new RuntimeException(String.format(</span>
+<span class="nc" id="L336">              &quot;tokens.size(): %d != pos.size(): %d%n&quot;, tokens.size(), posTags</span>
+<span class="nc" id="L337">                      .size()));</span>
+    }
+
+<span class="nc" id="L340">    List&lt;TreeGraphNode&gt; tgWordNodes = new ArrayList&lt;&gt;(tokens.size());</span>
+<span class="nc" id="L341">    List&lt;TreeGraphNode&gt; tgPOSNodes = new ArrayList&lt;&gt;(tokens.size());</span>
+
+<span class="nc" id="L343">    CoreLabel rootLabel = new CoreLabel();</span>
+<span class="nc" id="L344">    rootLabel.setValue(&quot;ROOT&quot;);</span>
+<span class="nc" id="L345">    List&lt;IndexedWord&gt; nodeWords = new ArrayList&lt;&gt;(tgPOSNodes.size() + 1);</span>
+<span class="nc" id="L346">    nodeWords.add(new IndexedWord(rootLabel));</span>
+
+<span class="nc" id="L348">    UniversalSemanticHeadFinder headFinder = new UniversalSemanticHeadFinder();</span>
+
+<span class="nc" id="L350">    Iterator&lt;String&gt; posIter = posTags.iterator();</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    for (String wordString : tokens) {</span>
+<span class="nc" id="L352">      String posString = posIter.next();</span>
+<span class="nc" id="L353">      CoreLabel wordLabel = new CoreLabel();</span>
+<span class="nc" id="L354">      wordLabel.setWord(wordString);</span>
+<span class="nc" id="L355">      wordLabel.setValue(wordString);</span>
+<span class="nc" id="L356">      wordLabel.setTag(posString);</span>
+<span class="nc" id="L357">      TreeGraphNode word = new TreeGraphNode(wordLabel);</span>
+<span class="nc" id="L358">      CoreLabel tagLabel = new CoreLabel();</span>
+<span class="nc" id="L359">      tagLabel.setValue(posString);</span>
+<span class="nc" id="L360">      tagLabel.setWord(posString);</span>
+<span class="nc" id="L361">      TreeGraphNode pos = new TreeGraphNode(tagLabel);</span>
+<span class="nc" id="L362">      tgWordNodes.add(word);</span>
+<span class="nc" id="L363">      tgPOSNodes.add(pos);</span>
+<span class="nc" id="L364">      TreeGraphNode[] childArr = {word};</span>
+<span class="nc" id="L365">      pos.setChildren(childArr);</span>
+<span class="nc" id="L366">      word.setParent(pos);</span>
+<span class="nc" id="L367">      pos.percolateHeads(headFinder);</span>
+<span class="nc" id="L368">      nodeWords.add(new IndexedWord(wordLabel));</span>
+<span class="nc" id="L369">    }</span>
+
+<span class="nc" id="L371">    TreeGraphNode root = new TreeGraphNode(rootLabel);</span>
+
+<span class="nc" id="L373">    root.setChildren(tgPOSNodes.toArray(new TreeGraphNode[tgPOSNodes.size()]));</span>
+
+<span class="nc" id="L375">    root.setIndex(0);</span>
+
+    // Build list of TypedDependencies
+<span class="nc" id="L378">    List&lt;TypedDependency&gt; tdeps = new ArrayList&lt;&gt;(deps.size());</span>
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    for (String depString : deps) {</span>
+<span class="nc" id="L381">      int firstBracket = depString.indexOf('(');</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">      if (firstBracket == -1) throwDepFormatException(depString);</span>
+
+
+<span class="nc" id="L385">      String type = depString.substring(0, firstBracket);</span>
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">      if (depString.charAt(depString.length() - 1) != ')') throwDepFormatException(depString);</span>
+
+<span class="nc" id="L389">      String args = depString.substring(firstBracket + 1, depString.length() - 1);</span>
+
+<span class="nc" id="L391">      int argSep = args.indexOf(&quot;, &quot;);</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">      if (argSep == -1) throwDepFormatException(depString);</span>
+
+<span class="nc" id="L394">      String parentArg = args.substring(0, argSep);</span>
+<span class="nc" id="L395">      String childArg  = args.substring(argSep + 2);</span>
+<span class="nc" id="L396">      int parentDash = parentArg.lastIndexOf('-');</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">      if (parentDash == -1) throwDepFormatException(depString);</span>
+<span class="nc" id="L398">      int childDash = childArg.lastIndexOf('-');</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">      if (childDash == -1) throwDepFormatException(depString);</span>
+      //System.err.printf(&quot;parentArg: %s%n&quot;, parentArg);
+<span class="nc" id="L401">      int parentIdx = Integer.parseInt(parentArg.substring(parentDash+1).replace(&quot;'&quot;, &quot;&quot;));</span>
+
+<span class="nc" id="L403">      int childIdx = Integer.parseInt(childArg.substring(childDash+1).replace(&quot;'&quot;, &quot;&quot;));</span>
+
+<span class="nc" id="L405">      GrammaticalRelation grel = new GrammaticalRelation(Language.Any, type, null, DEPENDENT);</span>
+
+<span class="nc" id="L407">      TypedDependency tdep = new TypedDependency(grel, nodeWords.get(parentIdx), nodeWords.get(childIdx));</span>
+<span class="nc" id="L408">      tdeps.add(tdep);</span>
+<span class="nc" id="L409">    }</span>
+
+    // TODO add some elegant way to construct language
+    // appropriate GrammaticalStructures (e.g., English, Chinese, etc.)
+<span class="nc" id="L413">    return new GrammaticalStructure(tdeps, root) {</span>
+      private static final long serialVersionUID = 1L;
+    };
+  }
+
+<span class="nc" id="L418">  public GrammaticalStructure(List&lt;TypedDependency&gt; projectiveDependencies, TreeGraphNode root) {</span>
+<span class="nc" id="L419">    this.root = root;</span>
+<span class="nc" id="L420">    indexNodes(this.root);</span>
+<span class="nc" id="L421">    this.puncFilter = Filters.acceptFilter();</span>
+<span class="nc" id="L422">    this.tagFilter = Filters.acceptFilter();</span>
+<span class="nc" id="L423">    allTypedDependencies = typedDependencies = new ArrayList&lt;&gt;(projectiveDependencies);</span>
+<span class="nc" id="L424">  }</span>
+
+  @Override
+  public String toString() {
+<span class="nc" id="L428">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L429">    sb.append(root.toPrettyString(0).substring(1));</span>
+<span class="nc" id="L430">    sb.append(&quot;Typed Dependencies:\n&quot;);</span>
+<span class="nc" id="L431">    sb.append(typedDependencies);</span>
+<span class="nc" id="L432">    return sb.toString();</span>
+  }
+
+  private static void attachStrandedNodes(TreeGraphNode t, TreeGraphNode root, boolean attach, Predicate&lt;String&gt; puncFilter, Predicate&lt;String&gt; tagFilter, DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; basicGraph) {
+<span class="fc bfc" id="L436" title="All 2 branches covered.">    if (t.isLeaf()) {</span>
+<span class="fc" id="L437">      return;</span>
+    }
+<span class="fc bfc" id="L439" title="All 4 branches covered.">    if (attach &amp;&amp; puncFilter.test(t.headWordNode().label().value()) &amp;&amp;</span>
+<span class="fc bfc" id="L440" title="All 2 branches covered.">        tagFilter.test(t.headWordNode().label().tag())) {</span>
+      // make faster by first looking for links from parent
+      // it is necessary to look for paths using all directions
+      // because sometimes there are edges created from lower nodes to
+      // nodes higher up
+<span class="fc" id="L445">      TreeGraphNode parent = t.parent().highestNodeWithSameHead();</span>
+<span class="fc bfc" id="L446" title="All 4 branches covered.">      if (!basicGraph.isEdge(parent, t) &amp;&amp; basicGraph.getShortestPath(root, t, false) == null) {</span>
+<span class="fc" id="L447">        basicGraph.add(parent, t, GrammaticalRelation.DEPENDENT);</span>
+      }
+    }
+<span class="fc bfc" id="L450" title="All 2 branches covered.">    for (TreeGraphNode kid : t.children()) {</span>
+<span class="fc bfc" id="L451" title="All 2 branches covered.">      attachStrandedNodes(kid, root, (kid.headWordNode() != t.headWordNode()), puncFilter, tagFilter, basicGraph);</span>
+    }
+<span class="fc" id="L453">  }</span>
+
+  // cdm dec 2009: I changed this to automatically fail on preterminal nodes, since they shouldn't match for GR parent patterns.  Should speed it up.
+  private static void analyzeNode(TreeGraphNode t, TreeGraphNode root, Collection&lt;GrammaticalRelation&gt; relations, HeadFinder hf, Predicate&lt;String&gt; puncFilter, Predicate&lt;String&gt; tagFilter, DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; basicGraph, DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; completeGraph) {
+<span class="fc bfc" id="L457" title="All 2 branches covered.">    if (t.isPhrasal()) {    // don't do leaves or preterminals!</span>
+<span class="fc" id="L458">      TreeGraphNode tHigh = t.highestNodeWithSameHead();</span>
+<span class="fc bfc" id="L459" title="All 2 branches covered.">      for (GrammaticalRelation egr : relations) {</span>
+<span class="fc bfc" id="L460" title="All 2 branches covered.">        if (egr.isApplicable(t)) {</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">          for (TreeGraphNode u : egr.getRelatedNodes(t, root, hf)) {</span>
+<span class="fc" id="L462">            TreeGraphNode uHigh = u.highestNodeWithSameHead();</span>
+<span class="fc bfc" id="L463" title="All 2 branches covered.">            if (uHigh == tHigh) {</span>
+<span class="fc" id="L464">              continue;</span>
+            }
+<span class="fc bfc" id="L466" title="All 2 branches covered.">            if (!puncFilter.test(uHigh.headWordNode().label().value()) ||</span>
+<span class="fc bfc" id="L467" title="All 2 branches covered.">                ! tagFilter.test(uHigh.headWordNode().label().tag())) {</span>
+<span class="fc" id="L468">              continue;</span>
+            }
+<span class="fc" id="L470">            completeGraph.add(tHigh, uHigh, egr);</span>
+            // If there are two patterns that add dependencies, X --&gt; Z and Y --&gt; Z, and X dominates Y, then the dependency Y --&gt; Z is not added to the basic graph to prevent unwanted duplication.
+            // Similarly, if there is already a path from X --&gt; Y, and an expression would trigger Y --&gt; X somehow, we ignore that
+<span class="fc" id="L473">            Set&lt;TreeGraphNode&gt; parents = basicGraph.getParents(uHigh);</span>
+<span class="pc bpc" id="L474" title="1 of 6 branches missed.">            if ((parents == null || parents.size() == 0 || parents.contains(tHigh)) &amp;&amp;</span>
+<span class="pc bpc" id="L475" title="1 of 2 branches missed.">                basicGraph.getShortestPath(uHigh, tHigh, true) == null) {</span>
+              // log.info(&quot;Adding &quot; + egr.getShortName() + &quot; from &quot; + t + &quot; to &quot; + u + &quot; tHigh=&quot; + tHigh + &quot;(&quot; + tHigh.headWordNode() + &quot;) uHigh=&quot; + uHigh + &quot;(&quot; + uHigh.headWordNode() + &quot;)&quot;);
+<span class="fc" id="L477">              basicGraph.add(tHigh, uHigh, egr);</span>
+            }
+<span class="fc" id="L479">          }</span>
+        }
+<span class="fc" id="L481">      }</span>
+      // now recurse into children
+<span class="fc bfc" id="L483" title="All 2 branches covered.">      for (TreeGraphNode kid : t.children()) {</span>
+<span class="fc" id="L484">        analyzeNode(kid, root, relations, hf, puncFilter, tagFilter, basicGraph, completeGraph);</span>
+      }
+    }
+<span class="fc" id="L487">  }</span>
+
+  private void getExtraDeps(List&lt;TypedDependency&gt; deps, Predicate&lt;TypedDependency&gt; puncTypedDepFilter, DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; completeGraph) {
+<span class="fc" id="L490">    getExtras(deps);</span>
+    // adds stuff to basicDep based on the tregex patterns over the tree
+<span class="fc" id="L492">    this.getTreeDeps(deps, completeGraph, puncTypedDepFilter, extraTreeDepFilter());</span>
+<span class="fc" id="L493">    Collections.sort(deps);</span>
+<span class="fc" id="L494">  }</span>
+
+  /**
+   * Helps the constructor build a list of typed dependencies using
+   * information from a {@code GrammaticalStructure}.
+   */
+  private List&lt;TypedDependency&gt; getDeps(Predicate&lt;TypedDependency&gt; puncTypedDepFilter, DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; basicGraph) {
+<span class="fc" id="L501">    List&lt;TypedDependency&gt; basicDep = Generics.newArrayList();</span>
+
+<span class="fc bfc" id="L503" title="All 2 branches covered.">    for (TreeGraphNode gov : basicGraph.getAllVertices()) {</span>
+<span class="fc bfc" id="L504" title="All 2 branches covered.">      for (TreeGraphNode dep : basicGraph.getChildren(gov)) {</span>
+<span class="fc" id="L505">        GrammaticalRelation reln = getGrammaticalRelationCommonAncestor(gov.headWordNode().label(), gov.label(), dep.headWordNode().label(), dep.label(), basicGraph.getEdges(gov, dep));</span>
+        // log.info(&quot;  Gov: &quot; + gov + &quot; Dep: &quot; + dep + &quot; Reln: &quot; + reln);
+<span class="fc" id="L507">        basicDep.add(new TypedDependency(reln, new IndexedWord(gov.headWordNode().label()), new IndexedWord(dep.headWordNode().label())));</span>
+<span class="fc" id="L508">      }</span>
+<span class="fc" id="L509">    }</span>
+
+    // add the root
+<span class="fc" id="L512">    TreeGraphNode dependencyRoot = new TreeGraphNode(new Word(&quot;ROOT&quot;));</span>
+<span class="fc" id="L513">    dependencyRoot.setIndex(0);</span>
+<span class="fc" id="L514">    TreeGraphNode rootDep = root().headWordNode();</span>
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">    if (rootDep == null) {</span>
+<span class="nc" id="L516">      List&lt;Tree&gt; leaves = Trees.leaves(root());</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">      if (leaves.size() &gt; 0) {</span>
+<span class="nc" id="L518">        Tree leaf = leaves.get(0);</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (!(leaf instanceof TreeGraphNode)) {</span>
+<span class="nc" id="L520">          throw new AssertionError(&quot;Leaves should be TreeGraphNodes&quot;);</span>
+        }
+<span class="nc" id="L522">        rootDep = (TreeGraphNode) leaf;</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (rootDep.headWordNode() != null) {</span>
+<span class="nc" id="L524">          rootDep = rootDep.headWordNode();</span>
+        }
+      }
+    }
+
+<span class="pc bpc" id="L529" title="1 of 2 branches missed.">    if (rootDep != null) {</span>
+<span class="fc" id="L530">      TypedDependency rootTypedDep = new TypedDependency(ROOT, new IndexedWord(dependencyRoot.label()), new IndexedWord(rootDep.label()));</span>
+<span class="pc bpc" id="L531" title="1 of 2 branches missed.">      if (puncTypedDepFilter.test(rootTypedDep)) {</span>
+<span class="fc" id="L532">        basicDep.add(rootTypedDep);</span>
+      } else { // Root is a punctuation character
+
+        /* Heuristic to find a root for the graph.
+         * Make the first child of the current root the
+         * new root and attach all other children to
+         * the new root.
+         */
+
+<span class="nc" id="L541">        IndexedWord root = rootTypedDep.dep();</span>
+<span class="nc" id="L542">        IndexedWord newRoot = null;</span>
+<span class="nc" id="L543">        Collections.sort(basicDep);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        for (TypedDependency td : basicDep) {</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">          if (td.gov().equals(root)) {</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            if (newRoot != null) {</span>
+<span class="nc" id="L547">              td.setGov(newRoot);</span>
+            } else {
+<span class="nc" id="L549">              td.setGov(td.gov());</span>
+<span class="nc" id="L550">              td.setReln(ROOT);</span>
+<span class="nc" id="L551">              newRoot = td.dep();</span>
+            }
+          }
+<span class="nc" id="L554">        }</span>
+      }
+    }
+
+<span class="fc" id="L558">    postProcessDependencies(basicDep);</span>
+
+<span class="fc" id="L560">    Collections.sort(basicDep);</span>
+
+<span class="fc" id="L562">    return basicDep;</span>
+  }
+
+  /**
+   * Returns a Filter which checks dependencies for usefulness as
+   * extra tree-based dependencies.  By default, everything is
+   * accepted.  One example of how this can be useful is in the
+   * English dependencies, where the REL dependency is used as an
+   * intermediate and we do not want this to be added when we make a
+   * second pass over the trees for missing dependencies.
+   */
+  protected Predicate&lt;TypedDependency&gt; extraTreeDepFilter() {
+<span class="fc" id="L574">    return Filters.acceptFilter();</span>
+  }
+
+  /**
+   * Post process the dependencies in whatever way this language
+   * requires.  For example, English might replace &quot;rel&quot; dependencies
+   * with either dobj or pobj depending on the surrounding
+   * dependencies.
+   */
+  protected void postProcessDependencies(List&lt;TypedDependency&gt; basicDep) {
+    // no post processing by default
+<span class="fc" id="L585">  }</span>
+
+  /**
+   * Get extra dependencies that do not depend on the tree structure,
+   * but rather only depend on the existing dependency structure.
+   * For example, the English xsubj dependency can be extracted that way.
+   */
+  protected void getExtras(List&lt;TypedDependency&gt; basicDep) {
+    // no extra dependencies by default
+<span class="fc" id="L594">  }</span>
+
+
+  /** Look through the tree t and adds to the List basicDep
+   *  additional dependencies which aren't
+   *  in the List but which satisfy the filter puncTypedDepFilter.
+   *
+   * @param deps The list of dependencies which may be augmented
+   * @param completeGraph a graph of all the tree dependencies found earlier
+   * @param puncTypedDepFilter The filter that may skip punctuation dependencies
+   * @param extraTreeDepFilter Additional dependencies are added only if they pass this filter
+   */
+  protected void getTreeDeps(List&lt;TypedDependency&gt; deps,
+                                  DirectedMultiGraph&lt;TreeGraphNode, GrammaticalRelation&gt; completeGraph,
+                                  Predicate&lt;TypedDependency&gt; puncTypedDepFilter,
+                                  Predicate&lt;TypedDependency&gt; extraTreeDepFilter) {
+<span class="fc bfc" id="L610" title="All 2 branches covered.">    for (TreeGraphNode gov : completeGraph.getAllVertices()) {</span>
+<span class="fc bfc" id="L611" title="All 2 branches covered.">      for (TreeGraphNode dep : completeGraph.getChildren(gov)) {</span>
+<span class="fc bfc" id="L612" title="All 2 branches covered.">        for (GrammaticalRelation rel : removeGrammaticalRelationAncestors(completeGraph.getEdges(gov, dep))) {</span>
+<span class="fc" id="L613">          TypedDependency newDep = new TypedDependency(rel, new IndexedWord(gov.headWordNode().label()), new IndexedWord(dep.headWordNode().label()));</span>
+<span class="pc bpc" id="L614" title="1 of 6 branches missed.">          if (!deps.contains(newDep) &amp;&amp; puncTypedDepFilter.test(newDep) &amp;&amp; extraTreeDepFilter.test(newDep)) {</span>
+<span class="fc" id="L615">            newDep.setExtra();</span>
+<span class="fc" id="L616">            deps.add(newDep);</span>
+          }
+<span class="fc" id="L618">        }</span>
+<span class="fc" id="L619">      }</span>
+<span class="fc" id="L620">    }</span>
+<span class="fc" id="L621">  }</span>
+
+  private static class NoPunctFilter implements Predicate&lt;Dependency&lt;Label, Label, Object&gt;&gt;, Serializable {
+    private Predicate&lt;String&gt; npf;
+
+<span class="nc" id="L626">    NoPunctFilter(Predicate&lt;String&gt; f) {</span>
+<span class="nc" id="L627">      this.npf = f;</span>
+<span class="nc" id="L628">    }</span>
+
+    @Override
+    public boolean test(Dependency&lt;Label, Label, Object&gt; d) {
+<span class="nc bnc" id="L632" title="All 2 branches missed.">      if (d == null) {</span>
+<span class="nc" id="L633">        return false;</span>
+      }
+<span class="nc" id="L635">      Label lab = d.dependent();</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">      if (lab == null) {</span>
+<span class="nc" id="L637">        return false;</span>
+      }
+<span class="nc" id="L639">      return npf.test(lab.value());</span>
+    }
+
+    // Automatically generated by Eclipse
+    private static final long serialVersionUID = -2319891944796663180L;
+  } // end static class NoPunctFilter
+
+
+  private static class NoPunctTypedDependencyFilter implements Predicate&lt;TypedDependency&gt;, Serializable {
+    private Predicate&lt;String&gt; npf;
+    private Predicate&lt;String&gt; tf;
+
+<span class="fc" id="L651">    NoPunctTypedDependencyFilter(Predicate&lt;String&gt; f, Predicate&lt;String&gt; tf) {</span>
+<span class="fc" id="L652">      this.npf = f;</span>
+<span class="fc" id="L653">      this.tf = tf;</span>
+<span class="fc" id="L654">    }</span>
+
+    @Override
+    public boolean test(TypedDependency d) {
+<span class="pc bpc" id="L658" title="1 of 2 branches missed.">      if (d == null) return false;</span>
+
+<span class="fc" id="L660">      IndexedWord l = d.dep();</span>
+<span class="pc bpc" id="L661" title="1 of 2 branches missed.">      if (l == null) return false;</span>
+
+<span class="pc bpc" id="L663" title="2 of 4 branches missed.">      return npf.test(l.value()) &amp;&amp; tf.test(l.tag());</span>
+    }
+
+    private static final long serialVersionUID = -2872766864289207468L;
+
+  } // end static class NoPunctTypedDependencyFilter
+
+
+  /**
+   * Get GrammaticalRelation between gov and dep, and null if gov  is not the
+   * governor of dep
+   */
+  public GrammaticalRelation getGrammaticalRelation(int govIndex, int depIndex) {
+<span class="nc" id="L676">    TreeGraphNode gov = getNodeByIndex(govIndex);</span>
+<span class="nc" id="L677">    TreeGraphNode dep = getNodeByIndex(depIndex);</span>
+    // TODO: this is pretty ugly
+<span class="nc" id="L679">    return getGrammaticalRelation(new IndexedWord(gov.label()), new IndexedWord(dep.label()));</span>
+  }
+
+  /**
+   * Get GrammaticalRelation between gov and dep, and null if gov is not the
+   * governor of dep
+   */
+  public GrammaticalRelation getGrammaticalRelation(IndexedWord gov, IndexedWord dep) {
+<span class="nc" id="L687">    List&lt;GrammaticalRelation&gt; labels = Generics.newArrayList();</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">    for (TypedDependency dependency : typedDependencies(Extras.MAXIMAL)) {</span>
+<span class="nc bnc" id="L689" title="All 4 branches missed.">      if (dependency.gov().equals(gov) &amp;&amp; dependency.dep().equals(dep)) {</span>
+<span class="nc" id="L690">        labels.add(dependency.reln());</span>
+      }
+<span class="nc" id="L692">    }</span>
+
+<span class="nc" id="L694">    return getGrammaticalRelationCommonAncestor(gov, gov, dep, dep, labels);</span>
+  }
+
+  /**
+   * Returns the GrammaticalRelation which is the highest common
+   * ancestor of the list of relations passed in.  The Labels are
+   * passed in only for debugging reasons.  gov &amp;amp; dep are the
+   * labels with the text, govH and depH can be higher labels in the
+   * tree which represent the category
+   */
+  private static GrammaticalRelation getGrammaticalRelationCommonAncestor(AbstractCoreLabel gov, AbstractCoreLabel govH, AbstractCoreLabel dep, AbstractCoreLabel depH, List&lt;GrammaticalRelation&gt; labels) {
+<span class="fc" id="L705">    GrammaticalRelation reln = GrammaticalRelation.DEPENDENT;</span>
+
+    List&lt;GrammaticalRelation&gt; sortedLabels;
+<span class="fc bfc" id="L708" title="All 2 branches covered.">    if (labels.size() &lt;= 1) {</span>
+<span class="fc" id="L709">      sortedLabels = labels;</span>
+    } else {
+<span class="fc" id="L711">      sortedLabels = new ArrayList&lt;&gt;(labels);</span>
+<span class="fc" id="L712">      Collections.sort(sortedLabels, new NameComparator&lt;&gt;());</span>
+    }
+    // log.info(&quot; gov &quot; + govH + &quot; dep &quot; + depH + &quot; arc labels: &quot; + sortedLabels);
+
+<span class="fc bfc" id="L716" title="All 2 branches covered.">    for (GrammaticalRelation reln2 : sortedLabels) {</span>
+<span class="fc bfc" id="L717" title="All 2 branches covered.">      if (reln.isAncestor(reln2)) {</span>
+<span class="fc" id="L718">        reln = reln2;</span>
+<span class="pc bpc" id="L719" title="3 of 4 branches missed.">      } else if (PRINT_DEBUGGING &amp;&amp; ! reln2.isAncestor(reln)) {</span>
+<span class="nc" id="L720">        log.info(&quot;@@@\t&quot; + reln + &quot;\t&quot; + reln2 + &quot;\t&quot; +</span>
+<span class="nc" id="L721">                           govH.get(CoreAnnotations.ValueAnnotation.class) + &quot;\t&quot; + depH.get(CoreAnnotations.ValueAnnotation.class));</span>
+      }
+<span class="fc" id="L723">    }</span>
+<span class="pc bpc" id="L724" title="3 of 4 branches missed.">    if (PRINT_DEBUGGING &amp;&amp; reln.equals(GrammaticalRelation.DEPENDENT)) {</span>
+<span class="nc" id="L725">      String topCat = govH.get(CoreAnnotations.ValueAnnotation.class);</span>
+<span class="nc" id="L726">      String topTag = gov.tag();</span>
+<span class="nc" id="L727">      String topWord = gov.value();</span>
+<span class="nc" id="L728">      String botCat = depH.get(CoreAnnotations.ValueAnnotation.class);</span>
+<span class="nc" id="L729">      String botTag = dep.tag();</span>
+<span class="nc" id="L730">      String botWord = dep.value();</span>
+<span class="nc" id="L731">      log.info(&quot;### dep\t&quot; + topCat + &quot;\t&quot; + topTag + &quot;\t&quot; + topWord +</span>
+                         &quot;\t&quot; + botCat + &quot;\t&quot; + botTag + &quot;\t&quot; + botWord + &quot;\t&quot;);
+    }
+<span class="fc" id="L734">    return reln;</span>
+  }
+
+  private static List&lt;GrammaticalRelation&gt; removeGrammaticalRelationAncestors(List&lt;GrammaticalRelation&gt; original) {
+<span class="fc" id="L738">    List&lt;GrammaticalRelation&gt; filtered = Generics.newArrayList();</span>
+<span class="fc bfc" id="L739" title="All 2 branches covered.">    for (GrammaticalRelation reln : original) {</span>
+<span class="fc" id="L740">      boolean descendantFound = false;</span>
+<span class="fc bfc" id="L741" title="All 2 branches covered.">      for (int index = 0; index &lt; filtered.size(); ++index) {</span>
+<span class="fc" id="L742">        GrammaticalRelation gr = filtered.get(index);</span>
+        //if the element in the list is an ancestor of the current
+        //relation, remove it (we will replace it later)
+<span class="fc bfc" id="L745" title="All 2 branches covered.">        if (gr.isAncestor(reln)) {</span>
+<span class="fc" id="L746">          filtered.remove(index);</span>
+<span class="fc" id="L747">          --index;</span>
+<span class="pc bpc" id="L748" title="1 of 2 branches missed.">        } else if (reln.isAncestor(gr)) {</span>
+          //if the relation is not an ancestor of an element in the
+          //list, we add the relation
+<span class="nc" id="L751">          descendantFound = true;</span>
+        }
+      }
+<span class="pc bpc" id="L754" title="1 of 2 branches missed.">      if (!descendantFound) {</span>
+<span class="fc" id="L755">        filtered.add(reln);</span>
+      }
+<span class="fc" id="L757">    }</span>
+<span class="fc" id="L758">    return filtered;</span>
+  }
+
+
+  /**
+   * Returns the typed dependencies of this grammatical structure.  These
+   * are the basic word-level typed dependencies, where each word is dependent
+   * on one other thing, either a word or the starting ROOT, and the
+   * dependencies have a tree structure.  This corresponds to the
+   * command-line option &quot;basicDependencies&quot;.
+   *
+   * @return The typed dependencies of this grammatical structure
+   */
+  public Collection&lt;TypedDependency&gt; typedDependencies() {
+<span class="fc" id="L772">    return typedDependencies(Extras.NONE);</span>
+  }
+
+
+  /**
+   * Returns all the typed dependencies of this grammatical structure.
+   * These are like the basic (uncollapsed) dependencies, but may include
+   * extra arcs for control relationships, etc. This corresponds to the
+   * &quot;nonCollapsed&quot; option.
+   */
+  public Collection&lt;TypedDependency&gt; allTypedDependencies() {
+<span class="fc" id="L783">    return typedDependencies(Extras.MAXIMAL);</span>
+  }
+
+
+  /**
+   * Returns the typed dependencies of this grammatical structure. These
+   * are non-collapsed dependencies (basic or nonCollapsed).
+   *
+   * @param includeExtras If true, the list of typed dependencies
+   * returned may include &quot;extras&quot;, and does not follow a tree structure.
+   * @return The typed dependencies of this grammatical structure
+   */
+  public List&lt;TypedDependency&gt; typedDependencies(Extras includeExtras) {
+    List&lt;TypedDependency&gt; deps;
+    // This copy has to be done because of the broken way
+    // TypedDependency objects can be mutated by downstream methods
+    // such as collapseDependencies.  Without the copy here it is
+    // possible for two consecutive calls to
+    // typedDependenciesCollapsed to get different results.  For
+    // example, the English dependencies rename existing objects KILL
+    // to note that they should be removed.
+<span class="fc bfc" id="L804" title="All 2 branches covered.">    if (includeExtras != Extras.NONE) {</span>
+<span class="fc" id="L805">      deps = new ArrayList&lt;&gt;(allTypedDependencies.size());</span>
+<span class="fc bfc" id="L806" title="All 2 branches covered.">      for (TypedDependency dep : allTypedDependencies) {</span>
+<span class="fc" id="L807">        deps.add(new TypedDependency(dep));</span>
+<span class="fc" id="L808">      }</span>
+    } else {
+<span class="fc" id="L810">      deps = new ArrayList&lt;&gt;(typedDependencies.size());</span>
+<span class="fc bfc" id="L811" title="All 2 branches covered.">      for (TypedDependency dep : typedDependencies) {</span>
+<span class="fc" id="L812">        deps.add(new TypedDependency(dep));</span>
+<span class="fc" id="L813">      }</span>
+    }
+    //TODO (sebschu): prevent correctDependencies from getting called multiple times
+<span class="fc" id="L816">    correctDependencies(deps);</span>
+<span class="fc" id="L817">    return deps;</span>
+  }
+
+  /**
+   * @see edu.stanford.nlp.trees.GrammaticalStructure#typedDependencies(edu.stanford.nlp.trees.GrammaticalStructure.Extras)
+   */
+  @Deprecated
+  public List&lt;TypedDependency&gt; typedDependencies(boolean includeExtras) {
+<span class="nc bnc" id="L825" title="All 2 branches missed.">    return typedDependencies(includeExtras ? Extras.MAXIMAL : Extras.NONE);</span>
+  }
+
+  /**
+   * Get the typed dependencies after collapsing them.
+   * Collapsing dependencies refers to turning certain function words
+   * such as prepositions and conjunctions into arcs, so they disappear from
+   * the set of nodes.
+   * There is no guarantee that the dependencies are a tree. While the
+   * dependencies are normally tree-like, the collapsing may introduce
+   * not only re-entrancies but even small cycles.
+   *
+   * @return A set of collapsed dependencies
+   */
+  public Collection&lt;TypedDependency&gt; typedDependenciesCollapsed() {
+<span class="nc" id="L840">    return typedDependenciesCollapsed(Extras.NONE);</span>
+  }
+
+  // todo [cdm 2012]: The semantics of this method is the opposite of the others.
+  // The other no argument methods correspond to includeExtras being
+  // true, but for this one it is false.  This should probably be made uniform.
+  /**
+   * Get the typed dependencies after mostly collapsing them, but keep a tree
+   * structure.  In order to do this, the code does:
+   * &lt;ol&gt;
+   * &lt;li&gt; no relative clause processing
+   * &lt;li&gt; no xsubj relations
+   * &lt;li&gt; no propagation of conjuncts
+   * &lt;/ol&gt;
+   * This corresponds to the &quot;tree&quot; option.
+   *
+   * @return collapsed dependencies keeping a tree structure
+   */
+  public Collection&lt;TypedDependency&gt; typedDependenciesCollapsedTree() {
+<span class="nc" id="L859">    List&lt;TypedDependency&gt; tdl = typedDependencies(Extras.NONE);</span>
+<span class="nc" id="L860">    collapseDependenciesTree(tdl);</span>
+<span class="nc" id="L861">    return tdl;</span>
+  }
+
+  /**
+   * Get the typed dependencies after collapsing them.
+   * The &quot;collapsed&quot; option corresponds to calling this method with argument
+   * {@code true}.
+   *
+   * @param includeExtras If true, the list of typed dependencies
+   * returned may include &quot;extras&quot;, like controlling subjects
+   * @return collapsed dependencies
+   */
+  public List&lt;TypedDependency&gt; typedDependenciesCollapsed(Extras includeExtras) {
+<span class="fc" id="L874">    List&lt;TypedDependency&gt; tdl = typedDependencies(includeExtras);</span>
+<span class="fc" id="L875">    collapseDependencies(tdl, false, includeExtras);</span>
+<span class="fc" id="L876">    return tdl;</span>
+  }
+
+  /**
+   * @see edu.stanford.nlp.trees.GrammaticalStructure#typedDependenciesCollapsed(edu.stanford.nlp.trees.GrammaticalStructure.Extras)
+   */
+  @Deprecated
+  public List&lt;TypedDependency&gt; typedDependenciesCollapsed(boolean includeExtras) {
+<span class="nc bnc" id="L884" title="All 2 branches missed.">    return typedDependenciesCollapsed(includeExtras ? Extras.MAXIMAL : Extras.NONE);</span>
+  }
+
+
+  /**
+   * Get the typed dependencies after collapsing them and processing eventual
+   * CC complements.  The effect of this part is to distributed conjoined
+   * arguments across relations or conjoined predicates across their arguments.
+   * This is generally useful, and we generally recommend using the output of
+   * this method with the second argument being {@code true}.
+   * The &quot;CCPropagated&quot; option corresponds to calling this method with an
+   * argument of {@code true}.
+   *
+   * @param includeExtras If true, the list of typed dependencies
+   * returned may include &quot;extras&quot;, such as controlled subject links.
+   * @return collapsed dependencies with CC processed
+   */
+  public List&lt;TypedDependency&gt; typedDependenciesCCprocessed(Extras includeExtras) {
+<span class="fc" id="L902">    List&lt;TypedDependency&gt; tdl = typedDependencies(includeExtras);</span>
+<span class="fc" id="L903">    collapseDependencies(tdl, true, includeExtras);</span>
+<span class="fc" id="L904">    return tdl;</span>
+  }
+
+  /**
+   * @see edu.stanford.nlp.trees.GrammaticalStructure#typedDependenciesCCprocessed(edu.stanford.nlp.trees.GrammaticalStructure.Extras)
+   */
+  @Deprecated
+  public List&lt;TypedDependency&gt; typedDependenciesCCprocessed(boolean includeExtras) {
+<span class="nc bnc" id="L912" title="All 2 branches missed.">    return typedDependenciesCCprocessed(includeExtras ? Extras.MAXIMAL : Extras.NONE);</span>
+  }
+
+
+  public List&lt;TypedDependency&gt; typedDependenciesEnhanced() {
+<span class="nc" id="L917">    List&lt;TypedDependency&gt; tdl = typedDependencies(Extras.MAXIMAL);</span>
+<span class="nc" id="L918">    addEnhancements(tdl, UniversalEnglishGrammaticalStructure.ENHANCED_OPTIONS);</span>
+<span class="nc" id="L919">    return tdl;</span>
+  }
+
+  public List&lt;TypedDependency&gt; typedDependenciesEnhancedPlusPlus() {
+<span class="nc" id="L923">    List&lt;TypedDependency&gt; tdl = typedDependencies(Extras.MAXIMAL);</span>
+<span class="nc" id="L924">    addEnhancements(tdl, UniversalEnglishGrammaticalStructure.ENHANCED_PLUS_PLUS_OPTIONS);</span>
+<span class="nc" id="L925">    return tdl;</span>
+  }
+
+
+  /**
+   * Get a list of the typed dependencies, including extras like control
+   * dependencies, collapsing them and distributing relations across
+   * coordination.  This method is generally recommended for best
+   * representing the semantic and syntactic relations of a sentence. In
+   * general it returns a directed graph (i.e., the output may not be a tree
+   * and it may contain (small) cycles).
+   * The &quot;CCPropagated&quot; option corresponds to calling this method.
+   *
+   * @return collapsed dependencies with CC processed
+   */
+  public List&lt;TypedDependency&gt; typedDependenciesCCprocessed() {
+<span class="nc" id="L941">    return typedDependenciesCCprocessed(Extras.MAXIMAL);</span>
+  }
+
+
+  /**
+   * Destructively modify the {@code Collection&amp;lt;TypedDependency&amp;gt;} to collapse
+   * language-dependent transitive dependencies.
+   * &lt;p/&gt;
+   * Default is no-op; to be over-ridden in subclasses.
+   *
+   * @param list A list of dependencies to process for possible collapsing
+   * @param CCprocess apply CC process?
+   */
+  protected void collapseDependencies(List&lt;TypedDependency&gt; list, boolean CCprocess, Extras includeExtras) {
+    // do nothing as default operation
+<span class="nc" id="L956">  }</span>
+
+
+  /**
+   *
+   * Destructively applies different enhancements to the dependency graph.
+   * &lt;p/&gt;
+   * Default is no-op; to be over-ridden in subclasses.
+   *
+   * @param list A list of dependencies
+   * @param options Options that determine which enhancements are applied to the dependency graph.
+   */
+  protected void addEnhancements(List&lt;TypedDependency&gt; list, EnhancementOptions options) {
+    // do nothing as default operation
+<span class="nc" id="L970">  }</span>
+
+  /**
+   * Destructively modify the {@code Collection&amp;lt;TypedDependency&amp;gt;} to collapse
+   * language-dependent transitive dependencies but keeping a tree structure.
+   * &lt;p/&gt;
+   * Default is no-op; to be over-ridden in subclasses.
+   *
+   * @param list A list of dependencies to process for possible collapsing
+   *
+   */
+  protected void collapseDependenciesTree(List&lt;TypedDependency&gt; list) {
+    // do nothing as default operation
+<span class="nc" id="L983">  }</span>
+
+
+  /**
+   * Destructively modify the {@code TypedDependencyGraph} to correct
+   * language-dependent dependencies. (e.g., nsubjpass in a relative clause)
+   * &lt;p/&gt;
+   * Default is no-op; to be over-ridden in subclasses.
+   *
+   */
+  protected void correctDependencies(List&lt;TypedDependency&gt; list) {
+    // do nothing as default operation
+<span class="fc" id="L995">  }</span>
+
+
+  /**
+   * Checks if all the typeDependencies are connected
+   * @param list a list of typedDependencies
+   * @return true if the list represents a connected graph, false otherwise
+   */
+  public static boolean isConnected(Collection&lt;TypedDependency&gt; list) {
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">    return getRoots(list).size() &lt;= 1; // there should be no more than one root to have a connected graph</span>
+                                         // there might be no root in the way we look when you have a relative clause
+                                         // ex.: Apple is a society that sells computers
+                                         // (the root &quot;society&quot; will also be the nsubj of &quot;sells&quot;)
+  }
+
+  /**
+   * Return a list of TypedDependencies which are not dependent on any node from the list.
+   *
+   * @param list The list of TypedDependencies to check
+   * @return A list of TypedDependencies which are not dependent on any node from the list
+   */
+  public static Collection&lt;TypedDependency&gt; getRoots(Collection&lt;TypedDependency&gt; list) {
+
+<span class="nc" id="L1018">    Collection&lt;TypedDependency&gt; roots = new ArrayList&lt;&gt;();</span>
+
+    // need to see if more than one governor is not listed somewhere as a dependent
+    // first take all the deps
+<span class="nc" id="L1022">    Collection&lt;IndexedWord&gt; deps = Generics.newHashSet();</span>
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">    for (TypedDependency typedDep : list) {</span>
+<span class="nc" id="L1024">      deps.add(typedDep.dep());</span>
+<span class="nc" id="L1025">    }</span>
+
+    // go through the list and add typedDependency for which the gov is not a dep
+<span class="nc" id="L1028">    Collection&lt;IndexedWord&gt; govs = Generics.newHashSet();</span>
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">    for (TypedDependency typedDep : list) {</span>
+<span class="nc" id="L1030">      IndexedWord gov = typedDep.gov();</span>
+<span class="nc bnc" id="L1031" title="All 4 branches missed.">      if (!deps.contains(gov) &amp;&amp; !govs.contains(gov)) {</span>
+<span class="nc" id="L1032">        roots.add(typedDep);</span>
+      }
+<span class="nc" id="L1034">      govs.add(gov);</span>
+<span class="nc" id="L1035">    }</span>
+<span class="nc" id="L1036">    return roots;</span>
+  }
+
+  private static final long serialVersionUID = 2286294455343892678L;
+
+<span class="fc" id="L1041">  private static class NameComparator&lt;X&gt; implements Comparator&lt;X&gt; {</span>
+    @Override
+    public int compare(X o1, X o2) {
+<span class="fc" id="L1044">      String n1 = o1.toString();</span>
+<span class="fc" id="L1045">      String n2 = o2.toString();</span>
+<span class="fc" id="L1046">      return n1.compareTo(n2);</span>
+    }
+  }
+
+  // Note that these field constants are 0-based whereas much documentation is 1-based
+
+  public static final int CoNLLX_WordField = 1;
+  public static final int CoNLLX_POSField = 4;
+  public static final int CoNLLX_GovField = 6;
+  public static final int CoNLLX_RelnField = 7;
+
+  public static final int CoNLLX_FieldCount = 10;
+
+  /**
+   * Read in a file containing a CoNLL-X dependency treebank and return a
+   * corresponding list of GrammaticalStructures.
+   *
+   * @throws IOException
+   */
+  public static List&lt;GrammaticalStructure&gt; readCoNLLXGrammaticalStructureCollection(String fileName, Map&lt;String, GrammaticalRelation&gt; shortNameToGRel, GrammaticalStructureFromDependenciesFactory factory) throws IOException {
+<span class="nc" id="L1066">    LineNumberReader reader = new LineNumberReader(IOUtils.readerFromString(fileName));</span>
+<span class="nc" id="L1067">    List&lt;GrammaticalStructure&gt; gsList = new LinkedList&lt;&gt;();</span>
+
+<span class="nc" id="L1069">    List&lt;List&lt;String&gt;&gt; tokenFields = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">    for (String inline = reader.readLine(); inline != null;</span>
+<span class="nc" id="L1072">         inline = reader.readLine()) {</span>
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">      if ( ! inline.isEmpty()) {</span>
+        // read in a single sentence token by token
+<span class="nc" id="L1075">        List&lt;String&gt; fields = Arrays.asList(inline.split(&quot;\t&quot;));</span>
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">        if (fields.size() != CoNLLX_FieldCount) {</span>
+<span class="nc" id="L1077">          throw new RuntimeException(String.format(&quot;Error (line %d): 10 fields expected but %d are present&quot;, reader.getLineNumber(), fields.size()));</span>
+        }
+<span class="nc" id="L1079">        tokenFields.add(fields);</span>
+<span class="nc" id="L1080">      } else {</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">        if (tokenFields.isEmpty())</span>
+<span class="nc" id="L1082">          continue; // skip excess empty lines</span>
+
+<span class="nc" id="L1084">        gsList.add(buildCoNLLXGrammaticalStructure(tokenFields, shortNameToGRel, factory));</span>
+<span class="nc" id="L1085">        tokenFields = new ArrayList&lt;&gt;();</span>
+      }
+    }
+
+<span class="nc" id="L1089">    return gsList;</span>
+  }
+
+  public static GrammaticalStructure buildCoNLLXGrammaticalStructure(List&lt;List&lt;String&gt;&gt; tokenFields,
+                                Map&lt;String, GrammaticalRelation&gt; shortNameToGRel,
+                                GrammaticalStructureFromDependenciesFactory factory) {
+<span class="nc" id="L1095">    List&lt;IndexedWord&gt; tgWords = new ArrayList&lt;&gt;(tokenFields.size());</span>
+<span class="nc" id="L1096">    List&lt;TreeGraphNode&gt; tgPOSNodes = new ArrayList&lt;&gt;(tokenFields.size());</span>
+
+<span class="nc" id="L1098">    SemanticHeadFinder headFinder = new SemanticHeadFinder();</span>
+
+    // Construct TreeGraphNodes for words and POS tags
+<span class="nc bnc" id="L1101" title="All 2 branches missed.">    for (List&lt;String&gt; fields : tokenFields) {</span>
+<span class="nc" id="L1102">      CoreLabel word = new CoreLabel();</span>
+<span class="nc" id="L1103">      word.setValue(fields.get(CoNLLX_WordField));</span>
+<span class="nc" id="L1104">      word.setWord(fields.get(CoNLLX_WordField));</span>
+<span class="nc" id="L1105">      word.setTag(fields.get(CoNLLX_POSField));</span>
+<span class="nc" id="L1106">      word.setIndex(tgWords.size() + 1);</span>
+<span class="nc" id="L1107">      CoreLabel pos = new CoreLabel();</span>
+<span class="nc" id="L1108">      pos.setTag(fields.get(CoNLLX_POSField));</span>
+<span class="nc" id="L1109">      pos.setValue(fields.get(CoNLLX_POSField));</span>
+<span class="nc" id="L1110">      TreeGraphNode wordNode = new TreeGraphNode(word);</span>
+<span class="nc" id="L1111">      TreeGraphNode posNode =new TreeGraphNode(pos);</span>
+<span class="nc" id="L1112">      tgWords.add(new IndexedWord(word));</span>
+<span class="nc" id="L1113">      tgPOSNodes.add(posNode);</span>
+<span class="nc" id="L1114">      TreeGraphNode[] childArr = { wordNode };</span>
+<span class="nc" id="L1115">      posNode.setChildren(childArr);</span>
+<span class="nc" id="L1116">      wordNode.setParent(posNode);</span>
+<span class="nc" id="L1117">      posNode.percolateHeads(headFinder);</span>
+<span class="nc" id="L1118">    }</span>
+
+    // We fake up the parts of the tree structure that are not
+    // actually used by the grammatical relation transformation
+    // operations.
+    //
+    // That is, the constructed TreeGraphs consist of a flat tree,
+    // without any phrase bracketing, but that does preserve the
+    // parent child relationship between words and their POS tags.
+    //
+    // e.g. (ROOT (PRP I) (VBD hit) (DT the) (NN ball) (. .))
+
+<span class="nc" id="L1130">    TreeGraphNode root =</span>
+<span class="nc" id="L1131">      new TreeGraphNode(new Word(&quot;ROOT-&quot; + (tgPOSNodes.size() + 1)));</span>
+<span class="nc" id="L1132">    root.setChildren(tgPOSNodes.toArray(new TreeGraphNode[tgPOSNodes.size()]));</span>
+
+    // Build list of TypedDependencies
+<span class="nc" id="L1135">    List&lt;TypedDependency&gt; tdeps = new ArrayList&lt;&gt;(tgWords.size());</span>
+
+    // Create a node outside the tree useful for root dependencies;
+    // we want to keep those if they were stored in the conll file
+
+<span class="nc" id="L1140">    CoreLabel rootLabel = new CoreLabel();</span>
+<span class="nc" id="L1141">    rootLabel.setValue(&quot;ROOT&quot;);</span>
+<span class="nc" id="L1142">    rootLabel.setWord(&quot;ROOT&quot;);</span>
+<span class="nc" id="L1143">    rootLabel.setIndex(0);</span>
+<span class="nc" id="L1144">    IndexedWord dependencyRoot = new IndexedWord(rootLabel);</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">    for (int i = 0; i &lt; tgWords.size(); i++) {</span>
+<span class="nc" id="L1146">      String parentIdStr = tokenFields.get(i).get(CoNLLX_GovField);</span>
+<span class="nc bnc" id="L1147" title="All 2 branches missed.">      if (StringUtils.isNullOrEmpty(parentIdStr)) {</span>
+<span class="nc" id="L1148">        continue;</span>
+      }
+<span class="nc" id="L1150">      int parentId = Integer.parseInt(parentIdStr) - 1;</span>
+<span class="nc" id="L1151">      String grelString = tokenFields.get(i).get(CoNLLX_RelnField);</span>
+<span class="nc bnc" id="L1152" title="All 4 branches missed.">      if (grelString.equals(&quot;null&quot;) || grelString.equals(&quot;erased&quot;))</span>
+<span class="nc" id="L1153">        continue;</span>
+<span class="nc" id="L1154">      GrammaticalRelation grel = shortNameToGRel.get(grelString.toLowerCase());</span>
+      TypedDependency tdep;
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">      if (grel == null) {</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">        if (grelString.toLowerCase().equals(&quot;root&quot;)) {</span>
+<span class="nc" id="L1158">          tdep = new TypedDependency(ROOT, dependencyRoot, tgWords.get(i));</span>
+        } else {
+<span class="nc" id="L1160">          throw new RuntimeException(&quot;Unknown grammatical relation '&quot; +</span>
+                                     grelString + &quot;' fields: &quot; +
+<span class="nc" id="L1162">                                     tokenFields.get(i) + &quot;\nNode: &quot; +</span>
+<span class="nc" id="L1163">                                     tgWords.get(i) + &quot;\n&quot; +</span>
+<span class="nc" id="L1164">                                     &quot;Known Grammatical relations: [&quot;+shortNameToGRel.keySet()+&quot;]&quot; );</span>
+        }
+      } else {
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">        if (parentId &gt;= tgWords.size()) {</span>
+<span class="nc" id="L1168">          System.err.printf(&quot;Warning: Invalid Parent Id %d Sentence Length: %d%n&quot;, parentId+1, tgWords.size());</span>
+<span class="nc" id="L1169">          System.err.printf(&quot;         Assigning to root (0)%n&quot;);</span>
+<span class="nc" id="L1170">          parentId = -1;</span>
+        }
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">        tdep = new TypedDependency(grel, (parentId == -1 ? dependencyRoot : tgWords.get(parentId)),</span>
+<span class="nc" id="L1173">                                   tgWords.get(i));</span>
+      }
+<span class="nc" id="L1175">      tdeps.add(tdep);</span>
+    }
+<span class="nc" id="L1177">    return factory.build(tdeps, root);</span>
+  }
+
+
+
+
+
+  public static void main(String[] args) {
+    /* Language-specific default properties. The default
+     * options produce English Universal dependencies.
+     * This should be overwritten in every subclass.
+     *
+     */
+<span class="nc" id="L1190">    GrammaticalStructureConversionUtils.convertTrees(args, &quot;en&quot;);</span>
+<span class="nc" id="L1191">  }</span>
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.7.8.201612092310</span></div></body></html>
