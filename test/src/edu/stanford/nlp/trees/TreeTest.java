@@ -102,4 +102,11 @@ public class TreeTest extends TestCase {
                      "    (. ?)))" + separator);
     assertEquals(answer, t.pennString());
   }
+
+ public void testSize() {
+  Tree t = Tree.valueOf("(ROOT (S (NP (DT The) (ADJP (RB very) (JJ proud)) (NN woman)) (VP (VBD yawned) (ADVP (RB loudly))) (. .)))");
+  assertEquals(20,t.size());
+ } 
+
+
 }
